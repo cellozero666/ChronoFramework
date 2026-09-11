@@ -1,8 +1,7 @@
 # Slice 5 Remediation Gate
 
-**Status:** COMPLETE
-**Completed:** 2026-09-11
-**Verified:** clean `npm ci` + lint + typecheck + build + 149/149 tests on Node v22.21.1 and v24.20.0; packed-tarball global `chrono` lifecycle; adversarial suites with no skips and no manual links.
+**Status:** BLOCKING
+**Reopened:** 2026-09-11 — independent review rejected the prior COMPLETE claim (10 blocking findings: syntactic-only identity/sessions, incomplete grant binding, grantless execution cycle, TTY insufficiency, destructive key generation, matrix divergence, migration audit gaps).
 **Scope:** domain, persistence, Core, CLI, packaging, and tests created through Slice 5
 **Rule:** Do not start or claim completion of Slice 6 until every exit criterion below passes from a clean checkout.
 

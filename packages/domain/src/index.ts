@@ -111,6 +111,7 @@ export {
   RTK_UPSTREAM,
   SKILL_UPSTREAM,
   buildApprovalPayload,
+  buildSessionAuthorizationPayload,
   buildWaiverPayload,
   generateApprovalKeyPair,
   parseApprovalPublicKey,
@@ -119,6 +120,7 @@ export {
   type ApprovalAction,
   type ApprovalKeyPair,
   type ApprovalPayload,
+  type SessionAuthorizationPayload,
   type WaiverPayload,
 } from "./authority.js";
 

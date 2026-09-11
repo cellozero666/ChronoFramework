@@ -10,9 +10,10 @@
  * independence) and cannot skip signatures (cryptography still applies).
  *
  * Deny-by-default: an operation not listed here, or an identity not listed
- * for an operation, is denied. Adapter sessions may act only where the row
- * explicitly includes "session", and only under an assigned role enforced
- * by adapters (Phase 5 maps sessions to real runtime definitions).
+ * for an operation, is denied. Adapter sessions are resolved to their bound
+ * role before consulting this matrix: there is deliberately no generic
+ * "session" holder, so a session string alone never confers capabilities
+ * [Remediation §3A, review finding 3].
  * No runtime-specific concepts [FW §22].
  */
 
@@ -21,7 +22,7 @@ import type { AgentRole } from "./state.js";
 /** Version of this authority policy, persisted with authorization evidence. */
 export const AUTHORITY_POLICY_VERSION = "1";
 
-export type CapabilityHolder = AgentRole | "PO" | "session";
+export type CapabilityHolder = AgentRole | "PO";
 
 /** Core operations governed by the matrix. */
 export type CoreOperation =
@@ -38,7 +39,9 @@ export type CoreOperation =
   | "blocker.resolve"
   | "waiver.expire"
   | "execution.request"
-  | "completion.request";
+  | "completion.request"
+  | "session.revoke"
+  | "attestation.record";
 
 const ALL_WORKERS: readonly AgentRole[] = ["belthazar", "melchior", "prometheus"];
 
@@ -53,14 +56,16 @@ export const ROLE_CAPABILITIES: Record<CoreOperation, readonly CapabilityHolder[
   "harness.record": ["gaspar", "PO"],
   "harness.invalidate": ["gaspar", "PO"],
   "security.profile": ["glenn", "gaspar", "PO"],
-  "evidence.record": ["gaspar", "belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio", "PO", "session"],
-  "defect.record": ["spekkio", "PO"],
+  "evidence.record": ["gaspar", "belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio", "PO"],
+  "defect.record": ["spekkio"],
   "verification.record": ["spekkio"],
-  "blocker.raise": ["gaspar", "belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio", "PO", "session"],
-  "blocker.resolve": ["gaspar", "belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio", "PO", "session"],
+  "blocker.raise": ["gaspar", "belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio", "PO"],
+  "blocker.resolve": ["gaspar", "belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio", "PO"],
   "waiver.expire": ["gaspar", "PO"],
-  "execution.request": ["gaspar", "PO", "session"],
-  "completion.request": ["gaspar", "spekkio", "PO", "session"],
+  "execution.request": ["gaspar", "PO"],
+  "completion.request": ["gaspar", "spekkio", "PO"],
+  "session.revoke": ["gaspar", "PO"],
+  "attestation.record": ["gaspar", "PO"],
 };
 
 /**
@@ -75,29 +80,34 @@ export const EVENT_ROLE_ALLOWLIST: Record<string, readonly CapabilityHolder[]> =
   SpecApprovedReady: ["gaspar", "PO"],
   ModulePlanned: ["gaspar", "PO"],
   ModuleApproved: ["gaspar", "PO"],
-  ExecutionStarted: [...ALL_WORKERS, "gaspar", "PO", "session"],
-  ImplementationComplete: [...ALL_WORKERS, "gaspar", "PO", "session"],
-  SpekkioPassed: ["spekkio", "gaspar", "PO"],
-  SpekkioFailed: ["spekkio", "gaspar", "PO"],
-  CorrectionComplete: [...ALL_WORKERS, "gaspar", "PO", "session"],
+  ExecutionStarted: [...ALL_WORKERS, "gaspar", "PO"],
+  ImplementationComplete: [...ALL_WORKERS, "gaspar", "PO"],
+  SpekkioPassed: ["spekkio"],
+  SpekkioFailed: ["spekkio"],
+  CorrectionComplete: [...ALL_WORKERS, "gaspar", "PO"],
   ChangeControlInitiated: ["gaspar", "PO"],
   DefinitionOfDoneSatisfied: ["gaspar", "PO"],
   WorkPackageAuthorized: ["gaspar", "PO"],
-  ExecutionAssigned: [...ALL_WORKERS, "gaspar", "PO", "session"],
-  ImplementationDone: [...ALL_WORKERS, "gaspar", "PO", "session"],
-  VerificationReady: [...ALL_WORKERS, "gaspar", "PO", "session"],
+  ExecutionAssigned: [...ALL_WORKERS, "gaspar", "PO"],
+  ImplementationDone: [...ALL_WORKERS, "gaspar", "PO"],
+  VerificationReady: [...ALL_WORKERS, "gaspar", "PO"],
   ArchitectureReviewed: ["gaspar", "PO"],
   ArchitectureSecurityApproved: ["gaspar", "PO"],
+  // Blocker linkage events: role-gated here AND linkage-governed in the
+  // Core (an active/resolved blocker record is additionally required).
+  BlockerRaised: ["gaspar", "belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio", "PO"],
+  BlockerResolved: ["gaspar", "belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio", "PO"],
 };
 
 /**
- * Check an authenticated identity against a capability row.
- * PO passes by supremacy wherever listed; sessions pass only where the
- * row includes "session"; the machine identity never authorizes.
+ * Check a session-resolved role against a capability row. Callers resolve
+ * adapter sessions to their bound role first; the "session" kind never
+ * reaches this function. PO passes by supremacy wherever listed; the
+ * machine identity never authorizes.
  */
 export function isCapable(
   operation: CoreOperation,
-  kind: "agent" | "po" | "session" | "system",
+  kind: "agent" | "po",
   role?: AgentRole
 ): boolean {
   const row = ROLE_CAPABILITIES[operation];
@@ -107,35 +117,28 @@ export function isCapable(
   if (kind === "po") {
     return row.includes("PO");
   }
-  if (kind === "session") {
-    return row.includes("session");
-  }
   if (kind === "agent" && role !== undefined) {
     return row.includes(role);
   }
   return false;
 }
 
-/** Check an authenticated identity against a transition event row. */
+/**
+ * Check a session-resolved role against a transition event row.
+ * BlockerRaised/Resolved are linkage-governed (the blocker record carries
+ * the authority); every other event requires its listed role.
+ */
 export function mayEnactEvent(
   eventType: string,
-  kind: "agent" | "po" | "session" | "system",
+  kind: "agent" | "po",
   role?: AgentRole
 ): boolean {
-  if (eventType === "BlockerRaised" || eventType === "BlockerResolved") {
-    // Linkage-governed: any authenticated identity may request; the
-    // blocker record carries the authority.
-    return kind === "agent" || kind === "po" || kind === "session";
-  }
   const row = EVENT_ROLE_ALLOWLIST[eventType];
   if (row === undefined) {
     return false;
   }
   if (kind === "po") {
     return row.includes("PO");
-  }
-  if (kind === "session") {
-    return row.includes("session");
   }
   if (kind === "agent" && role !== undefined) {
     return row.includes(role);

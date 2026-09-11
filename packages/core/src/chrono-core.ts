@@ -4,6 +4,7 @@
  * [FW §648] — Fail-closed semantics.
  */
 
+import { createHash, randomBytes } from "node:crypto";
 import {
   ChronoDatabase,
   type ProjectRepository,
@@ -16,9 +17,11 @@ import {
   type SequenceRepository,
   type QaRepository,
   type HarnessRepository,
+  type AgentSessionRecord,
 } from "@chrono/persistence";
 import {
   validateTransition,
+  isAgentRole,
   isValidState,
   projectProjectState,
   canonicalize,
@@ -30,9 +33,11 @@ import {
   assertRequiredFields,
   assertValidInitialState,
   buildApprovalPayload,
+  buildSessionAuthorizationPayload,
   buildWaiverPayload,
   parseActorIdentity,
   parseApprovalPublicKey,
+  toToolIdentity,
   verifyApprovalSignature,
   APPROVAL_ACTIONS,
   AUTHORITY_POLICY_VERSION,
@@ -46,7 +51,49 @@ import {
   Severity,
   type CoreOperation,
 } from "@chrono/domain";
-import type { ProjectState, EntityType, ApprovalPayload, WaiverPayload } from "@chrono/domain";
+import type { ProjectState, EntityType, ApprovalPayload, WaiverPayload, AgentRole } from "@chrono/domain";
+
+/**
+ * Caller authentication bundle for every protected Core operation.
+ * The session token is the credential; `actor` names the acting identity
+ * for audit and must be consistent with the session (equal to the bound
+ * role, or the orchestrating gaspar/PO). Bare role strings without a
+ * session never authorize [Remediation §3A, review finding 1].
+ */
+export interface CallerAuth {
+  readonly actor: string;
+  readonly session: {
+    readonly id: string;
+    readonly token: string;
+  };
+}
+
+/** Unvalidated caller bundle as received (e.g. inside guard contexts). */
+interface UnresolvedCaller {
+  readonly actor: unknown;
+  readonly session: unknown;
+}
+
+/**
+ * One-time PO-signed authorization for a privileged-session bootstrap.
+ * The nonce is consumed atomically with issuance, so a captured signature
+ * cannot mint a second privileged session inside its freshness window.
+ */
+export interface SessionAuthorization {
+  readonly nonce: string;
+  readonly authority: string;
+  readonly rationale: string;
+  readonly timestamp: string;
+  readonly signature: string;
+}
+
+/** Session-resolved caller used for capability and scope checks. */
+interface ResolvedCaller {
+  readonly kind: "agent" | "po";
+  readonly role: string;
+  readonly session: AgentSessionRecord;
+  readonly auditActor: string;
+}
 
 /**
  * Core configuration (PO-owned, external) [CORE §8, RUNTIME §8]
@@ -779,9 +826,10 @@ export class ChronoCore {
    * and references before anything is persisted [Remediation §2].
    * [CORE §7.3, DOM §3.9]
    */
-  registerSpec(specId: string, status: string, content: unknown, actor: string): CoreResult<string> {
+  registerSpec(specId: string, status: string, content: unknown, auth: CallerAuth): CoreResult<string> {
     try {
-      this.requireCapability("artifact.register", actor);
+      const specCaller = this.resolveCaller(auth, "register specification");
+      this.requireCapability("artifact.register", specCaller);
       this.assertIdentityForType(specId, "SP");
       assertValidInitialState("SP", status);
       assertRequiredFields("SP", content);
@@ -823,9 +871,10 @@ export class ChronoCore {
    * Register a Module artifact.
    * [CORE §7.4, DOM §3.13]
    */
-  registerModule(moduleId: string, status: string, content: unknown, actor: string): CoreResult<string> {
+  registerModule(moduleId: string, status: string, content: unknown, auth: CallerAuth): CoreResult<string> {
     try {
-      this.requireCapability("artifact.register", actor);
+      const moduleCaller = this.resolveCaller(auth, "register module");
+      this.requireCapability("artifact.register", moduleCaller);
       this.assertIdentityForType(moduleId, "MOD");
       assertValidInitialState("MOD", status);
       assertRequiredFields("MOD", content);
@@ -866,9 +915,10 @@ export class ChronoCore {
    * Register a WorkPackage artifact.
    * [CORE §7.4, DOM §3.14]
    */
-  registerWorkPackage(wpId: string, status: string, content: unknown, actor: string): CoreResult<string> {
+  registerWorkPackage(wpId: string, status: string, content: unknown, auth: CallerAuth): CoreResult<string> {
     try {
-      this.requireCapability("artifact.register", actor);
+      const wpCaller = this.resolveCaller(auth, "register work package");
+      this.requireCapability("artifact.register", wpCaller);
       this.assertIdentityForType(wpId, "WP");
       assertValidInitialState("WP", status);
       assertRequiredFields("WP", content);
@@ -923,9 +973,9 @@ export class ChronoCore {
    * registrar exists so the READY gate can verify Harness existence and
    * freshness deterministically [P5.6, P7.5].
    */
-  recordHarness(specRevision: string, contentHash: string, content: string, actor: string): CoreResult<string> {
+  recordHarness(specRevision: string, contentHash: string, content: string, auth: CallerAuth): CoreResult<string> {
     try {
-      this.requireCapability("harness.record", actor);
+      this.resolveCaller(auth, "record harness");
       if (!isRevisionHash(specRevision)) {
         throw new ChronoError({
           code: ErrorCode.VALIDATION_ERROR,
@@ -969,7 +1019,7 @@ export class ChronoCore {
         });
       }
 
-      const harnessActor = this.requireCapability("harness.record", actor);
+      const harnessActor = this.requireCapability("harness.record", this.resolveCaller(auth, "record harness"));
       const record = this.harnesses.create({
         specRevision,
         contentHash,
@@ -981,7 +1031,7 @@ export class ChronoCore {
         eventType: "ArtifactCreated",
         entityId: owner.id,
         payload: { type: "HARNESS", specRevision, contentHash },
-        actor: harnessActor,
+        actor: harnessActor.auditActor,
         priorState: undefined,
         newState: "recorded",
         reasoning: "Authoritative Harness recorded for Spec revision",
@@ -1011,9 +1061,9 @@ export class ChronoCore {
    * system-analysis completion flag is set here [P1.8: "Completion
    * authorizes architecture analysis only"].
    */
-  proposeArchitecture(content: unknown, actor: string): CoreResult<string> {
+  proposeArchitecture(content: unknown, auth: CallerAuth): CoreResult<string> {
     try {
-      const verifiedActor = this.requireCapability("architecture.propose", actor);
+      const verifiedActor = this.requireCapability("architecture.propose", this.resolveCaller(auth, "propose architecture"));
       const canonical = canonicalize(content);
       const revision = computeRevisionHash(content);
       const parsed = JSON.parse(canonical) as { title?: unknown };
@@ -1033,7 +1083,7 @@ export class ChronoCore {
         eventType: "ArtifactCreated",
         entityId: "ARCH",
         payload: { type: "ARCHITECTURE", revision },
-        actor: verifiedActor,
+        actor: verifiedActor.auditActor,
         priorState: undefined,
         newState: "proposed",
         reasoning: "Architecture proposed",
@@ -1046,9 +1096,9 @@ export class ChronoCore {
   }
 
   /** Move proposed architecture to security/architecture review. */
-  submitArchitectureForReview(actor: string): CoreResult<string> {
+  submitArchitectureForReview(auth: CallerAuth): CoreResult<string> {
     try {
-      this.requireCapability("architecture.enact", actor);
+      const submitter = this.requireCapability("architecture.enact", this.resolveCaller(auth, "submit architecture"));
       const project = this.projects.findById("default");
       const fromState = project.architectureState ?? "proposed";
       validateTransition("ARCHITECTURE", fromState, "under_review", "ArchitectureReviewed");
@@ -1057,7 +1107,7 @@ export class ChronoCore {
         eventType: "StateTransition",
         entityId: "ARCH",
         payload: { entityType: "ARCHITECTURE", eventType: "ArchitectureReviewed", fromState, toState: "under_review" },
-        actor: this.requireActor(actor),
+        actor: submitter.auditActor,
         priorState: fromState,
         newState: "under_review",
         reasoning: "Architecture submitted for review",
@@ -1073,9 +1123,9 @@ export class ChronoCore {
    * Approve architecture. Requires a valid Architecture Security Approval
    * bound to the exact architecture revision [P4.4, STATE §2.5].
    */
-  approveArchitecture(actor: string): CoreResult<string> {
+  approveArchitecture(auth: CallerAuth): CoreResult<string> {
     try {
-      const verifiedActor = this.requireCapability("architecture.enact", actor);
+      const verifiedActor = this.requireCapability("architecture.enact", this.resolveCaller(auth, "approve architecture"));
       const project = this.projects.findById("default");
       const revision = project.architectureRevision;
       if (revision === null) {
@@ -1105,7 +1155,7 @@ export class ChronoCore {
         eventType: "StateTransition",
         entityId: "ARCH",
         payload: { entityType: "ARCHITECTURE", eventType: "ArchitectureSecurityApproved", fromState, toState: "approved" },
-        actor: verifiedActor,
+        actor: verifiedActor.auditActor,
         priorState: fromState,
         newState: "approved",
         reasoning: "Architecture approved with security approval",
@@ -1121,16 +1171,16 @@ export class ChronoCore {
    * Mark a Harness stale after material change to its inputs [P6.7].
    * Execution against the stale revision denies until regeneration.
    */
-  markHarnessStale(specRevision: string, actor: string): CoreResult<void> {
+  markHarnessStale(specRevision: string, auth: CallerAuth): CoreResult<void> {
     try {
-      const verifiedActor = this.requireCapability("harness.invalidate", actor);
+      const verifiedActor = this.requireCapability("harness.invalidate", this.resolveCaller(auth, "invalidate harness"));
       this.harnesses.findBySpecRevision(specRevision);
       this.harnesses.markStale(specRevision);
       this.events.append({
         eventType: "StateTransition",
         entityId: specRevision,
         payload: { entityType: "HARNESS", eventType: "HarnessStaled" },
-        actor: verifiedActor,
+        actor: verifiedActor.auditActor,
         priorState: "current",
         newState: "stale",
         reasoning: "Harness inputs changed materially",
@@ -1180,9 +1230,9 @@ export class ChronoCore {
   /**
    * Execute a state transition after validating it against the legal
    * transition table AND evaluating every authoritative guard for the
-   * event type. Approval, security, Harness, evidence, attestation,
-   * dependency, blocker, and role requirements are evaluated by the Core
-   * before anything is persisted [CORE §6.1, STATE §6, Remediation §2].
+   * event type. The caller presents an authenticated session; capabilities
+   * resolve through the session's bound role. Bare role strings without a
+   * session never authorize [Remediation §3A, review finding 1].
    *
    * Every failure is audited as a DENIED event [CORE §7.7, STATE §6.3].
    */
@@ -1191,17 +1241,23 @@ export class ChronoCore {
     eventType: string,
     guardContext?: Record<string, unknown>
   ): CoreResult<{ fromState: string; toState: string }> {
-    let actor = "unknown";
+    let auditActor = "unknown";
     try {
-      actor = this.requireActor(guardContext?.["actor"]);
-      // Transition enactment is role-governed (BlockerRaised/Resolved are
-      // linkage-governed instead) [Remediation §3A].
-      const parsed = parseActorIdentity(actor);
-      if (!mayEnactEvent(eventType, parsed.kind, parsed.kind === "agent" ? parsed.role : undefined)) {
+      const caller = this.resolveCaller(
+        {
+          actor: guardContext?.["actor"],
+          session: guardContext?.["session"],
+        },
+        `transition ${eventType}`
+      );
+      auditActor = caller.auditActor;
+      // Transition enactment is role-governed through the session's bound
+      // role (BlockerRaised/Resolved are additionally linkage-governed).
+      if (!mayEnactEvent(eventType, caller.kind, caller.kind === "agent" ? (caller.role as AgentRole) : undefined)) {
         throw new ChronoError({
           code: ErrorCode.EXECUTION_DENIED,
           severity: Severity.BLOCKER,
-          message: `Event '${eventType}' on '${artifactId}' is not permitted to '${actor}' (authority policy v${AUTHORITY_POLICY_VERSION})`,
+          message: `Event '${eventType}' on '${artifactId}' is not permitted to '${caller.role}' (authority policy v${AUTHORITY_POLICY_VERSION})`,
           invariantRef: "INV §5.1",
           affectedTarget: artifactId,
           suggestedAction: "Escalate to the role that owns this transition",
@@ -1209,6 +1265,13 @@ export class ChronoCore {
       }
       const artifact = this.artifacts.findById(artifactId);
       const fromState = artifact.status;
+
+      // Assignment scope: the session must cover the artifact.
+      this.assertSessionScope(
+        caller,
+        { moduleId: this.artifactScopeModule(artifactId), workPackageId: artifact.type === "WP" ? artifactId : null },
+        `transition ${eventType}`
+      );
 
       // BlockerResolved re-enters the validated prior state recorded on
       // the resolved blocker — never an arbitrary target [STATE §2.2].
@@ -1221,7 +1284,7 @@ export class ChronoCore {
 
       // Authoritative per-event guards before persistence.
       this.evaluateTransitionGuards(
-        artifact.type, artifactId, artifact.revision, fromState, toState, eventType, guardContext, actor
+        artifact.type, artifactId, artifact.revision, fromState, toState, eventType, guardContext, caller
       );
 
       // Persist atomically: hash-chained history link, current-pointer
@@ -1252,7 +1315,7 @@ export class ChronoCore {
           eventType: "StateTransition",
           entityId: artifactId,
           payload: { entityType: artifact.type, eventType, fromState, toState },
-          actor,
+          actor: auditActor,
           priorState: fromState,
           newState: toState,
           reasoning: "Valid state transition",
@@ -1262,7 +1325,7 @@ export class ChronoCore {
       this.syncProjectState();
       return { ok: true, value: { fromState, toState } };
     } catch (e) {
-      this.auditDenial(artifactId, eventType, e, actor);
+      this.auditDenial(artifactId, eventType, e, auditActor);
       return this.handleError(e);
     }
   }
@@ -1355,59 +1418,595 @@ export class ChronoCore {
   // ---------------------------------------------------------------------------
 
   /**
-   * Actor identity is mandatory and must authenticate as a canonical agent
-   * role, the PO, or a `<runtime>:<session>` adapter session [RUNTIME §2,
-   * DOM §2.2, Remediation §3A]. `luca`, `agent`, case variants, unknown
-   * roles, and the machine identity as a caller fail closed — never
-   * normalized.
+   * Session-token validation: the credential behind every protected
+   * operation [DOM §2.2, Remediation §3A, review finding 1]. A bare
+   * role string or a syntactically valid but unregistered session id
+   * never authenticates: the presenter must hold the unguessable bearer
+   * token whose SHA-256 is persisted. Unknown, expired, revoked, and
+   * foreign-project sessions deny. Successful validation records usage.
    */
-  private requireActor(actor: unknown): string {
-    const parsed = parseActorIdentity(actor);
+  private validateSessionToken(
+    ref: unknown,
+    operation: string
+  ): AgentSessionRecord {
+    if (
+      typeof ref !== "object" ||
+      ref === null ||
+      typeof (ref as Record<string, unknown>)["id"] !== "string" ||
+      typeof (ref as Record<string, unknown>)["token"] !== "string" ||
+      ((ref as Record<string, unknown>)["id"] as string).length === 0 ||
+      ((ref as Record<string, unknown>)["token"] as string).length === 0
+    ) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Operation '${operation}' requires an authenticated session: present a session id and bearer token`,
+        invariantRef: "INV §5.1",
+        suggestedAction: "Open a session with chrono session open, then present its token",
+      });
+    }
+    const { id, token } = ref as { id: string; token: string };
+    const tokenHash = createHash("sha256").update(token, "utf8").digest("hex");
+    let session: AgentSessionRecord;
+    try {
+      session = this.db.sessions().findByTokenHash(tokenHash);
+    } catch {
+      throw new ChronoError({
+        code: ErrorCode.REFERENCE_UNRESOLVABLE,
+        severity: Severity.ERROR,
+        message: "Session token unknown: forged tokens deny",
+        invariantRef: "INV §10.2",
+        affectedTarget: id,
+        suggestedAction: "Open an authenticated session first",
+      });
+    }
+    if (session.id !== id) {
+      throw new ChronoError({
+        code: ErrorCode.INCONSISTENT_REFERENCE,
+        severity: Severity.ERROR,
+        message: "Session id and token do not belong together: tampering denied",
+        invariantRef: "INV §10.2",
+        affectedTarget: id,
+        suggestedAction: "Present the id and token issued together",
+      });
+    }
+    if (session.projectId !== "default") {
+      throw new ChronoError({
+        code: ErrorCode.INCONSISTENT_REFERENCE,
+        severity: Severity.ERROR,
+        message: "Session belongs to a different project",
+        invariantRef: "INV §10.2",
+        affectedTarget: id,
+        suggestedAction: "Open a session in this project",
+      });
+    }
+    if (session.revoked) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Session '${id}' was revoked`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Open a fresh session",
+      });
+    }
+    if (Date.parse(session.expiresAt) <= Date.parse(this.now())) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Session '${id}' expired at ${session.expiresAt}`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Open a fresh session",
+      });
+    }
+    const role = session.role;
+    if (role !== "PO" && !isAgentRole(role)) {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: `Session '${id}' carries an unknown role '${role}'`,
+        invariantRef: "INV §14.4",
+        affectedTarget: id,
+        suggestedAction: "Open a session with a canonical role",
+      });
+    }
+    this.db.sessions().touch(id, this.now());
+    return session;
+  }
+
+  /**
+   * Verify a one-time PO-signed authorization before minting a gaspar or
+   * PO session. The signature must bind the exact requested role, adapter,
+   * runtime, scopes, TTL, nonce, authority, rationale, and timestamp to
+   * the project-registered PO key. Freshness alone is not replay-safe, so
+   * the caller consumes the nonce atomically with session issuance.
+   */
+  private verifyPrivilegedSessionAuthorization(
+    role: string,
+    input: {
+      adapter: string;
+      runtime: string;
+      scopeModule?: string;
+      scopeWp?: string;
+      ttlSeconds: number;
+    },
+    authorization: SessionAuthorization
+  ): string {
+    if (role !== "gaspar" && role !== "PO") {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: "PO-signed session bootstrap applies only to gaspar and PO sessions",
+        invariantRef: "INV §14.4",
+        affectedTarget: role,
+        suggestedAction: "Open worker sessions interactively or by delegation",
+      });
+    }
+    if (!/^[0-9a-f]{32,128}$/.test(authorization.nonce)) {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: "Privileged-session authorization requires a 32–128 character lowercase hex nonce",
+        invariantRef: "INV §14.4",
+        suggestedAction: "Generate a fresh random nonce for the signed bootstrap",
+      });
+    }
+    if (authorization.authority.trim().length === 0 || authorization.rationale.trim().length === 0) {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: "Privileged-session authorization requires a PO authority and rationale",
+        invariantRef: "INV §14.4",
+        suggestedAction: "Identify the PO signer and the privileged session purpose",
+      });
+    }
+    this.assertFreshTimestamp(authorization.timestamp, "SESSION");
+    const registered = this.poPublicKey();
+    if (registered === null) {
+      throw new ChronoError({
+        code: ErrorCode.APPROVAL_REQUIRED,
+        severity: Severity.BLOCKER,
+        message: "No PO key registered: privileged sessions cannot be bootstrapped",
+        invariantRef: "INV §4.6",
+        affectedTarget: "PO-KEY",
+        suggestedAction: "Register the PO public key before bootstrapping privileged sessions",
+      });
+    }
+    const payload = buildSessionAuthorizationPayload({
+      sessionRole: role,
+      adapter: input.adapter,
+      runtime: input.runtime,
+      scopeModule: input.scopeModule ?? null,
+      scopeWp: input.scopeWp ?? null,
+      ttlSeconds: input.ttlSeconds,
+      nonce: authorization.nonce,
+      authority: authorization.authority,
+      rationale: authorization.rationale,
+      timestamp: authorization.timestamp,
+    });
+    const key = parseApprovalPublicKey(registered);
+    if (!verifyApprovalSignature(payload, authorization.signature, key)) {
+      throw new ChronoError({
+        code: ErrorCode.SIGNATURE_INVALID,
+        severity: Severity.ERROR,
+        message: "Privileged-session authorization signature invalid under the registered PO key",
+        invariantRef: "INV §4.3",
+        affectedTarget: role,
+        suggestedAction: "Sign the exact privileged-session request with the PO private key",
+      });
+    }
+    return authorization.authority;
+  }
+
+  /**
+   * Resolve the caller of a protected operation: validate the session
+   * token, then require the declared actor to equal the session's bound
+   * role. There is no orchestrator exception here: a separate authenticated
+   * requester is carried explicitly where orchestration is legitimate.
+   * The audit identity is the session-resolved role, never a divergent
+   * declaration [Remediation §3A].
+   */
+  private resolveCaller(auth: CallerAuth | UnresolvedCaller, operation: string): ResolvedCaller {
+    const session = this.validateSessionToken(auth.session, operation);
+    const parsed = parseActorIdentity(auth.actor);
     if (parsed.kind === "system") {
       throw new ChronoError({
         code: ErrorCode.VALIDATION_ERROR,
         severity: Severity.ERROR,
         message: "The machine identity cannot invoke protected operations",
         invariantRef: "INV §14.4",
-        suggestedAction: "Invoke with a canonical role, PO, or adapter session",
+        suggestedAction: "Invoke with the session's bound role",
       });
     }
-    return parsed.identity;
-  }
-
-  /**
-   * Capability enforcement against the Core-owned matrix [Remediation §3A].
-   * Deny-by-default: unlisted operations and unlisted identities deny with
-   * an explicit authorization error. PO passes by supremacy wherever the
-   * row lists PO; sessions pass only where the row lists "session".
-   */
-  private requireCapability(operation: CoreOperation, actor: unknown): string {
-    const parsed = parseActorIdentity(actor);
-    if (parsed.kind === "system") {
+    const role = session.role;
+    const declared = parsed.identity;
+    if (parsed.kind !== "agent" && parsed.kind !== "po") {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: `Actor '${parsed.identity}' is not a callable role identity`,
+        invariantRef: "INV §14.4",
+        affectedTarget: session.id,
+        suggestedAction: "Act as the session's bound role",
+      });
+    }
+    if (declared !== role) {
       throw new ChronoError({
         code: ErrorCode.EXECUTION_DENIED,
         severity: Severity.BLOCKER,
-        message: `Operation '${operation}' denied to the machine identity`,
+        message: `Actor '${declared}' does not match session '${session.id}' (bound to '${role}'): identity confusion denied`,
         invariantRef: "INV §5.1",
-        suggestedAction: "Invoke with a canonical role, PO, or adapter session",
+        affectedTarget: session.id,
+        suggestedAction: "Act as the session's bound role",
       });
     }
+    return {
+      kind: role === "PO" ? "po" : "agent",
+      role,
+      session,
+      auditActor: role,
+    };
+  }
+
+  /**
+   * Capability enforcement against the Core-owned matrix, evaluated on
+   * the session-resolved role [Remediation §3A]. Deny-by-default.
+   * PO passes by supremacy wherever the row lists PO.
+   */
+  private requireCapability(operation: CoreOperation, caller: ResolvedCaller): ResolvedCaller {
     const allowed = isCapable(
       operation,
-      parsed.kind,
-      parsed.kind === "agent" ? parsed.role : undefined
+      caller.kind,
+      caller.kind === "agent" ? (caller.role as AgentRole) : undefined
     );
     if (!allowed) {
       throw new ChronoError({
         code: ErrorCode.EXECUTION_DENIED,
         severity: Severity.BLOCKER,
-        message: `Operation '${operation}' is not permitted to '${parsed.identity}' (authority policy v${AUTHORITY_POLICY_VERSION})`,
+        message: `Operation '${operation}' is not permitted to '${caller.role}' (authority policy v${AUTHORITY_POLICY_VERSION})`,
         invariantRef: "INV §5.1",
-        affectedTarget: parsed.identity,
+        affectedTarget: caller.role,
         suggestedAction: "Escalate to the role that owns this operation",
       });
     }
-    return parsed.identity;
+    return caller;
+  }
+
+  /**
+   * Open an authenticated adapter session. Three roots of trust:
+   * interactive worker minting (a live terminal, but never sufficient for
+   * gaspar/PO); delegation from a valid gaspar/PO parent session; and a
+   * one-time PO-signed bootstrap for gaspar/PO sessions. Interactive
+   * presence alone never mints orchestrator or human authority.
+   *
+   * Returns the bearer token exactly once; only its SHA-256 persists.
+   */
+  openSession(
+    input: {
+      role: string;
+      adapter: string;
+      runtime: string;
+      scopeModule?: string;
+      scopeWp?: string;
+      ttlSeconds: number;
+    },
+    auth:
+      | { interactive: true }
+      | { parentSession: { id: string; token: string } }
+      | { poAuthorization: SessionAuthorization }
+  ): CoreResult<{ id: string; token: string; expiresAt: string }> {
+    try {
+      const role = input.role;
+      if (role !== "PO" && !isAgentRole(role)) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Session role '${role}' is not canonical`,
+          invariantRef: "INV §14.4",
+          suggestedAction: "Use a canonical agent role or PO",
+        });
+      }
+      if (input.adapter.trim().length === 0 || input.runtime.trim().length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Session requires a non-empty adapter and runtime",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Identify the adapter and runtime holding the token",
+        });
+      }
+      const project = this.projects.findById("default");
+      if (project.runtime !== null && project.runtime !== input.runtime) {
+        throw new ChronoError({
+          code: ErrorCode.INCONSISTENT_REFERENCE,
+          severity: Severity.ERROR,
+          message: `Session runtime '${input.runtime}' does not match project runtime '${project.runtime}'`,
+          invariantRef: "INV §10.2",
+          suggestedAction: "Open the session for the project's configured runtime",
+        });
+      }
+      // Assignment rule: sessions are scoped to a module or to the whole
+      // project ("default"); only gaspar and PO sessions may be unscoped.
+      if ((role !== "gaspar" && role !== "PO") && input.scopeModule === undefined) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Session for '${role}' requires an assigned scope (module or "default" for project-wide work)`,
+          invariantRef: "INV §14.4",
+          affectedTarget: role,
+          suggestedAction: "Assign the session to its module or to the project",
+        });
+      }
+      if (input.scopeModule !== undefined && input.scopeModule !== "default") {
+        const scope = this.artifacts.findById(input.scopeModule);
+        if (scope.type !== "MOD") {
+          throw new ChronoError({
+            code: ErrorCode.INCONSISTENT_REFERENCE,
+            severity: Severity.ERROR,
+            message: `Session scope '${input.scopeModule}' is not a Module`,
+            invariantRef: "INV §10.2",
+            affectedTarget: input.scopeModule,
+            suggestedAction: "Scope sessions to an existing Module or to the project",
+          });
+        }
+      }
+      if (input.scopeWp !== undefined) {
+        if (input.scopeModule === undefined) {
+          throw new ChronoError({
+            code: ErrorCode.VALIDATION_ERROR,
+            severity: Severity.ERROR,
+            message: "Session work-package scope requires a module scope",
+            invariantRef: "INV §14.4",
+            suggestedAction: "Scope the session to the owning module first",
+          });
+        }
+        const wp = this.artifacts.findById(input.scopeWp);
+        const owner = wp.type === "WP" ? this.workPackageModule(input.scopeWp) : null;
+        if (owner === null || (input.scopeModule !== "default" && owner !== input.scopeModule)) {
+          throw new ChronoError({
+            code: ErrorCode.INCONSISTENT_REFERENCE,
+            severity: Severity.ERROR,
+            message: `Session work-package scope '${input.scopeWp}' does not belong to '${input.scopeModule}'`,
+            invariantRef: "INV §10.2",
+            affectedTarget: input.scopeWp,
+            suggestedAction: "Scope the session to a Work Package of the assigned module",
+          });
+        }
+      }
+      if (!Number.isFinite(input.ttlSeconds) || input.ttlSeconds <= 0 || input.ttlSeconds > 86400) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Session TTL must be within 1 second and 24 hours",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Request a bounded session lifetime",
+        });
+      }
+
+      let authPath: "interactive-worker" | "delegated" | "signed-bootstrap";
+      let auditActor: string;
+      let consumedAuthorization: { nonce: string; authority: string } | null = null;
+      if ("interactive" in auth) {
+        this.requireInteractiveAuthority("Session opening");
+        if (role === "gaspar" || role === "PO") {
+          throw new ChronoError({
+            code: ErrorCode.APPROVAL_REQUIRED,
+            severity: Severity.BLOCKER,
+            message: `Session role '${role}' requires a one-time PO-signed bootstrap: a live terminal alone never mints orchestrator or human authority`,
+            invariantRef: "INV §4.6",
+            affectedTarget: role,
+            suggestedAction: "Open privileged sessions with chrono session open and a PO key signature",
+          });
+        }
+        authPath = "interactive-worker";
+        auditActor = role;
+      } else if ("parentSession" in auth) {
+        const parent = this.validateSessionToken(auth.parentSession, "session.open");
+        if (parent.role !== "gaspar" && parent.role !== "PO") {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Session delegation requires a gaspar or PO parent session, not '${parent.role}'`,
+            invariantRef: "INV §5.1",
+            affectedTarget: parent.id,
+            suggestedAction: "Delegate sessions only from the orchestrator or PO",
+          });
+        }
+        if (role === "PO") {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: "PO sessions require interactive opening: delegation cannot mint PO authority",
+            invariantRef: "INV §5.1",
+            suggestedAction: "Open PO sessions at a live terminal",
+          });
+        }
+        if (
+          parent.scopeModule !== null &&
+          (input.scopeModule === undefined || input.scopeModule !== parent.scopeModule)
+        ) {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: "Delegated session scope exceeds the parent session scope",
+            invariantRef: "INV §5.1",
+            affectedTarget: parent.id,
+            suggestedAction: "Narrow the delegated scope within the parent assignment",
+          });
+        }
+        if (
+          parent.scopeWp !== null &&
+          (input.scopeWp === undefined || input.scopeWp !== parent.scopeWp)
+        ) {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: "Delegated work-package scope exceeds the parent session scope",
+            invariantRef: "INV §5.1",
+            affectedTarget: parent.id,
+            suggestedAction: "Narrow the delegated scope within the parent assignment",
+          });
+        }
+        authPath = "delegated";
+        auditActor = parent.role;
+      } else if ("poAuthorization" in auth) {
+        this.requireInteractiveAuthority("Privileged session bootstrap");
+        const authority = this.verifyPrivilegedSessionAuthorization(role, input, auth.poAuthorization);
+        authPath = "signed-bootstrap";
+        auditActor = authority;
+        consumedAuthorization = { nonce: auth.poAuthorization.nonce, authority };
+      } else {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Session opening requires interactive, parent-session, or PO-signed authorization",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Present one recognized session-opening credential",
+        });
+      }
+
+      const token = randomBytes(32).toString("hex");
+      const tokenHash = createHash("sha256").update(token, "utf8").digest("hex");
+      const id = this.sequences.allocate("SES");
+      const issuedAt = this.now();
+      const expiresAt = new Date(Date.parse(issuedAt) + input.ttlSeconds * 1000).toISOString();
+      this.db.transaction(() => {
+        if (consumedAuthorization !== null) {
+          this.db.sessionAuthorizations().consume({
+            nonce: consumedAuthorization.nonce,
+            role,
+            authority: consumedAuthorization.authority,
+            usedAt: issuedAt,
+          });
+        }
+        this.db.sessions().create({
+          id,
+          tokenHash,
+          role,
+          adapter: input.adapter,
+          runtime: input.runtime,
+          projectId: "default",
+          scopeModule: input.scopeModule ?? null,
+          scopeWp: input.scopeWp ?? null,
+          parentId: "parentSession" in auth ? auth.parentSession.id : null,
+          issuedAt,
+          expiresAt,
+        });
+        this.events.append({
+          eventType: "ArtifactCreated",
+          entityId: id,
+          payload: {
+            type: "SESSION",
+            role,
+            adapter: input.adapter,
+            authPath,
+            scopeModule: input.scopeModule ?? null,
+            scopeWp: input.scopeWp ?? null,
+            parentId: "parentSession" in auth ? auth.parentSession.id : null,
+          },
+          actor: auditActor,
+          priorState: undefined,
+          newState: "active",
+          reasoning: "Authenticated session opened",
+        });
+      });
+      return { ok: true, value: { id, token, expiresAt } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /** Revoke a session (terminal; gaspar/PO only). Revocation is audited. */
+  revokeSession(id: string, auth: CallerAuth): CoreResult<void> {
+    try {
+      const caller = this.resolveCaller(auth, "session.revoke");
+      this.requireCapability("session.revoke", caller);
+      this.db.sessions().revoke(id);
+      this.events.append({
+        eventType: "StateTransition",
+        entityId: id,
+        payload: { entityType: "SESSION", eventType: "SessionRevoked" },
+        actor: caller.auditActor,
+        priorState: "active",
+        newState: "revoked",
+        reasoning: "Session revoked",
+      });
+      return { ok: true, value: undefined };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Assignment-scope check: unscoped (gaspar/PO) sessions cover any
+   * target; scoped sessions cover exactly their module (and, when set,
+   * exactly their Work Package for WP targets).
+   */
+  private assertSessionScope(
+    caller: ResolvedCaller,
+    target: { moduleId: string | null; workPackageId?: string | null },
+    operation: string
+  ): void {
+    const scopeModule = caller.session.scopeModule;
+    if (scopeModule === null || scopeModule === "default") {
+      return;
+    }
+    if (target.moduleId === null || target.moduleId !== scopeModule) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Session '${caller.session.id}' is scoped to '${scopeModule}': '${operation}' outside the assignment denied`,
+        invariantRef: "INV §5.1",
+        affectedTarget: target.moduleId ?? "project",
+        suggestedAction: "Operate inside the session assignment",
+      });
+    }
+    if (
+      caller.session.scopeWp !== null &&
+      target.workPackageId !== undefined &&
+      target.workPackageId !== caller.session.scopeWp
+    ) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Session '${caller.session.id}' is scoped to Work Package '${caller.session.scopeWp}'`,
+        invariantRef: "INV §5.1",
+        affectedTarget: target.workPackageId ?? target.moduleId ?? "project",
+        suggestedAction: "Operate inside the session assignment",
+      });
+    }
+  }
+
+  /**
+   * Resolve an artifact to its owning module for scope checks: the module
+   * itself, a Work Package's module, or any module listing a Spec.
+   */
+  private artifactScopeModule(artifactId: string): string | null {
+    let artifact: { id: string; type: string };
+    try {
+      artifact = this.artifacts.findById(artifactId);
+    } catch {
+      return null;
+    }
+    if (artifact.type === "MOD") {
+      return artifact.id;
+    }
+    if (artifact.type === "WP") {
+      try {
+        return this.workPackageModule(artifact.id);
+      } catch {
+        return null;
+      }
+    }
+    if (artifact.type === "SP") {
+      for (const module of this.artifacts.listByType("MOD")) {
+        if (this.moduleSpecIds(module.id).includes(artifact.id)) {
+          return module.id;
+        }
+      }
+    }
+    return null;
   }
 
   /**
@@ -1525,7 +2124,7 @@ export class ChronoCore {
     _toState: string,
     eventType: string,
     guardContext: Record<string, unknown> | undefined,
-    actor: string
+    caller: ResolvedCaller
   ): void {
     switch (`${entityType}:${eventType}`) {
       case "SP:SpecSubmittedForReview":
@@ -1541,41 +2140,55 @@ export class ChronoCore {
         this.requireValidApproval(artifactId, revision, "module-approval");
         break;
       case "MOD:ExecutionStarted":
-        this.validateExecutionGrant(artifactId, null, guardContext, actor);
+        this.validateExecutionGrant(artifactId, null, guardContext, caller);
         break;
       case "MOD:ImplementationComplete":
         this.denyIfBlocked(artifactId);
+        this.validateExecutionGrant(artifactId, null, guardContext, caller);
         break;
       case "MOD:SpekkioPassed":
         this.requireQaVerdict(artifactId, revision, null, "PASS");
+        this.validateExecutionGrant(artifactId, null, guardContext, caller);
         break;
       case "MOD:DefinitionOfDoneSatisfied":
-        this.propagateAuthorization(this.authorizeCompletion(artifactId, actor), artifactId);
+        this.propagateAuthorization(
+          this.authorizeCompletion(artifactId, {
+            actor: guardContext?.["actor"] as string,
+            session: guardContext?.["session"] as { id: string; token: string },
+          }),
+          artifactId
+        );
+        this.validateExecutionGrant(artifactId, null, guardContext, caller);
         break;
       case "MOD:SpekkioFailed":
         this.requireQaVerdict(artifactId, revision, null, "FAILED");
+        this.validateExecutionGrant(artifactId, null, guardContext, caller);
         break;
       case "MOD:CorrectionComplete":
         this.denyIfBlocked(artifactId);
         this.requireValidApproval(artifactId, revision, "module-approval");
+        this.validateExecutionGrant(artifactId, null, guardContext, caller);
         break;
       case "WP:WorkPackageAuthorized":
         this.guardWorkPackageAuthorized(artifactId);
         break;
       case "WP:ExecutionAssigned":
         this.guardWorkPackageAssigned(artifactId, revision);
-        this.validateExecutionGrant(this.workPackageModule(artifactId), artifactId, guardContext, actor);
+        this.validateExecutionGrant(this.workPackageModule(artifactId), artifactId, guardContext, caller);
         break;
       case "WP:ImplementationDone":
       case "WP:VerificationReady":
       case "WP:CorrectionComplete":
         this.denyIfBlocked(artifactId);
+        this.validateExecutionGrant(this.workPackageModule(artifactId), artifactId, guardContext, caller);
         break;
       case "WP:SpekkioPassed":
         this.requireQaVerdict(artifactId, revision, artifactId, "PASS");
+        this.validateExecutionGrant(this.workPackageModule(artifactId), artifactId, guardContext, caller);
         break;
       case "WP:SpekkioFailed":
         this.requireQaVerdict(artifactId, revision, artifactId, "FAILED");
+        this.validateExecutionGrant(this.workPackageModule(artifactId), artifactId, guardContext, caller);
         break;
       default:
         // BlockerRaised / BlockerResolved linkage is enforced by
@@ -1707,37 +2320,47 @@ export class ChronoCore {
   /** Propagate a CoreResult denial as a guard exception (no persistence). */
 
   /**
-   * Validate the dispatch grant presented for an
-   * ExecutionStarted/ExecutionAssigned transition. The grant must exist,
-   * be unexpired and unconsumed, cover this exact module/work-package
-   * revision scope, and match the caller: the assigned role, the bound
-   * session, or the orchestrating gaspar/PO. Expired, tampered,
-   * cross-scope-reused, and role/session-mismatched grants deny.
-   * Consumption happens atomically with the transition itself.
+   * Validate the dispatch grant presented for a lifecycle step and burn
+   * it on staleness. Every binding recorded at issuance is re-evaluated:
+   * project, module/work-package revisions, every Spec revision, every
+   * Harness binding, both attestations, both approvals, the exact assigned
+   * role and executing session, and the policy version. Any material
+   * change, stale reference, replaced attestation, altered Harness, or
+   * role/session mismatch consumes (where stale) or denies. Consumption
+   * happens atomically with the transition itself.
    */
   private validateExecutionGrant(
     moduleId: string,
     workPackageId: string | null,
     guardContext: Record<string, unknown> | undefined,
-    actor: string
+    caller: ResolvedCaller
   ): void {
     const grantId = guardContext?.["grantId"];
     if (typeof grantId !== "string" || grantId.length === 0) {
       throw new ChronoError({
         code: ErrorCode.MISSING_REQUIRED_ARTIFACT,
         severity: Severity.BLOCKER,
-        message: `Dispatch requires an execution grant for '${workPackageId ?? moduleId}': authorize first`,
+        message: `Step requires an execution grant for '${workPackageId ?? moduleId}': authorize first`,
         invariantRef: "INV §5.1",
         affectedTarget: workPackageId ?? moduleId,
         suggestedAction: "Authorize execution to issue a single-use grant, then present its id",
       });
     }
     let grant: {
+      projectId: string | null;
       moduleId: string;
       workPackageId: string | null;
       moduleRevision: string;
+      workPackageRevision: string | null;
+      specRevisions: Record<string, string>;
+      harnessBindings: Array<{ specId: string; specRevision: string; contentHash: string }>;
       role: string;
       session: string | null;
+      rtkAttestationId: string | null;
+      skillAttestationId: string | null;
+      moduleApprovalId: string | null;
+      archApprovalId: string | null;
+      policyVersion: string | null;
       expiresAt: string;
       consumed: boolean;
     };
@@ -1764,6 +2387,7 @@ export class ChronoCore {
       });
     }
     if (Date.parse(grant.expiresAt) <= Date.parse(this.now())) {
+      this.burnGrant(grantId);
       throw new ChronoError({
         code: ErrorCode.EXECUTION_DENIED,
         severity: Severity.BLOCKER,
@@ -1773,38 +2397,184 @@ export class ChronoCore {
         suggestedAction: "Authorize execution again for a fresh grant",
       });
     }
+    const target = workPackageId ?? moduleId;
+    const stale = (reason: string): ChronoError =>
+      new ChronoError({
+        code: ErrorCode.STALE_REVISION,
+        severity: Severity.BLOCKER,
+        message: `Dispatch grant '${grantId}' invalidated: ${reason}`,
+        invariantRef: "INV §10.3",
+        affectedTarget: target,
+        suggestedAction: "Authorize execution again for the current revisions",
+      });
+    if (grant.projectId !== null && grant.projectId !== "default") {
+      this.burnGrant(grantId);
+      throw stale("grant belongs to a different project");
+    }
+    if (grant.policyVersion !== null && grant.policyVersion !== AUTHORITY_POLICY_VERSION) {
+      this.burnGrant(grantId);
+      throw stale(`authority policy moved to v${AUTHORITY_POLICY_VERSION}`);
+    }
     const currentModule = this.artifacts.findById(moduleId);
-    if (
-      grant.moduleId !== moduleId ||
-      grant.workPackageId !== workPackageId ||
-      grant.moduleRevision !== currentModule.revision
-    ) {
+    if (grant.moduleId !== moduleId) {
       throw new ChronoError({
         code: ErrorCode.INCONSISTENT_REFERENCE,
         severity: Severity.ERROR,
-        message: `Dispatch grant '${grantId}' does not cover '${workPackageId ?? moduleId}@${currentModule.revision}'`,
+        message: `Dispatch grant '${grantId}' was issued for module '${grant.moduleId}', not '${moduleId}'`,
         invariantRef: "INV §10.2",
-        affectedTarget: workPackageId ?? moduleId,
-        suggestedAction: "Use the grant only for its authorized scope and revision",
+        affectedTarget: target,
+        suggestedAction: "Use the grant only for its authorized scope",
       });
     }
-    const caller = parseActorIdentity(actor);
-    const roleMatches = caller.kind === "agent" && caller.role === grant.role;
-    const sessionMatches =
-      caller.kind === "session" && grant.session !== null && caller.identity === grant.session;
-    const orchestrates =
-      (caller.kind === "agent" && caller.role === "gaspar") || caller.kind === "po";
-    if (!roleMatches && !sessionMatches && !orchestrates) {
+    if (grant.moduleRevision !== currentModule.revision) {
+      this.burnGrant(grantId);
+      throw stale("module revision changed since issuance");
+    }
+    if (workPackageId !== null || grant.workPackageId !== null) {
+      if (grant.workPackageId !== workPackageId) {
+        throw new ChronoError({
+          code: ErrorCode.INCONSISTENT_REFERENCE,
+          severity: Severity.ERROR,
+          message: `Dispatch grant '${grantId}' does not cover work-package scope '${workPackageId ?? "(module)"}'`,
+          invariantRef: "INV §10.2",
+          affectedTarget: target,
+          suggestedAction: "Use the grant only for its authorized scope",
+        });
+      }
+      const currentWp = this.artifacts.findById(workPackageId!);
+      if (grant.workPackageRevision !== currentWp.revision) {
+        this.burnGrant(grantId);
+        throw stale("work-package revision changed since issuance");
+      }
+    }
+    for (const [specId, boundRevision] of Object.entries(grant.specRevisions)) {
+      let current: { revision: string };
+      try {
+        current = this.artifacts.findById(specId);
+      } catch {
+        this.burnGrant(grantId);
+        throw stale(`spec '${specId}' is gone`);
+      }
+      if (current.revision !== boundRevision) {
+        this.burnGrant(grantId);
+        throw stale(`spec '${specId}' moved to ${current.revision}`);
+      }
+    }
+    for (const binding of grant.harnessBindings) {
+      let harness: { contentHash: string; stale: boolean };
+      try {
+        harness = this.harnesses.findBySpecRevision(binding.specRevision);
+      } catch {
+        this.burnGrant(grantId);
+        throw stale(`harness for '${binding.specId}@${binding.specRevision}' is gone`);
+      }
+      if (harness.stale || harness.contentHash !== binding.contentHash) {
+        this.burnGrant(grantId);
+        throw stale(`harness for '${binding.specId}@${binding.specRevision}' changed`);
+      }
+    }
+    this.revalidateGrantAttestation(grant.rtkAttestationId, "rtk", grantId, target);
+    this.revalidateGrantAttestation(grant.skillAttestationId, "skill", grantId, target);
+    this.revalidateGrantApproval(grant.moduleApprovalId, grantId, target);
+    this.revalidateGrantApproval(grant.archApprovalId, grantId, target);
+    // Caller binding: the exact session and assigned role bound at
+    // issuance. Any other session — including another session holding the
+    // same role, and including gaspar/PO — may not enact this grant.
+    // Orchestration is expressed by requesting a grant for the executor,
+    // never by consuming the executor's grant.
+    if (grant.session === null || caller.session.id !== grant.session || caller.role !== grant.role) {
       throw new ChronoError({
         code: ErrorCode.EXECUTION_DENIED,
         severity: Severity.BLOCKER,
-        message: `Dispatch grant '${grantId}' is bound to role '${grant.role}'${grant.session === null ? "" : ` and session '${grant.session}'`}: '${actor}' may not enact it`,
+        message: `Dispatch grant '${grantId}' is bound to role '${grant.role}' in session '${grant.session ?? "unbound"}': enactment by '${caller.role}' in session '${caller.session.id}' denied`,
         invariantRef: "INV §5.1",
-        affectedTarget: workPackageId ?? moduleId,
-        suggestedAction: "Enact the dispatch as the assigned role or session",
+        affectedTarget: target,
+        suggestedAction: "Enact the dispatch from the exact bound session, or authorize a grant for the acting session",
       });
     }
-  }  private propagateAuthorization(
+  }
+
+  /** Best-effort grant invalidation after a failed revalidation. */
+  private burnGrant(grantId: string): void {
+    try {
+      this.db.grants().consume(grantId);
+    } catch {
+      // Already consumed or concurrently burned: the denial below stands.
+    }
+  }
+
+  /** The exact attestation row bound at issuance must still be current. */
+  private revalidateGrantAttestation(
+    attestationId: string | null,
+    kind: string,
+    grantId: string,
+    target: string
+  ): void {
+    if (attestationId === null) {
+      this.burnGrant(grantId);
+      throw new ChronoError({
+        code: ErrorCode.STALE_REVISION,
+        severity: Severity.BLOCKER,
+        message: `Dispatch grant '${grantId}' has no bound ${kind} attestation`,
+        invariantRef: "INV §10.3",
+        affectedTarget: target,
+        suggestedAction: "Authorize execution again with current attestations",
+      });
+    }
+    const repo = kind === "rtk" ? this.db.rtkAttestations() : this.db.skillAttestations();
+    const latest = repo.latest();
+    const state = this.attestationState(latest, Date.parse(this.now()));
+    if (latest === null || latest.id !== attestationId || state !== "current") {
+      this.burnGrant(grantId);
+      throw new ChronoError({
+        code: ErrorCode.STALE_REVISION,
+        severity: Severity.BLOCKER,
+        message: `Dispatch grant '${grantId}': bound ${kind} attestation was replaced or went stale`,
+        invariantRef: "INV §10.3",
+        affectedTarget: target,
+        suggestedAction: "Authorize execution again with current attestations",
+      });
+    }
+  }
+
+  /** The exact approval rows bound at issuance must still be valid. */
+  private revalidateGrantApproval(
+    approvalId: string | null,
+    grantId: string,
+    target: string
+  ): void {
+    if (approvalId === null) {
+      return;
+    }
+    let approval: { revoked: boolean; scopeArtifactId: string; scopeRevision: string };
+    try {
+      approval = this.db.approvals().findById(approvalId);
+    } catch {
+      this.burnGrant(grantId);
+      throw new ChronoError({
+        code: ErrorCode.STALE_REVISION,
+        severity: Severity.BLOCKER,
+        message: `Dispatch grant '${grantId}': bound approval is gone`,
+        invariantRef: "INV §10.3",
+        affectedTarget: target,
+        suggestedAction: "Authorize execution again with current approvals",
+      });
+    }
+    const current = this.currentRevisionOf(approval.scopeArtifactId);
+    if (approval.revoked || current === null || isStaleReference(approval.scopeRevision, current)) {
+      this.burnGrant(grantId);
+      throw new ChronoError({
+        code: ErrorCode.APPROVAL_REQUIRED,
+        severity: Severity.BLOCKER,
+        message: `Dispatch grant '${grantId}': bound approval is revoked or stale`,
+        invariantRef: "INV §4.4",
+        affectedTarget: target,
+        suggestedAction: "Re-approve the current revisions, then authorize again",
+      });
+    }
+  }
+
+  private propagateAuthorization(
     result: CoreResult<boolean>,
     artifactId: string
   ): void {
@@ -1937,19 +2707,23 @@ export class ChronoCore {
   // ---------------------------------------------------------------------------
 
   /**
-   * Raise a blocker. Validates type, issuer identity, and target
-   * references before persisting [DOM §3.17, INV §10.2, Remediation §2].
+   * Raise a blocker. The issuer is the session's bound role — never a
+   * declared string — so spoofed issuance is structurally impossible.
+   * Type, targets, scope, and SECURITY_BLOCKER ownership are validated
+   * before persisting [DOM §3.17, INV §10.2, Remediation §2/§3A].
    * [CORE §7, DOM §3.17, INV §4]
    */
-  raiseBlocker(type: string, issuer: string, targetIds: string[], reason: string, evidenceRefs: string[] = []): CoreResult<{ id: string }> {
+  raiseBlocker(type: string, targetIds: string[], reason: string, auth: CallerAuth, evidenceRefs: string[] = []): CoreResult<{ id: string }> {
     try {
       assertBlockerType(type);
-      const verifiedIssuer = this.requireCapability("blocker.raise", issuer);
-      if (type === "SECURITY_BLOCKER" && verifiedIssuer !== "glenn" && verifiedIssuer !== "PO") {
+      const caller = this.resolveCaller(auth, "raise blocker");
+      this.requireCapability("blocker.raise", caller);
+      const issuer = caller.role;
+      if (type === "SECURITY_BLOCKER" && issuer !== "glenn" && issuer !== "PO") {
         throw new ChronoError({
           code: ErrorCode.EXECUTION_DENIED,
           severity: Severity.BLOCKER,
-          message: `SECURITY_BLOCKER is Glenn's authority: issuance by '${verifiedIssuer}' denied`,
+          message: `SECURITY_BLOCKER is Glenn's authority: issuance by '${issuer}' denied`,
           invariantRef: "INV §5.1",
           suggestedAction: "Escalate security findings to Glenn",
         });
@@ -1973,9 +2747,25 @@ export class ChronoCore {
         });
       }
       for (const target of targetIds) {
-        if (target !== "default") {
-          this.requireReference(target, this.artifactTypeOf(target), type);
+        if (target === "default") {
+          if (caller.session.scopeModule !== null) {
+            throw new ChronoError({
+              code: ErrorCode.EXECUTION_DENIED,
+              severity: Severity.BLOCKER,
+              message: "Project-scoped blockers require an unscoped (gaspar/PO) session",
+              invariantRef: "INV §5.1",
+              affectedTarget: target,
+              suggestedAction: "Escalate project-wide blocks to the orchestrator",
+            });
+          }
+          continue;
         }
+        this.requireReference(target, this.artifactTypeOf(target), type);
+        this.assertSessionScope(
+          caller,
+          { moduleId: this.artifactScopeModule(target), workPackageId: null },
+          "raise blocker"
+        );
       }
 
       const blockerId = this.sequences.allocate("BLK");
@@ -1983,6 +2773,8 @@ export class ChronoCore {
         id: blockerId,
         type,
         issuer,
+        issuerRole: caller.role,
+        issuerSession: caller.session.id,
         targetIds,
         reason,
         evidenceRefs,
@@ -1991,8 +2783,8 @@ export class ChronoCore {
       this.events.append({
         eventType: "BlockerRaised",
         entityId: blockerId,
-        payload: { type, issuer: verifiedIssuer, targetIds, reason, evidenceRefs: evidenceRefs },
-        actor: verifiedIssuer,
+        payload: { type, issuer, targetIds, reason, evidenceRefs: evidenceRefs },
+        actor: caller.auditActor,
         priorState: undefined,
         newState: "active",
         reasoning: "Blocker raised — fail-closed until resolved",
@@ -2006,19 +2798,33 @@ export class ChronoCore {
   }
 
   /**
-   * Resolve a blocker.
+   * Resolve a blocker. Only the issuing role (recorded at raise time),
+   * gaspar, or PO may resolve [Remediation §3A.6].
    * [CORE §7, DOM §3.17, INV §4]
    */
-  resolveBlocker(blockerId: string, resolvedBy: string): CoreResult<{ id: string }> {
+  resolveBlocker(blockerId: string, auth: CallerAuth): CoreResult<{ id: string }> {
     try {
-      const verifiedResolver = this.requireCapability("blocker.resolve", resolvedBy);
-      this.blockers.resolve(blockerId, verifiedResolver);
+      const caller = this.resolveCaller(auth, "resolve blocker");
+      this.requireCapability("blocker.resolve", caller);
+      const blocker = this.blockers.findById(blockerId);
+      const ownerRole = blocker.issuerRole ?? blocker.issuer;
+      if (caller.role !== ownerRole && caller.role !== "gaspar" && caller.role !== "PO") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Blocker '${blockerId}' was issued by '${ownerRole}': resolution by '${caller.role}' denied`,
+          invariantRef: "INV §5.1",
+          affectedTarget: blockerId,
+          suggestedAction: "Resolve through the issuing role, gaspar, or PO",
+        });
+      }
+      this.blockers.resolve(blockerId, caller.auditActor);
 
       this.events.append({
         eventType: "BlockerResolved",
         entityId: blockerId,
-        payload: { resolvedBy: verifiedResolver },
-        actor: verifiedResolver,
+        payload: { resolvedBy: caller.auditActor },
+        actor: caller.auditActor,
         priorState: "active",
         newState: "resolved",
         reasoning: "Blocker resolved — gates re-evaluated",
@@ -2182,6 +2988,16 @@ export class ChronoCore {
   /** Project-registered PO public key, or null when none is registered. */
   private poPublicKey(): string | null {
     return this.db.runtimeConfig().get("po.public_key");
+  }
+
+  /**
+   * Revision fingerprint of the registered PO public key. The CLI needs
+   * this fingerprint to construct a signed rotation payload without ever
+   * receiving private key material.
+   */
+  poKeyRevision(): string | null {
+    const existing = this.poPublicKey();
+    return existing === null ? null : computeRevisionHash(existing);
   }
 
   /**
@@ -2555,9 +3371,9 @@ export class ChronoCore {
    * Versions are append-only and monotonic; currency against material
    * change is evaluated at the gates, not here.
    */
-  recordSecurityProfile(content: unknown, actor: string): CoreResult<{ id: string; version: number }> {
+  recordSecurityProfile(content: unknown, auth: CallerAuth): CoreResult<{ id: string; version: number }> {
     try {
-      const profileActor = this.requireCapability("security.profile", actor);
+      const profileActor = this.requireCapability("security.profile", this.resolveCaller(auth, "record security profile"));
       const canonical = canonicalize(content);
       const parsed = JSON.parse(canonical) as { title?: unknown };
       if (typeof parsed.title !== "string" || parsed.title.trim().length === 0) {
@@ -2578,7 +3394,7 @@ export class ChronoCore {
         eventType: "ArtifactCreated",
         entityId: id,
         payload: { type: "SECURITY_PROFILE", version, contentHash },
-        actor: profileActor,
+        actor: profileActor.auditActor,
         priorState: undefined,
         newState: "recorded",
         reasoning: "Security Profile version recorded",
@@ -2604,10 +3420,11 @@ export class ChronoCore {
       blockingScope: string | null;
       reproInfo: string | null;
     },
-    actor: string
+    auth: CallerAuth
   ): CoreResult<{ id: string }> {
     try {
-      const verifiedActor = this.requireCapability("defect.record", actor);
+      const caller = this.resolveCaller(auth, "record defect");
+      this.requireCapability("defect.record", caller);
       const owner = (DEFECT_ROUTING as Record<string, string>)[data.classification];
       if (owner === undefined) {
         throw new ChronoError({
@@ -2629,6 +3446,11 @@ export class ChronoCore {
       }
       for (const target of data.affectedArtifacts) {
         this.requireReference(target, this.artifactTypeOf(target), "defect");
+        this.assertSessionScope(
+          caller,
+          { moduleId: this.artifactScopeModule(target), workPackageId: null },
+          "record defect"
+        );
       }
       for (const ref of data.evidenceRefs) {
         try {
@@ -2660,7 +3482,7 @@ export class ChronoCore {
         eventType: "DefectRaised",
         entityId: id,
         payload: { classification: data.classification, owner },
-        actor: verifiedActor,
+        actor: caller.auditActor,
         priorState: undefined,
         newState: "open",
         reasoning: `Defect classified ${data.classification}, routed to ${owner}`,
@@ -2673,28 +3495,27 @@ export class ChronoCore {
   }
 
   /** Mark a defect resolved after correction and re-verification. */
-  resolveDefect(id: string, actor: string): CoreResult<{ id: string }> {
+  resolveDefect(id: string, auth: CallerAuth): CoreResult<{ id: string }> {
     try {
-      const parsed = parseActorIdentity(actor);
+      const caller = this.resolveCaller(auth, "resolve defect");
       const defect = this.defects.findById(id);
-      const isOwner = parsed.kind === "agent" && parsed.role === defect.owner;
-      if (!isOwner && parsed.kind !== "po") {
+      const isOwner = caller.role === defect.owner;
+      if (!isOwner && caller.role !== "PO") {
         throw new ChronoError({
           code: ErrorCode.EXECUTION_DENIED,
           severity: Severity.BLOCKER,
-          message: `Defect '${id}' is owned by '${defect.owner}': resolution by '${parsed.identity}' denied`,
+          message: `Defect '${id}' is owned by '${defect.owner}': resolution by '${caller.role}' denied`,
           invariantRef: "INV §5.1",
           affectedTarget: id,
           suggestedAction: "Route correction to the responsible owner",
         });
       }
-      const verifiedActor = parsed.identity;
       this.defects.setStatus(id, "resolved", true);
       this.events.append({
         eventType: "DefectResolved",
         entityId: id,
         payload: {},
-        actor: verifiedActor,
+        actor: caller.auditActor,
         priorState: "in_progress",
         newState: "resolved",
         reasoning: "Defect corrected and re-verified",
@@ -2707,15 +3528,15 @@ export class ChronoCore {
   }
 
   /** Expire a waiver whose review condition elapsed (guarded lifecycle step). */
-  expireWaiver(id: string, actor: string): CoreResult<{ id: string }> {
+  expireWaiver(id: string, auth: CallerAuth): CoreResult<{ id: string }> {
     try {
-      const verifiedActor = this.requireCapability("waiver.expire", actor);
+      const verifiedActor = this.requireCapability("waiver.expire", this.resolveCaller(auth, "expire waiver"));
       this.db.waivers().setStatus(id, "expired");
       this.events.append({
         eventType: "StateTransition",
         entityId: id,
         payload: { entityType: "WAIVER", eventType: "WaiverExpired", fromState: "active", toState: "expired" },
-        actor: verifiedActor,
+        actor: verifiedActor.auditActor,
         priorState: "active",
         newState: "expired",
         reasoning: "Waiver review condition elapsed",
@@ -2733,9 +3554,12 @@ export class ChronoCore {
 
   /**
    * Record evidence bound to an exact artifact revision. The identifier
-   * is Core-allocated. Payloads are scanned for secret material before
-   * persistence [RUNTIME §10.3, INV §14.5], and the integrity hash is
-   * recomputed and verified [CORE §9.1].
+   * is Core-allocated. The producer must equal the session's bound role:
+   * orchestration sessions cannot attribute work to another role. The
+   * target must sit inside the session assignment. Payloads are
+   * scanned for secret material before persistence [RUNTIME §10.3,
+   * INV §14.5], and the integrity hash is recomputed and verified
+   * [CORE §9.1].
    * [CORE §9, DOM §3.19, INV §11.1]
    */
   recordEvidence(data: {
@@ -2746,11 +3570,31 @@ export class ChronoCore {
     result: string;
     diagnostics: string | null;
     integrityHash: string;
-  }): CoreResult<{ id: string }> {
+  }, auth: CallerAuth): CoreResult<{ id: string }> {
     try {
-      // Evidence producers authenticate: testing, security, and
-      // implementation evidence must come from known identities.
-      this.requireCapability("evidence.record", data.producer);
+      const caller = this.resolveCaller(auth, "record evidence");
+      this.requireCapability("evidence.record", caller);
+      if (data.producer !== caller.role) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Evidence producer '${data.producer}' does not match session role '${caller.role}'`,
+          invariantRef: "INV §5.1",
+          suggestedAction: "Record evidence as the producing role",
+        });
+      }
+      if (data.tool !== null) {
+        toToolIdentity(data.tool);
+      }
+      const evidenceTarget = this.artifacts.findArtifactIdByRevision(data.targetRevision);
+      this.assertSessionScope(
+        caller,
+        {
+          moduleId: evidenceTarget === null ? null : this.artifactScopeModule(evidenceTarget),
+          workPackageId: null,
+        },
+        "record evidence"
+      );
       this.assertNoSecrets(data.checkName, data.diagnostics, "evidence");
       if (!isRevisionHash(data.targetRevision)) {
         throw new ChronoError({
@@ -2793,7 +3637,7 @@ export class ChronoCore {
           checkName: data.checkName,
           result: data.result,
         },
-        actor: data.producer,
+        actor: caller.auditActor,
         priorState: undefined,
         newState: "recorded",
         reasoning: `Evidence recorded: ${data.checkName} → ${data.result}`,
@@ -2826,7 +3670,7 @@ export class ChronoCore {
    * Provenance must be the canonical upstream; `rtk gain` must have
    * succeeded (identity proof); the validity window must be future.
    */
-  recordRtkAttestation(input: {
+  recordRtkAttestation(auth: CallerAuth, input: {
     binaryPath: string;
     binaryIdentity: string;
     version: string;
@@ -2839,6 +3683,8 @@ export class ChronoCore {
     ttlSeconds: number;
   }): CoreResult<{ id: string }> {
     try {
+      const rtkCaller = this.resolveCaller(auth, "record RTK attestation");
+      this.requireCapability("attestation.record", rtkCaller);
       if (input.provenance !== RTK_UPSTREAM) {
         throw new ChronoError({
           code: ErrorCode.RTK_NAME_COLLISION,
@@ -2910,7 +3756,7 @@ export class ChronoCore {
    * Upstream must be canonical, the commit a full SHA, the source hash a
    * revision hash, the license MIT, and activation proven.
    */
-  recordSkillAttestation(input: {
+  recordSkillAttestation(auth: CallerAuth, input: {
     upstream: string;
     pinnedCommit: string;
     sourceHash: string;
@@ -2926,6 +3772,8 @@ export class ChronoCore {
     ttlSeconds: number;
   }): CoreResult<{ id: string }> {
     try {
+      const skillCaller = this.resolveCaller(auth, "record skill attestation");
+      this.requireCapability("attestation.record", skillCaller);
       if (input.upstream !== SKILL_UPSTREAM) {
         throw new ChronoError({
           code: ErrorCode.SKILL_PROVENANCE_FAILURE,
@@ -3020,8 +3868,13 @@ export class ChronoCore {
   /**
    * Evaluate execution authorization for a module (optionally scoped to one
    * Work Package) and, on success, issue a single-use dispatch grant bound
-   * to the exact revisions, one assigned role, and the requesting session.
+   * to the exact revisions, one assigned role, and the executing session.
    * Implements gate_execution [CORE §7.4, DOM §6.4].
+   *
+   * Orchestration is explicit: `actor` and `requesterSession` authenticate
+   * the requester, while `session` authenticates the executor that will
+   * enact the grant. A requester may omit `requesterSession` only when it
+   * is the assigned role presenting its own executing session.
    *
    * Every prerequisite is evaluated; the first failure denies with its
    * explicit gate code. Missing capabilities deny — success is never
@@ -3031,21 +3884,86 @@ export class ChronoCore {
    */
   authorizeExecution(
     moduleId: string,
-    options: { workPackageId?: string | undefined; actor: string; role: string }
+    options: {
+      workPackageId?: string | undefined;
+      actor: string;
+      role: string;
+      session: { id: string; token: string };
+      requesterSession?: { id: string; token: string } | undefined;
+    }
   ): CoreResult<{ authorized: boolean; grantId: string }> {
     const actor = options.actor;
     try {
-      this.requireCapability("execution.request", actor);
       const assignedRole = this.requireAssignedRole(options.role, moduleId);
-      const moduleArtifact = this.artifacts.findById(moduleId);
-      if (moduleArtifact.status !== "APPROVED" && moduleArtifact.status !== "EXECUTING") {
+      const requester = this.resolveCaller(
+        { actor, session: options.requesterSession ?? options.session },
+        "authorize execution"
+      );
+      // Requesters: gaspar or PO by matrix, or the assigned role querying
+      // its own dispatch (bound to its session below). The requester is
+      // already session-resolved, so `requester.role` is authoritative.
+      const matrixOk = isCapable("execution.request", requester.kind, requester.kind === "agent" ? (requester.role as AgentRole) : undefined);
+      const selfOk = requester.role === assignedRole;
+      if (!matrixOk && !selfOk) {
         throw new ChronoError({
           code: ErrorCode.EXECUTION_DENIED,
           severity: Severity.BLOCKER,
-          message: `Module ${moduleId} is in state ${moduleArtifact.status}, not APPROVED or EXECUTING`,
+          message: `Execution for '${moduleId}' must be requested by gaspar, PO, or the assigned role itself`,
+          invariantRef: "INV §5.1",
+          affectedTarget: moduleId,
+          suggestedAction: "Request authorization as the orchestrator or assignee",
+        });
+      }
+      if (options.requesterSession === undefined && requester.session.id !== options.session.id) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Requester session '${requester.session.id}' is not the executing session '${options.session.id}': orchestration requires an explicit requester session`,
+          invariantRef: "INV §5.1",
+          affectedTarget: moduleId,
+          suggestedAction: "Present both the requester's and the executor's sessions",
+        });
+      }
+      // The executing session is mandatory and bound into the grant: a
+      // grant requested without an executor session is refused, so no
+      // grant ever floats without an authenticated session to enact it.
+      const executor = this.validateSessionToken(options.session, "authorize execution");
+      if (executor.role !== assignedRole) {
+        throw new ChronoError({
+          code: ErrorCode.INCONSISTENT_REFERENCE,
+          severity: Severity.ERROR,
+          message: `Executor session '${executor.id}' is bound to '${executor.role}', not the assigned '${assignedRole}'`,
+          invariantRef: "INV §10.2",
+          affectedTarget: moduleId,
+          suggestedAction: "Present the assigned role's own session",
+        });
+      }
+      this.assertSessionScope(
+        {
+          kind: executor.role === "PO" ? "po" : "agent",
+          role: executor.role,
+          session: executor,
+          auditActor: executor.role,
+        },
+        { moduleId, workPackageId: options.workPackageId ?? null },
+        "authorize execution"
+      );
+      this.assertSessionScope(requester, { moduleId, workPackageId: options.workPackageId ?? null }, "authorize execution");
+      const moduleArtifact = this.artifacts.findById(moduleId);
+      // Re-authorization states: APPROVED/EXECUTING for dispatch, and
+      // VERIFYING/PASSED/FAILED for step-scoped re-authorization (every
+      // forward lifecycle step presents a fresh grant). The transition
+      // tables still govern which step each state may enact, so a grant
+      // issued here cannot reopen unrelated transitions. DRAFT,
+      // AWAITING_APPROVAL, COMPLETE, and BLOCKED never authorize.
+      if (!["APPROVED", "EXECUTING", "VERIFYING", "PASSED", "FAILED"].includes(moduleArtifact.status)) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Module ${moduleId} is in state ${moduleArtifact.status}: no dispatch authorized`,
           invariantRef: "INV §5.3, DOM §6.4",
           affectedTarget: moduleId,
-          suggestedAction: "Promote module to APPROVED first",
+          suggestedAction: "Promote the module through its lifecycle first",
         });
       }
 
@@ -3177,22 +4095,18 @@ export class ChronoCore {
       }
 
       // All prerequisites hold: issue the single-use dispatch grant bound
-      // to exact revisions, one assigned role, and the requesting session.
-      const parsedRequester = parseActorIdentity(actor);
-      const grantId = this.sequences.allocate("GRANT");
-      const ttlSeconds = this.config.grantTtlSeconds ?? 3600;
-      const issuedAt = this.now();
-      this.db.grants().create({
-        id: grantId,
+      // to the project, exact module/work-package/spec revisions, Harness
+      // bindings, one assigned role, the executing session, both
+      // attestations, both approvals, and the policy version.
+      const grantId = this.issueBoundGrant({
         moduleId,
         workPackageId: options.workPackageId ?? null,
         moduleRevision: moduleArtifact.revision,
-        specRevisions: specIds.map((specId) => this.artifacts.findById(specId).revision),
+        specIds,
+        archRevision: archRev,
         role: assignedRole,
-        session: parsedRequester.kind === "session" ? parsedRequester.identity : null,
-        requestedBy: actor,
-        issuedAt,
-        expiresAt: new Date(Date.parse(issuedAt) + ttlSeconds * 1000).toISOString(),
+        sessionId: executor.id,
+        requestedBy: requester.role,
       });
 
       return { ok: true, value: { authorized: true, grantId } };
@@ -3203,20 +4117,77 @@ export class ChronoCore {
   }
 
   /**
-   * The assigned implementation role bound into a dispatch grant.
-   * Only implementation-capable roles take assignments: orchestrators
-   * (gaspar), verifiers (spekkio), reviewers (glenn), and the human PO
-   * never execute dispatched work.
+   * Issue a single-use grant with the full revision/approval/attestation
+   * binding. The caller supplies an already-authorized role and session;
+   * this helper does not decide authority, it only binds it.
+   */
+  private issueBoundGrant(input: {
+    moduleId: string;
+    workPackageId: string | null;
+    moduleRevision: string;
+    specIds: string[];
+    archRevision: string;
+    role: string;
+    sessionId: string;
+    requestedBy: string;
+  }): string {
+    const grantId = this.sequences.allocate("GRANT");
+    const ttlSeconds = this.config.grantTtlSeconds ?? 3600;
+    const issuedAt = this.now();
+    const workPackageRevision = input.workPackageId !== null
+      ? this.artifacts.findById(input.workPackageId).revision
+      : null;
+    const specRevisionMap: Record<string, string> = {};
+    const harnessBindings: Array<{ specId: string; specRevision: string; contentHash: string }> = [];
+    for (const specId of input.specIds) {
+      const specRevision = this.artifacts.findById(specId).revision;
+      specRevisionMap[specId] = specRevision;
+      const harness = this.harnesses.findBySpecRevision(specRevision);
+      harnessBindings.push({ specId, specRevision, contentHash: harness.contentHash });
+    }
+    const rtkLatest = this.db.rtkAttestations().latest();
+    const skillLatest = this.db.skillAttestations().latest();
+    const moduleApprovalRow = this.approvals.findByScope(input.moduleId, input.moduleRevision, "module-approval");
+    const archApprovalRow = this.approvals.findByScope("ARCH", input.archRevision, "architecture-security");
+    this.db.grants().create({
+      id: grantId,
+      projectId: "default",
+      moduleId: input.moduleId,
+      workPackageId: input.workPackageId,
+      moduleRevision: input.moduleRevision,
+      workPackageRevision,
+      specRevisions: specRevisionMap,
+      harnessBindings,
+      role: input.role,
+      session: input.sessionId,
+      requestedBy: input.requestedBy,
+      rtkAttestationId: rtkLatest?.id ?? null,
+      skillAttestationId: skillLatest?.id ?? null,
+      moduleApprovalId: moduleApprovalRow?.id ?? null,
+      archApprovalId: archApprovalRow?.id ?? null,
+      policyVersion: AUTHORITY_POLICY_VERSION,
+      issuedAt,
+      expiresAt: new Date(Date.parse(issuedAt) + ttlSeconds * 1000).toISOString(),
+    });
+    return grantId;
+  }
+
+  /**
+   * The assigned role bound into a dispatch grant. Implementation work
+   * assigns belthazar, melchior, prometheus, or lucca; independent
+   * verification steps assign spekkio (the verdict author enacts its own
+   * verdict transitions). Orchestrators (gaspar), reviewers (glenn), and
+   * the human PO never take assigned work.
    */
   private requireAssignedRole(role: string, moduleId: string): string {
-    if (!["belthazar", "melchior", "prometheus", "lucca"].includes(role)) {
+    if (!["belthazar", "melchior", "prometheus", "lucca", "spekkio"].includes(role)) {
       throw new ChronoError({
         code: ErrorCode.VALIDATION_ERROR,
         severity: Severity.ERROR,
-        message: `Invalid assignment role '${role}' for '${moduleId}': dispatched work assigns belthazar, melchior, prometheus, or lucca`,
+        message: `Invalid assignment role '${role}' for '${moduleId}': dispatched work assigns belthazar, melchior, prometheus, lucca, or spekkio (verification only)`,
         invariantRef: "INV §14.4",
         affectedTarget: moduleId,
-        suggestedAction: "Assign dispatched work to an implementation-capable role",
+        suggestedAction: "Assign dispatched work to a capable role",
       });
     }
     return role;
@@ -3361,9 +4332,11 @@ export class ChronoCore {
    * blockers resolved or validly waived, current attestations, intact
    * traceability, and a legal transition. Every denial is audited.
    */
-  authorizeCompletion(moduleId: string, actor: string): CoreResult<boolean> {
+  authorizeCompletion(moduleId: string, auth: CallerAuth): CoreResult<boolean> {
     try {
-      this.requireCapability("completion.request", actor);
+      const caller = this.resolveCaller(auth, "authorize completion");
+      this.requireCapability("completion.request", caller);
+      this.assertSessionScope(caller, { moduleId, workPackageId: null }, "authorize completion");
       const moduleArtifact = this.artifacts.findById(moduleId);
 
       if (moduleArtifact.status !== "VERIFYING" && moduleArtifact.status !== "PASSED") {
@@ -3486,7 +4459,7 @@ export class ChronoCore {
 
       return { ok: true, value: true };
     } catch (e) {
-      this.auditDenial(moduleId, "CompletionAuthorization", e, actor);
+      this.auditDenial(moduleId, "CompletionAuthorization", e, auth.actor);
       return this.handleError(e);
     }
   }
@@ -3509,18 +4482,23 @@ export class ChronoCore {
     reviewer: string,
     defectIds: string[] = [],
     waiverIds: string[] = [],
-    evidenceIds: string[] = []
+    evidenceIds: string[] = [],
+    auth: CallerAuth
   ): CoreResult<{ qaId: string }> {
     try {
-      // Verdicts are Spekkio's independent authority [FW §2.7, DOM §3.20].
-      if (reviewer !== "spekkio") {
+      // Verdicts are Spekkio's independent authority, enacted through
+      // Spekkio's own authenticated session [FW §2.7, DOM §3.20,
+      // Remediation §3A.6]. Nobody else — not even PO — records verdicts.
+      const caller = this.resolveCaller(auth, "record verification");
+      this.requireCapability("verification.record", caller);
+      if (reviewer !== caller.role) {
         throw new ChronoError({
-          code: ErrorCode.VALIDATION_ERROR,
-          severity: Severity.ERROR,
-          message: `Verification reviewer must be spekkio, not '${reviewer}'`,
-          invariantRef: "INV §14.4",
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Declared reviewer '${reviewer}' does not match session role '${caller.role}'`,
+          invariantRef: "INV §5.1",
           affectedTarget: moduleId,
-          suggestedAction: "Route verification verdicts through Spekkio",
+          suggestedAction: "Record the verdict as the reviewing role",
         });
       }
 
@@ -3666,14 +4644,18 @@ export class ChronoCore {
 
   /**
    * Mark module as complete (after successful verification).
-   * [CORE §7.6, DOM §6.6]
+   * Completion mints its own single-use grant for the already-authorized
+   * caller session: no external execution grant is accepted, so a worker's
+   * grant can never be consumed by an orchestrator session [CORE §7.6,
+   * DOM §6.6].
    */
-  completeModule(moduleId: string, actor: string): CoreResult<{ state: string }> {
+  completeModule(moduleId: string, auth: CallerAuth): CoreResult<{ state: string }> {
     try {
-      const authz = this.authorizeCompletion(moduleId, actor);
+      const authz = this.authorizeCompletion(moduleId, auth);
       if (!authz.ok) {
         return authz as unknown as CoreResult<{ state: string }>;
       }
+      const caller = this.resolveCaller(auth, "complete module");
 
       const artifact = this.artifacts.findById(moduleId);
       if (artifact.status !== "PASSED") {
@@ -3686,8 +4668,34 @@ export class ChronoCore {
           suggestedAction: "Complete verification and obtain PASS verdict",
         });
       }
+      const project = this.projects.findById("default");
+      const archRevision = project.architectureRevision;
+      if (project.architectureState !== "approved" || archRevision === null) {
+        throw new ChronoError({
+          code: ErrorCode.APPROVAL_REQUIRED,
+          severity: Severity.BLOCKER,
+          message: `Module ${moduleId}: architecture is not approved`,
+          invariantRef: "INV §5.5",
+          affectedTarget: moduleId,
+          suggestedAction: "Approve the architecture with its security approval first",
+        });
+      }
+      const grantId = this.issueBoundGrant({
+        moduleId,
+        workPackageId: null,
+        moduleRevision: artifact.revision,
+        specIds: this.moduleSpecIds(moduleId),
+        archRevision,
+        role: caller.role,
+        sessionId: caller.session.id,
+        requestedBy: caller.role,
+      });
 
-      const result = this.transitionState(moduleId, "DefinitionOfDoneSatisfied", { actor });
+      const result = this.transitionState(moduleId, "DefinitionOfDoneSatisfied", {
+        actor: auth.actor,
+        session: auth.session,
+        grantId,
+      });
       if (!result.ok) {
         return result as unknown as CoreResult<{ state: string }>;
       }

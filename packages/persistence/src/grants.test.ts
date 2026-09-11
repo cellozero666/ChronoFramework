@@ -26,13 +26,21 @@ describe("GrantRepository", () => {
   function grant(id: string) {
     return {
       id,
+      projectId: "default",
       moduleId: "MOD-0001",
       workPackageId: null as string | null,
       moduleRevision: `sha256:${"a".repeat(64)}`,
-      specRevisions: [] as string[],
+      workPackageRevision: null as string | null,
+      specRevisions: {} as Record<string, string>,
+      harnessBindings: [] as Array<{ specId: string; specRevision: string; contentHash: string }>,
       role: "belthazar",
       session: null as string | null,
       requestedBy: "gaspar",
+      rtkAttestationId: null as string | null,
+      skillAttestationId: null as string | null,
+      moduleApprovalId: null as string | null,
+      archApprovalId: null as string | null,
+      policyVersion: "1",
       issuedAt: "2026-09-11T00:00:00.000Z",
       expiresAt: "2026-09-11T01:00:00.000Z",
     };

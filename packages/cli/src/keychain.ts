@@ -13,11 +13,16 @@ import { execFileSync } from "node:child_process";
 export const PO_KEY_SERVICE = "chrono-po-signing-key";
 export const PO_KEY_ACCOUNT = "po";
 
+/** PO signing-key staging account for crash-safe rotation. */
+export const PO_KEY_STAGING_ACCOUNT = "po.staging";
+
 export interface KeyStore {
   /** Read the private key PEM, or null when absent. */
   readKey(account: string): string | null;
   /** Create or replace the private key PEM. */
   writeKey(account: string, privateKeyPem: string): void;
+  /** Remove a key when present; absent keys are not an error. */
+  deleteKey(account: string): void;
 }
 
 export class KeychainError extends Error {
@@ -112,6 +117,46 @@ export class OsKeychainStore implements KeyStore {
       `PO key storage requires macOS Keychain or Linux Secret Service (platform: ${process.platform})`
     );
   }
+
+  deleteKey(account: string): void {
+    if (process.platform === "darwin") {
+      try {
+        execFileSync(
+          "security",
+          ["delete-generic-password", "-s", PO_KEY_SERVICE, "-a", account],
+          { stdio: ["ignore", "pipe", "pipe"] }
+        );
+        return;
+      } catch (e) {
+        if (isNotFound(e)) {
+          return;
+        }
+        throw new KeychainError(
+          `OS keychain delete failed: ${shortMessage(e)}. Approve the keychain prompt or check permissions.`
+        );
+      }
+    }
+    if (process.platform === "linux") {
+      try {
+        execFileSync(
+          "secret-tool",
+          ["clear", "service", PO_KEY_SERVICE, "account", account],
+          { stdio: ["ignore", "pipe", "pipe"] }
+        );
+        return;
+      } catch (e) {
+        if (isMissingBinary(e)) {
+          throw new KeychainError(
+            "secret-tool is not installed; install libsecret (e.g. apt install libsecret-tools) so the PO key stays in the OS keychain"
+          );
+        }
+        throw new KeychainError(`OS keychain delete failed: ${shortMessage(e)}`);
+      }
+    }
+    throw new KeychainError(
+      `PO key storage requires macOS Keychain or Linux Secret Service (platform: ${process.platform})`
+    );
+  }
 }
 
 function isNotFound(e: unknown): boolean {
@@ -151,5 +196,9 @@ export class MemoryKeyStore implements KeyStore {
 
   writeKey(account: string, privateKeyPem: string): void {
     this.keys.set(account, privateKeyPem);
+  }
+
+  deleteKey(account: string): void {
+    this.keys.delete(account);
   }
 }

@@ -8,9 +8,11 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 import Database from "better-sqlite3";
 import {
   buildApprovalPayload,
+  buildSessionAuthorizationPayload,
   computeRevisionHash,
   generateApprovalKeyPair,
   signApprovalPayload,
@@ -25,7 +27,6 @@ type SignFn = (fields: {
   rationale: string;
 }) => { signature: string; timestamp: string };
 
-const ACTOR = { actor: "gaspar" };
 const SPEC = {
   id: "SP-0001",
   title: "T",
@@ -66,6 +67,31 @@ function fakeInteractiveTerminal(): () => void {
   let tempDir: string;
   let core: ChronoCore;
   let sign: SignFn;
+  let gaspar: { actor: string; session: { id: string; token: string } };
+
+function openSessionFor(
+  core: ChronoCore,
+  role: string,
+  scopeModule?: string
+): { id: string; token: string } {
+  if (role === "gaspar" || role === "PO") {
+    throw new Error("Privileged test sessions require a PO-signed bootstrap");
+  }
+  const res = core.openSession(
+    {
+      role,
+      adapter: "test-adapter",
+      runtime: "test-runtime",
+      ...(scopeModule !== undefined ? { scopeModule } : {}),
+      ttlSeconds: 3600,
+    },
+    { interactive: true }
+  );
+  if (!res.ok) {
+    throw new Error(`test session open failed: ${JSON.stringify(res.error)}`);
+  }
+  return { id: res.value!.id, token: res.value!.token };
+}
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "chrono-validate-test-"));
@@ -82,6 +108,32 @@ function fakeInteractiveTerminal(): () => void {
         signature: signApprovalPayload(buildApprovalPayload({ ...fields, timestamp }), privateKeyPem),
       };
     };
+    const opened = (() => {
+      const nonce = randomBytes(16).toString("hex");
+      const timestamp = "2026-09-11T00:00:00.000Z";
+      const rationale = "test privileged-session bootstrap";
+      const signature = signApprovalPayload(
+        buildSessionAuthorizationPayload({
+          sessionRole: "gaspar",
+          adapter: "test-adapter",
+          runtime: "test-runtime",
+          scopeModule: null,
+          scopeWp: null,
+          ttlSeconds: 3600,
+          nonce,
+          authority: "PO",
+          rationale,
+          timestamp,
+        }),
+        privateKeyPem
+      );
+      return core.openSession(
+        { role: "gaspar", adapter: "test-adapter", runtime: "test-runtime", ttlSeconds: 3600 },
+        { poAuthorization: { nonce, authority: "PO", rationale, timestamp, signature } }
+      );
+    })();
+    expect(opened.ok).toBe(true);
+    gaspar = { actor: "gaspar", session: { id: opened.value!.id, token: opened.value!.token } };
   });
 
   afterEach(() => {
@@ -91,9 +143,9 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   function approveArchitecture(): void {
-    const proposed = core.proposeArchitecture({ title: "A" }, "gaspar");
+    const proposed = core.proposeArchitecture({ title: "A" }, gaspar);
     expect(proposed.ok).toBe(true);
-    expect(core.submitArchitectureForReview("gaspar").ok).toBe(true);
+    expect(core.submitArchitectureForReview(gaspar).ok).toBe(true);
     const { signature, timestamp } = sign({
       action: "architecture-security",
       scopeArtifactId: "ARCH",
@@ -112,12 +164,12 @@ function fakeInteractiveTerminal(): () => void {
         signature,
       }).ok
     ).toBe(true);
-    expect(core.approveArchitecture("PO").ok).toBe(true);
+    expect(core.approveArchitecture(gaspar).ok).toBe(true);
   }
 
   function readySpec(): string {
-    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, "gaspar").ok).toBe(true);
-    expect(core.transitionState("SP-0001", "SpecSubmittedForReview", ACTOR).ok).toBe(true);
+    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, gaspar).ok).toBe(true);
+    expect(core.transitionState("SP-0001", "SpecSubmittedForReview", { actor: "gaspar", session: gaspar.session }).ok).toBe(true);
     const revision = core.getArtifact("SP-0001").revision;
     const { signature, timestamp } = sign({
       action: "architecture-security",
@@ -137,8 +189,8 @@ function fakeInteractiveTerminal(): () => void {
         signature,
       }).ok
     ).toBe(true);
-    expect(core.recordHarness(revision, `sha256:${"a".repeat(64)}`, "# h", "gaspar").ok).toBe(true);
-    expect(core.transitionState("SP-0001", "SpecApprovedReady", ACTOR).ok).toBe(true);
+    expect(core.recordHarness(revision, `sha256:${"a".repeat(64)}`, "# h", gaspar).ok).toBe(true);
+    expect(core.transitionState("SP-0001", "SpecApprovedReady", { actor: "gaspar", session: gaspar.session }).ok).toBe(true);
     return core.getArtifact("SP-0001").revision;
   }
 
@@ -151,8 +203,8 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   it("treats active blockers as errors, not warnings", () => {
-    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, "gaspar").ok).toBe(true);
-    expect(core.raiseBlocker("PRODUCT_BLOCKER", "gaspar", ["SP-0001"], "gap").ok).toBe(true);
+    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, gaspar).ok).toBe(true);
+    expect(core.raiseBlocker("PRODUCT_BLOCKER", ["SP-0001"], "gap", gaspar).ok).toBe(true);
     const result = core.validate();
     expect(result.value?.valid).toBe(false);
     expect(result.value?.errors.some((e) => e.includes("Active blocker"))).toBe(true);
@@ -160,7 +212,7 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   it("reports persisted/projected divergence as an error", () => {
-    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, "gaspar").ok).toBe(true);
+    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, gaspar).ok).toBe(true);
     expect(core.validate().value?.valid).toBe(true);
     // External tamper outside the Core: flip the stored projection.
     const raw = new Database(join(tempDir, ".chrono", "chrono.db"));
@@ -181,7 +233,7 @@ function fakeInteractiveTerminal(): () => void {
     expect(missing.value?.valid).toBe(false);
     expect(missing.value?.errors.some((e) => e.includes("SecurityProfile"))).toBe(true);
 
-    expect(core.recordSecurityProfile({ title: "P", threats: [] }, "gaspar").ok).toBe(true);
+    expect(core.recordSecurityProfile({ title: "P", threats: [] }, gaspar).ok).toBe(true);
     const present = core.validate();
     expect(present.value?.errors.filter((e) => e.includes("SecurityProfile"))).toHaveLength(0);
   });
@@ -189,9 +241,9 @@ function fakeInteractiveTerminal(): () => void {
   it("requires attestations and runtime once execution-relevant", () => {
     approveArchitecture();
     readySpec();
-    expect(core.recordSecurityProfile({ title: "P" }, "gaspar").ok).toBe(true);
-    expect(core.registerModule("MOD-0001", "DRAFT", MOD, "gaspar").ok).toBe(true);
-    expect(core.transitionState("MOD-0001", "ModulePlanned", ACTOR).ok).toBe(true);
+    expect(core.recordSecurityProfile({ title: "P" }, gaspar).ok).toBe(true);
+    expect(core.registerModule("MOD-0001", "DRAFT", MOD, gaspar).ok).toBe(true);
+    expect(core.transitionState("MOD-0001", "ModulePlanned", { actor: "gaspar", session: gaspar.session }).ok).toBe(true);
     const revision = core.getArtifact("MOD-0001").revision;
     const { signature, timestamp } = sign({
       action: "module-approval",
@@ -211,7 +263,7 @@ function fakeInteractiveTerminal(): () => void {
         signature,
       }).ok
     ).toBe(true);
-    expect(core.transitionState("MOD-0001", "ModuleApproved", ACTOR).ok).toBe(true);
+    expect(core.transitionState("MOD-0001", "ModuleApproved", { actor: "gaspar", session: gaspar.session }).ok).toBe(true);
 
     const result = core.validate();
     expect(result.value?.valid).toBe(false);
@@ -221,34 +273,39 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   it("flags open defects and clears them on resolution", () => {
+    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, gaspar).ok).toBe(true);
+    expect(core.registerModule("MOD-0001", "DRAFT", MOD, gaspar).ok).toBe(true);
+    const spekkioSession = openSessionFor(core, "spekkio", "MOD-0001");
+    const belthazarSession = openSessionFor(core, "belthazar", "MOD-0001");
     const recorded = core.recordDefect(
       {
         classification: "IMPLEMENTATION_DEFECT",
         severity: "major",
         evidenceRefs: [],
         affectedCriteria: [],
-        affectedArtifacts: [],
+        affectedArtifacts: ["MOD-0001"],
         blockingScope: "MOD-0001",
         reproInfo: null,
       },
-      "spekkio"
+      { actor: "spekkio", session: spekkioSession }
     );
     expect(recorded.ok).toBe(true);
     expect(core.validate().value?.errors.some((e) => e.includes(recorded.value!.id))).toBe(true);
-    expect(core.resolveDefect(recorded.value!.id, "belthazar").ok).toBe(true);
+    expect(core.resolveDefect(recorded.value!.id, { actor: "belthazar", session: belthazarSession }).ok).toBe(true);
     expect(
       core.validate().value?.errors.some((e) => e.includes(recorded.value!.id))
     ).toBe(false);
   });
 
   it("flags orphan modules and expired waivers", () => {
-    expect(core.registerModule("MOD-0009", "DRAFT", { id: "MOD-0009", name: "O", purpose: "P", specs: [] }, "gaspar").ok).toBe(
+    expect(core.registerModule("MOD-0009", "DRAFT", { id: "MOD-0009", name: "O", purpose: "P", specs: [] }, gaspar).ok).toBe(
       true
     );
     expect(core.validate().value?.errors.some((e) => e.includes("Orphan module"))).toBe(true);
   });
 
   it("rejects secrets and integrity mismatches in evidence", () => {
+    const lucca = { actor: "lucca", session: openSessionFor(core, "lucca", "default") };
     const before = core.listEvents().length;
     const revision = `sha256:${"d".repeat(64)}`;
     const integrity = (result: string, diagnostics: string | null): string =>
@@ -261,7 +318,7 @@ function fakeInteractiveTerminal(): () => void {
       result: "pass",
       diagnostics: "api_key = 'sk-live-1234567890'",
       integrityHash: integrity("pass", "api_key = 'sk-live-1234567890'"),
-    });
+    }, lucca);
     expect(leaked.ok).toBe(false);
     expect(leaked.error?.code).toBe("SECRET_DETECTED");
 
@@ -273,7 +330,7 @@ function fakeInteractiveTerminal(): () => void {
       result: "pass",
       diagnostics: null,
       integrityHash: `sha256:${"e".repeat(64)}`,
-    });
+    }, lucca);
     expect(forged.ok).toBe(false);
     expect(forged.error?.code).toBe("VALIDATION_ERROR");
 

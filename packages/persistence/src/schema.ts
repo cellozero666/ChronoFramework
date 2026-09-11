@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 8;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -466,5 +466,58 @@ export const MIGRATIONS: Record<number, string> = {
       consumed         INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX idx_grant_module ON execution_grant(module_id);
+  `,
+  7: `
+    -- Authenticated adapter sessions [DOM §2.2, Remediation §3A].
+    -- A session binds one adapter, runtime, project, role, and assignment
+    -- scope to a non-forgeable token. Only the token SHA-256 persists;
+    -- the token itself is returned once at issuance and never stored.
+    CREATE TABLE agent_session (
+      id              TEXT PRIMARY KEY,
+      token_hash      TEXT NOT NULL UNIQUE,
+      role            TEXT NOT NULL,
+      adapter         TEXT NOT NULL,
+      runtime         TEXT NOT NULL,
+      project_id      TEXT NOT NULL,
+      scope_module    TEXT,
+      scope_wp        TEXT,
+      parent_id       TEXT,
+      issued_at       TEXT NOT NULL,
+      expires_at      TEXT NOT NULL,
+      revoked         INTEGER NOT NULL DEFAULT 0,
+      last_seen       TEXT NOT NULL
+    );
+    CREATE INDEX idx_session_token ON agent_session(token_hash);
+
+    -- Full grant binding [Remediation §2, review R2].
+    -- A grant pins the project, module/WP revisions, every Spec revision,
+    -- the Harness bindings, the assigned role, the executing session, the
+    -- adapter/runtime, the policy version, both attestations, and both
+    -- approvals. Revalidation compares all of them on every consumption.
+    ALTER TABLE execution_grant ADD COLUMN project_id TEXT;
+    ALTER TABLE execution_grant ADD COLUMN work_package_revision TEXT;
+    ALTER TABLE execution_grant ADD COLUMN harness_bindings TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE execution_grant ADD COLUMN rtk_attestation_id TEXT;
+    ALTER TABLE execution_grant ADD COLUMN skill_attestation_id TEXT;
+    ALTER TABLE execution_grant ADD COLUMN module_approval_id TEXT;
+    ALTER TABLE execution_grant ADD COLUMN arch_approval_id TEXT;
+    ALTER TABLE execution_grant ADD COLUMN policy_version TEXT;
+
+    -- Blocker issuer authority [Remediation §3A.6]: who raised it, in
+    -- which role and session, so resolution can verify ownership.
+    ALTER TABLE blocker ADD COLUMN issuer_role TEXT;
+    ALTER TABLE blocker ADD COLUMN issuer_session TEXT;
+  `,
+  8: `
+    -- One-time privileged-session authorizations [Remediation §3A].
+    -- A PO-signed bootstrap nonce is consumed atomically with the session
+    -- it authorizes. The PRIMARY KEY makes replay fail closed, even inside
+    -- the five-minute signature freshness window.
+    CREATE TABLE session_authorization (
+      nonce      TEXT PRIMARY KEY,
+      role       TEXT NOT NULL,
+      authority  TEXT NOT NULL,
+      used_at    TEXT NOT NULL
+    );
   `,
 };

@@ -41,6 +41,21 @@ export interface ApprovalPayload {
   readonly timestamp: string;
 }
 
+/** Canonical privileged-session bootstrap payload [Remediation §3A]. */
+export interface SessionAuthorizationPayload {
+  readonly action: "session-open";
+  readonly session_role: string;
+  readonly adapter: string;
+  readonly runtime: string;
+  readonly scope_module: string | null;
+  readonly scope_wp: string | null;
+  readonly ttl_seconds: number;
+  readonly nonce: string;
+  readonly authority: string;
+  readonly rationale: string;
+  readonly timestamp: string;
+}
+
 /** Canonical waiver payload [CORE §8.3, DOM §3.24]. */
 export interface WaiverPayload {
   readonly action: "waiver";
@@ -104,7 +119,7 @@ export function parseApprovalPublicKey(publicKeyPem: string): KeyObject {
 }
 
 /** Sign a canonical payload with an Ed25519 private key (PKCS8 PEM). Returns base64. */
-export function signApprovalPayload(payload: ApprovalPayload | WaiverPayload, privateKeyPem: string): string {
+export function signApprovalPayload(payload: ApprovalPayload | WaiverPayload | SessionAuthorizationPayload, privateKeyPem: string): string {
   let key: KeyObject;
   try {
     key = createPrivateKey(privateKeyPem);
@@ -127,7 +142,7 @@ export function signApprovalPayload(payload: ApprovalPayload | WaiverPayload, pr
  * false to SIGNATURE_INVALID / APPROVAL_REQUIRED.
  */
 export function verifyApprovalSignature(
-  payload: ApprovalPayload | WaiverPayload,
+  payload: ApprovalPayload | WaiverPayload | SessionAuthorizationPayload,
   signatureBase64: string,
   publicKey: KeyObject
 ): boolean {
@@ -160,6 +175,34 @@ export function buildApprovalPayload(fields: {
     action: fields.action,
     scope_artifact_id: fields.scopeArtifactId,
     scope_revision: fields.scopeRevision,
+    authority: fields.authority,
+    rationale: fields.rationale,
+    timestamp: fields.timestamp,
+  };
+}
+
+/** Build the canonical privileged-session bootstrap payload [Remediation §3A]. */
+export function buildSessionAuthorizationPayload(fields: {
+  sessionRole: string;
+  adapter: string;
+  runtime: string;
+  scopeModule: string | null;
+  scopeWp: string | null;
+  ttlSeconds: number;
+  nonce: string;
+  authority: string;
+  rationale: string;
+  timestamp: string;
+}): SessionAuthorizationPayload {
+  return {
+    action: "session-open",
+    session_role: fields.sessionRole,
+    adapter: fields.adapter,
+    runtime: fields.runtime,
+    scope_module: fields.scopeModule,
+    scope_wp: fields.scopeWp,
+    ttl_seconds: fields.ttlSeconds,
+    nonce: fields.nonce,
     authority: fields.authority,
     rationale: fields.rationale,
     timestamp: fields.timestamp,

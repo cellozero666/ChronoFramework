@@ -8,14 +8,16 @@
 
 import { Command } from "commander";
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { ChronoCore } from "@chrono/core";
-import { RTK_UPSTREAM, buildApprovalPayload, buildWaiverPayload, generateApprovalKeyPair, signApprovalPayload } from "@chrono/domain";
+import { RTK_UPSTREAM, buildApprovalPayload, buildSessionAuthorizationPayload, buildWaiverPayload, generateApprovalKeyPair, signApprovalPayload } from "@chrono/domain";
 import { CHRONO_VERSION } from "./version.js";
 import {
   MemoryKeyStore,
   OsKeychainStore,
   PO_KEY_ACCOUNT,
   PO_KEY_SERVICE,
+  PO_KEY_STAGING_ACCOUNT,
   isInteractiveTerminal,
   type KeyStore,
 } from "./keychain.js";
@@ -92,7 +94,15 @@ interface CommandOpts {
   readonly wp?: unknown;
   readonly as?: unknown;
   readonly role?: unknown;
+  readonly sessionToken?: unknown;
+  readonly requesterToken?: unknown;
   readonly binary?: unknown;
+  readonly adapter?: unknown;
+  readonly scopeModule?: unknown;
+  readonly scopeWp?: unknown;
+  readonly ttl?: unknown;
+  readonly parentToken?: unknown;
+  readonly rotate?: unknown;
 }
 
 function formatCoreError(error: {
@@ -444,6 +454,11 @@ export function runWaive(
   }
 }
 
+export interface KeysGenerateOptions extends OutputOptions {
+  readonly rotate?: boolean | undefined;
+  readonly rationale?: string | undefined;
+}
+
 /**
  * Interactive PO key generation: Ed25519 keypair, private key to the OS
  * keychain, public key registered with the project. The private key is
@@ -451,7 +466,7 @@ export function runWaive(
  */
 export function runKeysGenerate(
   projectPath: string,
-  options: OutputOptions = {},
+  options: KeysGenerateOptions = {},
   deps: HumanCommandDeps = productionDeps()
 ): CliOutput {
   const asJson = options.json === true;
@@ -465,24 +480,139 @@ export function runKeysGenerate(
     return constructionFailure(e, asJson);
   }
   try {
+    const existingPrivate = readPoKey(deps.store);
+    const registeredRevision = core.poKeyRevision();
+    if (registeredRevision !== null) {
+      if (existingPrivate === null) {
+        return approvalRequired(
+          "A PO public key is already registered, but no matching private key is available",
+          "Recover the registered private key; keys generate cannot replace it without a signed rotation",
+          asJson
+        );
+      }
+      if (options.rotate !== true) {
+        return coreError(
+          {
+            code: "VALIDATION_ERROR",
+            severity: "ERROR",
+            message: "Refusing to replace the active PO key: pass --rotate with --rationale for a signed rotation",
+          },
+          asJson
+        );
+      }
+      const rationale = options.rationale?.trim() ?? "";
+      if (rationale.length === 0) {
+        return coreError(
+          { code: "VALIDATION_ERROR", severity: "ERROR", message: "Key rotation requires --rationale bound into the PO signature" },
+          asJson
+        );
+      }
+    }
+
     const pair = generateApprovalKeyPair();
+    // Stage the new private key before changing project trust: if Core
+    // registration fails, the active key is untouched and staging is
+    // removed. The primary account is replaced only after acceptance.
     try {
-      deps.store.writeKey(PO_KEY_ACCOUNT, pair.privateKeyPem);
+      deps.store.writeKey(PO_KEY_STAGING_ACCOUNT, pair.privateKeyPem);
     } catch (e) {
       return keychainFailure(e, asJson);
     }
-    const registered = core.registerPoPublicKey(pair.publicKeyPem);
-    if (!registered.ok) {
-      return coreError(registered.error, asJson);
+    if (registeredRevision === null) {
+      const registered = core.registerPoPublicKey(pair.publicKeyPem);
+      if (!registered.ok) {
+        cleanupStaging(deps.store);
+        return coreError(registered.error, asJson);
+      }
+    } else {
+      if (existingPrivate === null) {
+        cleanupStaging(deps.store);
+        return approvalRequired(
+          "A PO public key is already registered, but no matching private key is available",
+          "Recover the registered private key; keys generate cannot replace it without a signed rotation",
+          asJson
+        );
+      }
+      const timestamp = new Date().toISOString();
+      let signature: string;
+      try {
+        signature = signApprovalPayload(
+          buildApprovalPayload({
+            action: "key-rotation",
+            scopeArtifactId: "PO-KEY",
+            scopeRevision: registeredRevision,
+            authority: "PO",
+            rationale: options.rationale?.trim() ?? "",
+            timestamp,
+          }),
+          existingPrivate
+        );
+      } catch {
+        cleanupStaging(deps.store);
+        return coreError(
+          { code: "SIGNATURE_INVALID", severity: "ERROR", message: "Active PO key is not a valid PEM private key" },
+          asJson
+        );
+      }
+      const registered = core.registerPoPublicKey(pair.publicKeyPem, {
+        signature,
+        authority: "PO",
+        rationale: options.rationale?.trim() ?? "",
+        timestamp,
+      });
+      if (!registered.ok) {
+        cleanupStaging(deps.store);
+        return coreError(registered.error, asJson);
+      }
     }
+
+    try {
+      deps.store.writeKey(PO_KEY_ACCOUNT, pair.privateKeyPem);
+    } catch (e) {
+      return keychainFailure(
+        new Error(
+          `Primary key storage failed after the new public key was accepted. The new private key remains staged as '${PO_KEY_STAGING_ACCOUNT}'; restore it before approving. ${e instanceof Error ? e.message : String(e)}`
+        ),
+        asJson
+      );
+    }
+    if (readPoKey(deps.store) !== pair.privateKeyPem) {
+      return keychainFailure(
+        new Error(
+          `Primary key verification failed after the new public key was accepted. The new private key remains staged as '${PO_KEY_STAGING_ACCOUNT}'; restore it before approving.`
+        ),
+        asJson
+      );
+    }
+    const cleanup = cleanupStaging(deps.store);
     const body = asJson
-      ? JSON.stringify({ ok: true, account: PO_KEY_ACCOUNT }, null, 2)
+      ? JSON.stringify(
+          {
+            ok: true,
+            account: PO_KEY_ACCOUNT,
+            ...(cleanup === null ? {} : { stagingCleanup: cleanup }),
+          },
+          null,
+          2
+        )
       : ["PO signing key generated.", `  private: OS keychain (${PO_KEY_SERVICE})`, "  public: registered with this project."].join(
           "\n"
         );
-    return { exitCode: 0, stdout: body, stderr: "" };
+    if (cleanup === null) {
+      return { exitCode: 0, stdout: body, stderr: "" };
+    }
+    return { exitCode: 0, stdout: body, stderr: `Warning: staging cleanup failed: ${cleanup}` };
   } finally {
     core.close();
+  }
+}
+
+function cleanupStaging(store: KeyStore): string | null {
+  try {
+    store.deleteKey(PO_KEY_STAGING_ACCOUNT);
+    return null;
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
   }
 }
 
@@ -571,7 +701,34 @@ export interface GateOptions {
   readonly wp?: string | undefined;
   readonly as?: string | undefined;
   readonly role?: string | undefined;
+  readonly sessionToken?: string | undefined;
+  readonly requesterToken?: string | undefined;
   readonly json?: boolean | undefined;
+}
+
+/** Parse an explicit session token without environment fallback. */
+function parseSessionToken(raw?: string): { id: string; token: string } | null {
+  if (raw === undefined || raw.length === 0) {
+    return null;
+  }
+  const slash = raw.indexOf("/");
+  if (slash <= 0) {
+    return null;
+  }
+  return { id: raw.slice(0, slash), token: raw.slice(slash + 1) };
+}
+
+/** Session token from flag or process-local env (never from project files). */
+export function resolveSessionToken(explicit?: string): { id: string; token: string } | null {
+  const raw = explicit ?? process.env["CHRONO_SESSION_TOKEN"];
+  if (raw === undefined || raw.length === 0) {
+    return null;
+  }
+  const slash = raw.indexOf("/");
+  if (slash <= 0) {
+    return null;
+  }
+  return { id: raw.slice(0, slash), token: raw.slice(slash + 1) };
 }
 
 /**
@@ -606,10 +763,23 @@ export function runGate(projectPath: string, options: GateOptions): CliOutput {
       if (options.role === undefined || options.role.length === 0) {
         return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "execution gate requires --role (assigned implementation role)" }, "Error [VALIDATION_ERROR]: execution gate requires --role (assigned implementation role)");
       }
+      const session = resolveSessionToken(options.sessionToken);
+      if (session === null) {
+        return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "execution gate requires --session-token (or CHRONO_SESSION_TOKEN)" }, "Error [VALIDATION_ERROR]: execution gate requires --session-token (or CHRONO_SESSION_TOKEN)");
+      }
+      const requesterSession = parseSessionToken(options.requesterToken);
+      if (options.requesterToken !== undefined && requesterSession === null) {
+        return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "execution gate requires --requester-token <id/token>" }, "Error [VALIDATION_ERROR]: execution gate requires --requester-token <id/token>");
+      }
+      if (requesterSession === null && options.as !== options.role) {
+        return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "orchestrated execution requests require --requester-token for the requesting session" }, "Error [VALIDATION_ERROR]: orchestrated execution requests require --requester-token for the requesting session");
+      }
       const result = core.authorizeExecution(options.module, {
         ...(options.wp !== undefined ? { workPackageId: options.wp } : {}),
         actor: options.as,
         role: options.role,
+        session,
+        ...(requesterSession === null ? {} : { requesterSession }),
       });
       if (result.ok) {
         return respond(0, { result: "AUTHORIZED", grantId: result.value?.grantId }, "AUTHORIZED");
@@ -624,7 +794,11 @@ export function runGate(projectPath: string, options: GateOptions): CliOutput {
       if (options.module === undefined || options.module.length === 0) {
         return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "completion gate requires --module" }, "Error [VALIDATION_ERROR]: completion gate requires --module");
       }
-      const result = core.authorizeCompletion(options.module, options.as);
+      const completionSession = resolveSessionToken(options.sessionToken);
+      if (completionSession === null) {
+        return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "completion gate requires --session-token (or CHRONO_SESSION_TOKEN)" }, "Error [VALIDATION_ERROR]: completion gate requires --session-token (or CHRONO_SESSION_TOKEN)");
+      }
+      const result = core.authorizeCompletion(options.module, { actor: options.as, session: completionSession });
       if (result.ok) {
         return respond(0, { result: "AUTHORIZED" }, "AUTHORIZED");
       }
@@ -690,7 +864,7 @@ export function runAttestationStatus(
  */
 export function runRtkVerify(
   projectPath: string,
-  options: OutputOptions & { binaryPath?: string } = {},
+  options: OutputOptions & { binaryPath?: string; session?: { id: string; token: string } } = {},
   exec: (binary: string, args: string[]) => { exitCode: number; stdout: string } = defaultExec
 ): CliOutput {
   const asJson = options.json === true;
@@ -701,6 +875,13 @@ export function runRtkVerify(
     return constructionFailure(e, asJson);
   }
   try {
+    if (options.session === undefined) {
+      return coreError(
+        { code: "VALIDATION_ERROR", severity: "ERROR", message: "rtk verify requires --session-token" },
+        asJson
+      );
+    }
+    const caller = { actor: "gaspar", session: options.session };
     const binary = options.binaryPath ?? "rtk";
     let version: string;
     try {
@@ -721,7 +902,7 @@ export function runRtkVerify(
     if (gain.exitCode !== 0) {
       return rtkBlocked("RTK_NAME_COLLISION: installed rtk is not Rust Token Killer (rtk gain failed)", asJson);
     }
-    const recorded = core.recordRtkAttestation({
+    const recorded = core.recordRtkAttestation(caller, {
       binaryPath: binary,
       binaryIdentity: `rtk gain ok :: ${version}`,
       version,
@@ -745,8 +926,47 @@ export function runRtkVerify(
   }
 }
 
-function rtkBlocked(reason: string, asJson: boolean): CliOutput {
-  if (asJson) {
+/**
+ * Skill re-verification. Fail-closed until pinned release metadata exists:
+ * without an immutable pinned commit to compare against, provenance is
+ * unverifiable, so nothing is recorded and dispatch stays denied. The
+ * Core.recordSkillAttestation path remains fully tested; this command
+ * becomes functional when release metadata lands (Slice 8).
+ */
+export function runSkillVerify(
+  projectPath: string,
+  options: OutputOptions = {}
+): CliOutput {
+  const asJson = options.json === true;
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    const status = core.attestationCurrency("skill");
+    const reason =
+      `Karpathy Guidelines skill is ${status.state}: no pinned release metadata to verify provenance against; ` +
+      "recording is refused until release metadata lands";
+    if (asJson) {
+      return {
+        exitCode: 1,
+        stdout: JSON.stringify(
+          { ok: false, error: { code: "BLOCKED_PROCESS_SKILL", severity: "BLOCKER", message: reason } },
+          null,
+          2
+        ),
+        stderr: "",
+      };
+    }
+    return { exitCode: 1, stdout: "", stderr: `Error [BLOCKED_PROCESS_SKILL] (BLOCKER): ${reason}` };
+  } finally {
+    core.close();
+  }
+}
+
+function rtkBlocked(reason: string, asJson: boolean): CliOutput {  if (asJson) {
     return {
       exitCode: 1,
       stdout: JSON.stringify({ ok: false, error: { code: "BLOCKED_RTK", severity: "BLOCKER", message: reason } }, null, 2),
@@ -764,6 +984,169 @@ function defaultExec(binary: string, args: string[]): { exitCode: number; stdout
     const code = (e as { status?: number }).status ?? 1;
     const stdout = (e as { stdout?: unknown }).stdout;
     return { exitCode: code, stdout: typeof stdout === "string" ? stdout : "" };
+  }
+}
+
+export interface SessionOpenOptions {
+  readonly role: string;
+  readonly adapter: string;
+  readonly runtime: string;
+  readonly scopeModule?: string | undefined;
+  readonly scopeWp?: string | undefined;
+  readonly ttlSeconds?: number | undefined;
+  readonly parentToken?: string | undefined;
+  readonly rationale?: string | undefined;
+  readonly json?: boolean | undefined;
+}
+
+/**
+ * Open an authenticated session. Worker sessions use interactive minting;
+ * privileged gaspar/PO sessions require a one-time PO-signed bootstrap;
+ * delegation requires a valid parent session token. The bearer
+ * token is returned once and never persisted.
+ */
+export function runSessionOpen(
+  projectPath: string,
+  options: SessionOpenOptions,
+  deps: HumanCommandDeps = productionDeps()
+): CliOutput {
+  const asJson = options.json === true;
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    const ttlSeconds = options.ttlSeconds ?? 3600;
+    const request = {
+      role: options.role,
+      adapter: options.adapter,
+      runtime: options.runtime,
+      ...(options.scopeModule !== undefined ? { scopeModule: options.scopeModule } : {}),
+      ...(options.scopeWp !== undefined ? { scopeWp: options.scopeWp } : {}),
+      ttlSeconds,
+    };
+    if (options.parentToken !== undefined) {
+      const parent = resolveSessionToken(options.parentToken);
+      if (parent === null) {
+        return coreError(
+          { code: "VALIDATION_ERROR", severity: "ERROR", message: "Malformed parent session token" },
+          asJson
+        );
+      }
+      const result = core.openSession(request, { parentSession: parent });
+      if (!result.ok) {
+        return coreError(result.error, asJson);
+      }
+      return {
+        exitCode: 0,
+        stdout: asJson
+          ? JSON.stringify({ ok: true, id: result.value?.id, token: result.value?.token, expiresAt: result.value?.expiresAt }, null, 2)
+          : [`session: ${result.value?.id ?? ""}`, `token: ${result.value?.token ?? ""}`, "Store the token securely; it is never shown again."].join("\n"),
+        stderr: "",
+      };
+    }
+    if (!deps.interactive) {
+      return humanOnlyRefusal("session open", asJson);
+    }
+    if (options.role === "gaspar" || options.role === "PO") {
+      const privateKey = readPoKey(deps.store);
+      if (privateKey === null) {
+        return approvalRequired(
+          "Privileged sessions require the PO signing key from the OS keychain",
+          "Generate one with chrono keys generate, then retry interactively with --rationale",
+          asJson
+        );
+      }
+      const rationale = options.rationale?.trim() ?? "";
+      if (rationale.length === 0) {
+        return coreError(
+          {
+            code: "VALIDATION_ERROR",
+            severity: "ERROR",
+            message: "Privileged session open requires --rationale bound into the PO signature",
+          },
+          asJson
+        );
+      }
+      const nonce = randomBytes(16).toString("hex");
+      const timestamp = new Date().toISOString();
+      let signature: string;
+      try {
+        signature = signApprovalPayload(
+          buildSessionAuthorizationPayload({
+            sessionRole: options.role,
+            adapter: options.adapter,
+            runtime: options.runtime,
+            scopeModule: options.scopeModule ?? null,
+            scopeWp: options.scopeWp ?? null,
+            ttlSeconds,
+            nonce,
+            authority: "PO",
+            rationale,
+            timestamp,
+          }),
+          privateKey
+        );
+      } catch {
+        return coreError(
+          { code: "SIGNATURE_INVALID", severity: "ERROR", message: "PO signing key is not a valid PEM private key" },
+          asJson
+        );
+      }
+      const result = core.openSession(request, {
+        poAuthorization: { nonce, authority: "PO", rationale, timestamp, signature },
+      });
+      if (!result.ok) {
+        return coreError(result.error, asJson);
+      }
+      return {
+        exitCode: 0,
+        stdout: asJson
+          ? JSON.stringify({ ok: true, id: result.value?.id, token: result.value?.token, expiresAt: result.value?.expiresAt }, null, 2)
+          : [`session: ${result.value?.id ?? ""}`, `token: ${result.value?.token ?? ""}`, "Store the token securely; it is never shown again."].join("\n"),
+        stderr: "",
+      };
+    }
+    const result = core.openSession(request, { interactive: true });
+    if (!result.ok) {
+      return coreError(result.error, asJson);
+    }
+    return {
+      exitCode: 0,
+      stdout: asJson
+        ? JSON.stringify({ ok: true, id: result.value?.id, token: result.value?.token, expiresAt: result.value?.expiresAt }, null, 2)
+        : [`session: ${result.value?.id ?? ""}`, `token: ${result.value?.token ?? ""}`, "Store the token securely; it is never shown again."].join("\n"),
+      stderr: "",
+    };
+  } finally {
+    core.close();
+  }
+}
+
+/** Revoke a session (gaspar/PO caller with a valid session). */
+export function runSessionRevoke(
+  projectPath: string,
+  id: string,
+  auth: { actor: string; session: { id: string; token: string } },
+  options: OutputOptions = {}
+): CliOutput {
+  const asJson = options.json === true;
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    const result = core.revokeSession(id, auth);
+    if (!result.ok) {
+      return coreError(result.error, asJson);
+    }
+    return { exitCode: 0, stdout: asJson ? JSON.stringify({ ok: true, id }, null, 2) : `revoked session ${id}`, stderr: "" };
+  } finally {
+    core.close();
   }
 }
 
@@ -901,10 +1284,19 @@ export function createProgram(cwd: string): Command {
     .command("generate")
     .description("Generate an Ed25519 PO key (private to OS keychain, public to project)")
     .option("--path <dir>", "project directory (default: current directory)")
+    .option("--rotate", "replace the active key with a signed rotation")
+    .option("--rationale <text>", "rationale bound into a rotation signature")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
       const projectPath = typeof opts.path === "string" ? opts.path : cwd;
-      emitProgramResult(program, runKeysGenerate(projectPath, { json: opts.json === true }));
+      emitProgramResult(
+        program,
+        runKeysGenerate(projectPath, {
+          rotate: opts.rotate === true,
+          ...(typeof opts.rationale === "string" ? { rationale: opts.rationale } : {}),
+          json: opts.json === true,
+        })
+      );
     });
 
   program
@@ -913,8 +1305,10 @@ export function createProgram(cwd: string): Command {
     .argument("<gate>", "gate name (execution, completion)")
     .option("--module <id>", "module scope")
     .option("--wp <id>", "work-package scope")
-    .option("--as <actor>", "requesting identity (canonical role or <runtime>:<session>)")
+    .option("--as <actor>", "requesting identity (canonical role)")
     .option("--role <role>", "assigned implementation role (execution gate)")
+    .option("--session-token <id/token>", "executor session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--requester-token <id/token>", "requester session credential for orchestrated execution")
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((gate: string, opts: CommandOpts) => {
@@ -927,6 +1321,8 @@ export function createProgram(cwd: string): Command {
           wp: typeof opts.wp === "string" ? opts.wp : undefined,
           as: typeof opts.as === "string" ? opts.as : undefined,
           role: typeof opts.role === "string" ? opts.role : undefined,
+          sessionToken: typeof opts.sessionToken === "string" ? opts.sessionToken : undefined,
+          requesterToken: typeof opts.requesterToken === "string" ? opts.requesterToken : undefined,
           json: opts.json === true,
         })
       );
@@ -949,13 +1345,16 @@ export function createProgram(cwd: string): Command {
     .description("Verify a genuine RTK installation (runs rtk --version and rtk gain)")
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--binary <path>", "rtk binary (default: rtk from PATH)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
       const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       emitProgramResult(
         program,
         runRtkVerify(projectPath, {
           ...(typeof opts.binary === "string" ? { binaryPath: opts.binary } : {}),
+          ...(token === null ? {} : { session: token }),
         })
       );
     });
@@ -970,6 +1369,80 @@ export function createProgram(cwd: string): Command {
     .action((opts: CommandOpts) => {
       const projectPath = typeof opts.path === "string" ? opts.path : cwd;
       emitProgramResult(program, runAttestationStatus(projectPath, "skill", { json: opts.json === true }));
+    });
+
+  skill
+    .command("verify")
+    .description("Re-verify the pinned Karpathy Guidelines skill (fail-closed until release metadata lands)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      emitProgramResult(program, runSkillVerify(projectPath, { json: opts.json === true }));
+    });
+
+  const session = program.command("session").description("authenticated session management");
+
+  session
+    .command("open")
+    .description("Open an authenticated session (interactive, or delegated from a parent session token)")
+    .requiredOption("--role <role>", "canonical agent role (or PO)")
+    .requiredOption("--adapter <name>", "adapter holding the token")
+    .requiredOption("--runtime <name>", "runtime the session operates in")
+    .option("--scope-module <id>", "assigned module scope (required for worker roles)")
+    .option("--scope-wp <id>", "assigned work-package scope")
+    .option("--ttl <seconds>", "lifetime in seconds (default 3600, max 86400)")
+    .option("--parent-token <id/token>", "delegate from an existing session instead of a terminal")
+    .option("--rationale <text>", "purpose bound into a privileged-session PO signature")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const ttl = typeof opts.ttl === "string" ? Number(opts.ttl) : undefined;
+      emitProgramResult(
+        program,
+        runSessionOpen(
+          projectPath,
+          {
+            role: String(opts.role ?? ""),
+            adapter: String(opts.adapter ?? ""),
+            runtime: String(opts.runtime ?? ""),
+            ...(typeof opts.scopeModule === "string" ? { scopeModule: opts.scopeModule } : {}),
+            ...(typeof opts.scopeWp === "string" ? { scopeWp: opts.scopeWp } : {}),
+            ...(ttl !== undefined && Number.isFinite(ttl) ? { ttlSeconds: ttl } : {}),
+            ...(typeof opts.parentToken === "string" ? { parentToken: opts.parentToken } : {}),
+            ...(typeof opts.rationale === "string" ? { rationale: opts.rationale } : {}),
+            json: opts.json === true,
+          }
+        )
+      );
+    });
+
+  session
+    .command("revoke")
+    .description("Revoke a session (gaspar/PO caller with a valid session)")
+    .argument("<id>", "session id")
+    .requiredOption("--as <actor>", "requesting identity")
+    .requiredOption("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((id: string, opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
+      if (token === null || typeof opts.as !== "string") {
+        emitProgramResult(
+          program,
+          opts.json === true
+            ? { exitCode: 2, stdout: JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: "revoke requires --as and --session-token" } }, null, 2), stderr: "" }
+            : { exitCode: 2, stdout: "", stderr: "Error [VALIDATION_ERROR]: revoke requires --as and --session-token" }
+        );
+        return;
+      }
+      emitProgramResult(
+        program,
+        runSessionRevoke(projectPath, id, { actor: opts.as, session: token }, { json: opts.json === true })
+      );
     });
 
   return program;

@@ -8,9 +8,11 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 import { SCHEMA_VERSION } from "@chrono/persistence";
 import {
   buildApprovalPayload,
+  buildSessionAuthorizationPayload,
   generateApprovalKeyPair,
   signApprovalPayload,
 } from "@chrono/domain";
@@ -31,10 +33,35 @@ function setupTestPo(core: ChronoCore): {
     rationale: string;
   }) => { signature: string; timestamp: string };
   restoreTty: () => void;
+  gaspar: { actor: string; session: { id: string; token: string } };
 } {
   const pair = generateApprovalKeyPair();
   const restoreTty = fakeInteractiveTerminal();
   expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+  const nonce = randomBytes(16).toString("hex");
+  const sessionTimestamp = "2026-09-11T00:00:00.000Z";
+  const rationale = "test privileged-session bootstrap";
+  const sessionSignature = signApprovalPayload(
+    buildSessionAuthorizationPayload({
+      sessionRole: "gaspar",
+      adapter: "test-adapter",
+      runtime: "test-runtime",
+      scopeModule: null,
+      scopeWp: null,
+      ttlSeconds: 3600,
+      nonce,
+      authority: "PO",
+      rationale,
+      timestamp: sessionTimestamp,
+    }),
+    pair.privateKeyPem
+  );
+  const opened = core.openSession(
+    { role: "gaspar", adapter: "test-adapter", runtime: "test-runtime", ttlSeconds: 3600 },
+    { poAuthorization: { nonce, authority: "PO", rationale, timestamp: sessionTimestamp, signature: sessionSignature } }
+  );
+  expect(opened.ok).toBe(true);
+  const gaspar = { actor: "gaspar", session: { id: opened.value!.id, token: opened.value!.token } };
   return {
     sign: (fields) => {
       const timestamp = "2026-06-01T00:00:00.000Z";
@@ -42,6 +69,7 @@ function setupTestPo(core: ChronoCore): {
       return { signature: signApprovalPayload(payload, pair.privateKeyPem), timestamp };
     },
     restoreTty,
+    gaspar,
   };
 }
 
@@ -93,6 +121,7 @@ describe("Persistence: state survives process restart", () => {
     const initResult = core.init();
     expect(initResult.ok).toBe(true);
 
+    const po = setupTestPo(core);
     const specResult = core.registerSpec("SP-0001", "DRAFT", {
       id: "SP-0001",
       title: "Test Spec",
@@ -101,8 +130,9 @@ describe("Persistence: state survives process restart", () => {
       status: "DRAFT",
       inScope: [],
       dependencies: [],
-    }, "gaspar");
+    }, po.gaspar);
     expect(specResult.ok).toBe(true);
+    po.restoreTty();
 
     // Close the first instance
     core.close();
@@ -119,6 +149,8 @@ describe("Persistence: state survives process restart", () => {
     core = new ChronoCore({ projectPath: tempDir });
     core.init();
 
+    // Record a signed approval (real Ed25519 signature, test key).
+    const po = setupTestPo(core);
     const moduleResult = core.registerModule("MOD-0001", "DRAFT", {
       id: "MOD-0001",
       name: "Test Module",
@@ -128,12 +160,10 @@ describe("Persistence: state survives process restart", () => {
       dependencies: [],
       risks: [],
       securityStatus: "pending",
-    }, "gaspar");
+    }, po.gaspar);
     expect(moduleResult.ok).toBe(true);
     const revision = moduleResult.value;
 
-    // Record a signed approval (real Ed25519 signature, test key).
-    const po = setupTestPo(core);
     const { signature, timestamp } = po.sign({
       action: "module-approval",
       scopeArtifactId: "MOD-0001",
@@ -168,6 +198,7 @@ describe("Persistence: state survives process restart", () => {
     core = new ChronoCore({ projectPath: tempDir });
     core.init();
 
+    const po = setupTestPo(core);
     const moduleResult = core.registerModule("MOD-0001", "DRAFT", {
       id: "MOD-0001",
       name: "Test Module",
@@ -177,10 +208,9 @@ describe("Persistence: state survives process restart", () => {
       dependencies: [],
       risks: [],
       securityStatus: "pending",
-    }, "gaspar");
+    }, po.gaspar);
     expect(moduleResult.ok).toBe(true);
 
-    const po = setupTestPo(core);
     const { signature, timestamp } = po.sign({
       action: "module-approval",
       scopeArtifactId: "MOD-0001",
@@ -199,7 +229,7 @@ describe("Persistence: state survives process restart", () => {
     });
     expect(result.ok).toBe(true);
 
-    core.raiseBlocker("PRODUCT_BLOCKER", "gaspar", ["MOD-0001"], "Missing requirement");
+    core.raiseBlocker("PRODUCT_BLOCKER", ["MOD-0001"], "Missing requirement", po.gaspar);
 
     // Close and reopen
     core.close();
@@ -216,8 +246,9 @@ describe("Persistence: state survives process restart", () => {
     core = new ChronoCore({ projectPath: tempDir });
     core.init();
 
-    core.registerSpec("SP-0001", "DRAFT", { id: "SP-0001", title: "S1", purpose: "P", status: "DRAFT" }, "gaspar");
-    core.transitionState("SP-0001", "SpecSubmittedForReview", { actor: "gaspar" });
+    const poEv = setupTestPo(core);
+    core.registerSpec("SP-0001", "DRAFT", { id: "SP-0001", title: "S1", purpose: "P", status: "DRAFT" }, poEv.gaspar);
+    core.transitionState("SP-0001", "SpecSubmittedForReview", { actor: "gaspar", session: poEv.gaspar.session });
 
     core.close();
 
@@ -261,12 +292,14 @@ describe("Persistence: SQLite schema", () => {
   it("event log is append-only and ordered", () => {
     core = new ChronoCore({ projectPath: tempDir });
     core.init();
-    core.registerSpec("SP-0001", "DRAFT", { id: "SP-0001", title: "S1", purpose: "P" }, "gaspar");
+    const po = setupTestPo(core);
+    core.registerSpec("SP-0001", "DRAFT", { id: "SP-0001", title: "S1", purpose: "P" }, po.gaspar);
 
     const count1 = core.listEvents().length;
-    core.registerSpec("SP-0002", "DRAFT", { id: "SP-0002", title: "S2", purpose: "P" }, "gaspar");
+    core.registerSpec("SP-0002", "DRAFT", { id: "SP-0002", title: "S2", purpose: "P" }, po.gaspar);
     const count2 = core.listEvents().length;
 
     expect(count2).toBe(count1 + 1);
+    po.restoreTty();
   });
 });

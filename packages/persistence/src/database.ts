@@ -24,6 +24,8 @@ import {
   RuntimeConfigRepository,
   SecurityProfileRepository,
   SequenceRepository,
+  SessionAuthorizationRepository,
+  SessionRepository,
   SkillRepository,
   WaiverRepository,
 } from "./repositories.js";
@@ -166,6 +168,14 @@ export class ChronoDatabase {
 
   grants(): GrantRepository {
     return new GrantRepository(this.db);
+  }
+
+  sessions(): SessionRepository {
+    return new SessionRepository(this.db);
+  }
+
+  sessionAuthorizations(): SessionAuthorizationRepository {
+    return new SessionAuthorizationRepository(this.db);
   }
 
   sequences(): SequenceRepository {

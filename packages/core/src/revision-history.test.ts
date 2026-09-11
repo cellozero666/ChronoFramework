@@ -9,30 +9,89 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import {
+  buildSessionAuthorizationPayload,
+  generateApprovalKeyPair,
+  signApprovalPayload,
+} from "@chrono/domain";
 import { ChronoCore } from "./chrono-core.js";
 
 describe("Revision history", () => {
   let tempDir: string;
   let core: ChronoCore;
+  let restoreTty: () => void;
+  let gaspar: { actor: string; session: { id: string; token: string } };
+
+/**
+ * TEST-ONLY terminal simulation (session opening is interactive).
+ * Never ships; lives only in *.test.ts files.
+ */
+function fakeInteractiveTerminal(): () => void {
+  const stdinDesc = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  const stdoutDesc = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  return () => {
+    if (stdinDesc !== undefined) {
+      Object.defineProperty(process.stdin, "isTTY", stdinDesc);
+    } else {
+      delete (process.stdin as { isTTY?: boolean }).isTTY;
+    }
+    if (stdoutDesc !== undefined) {
+      Object.defineProperty(process.stdout, "isTTY", stdoutDesc);
+    } else {
+      delete (process.stdout as { isTTY?: boolean }).isTTY;
+    }
+  };
+}
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "chrono-rev-test-"));
     core = new ChronoCore({ projectPath: tempDir });
     expect(core.init().ok).toBe(true);
+    restoreTty = fakeInteractiveTerminal();
+    const pair = generateApprovalKeyPair();
+    expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+    const nonce = randomBytes(16).toString("hex");
+    const timestamp = "2026-09-11T00:00:00.000Z";
+    const rationale = "test privileged-session bootstrap";
+    const signature = signApprovalPayload(
+      buildSessionAuthorizationPayload({
+        sessionRole: "gaspar",
+        adapter: "test-adapter",
+        runtime: "test-runtime",
+        scopeModule: null,
+        scopeWp: null,
+        ttlSeconds: 3600,
+        nonce,
+        authority: "PO",
+        rationale,
+        timestamp,
+      }),
+      pair.privateKeyPem
+    );
+    const opened = core.openSession(
+      { role: "gaspar", adapter: "test-adapter", runtime: "test-runtime", ttlSeconds: 3600 },
+      { poAuthorization: { nonce, authority: "PO", rationale, timestamp, signature } }
+    );
+    expect(opened.ok).toBe(true);
+    gaspar = { actor: "gaspar", session: { id: opened.value!.id, token: opened.value!.token } };
   });
 
   afterEach(() => {
+    restoreTty();
     core.close();
     rmSync(tempDir, { recursive: true, force: true });
   });
 
   it("preserves every revision across transitions without rotating the contract", () => {
     const content = { id: "SP-0001", title: "History", purpose: "I3", revision: "x", status: "DRAFT", inScope: [], dependencies: [] };
-    const created = core.registerSpec("SP-0001", "DRAFT", content, "gaspar");
+    const created = core.registerSpec("SP-0001", "DRAFT", content, gaspar);
     expect(created.ok).toBe(true);
     const contractRevision = created.value!;
 
-    const moved = core.transitionState("SP-0001", "SpecSubmittedForReview", { actor: "gaspar" });
+    const moved = core.transitionState("SP-0001", "SpecSubmittedForReview", { actor: "gaspar", session: gaspar.session });
     expect(moved.ok).toBe(true);
 
     // Status transitions are audit events, not material changes: the
@@ -56,7 +115,7 @@ describe("Revision history", () => {
     expect(missing.ok).toBe(false);
     expect(missing.error?.code).toBe("ENTITY_NOT_FOUND");
 
-    core.registerSpec("SP-0002", "DRAFT", { id: "SP-0002", title: "T", purpose: "P" }, "gaspar");
+    core.registerSpec("SP-0002", "DRAFT", { id: "SP-0002", title: "T", purpose: "P" }, gaspar);
     const stale = core.resolveReference(
       "SP-0002",
       "sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -66,9 +125,9 @@ describe("Revision history", () => {
   });
 
   it("rejects non-canonical content instead of hashing it ambiguously", () => {
-    expect(core.registerSpec("SP-0003", "DRAFT", undefined, "gaspar").ok).toBe(false);
-    expect(core.registerSpec("SP-0004", "DRAFT", { fn: () => 1 }, "gaspar").ok).toBe(false);
-    expect(core.registerSpec("SP-0005", "DRAFT", { n: Number.NaN }, "gaspar").ok).toBe(false);
-    expect(core.registerSpec("SP-0006", "DRAFT", { when: new Date() }, "gaspar").ok).toBe(false);
+    expect(core.registerSpec("SP-0003", "DRAFT", undefined, gaspar).ok).toBe(false);
+    expect(core.registerSpec("SP-0004", "DRAFT", { fn: () => 1 }, gaspar).ok).toBe(false);
+    expect(core.registerSpec("SP-0005", "DRAFT", { n: Number.NaN }, gaspar).ok).toBe(false);
+    expect(core.registerSpec("SP-0006", "DRAFT", { when: new Date() }, gaspar).ok).toBe(false);
   });
 });

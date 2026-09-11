@@ -8,7 +8,12 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { generateApprovalKeyPair } from "@chrono/domain";
+import { randomBytes } from "node:crypto";
+import {
+  buildSessionAuthorizationPayload,
+  generateApprovalKeyPair,
+  signApprovalPayload,
+} from "@chrono/domain";
 import { ChronoCore } from "@chrono/core";
 import {
   runApprove,
@@ -18,7 +23,7 @@ import {
   testDeps,
   type HumanCommandDeps,
 } from "./index.js";
-import { MemoryKeyStore } from "./keychain.js";
+import { MemoryKeyStore, PO_KEY_STAGING_ACCOUNT } from "./keychain.js";
 
 const SPEC = { id: "SP-0001", title: "T", purpose: "P" };
 const FIXED_REVISION = `sha256:${"c".repeat(64)}`;
@@ -29,6 +34,33 @@ function interactive(store?: MemoryKeyStore): HumanCommandDeps {
 
 function nonInteractive(store?: MemoryKeyStore): HumanCommandDeps {
   return { interactive: false, store: store ?? new MemoryKeyStore() };
+}
+
+function openGasparWithKey(core: ChronoCore, privateKeyPem: string): { actor: string; session: { id: string; token: string } } {
+  const nonce = randomBytes(16).toString("hex");
+  const timestamp = "2026-09-11T00:00:00.000Z";
+  const rationale = "test privileged-session bootstrap";
+  const signature = signApprovalPayload(
+    buildSessionAuthorizationPayload({
+      sessionRole: "gaspar",
+      adapter: "test-adapter",
+      runtime: "test-runtime",
+      scopeModule: null,
+      scopeWp: null,
+      ttlSeconds: 3600,
+      nonce,
+      authority: "PO",
+      rationale,
+      timestamp,
+    }),
+    privateKeyPem
+  );
+  const opened = core.openSession(
+    { role: "gaspar", adapter: "test-adapter", runtime: "test-runtime", ttlSeconds: 3600 },
+    { poAuthorization: { nonce, authority: "PO", rationale, timestamp, signature } }
+  );
+  expect(opened.ok).toBe(true);
+  return { actor: "gaspar", session: { id: opened.value!.id, token: opened.value!.token } };
 }
 
 
@@ -121,7 +153,10 @@ describe("CLI human-only authority", () => {
     const core = new ChronoCore({ projectPath: tempDir });
     let revision: string;
     try {
-      expect(core.registerSpec("SP-0001", "DRAFT", SPEC, "gaspar").ok).toBe(true);
+      const privateKey = store.readKey("po");
+      expect(privateKey).not.toBeNull();
+      const gaspar = openGasparWithKey(core, privateKey!);
+      expect(core.registerSpec("SP-0001", "DRAFT", SPEC, gaspar).ok).toBe(true);
       revision = core.getArtifact("SP-0001").revision;
     } finally {
       core.close();
@@ -155,7 +190,8 @@ describe("CLI human-only authority", () => {
     let revision: string;
     try {
       expect(core.registerPoPublicKey(registered.publicKeyPem).ok).toBe(true);
-      expect(core.registerSpec("SP-0001", "DRAFT", SPEC, "gaspar").ok).toBe(true);
+      const gaspar = openGasparWithKey(core, registered.privateKeyPem);
+      expect(core.registerSpec("SP-0001", "DRAFT", SPEC, gaspar).ok).toBe(true);
       revision = core.getArtifact("SP-0001").revision;
     } finally {
       core.close();
@@ -179,7 +215,10 @@ describe("CLI human-only authority", () => {
     const core = new ChronoCore({ projectPath: tempDir });
     let revision: string;
     try {
-      expect(core.registerSpec("SP-0001", "DRAFT", SPEC, "gaspar").ok).toBe(true);
+      const privateKey = store.readKey("po");
+      expect(privateKey).not.toBeNull();
+      const gaspar = openGasparWithKey(core, privateKey!);
+      expect(core.registerSpec("SP-0001", "DRAFT", SPEC, gaspar).ok).toBe(true);
       revision = core.getArtifact("SP-0001").revision;
     } finally {
       core.close();
@@ -192,6 +231,64 @@ describe("CLI human-only authority", () => {
     );
     expect(waived.exitCode).toBe(0);
     expect(waived.stdout).toContain("WAIVER-");
+    restoreTty();
+  });
+
+  it("refuses key replacement without --rotate and preserves the active key", () => {
+    const restoreTty = fakeInteractiveTerminal();
+    const store = new MemoryKeyStore();
+    const deps = interactive(store);
+    expect(runKeysGenerate(tempDir, {}, deps).exitCode).toBe(0);
+    const active = store.readKey("po");
+    expect(active).not.toBeNull();
+
+    const refused = runKeysGenerate(tempDir, {}, deps);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toContain("Refusing to replace");
+    expect(store.readKey("po")).toBe(active);
+    expect(store.readKey(PO_KEY_STAGING_ACCOUNT)).toBeNull();
+    restoreTty();
+  });
+
+  it("rotates with a signed rotation, replaces the primary, and cleans staging", () => {
+    const restoreTty = fakeInteractiveTerminal();
+    const store = new MemoryKeyStore();
+    const deps = interactive(store);
+    expect(runKeysGenerate(tempDir, {}, deps).exitCode).toBe(0);
+    const active = store.readKey("po");
+    expect(active).not.toBeNull();
+
+    const rotated = runKeysGenerate(tempDir, { rotate: true, rationale: "scheduled rotation" }, deps);
+    expect(rotated.exitCode).toBe(0);
+    const replacement = store.readKey("po");
+    expect(replacement).not.toBeNull();
+    expect(replacement).not.toBe(active);
+    expect(store.readKey(PO_KEY_STAGING_ACCOUNT)).toBeNull();
+    restoreTty();
+  });
+
+  it("failed rotation preserves the active key and cleans staging", () => {
+    const restoreTty = fakeInteractiveTerminal();
+    const unrelated = generateApprovalKeyPair();
+    const store = new MemoryKeyStore();
+    store.writeKey("po", unrelated.privateKeyPem);
+    const registered = generateApprovalKeyPair();
+    const core = new ChronoCore({ projectPath: tempDir });
+    try {
+      expect(core.registerPoPublicKey(registered.publicKeyPem).ok).toBe(true);
+    } finally {
+      core.close();
+    }
+
+    const failed = runKeysGenerate(
+      tempDir,
+      { rotate: true, rationale: "attacker rotation" },
+      interactive(store)
+    );
+    expect(failed.exitCode).toBe(1);
+    expect(failed.stderr).toContain("SIGNATURE_INVALID");
+    expect(store.readKey("po")).toBe(unrelated.privateKeyPem);
+    expect(store.readKey(PO_KEY_STAGING_ACCOUNT)).toBeNull();
     restoreTty();
   });
 });

@@ -7,8 +7,10 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 import {
   buildApprovalPayload,
+  buildSessionAuthorizationPayload,
   buildWaiverPayload,
   generateApprovalKeyPair,
   signApprovalPayload,
@@ -17,12 +19,6 @@ import { ChronoCore } from "./chrono-core.js";
 
 const FIXED_TIME = "2026-06-01T00:00:00.000Z";
 const SPEC = { id: "SP-0001", title: "T", purpose: "P" };
-
-function freshPo(core: ChronoCore): { privateKeyPem: string } {
-  const pair = generateApprovalKeyPair();
-  expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
-  return { privateKeyPem: pair.privateKeyPem };
-}
 
 function approvalFields(revision: string, action = "module-approval") {
   return {
@@ -64,13 +60,42 @@ function fakeInteractiveTerminal(): () => void {
 
   let tempDir: string;
   let core: ChronoCore;
+  let poPrivateKey: string;
+  let gasparSession: { id: string; token: string };
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "chrono-auth-test-"));
     core = new ChronoCore({ projectPath: tempDir });
     expect(core.init().ok).toBe(true);
     restoreTty = fakeInteractiveTerminal();
-    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, "gaspar").ok).toBe(true);
+    const pair = generateApprovalKeyPair();
+    expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+    poPrivateKey = pair.privateKeyPem;
+    const nonce = randomBytes(16).toString("hex");
+    const timestamp = "2026-09-11T00:00:00.000Z";
+    const rationale = "test privileged-session bootstrap";
+    const signature = signApprovalPayload(
+      buildSessionAuthorizationPayload({
+        sessionRole: "gaspar",
+        adapter: "test-adapter",
+        runtime: "test-runtime",
+        scopeModule: null,
+        scopeWp: null,
+        ttlSeconds: 3600,
+        nonce,
+        authority: "PO",
+        rationale,
+        timestamp,
+      }),
+      poPrivateKey
+    );
+    const opened = core.openSession(
+      { role: "gaspar", adapter: "test-adapter", runtime: "test-runtime", ttlSeconds: 3600 },
+      { poAuthorization: { nonce, authority: "PO", rationale, timestamp, signature } }
+    );
+    expect(opened.ok).toBe(true);
+    gasparSession = { id: opened.value!.id, token: opened.value!.token };
+    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, { actor: "gaspar", session: gasparSession }).ok).toBe(true);
   });
 
   afterEach(() => {
@@ -99,20 +124,26 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   it("rejects approvals when no PO key is registered", () => {
-    const revision = core.getArtifact("SP-0001").revision;
-    const pair = generateApprovalKeyPair();
-    const signature = signApprovalPayload(
-      buildApprovalPayload({ ...approvalFields(revision), timestamp: FIXED_TIME }),
-      pair.privateKeyPem
-    );
-    const res = core.recordApproval({ ...approvalFields(revision), timestamp: FIXED_TIME, signature });
-    expect(res.ok).toBe(false);
-    expect(res.error?.code).toBe("APPROVAL_REQUIRED");
+    const keylessDir = mkdtempSync(join(tmpdir(), "chrono-nokey-test-"));
+    const keyless = new ChronoCore({ projectPath: keylessDir });
+    try {
+      expect(keyless.init().ok).toBe(true);
+      const revision = `sha256:${"a".repeat(64)}`;
+      const pair = generateApprovalKeyPair();
+      const signature = signApprovalPayload(
+        buildApprovalPayload({ ...approvalFields(revision), timestamp: FIXED_TIME }),
+        pair.privateKeyPem
+      );
+      const res = keyless.recordApproval({ ...approvalFields(revision), timestamp: FIXED_TIME, signature });
+      expect(res.ok).toBe(false);
+      expect(res.error?.code).toBe("APPROVAL_REQUIRED");
+    } finally {
+      keyless.close();
+      rmSync(keylessDir, { recursive: true, force: true });
+    }
   });
 
   it("rejects forged, malformed, and empty signatures", () => {
-    const { privateKeyPem } = freshPo(core);
-    void privateKeyPem;
     const revision = core.getArtifact("SP-0001").revision;
     const other = generateApprovalKeyPair();
     const forged = signApprovalPayload(
@@ -131,7 +162,7 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   it("rejects tampered payloads (signature binds every field)", () => {
-    const { privateKeyPem } = freshPo(core);
+    const privateKeyPem = poPrivateKey;
     const revision = core.getArtifact("SP-0001").revision;
     const signature = signApprovalPayload(
       buildApprovalPayload({ ...approvalFields(revision), timestamp: FIXED_TIME }),
@@ -147,7 +178,7 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   it("accepts a valid signature and replays collide explicitly", () => {
-    const { privateKeyPem } = freshPo(core);
+    const privateKeyPem = poPrivateKey;
     const revision = core.getArtifact("SP-0001").revision;
     const signature = signApprovalPayload(
       buildApprovalPayload({ ...approvalFields(revision), timestamp: FIXED_TIME }),
@@ -163,7 +194,7 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   it("rejects stale-at-birth scope revisions and unknown scopes", () => {
-    const { privateKeyPem } = freshPo(core);
+    const privateKeyPem = poPrivateKey;
     const signFor = (scopeArtifactId: string, scopeRevision: string) => {
       const timestamp = FIXED_TIME;
       return {
@@ -187,7 +218,7 @@ function fakeInteractiveTerminal(): () => void {
     // Stale revision after a transition.
     // Status transitions preserve the contract revision [DOM §2.3], so a
     // well-formed but non-current revision is stale-at-birth.
-    expect(core.transitionState("SP-0001", "SpecSubmittedForReview", { actor: "gaspar" }).ok).toBe(true);
+    expect(core.transitionState("SP-0001", "SpecSubmittedForReview", { actor: "gaspar", session: gasparSession }).ok).toBe(true);
     const foreign = `sha256:${"f".repeat(64)}`;
     const stale = signFor("SP-0001", foreign);
     expect(
@@ -196,7 +227,7 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   it("rejects unknown actions and future timestamps", () => {
-    const { privateKeyPem } = freshPo(core);
+    const privateKeyPem = poPrivateKey;
     const revision = core.getArtifact("SP-0001").revision;
     const future = "2999-01-01T00:00:00.000Z";
     const futureSig = signApprovalPayload(
@@ -216,9 +247,8 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   it("rejects garbage public keys and guards rotation", () => {
+    const privateKeyPem = poPrivateKey;
     expect(core.registerPoPublicKey("not-a-key").ok).toBe(false);
-    const first = generateApprovalKeyPair();
-    expect(core.registerPoPublicKey(first.publicKeyPem).ok).toBe(true);
     const second = generateApprovalKeyPair();
     // Overwrite without rotation proof → refused.
     expect(core.registerPoPublicKey(second.publicKeyPem).error?.code).toBe("APPROVAL_REQUIRED");
@@ -242,10 +272,32 @@ function fakeInteractiveTerminal(): () => void {
         timestamp: FIXED_TIME,
       }).error?.code
     ).toBe("SIGNATURE_INVALID");
+    // Rotation signed by the current key → accepted.
+    const currentRevision = core.poKeyRevision();
+    expect(currentRevision).toMatch(/^sha256:[0-9a-f]{64}$/);
+    const rotationSig = signApprovalPayload(
+      buildApprovalPayload({
+        action: "key-rotation",
+        scopeArtifactId: "PO-KEY",
+        scopeRevision: currentRevision!,
+        authority: "PO",
+        rationale: "rotation",
+        timestamp: FIXED_TIME,
+      }),
+      privateKeyPem
+    );
+    expect(
+      core.registerPoPublicKey(second.publicKeyPem, {
+        signature: rotationSig,
+        authority: "PO",
+        rationale: "rotation",
+        timestamp: FIXED_TIME,
+      }).ok
+    ).toBe(true);
   });
 
   it("records waivers only with valid signatures and complete fields", () => {
-    const { privateKeyPem } = freshPo(core);
+    const privateKeyPem = poPrivateKey;
     const revision = core.getArtifact("SP-0001").revision;
     const fields = {
       scopeArtifactId: "SP-0001",

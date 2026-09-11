@@ -6,7 +6,9 @@
 
 export {
   ChronoCore,
+  type CallerAuth,
   type CoreConfig,
   type CoreResult,
   type GateDecision,
+  type SessionAuthorization,
 } from "./chrono-core.js";

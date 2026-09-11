@@ -7,17 +7,18 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 import {
   buildApprovalPayload,
+  buildSessionAuthorizationPayload,
   computeRevisionHash,
   generateApprovalKeyPair,
   signApprovalPayload,
   RTK_UPSTREAM,
   SKILL_UPSTREAM,
 } from "@chrono/domain";
-import { ChronoCore } from "./chrono-core.js";
+import { ChronoCore, type CallerAuth } from "./chrono-core.js";
 
-const ACTOR = { actor: "gaspar" };
 const FIXED_TIME = "2026-06-01T00:00:00.000Z";
 const SPEC = {
   id: "SP-0001",
@@ -63,31 +64,33 @@ function approve(
 }
 
 /** Drive a module to APPROVED with all non-attestation prerequisites met. */
-function approvedModule(core: ChronoCore, sign: SignFn): string {
-  const proposed = core.proposeArchitecture({ title: "A" }, "gaspar");
+function approvedModule(core: ChronoCore, sign: SignFn, privateKeyPem: string): { modRev: string; gaspar: CallerAuth } {
+  const gaspar = { actor: "gaspar", session: bootstrapPrivilegedSession(core, "gaspar", privateKeyPem) };
+  const ctx = { actor: "gaspar", session: gaspar.session };
+  const proposed = core.proposeArchitecture({ title: "A" }, gaspar);
   expect(proposed.ok).toBe(true);
-  expect(core.submitArchitectureForReview("gaspar").ok).toBe(true);
+  expect(core.submitArchitectureForReview(gaspar).ok).toBe(true);
   approve(core, sign, "architecture-security", "ARCH", proposed.value!);
-  expect(core.approveArchitecture("PO").ok).toBe(true);
+  expect(core.approveArchitecture(gaspar).ok).toBe(true);
 
-  expect(core.registerSpec("SP-0001", "DRAFT", SPEC, "gaspar").ok).toBe(true);
-  expect(core.transitionState("SP-0001", "SpecSubmittedForReview", ACTOR).ok).toBe(true);
+  expect(core.registerSpec("SP-0001", "DRAFT", SPEC, gaspar).ok).toBe(true);
+  expect(core.transitionState("SP-0001", "SpecSubmittedForReview", ctx).ok).toBe(true);
   const specRev = core.getArtifact("SP-0001").revision;
   approve(core, sign, "architecture-security", "SP-0001", specRev);
-  expect(core.recordHarness(specRev, `sha256:${"a".repeat(64)}`, "# h", "gaspar").ok).toBe(true);
-  expect(core.transitionState("SP-0001", "SpecApprovedReady", ACTOR).ok).toBe(true);
+  expect(core.recordHarness(specRev, `sha256:${"a".repeat(64)}`, "# h", gaspar).ok).toBe(true);
+  expect(core.transitionState("SP-0001", "SpecApprovedReady", ctx).ok).toBe(true);
 
-  expect(core.registerModule("MOD-0001", "DRAFT", MOD, "gaspar").ok).toBe(true);
-  expect(core.transitionState("MOD-0001", "ModulePlanned", ACTOR).ok).toBe(true);
+  expect(core.registerModule("MOD-0001", "DRAFT", MOD, gaspar).ok).toBe(true);
+  expect(core.transitionState("MOD-0001", "ModulePlanned", ctx).ok).toBe(true);
   const modRev = core.getArtifact("MOD-0001").revision;
   approve(core, sign, "module-approval", "MOD-0001", modRev);
-  expect(core.transitionState("MOD-0001", "ModuleApproved", ACTOR).ok).toBe(true);
-  return modRev;
+  expect(core.transitionState("MOD-0001", "ModuleApproved", ctx).ok).toBe(true);
+  return { modRev, gaspar };
 }
 
-function recordAttestations(core: ChronoCore): void {
+function recordAttestations(core: ChronoCore, auth: CallerAuth): void {
   expect(
-    core.recordRtkAttestation({
+    core.recordRtkAttestation(auth, {
       binaryPath: "/usr/local/bin/rtk",
       binaryIdentity: "rtk-test",
       version: "1.0.0-test",
@@ -101,7 +104,7 @@ function recordAttestations(core: ChronoCore): void {
     }).ok
   ).toBe(true);
   expect(
-    core.recordSkillAttestation({
+    core.recordSkillAttestation(auth, {
       upstream: SKILL_UPSTREAM,
       pinnedCommit: "a".repeat(40),
       sourceHash: `sha256:${"b".repeat(64)}`,
@@ -119,21 +122,80 @@ function recordAttestations(core: ChronoCore): void {
   ).toBe(true);
 }
 
-function testEvidence(core: ChronoCore, producer: string, targetRevision: string, checkName: string): string {
+function bootstrapPrivilegedSession(
+  core: ChronoCore,
+  role: "gaspar" | "PO",
+  privateKeyPem: string,
+  scopeModule?: string,
+  timestamp = "2026-09-11T00:00:00.000Z"
+): { id: string; token: string } {
+  const nonce = randomBytes(16).toString("hex");
+  const signature = signApprovalPayload(
+    buildSessionAuthorizationPayload({
+      sessionRole: role,
+      adapter: "test-adapter",
+      runtime: "test-runtime",
+      scopeModule: scopeModule ?? null,
+      scopeWp: null,
+      ttlSeconds: 3600,
+      nonce,
+      authority: "PO",
+      rationale: "test privileged-session bootstrap",
+      timestamp,
+    }),
+    privateKeyPem
+  );
+  const res = core.openSession(
+    {
+      role,
+      adapter: "test-adapter",
+      runtime: "test-runtime",
+      ...(scopeModule !== undefined ? { scopeModule } : {}),
+      ttlSeconds: 3600,
+    },
+    { poAuthorization: { nonce, authority: "PO", rationale: "test privileged-session bootstrap", timestamp, signature } }
+  );
+  expect(res.ok).toBe(true);
+  return { id: res.value!.id, token: res.value!.token };
+}
+
+function openTestSession(
+  core: ChronoCore,
+  role: string,
+  scopeModule?: string
+): { id: string; token: string } {
+  if (role === "gaspar" || role === "PO") {
+    throw new Error("Privileged test sessions require bootstrapPrivilegedSession with a PO-signed authorization");
+  }
+  const res = core.openSession(
+    {
+      role,
+      adapter: "test-adapter",
+      runtime: "test-runtime",
+      ...(scopeModule !== undefined ? { scopeModule } : {}),
+      ttlSeconds: 3600,
+    },
+    { interactive: true }
+  );
+  expect(res.ok).toBe(true);
+  return { id: res.value!.id, token: res.value!.token };
+}
+
+function testEvidence(core: ChronoCore, auth: CallerAuth, targetRevision: string, checkName: string, producer?: string): string {
   const integrityHash = computeRevisionHash({
     result: "pass",
     diagnostics: null,
     target_revision: targetRevision,
   });
   const res = core.recordEvidence({
-    producer,
+    producer: producer ?? auth.actor,
     tool: "vitest",
     targetRevision,
     checkName,
     result: "pass",
     diagnostics: null,
     integrityHash,
-  });
+  }, auth);
   expect(res.ok).toBe(true);
   return res.value!.id;
 }
@@ -170,6 +232,7 @@ describe("Execution authorization", () => {
   let tempDir: string;
   let core: ChronoCore;
   let sign: SignFn;
+  let privateKeyPem: string;
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "chrono-authz-test-"));
@@ -178,7 +241,7 @@ describe("Execution authorization", () => {
     const pair = generateApprovalKeyPair();
     restoreTty = fakeInteractiveTerminal();
     expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
-    const privateKeyPem = pair.privateKeyPem;
+    privateKeyPem = pair.privateKeyPem;
     sign = (fields) => ({
       timestamp: FIXED_TIME,
       signature: signApprovalPayload(buildApprovalPayload({ ...fields, timestamp: FIXED_TIME }), privateKeyPem),
@@ -192,41 +255,49 @@ describe("Execution authorization", () => {
   });
 
   it("denies when the module is not approved", () => {
-    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, "gaspar").ok).toBe(true);
-    expect(core.registerModule("MOD-0001", "DRAFT", MOD, "gaspar").ok).toBe(true);
-    const res = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar" });
+    const gaspar = { actor: "gaspar", session: bootstrapPrivilegedSession(core, "gaspar", privateKeyPem) };
+    // Registration itself needs the session; the module cannot exist yet
+    // for scoping, so register first, then mint the worker session.
+    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, gaspar).ok).toBe(true);
+    expect(core.registerModule("MOD-0001", "DRAFT", { ...MOD, specs: [] }, gaspar).ok).toBe(true);
+    const worker = { actor: "belthazar", session: openTestSession(core, "belthazar", "MOD-0001") };
+    const res = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar", session: worker.session, requesterSession: gaspar.session });
     expect(res.ok).toBe(false);
     expect(res.error?.code).toBe("EXECUTION_DENIED");
   });
 
   it("denies without attestations (missing capability, explicit code)", () => {
-    approvedModule(core, sign);
-    const res = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar" });
+    const { gaspar } = approvedModule(core, sign, privateKeyPem);
+    const worker = openTestSession(core, "belthazar", "MOD-0001");
+    const res = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar", session: worker, requesterSession: gaspar.session });
     expect(res.ok).toBe(false);
     expect(res.error?.code).toBe("BLOCKED_RTK");
   });
 
   it("denies without module approval even when attestations exist", () => {
-    recordAttestations(core);
-    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, "gaspar").ok).toBe(true);
-    expect(core.registerModule("MOD-0001", "DRAFT", MOD, "gaspar").ok).toBe(true);
-    const res = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar" });
+    const gaspar = { actor: "gaspar", session: bootstrapPrivilegedSession(core, "gaspar", privateKeyPem) };
+    recordAttestations(core, gaspar);
+    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, gaspar).ok).toBe(true);
+    expect(core.registerModule("MOD-0001", "DRAFT", MOD, gaspar).ok).toBe(true);
+    const worker = openTestSession(core, "belthazar", "MOD-0001");
+    const res = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar", session: worker, requesterSession: gaspar.session });
     expect(res.ok).toBe(false);
     // DRAFT modules fail on state before approval is even consulted.
     expect(res.error?.code).toBe("EXECUTION_DENIED");
   });
 
   it("authorizes a fully qualified module and audits denials", () => {
-    approvedModule(core, sign);
-    recordAttestations(core);
-    const authorized = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar" });
+    const { gaspar } = approvedModule(core, sign, privateKeyPem);
+    recordAttestations(core, gaspar);
+    const worker = openTestSession(core, "belthazar", "MOD-0001");
+    const authorized = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar", session: worker, requesterSession: gaspar.session });
     expect(authorized.ok).toBe(true);
     expect(authorized.value?.authorized).toBe(true);
     expect(authorized.value?.grantId).toMatch(/^GRANT-\d{4,}$/);
 
     // A new blocker denies again, with a DENIED audit event.
-    expect(core.raiseBlocker("PRODUCT_BLOCKER", "gaspar", ["MOD-0001"], "hold").ok).toBe(true);
-    const denied = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar" });
+    expect(core.raiseBlocker("PRODUCT_BLOCKER", ["MOD-0001"], "hold", gaspar).ok).toBe(true);
+    const denied = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar", session: worker, requesterSession: gaspar.session });
     expect(denied.ok).toBe(false);
     expect(denied.error?.code).toBe("EXECUTION_DENIED");
     const audit = core.listEvents().filter((e) => e.eventType === "DENIED");
@@ -234,34 +305,37 @@ describe("Execution authorization", () => {
   });
 
   it("denies stale harness and non-READY specs", () => {
-    approvedModule(core, sign);
-    recordAttestations(core);
+    const { gaspar } = approvedModule(core, sign, privateKeyPem);
+    recordAttestations(core, gaspar);
+    const worker = openTestSession(core, "belthazar", "MOD-0001");
     const specRev = core.getArtifact("SP-0001").revision;
-    expect(core.markHarnessStale(specRev, "gaspar").ok).toBe(true);
-    const stale = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar" });
+    expect(core.markHarnessStale(specRev, gaspar).ok).toBe(true);
+    const stale = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar", session: worker, requesterSession: gaspar.session });
     expect(stale.ok).toBe(false);
     expect(stale.error?.code).toBe("STALE_REVISION");
   });
 
   it("requires explicit work-package scope when WPs exist", () => {
-    approvedModule(core, sign);
-    recordAttestations(core);
+    const { gaspar } = approvedModule(core, sign, privateKeyPem);
+    recordAttestations(core, gaspar);
     expect(
-      core.registerWorkPackage("WP-0001", "PLANNED", { id: "WP-0001", name: "W", module: "MOD-0001", dependsOn: [] }, "gaspar").ok
+      core.registerWorkPackage("WP-0001", "PLANNED", { id: "WP-0001", name: "W", module: "MOD-0001", dependsOn: [] }, gaspar).ok
     ).toBe(true);
-    const unscoped = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar" });
+    const worker = openTestSession(core, "belthazar", "MOD-0001");
+    const unscoped = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar", session: worker, requesterSession: gaspar.session });
     expect(unscoped.ok).toBe(false);
     expect(unscoped.error?.code).toBe("EXECUTION_DENIED");
     // Un-AUTHORIZED WP scope also denies.
-    const scoped = core.authorizeExecution("MOD-0001", { workPackageId: "WP-0001", actor: "gaspar", role: "belthazar" });
+    const scoped = core.authorizeExecution("MOD-0001", { workPackageId: "WP-0001", actor: "gaspar", role: "belthazar", session: worker, requesterSession: gaspar.session });
     expect(scoped.ok).toBe(false);
   });
 
   it("denies execution for invalid assignment roles", () => {
-    approvedModule(core, sign);
-    recordAttestations(core);
-    for (const role of ["spekkio", "gaspar", "glenn", "PO", "mallory"]) {
-      const res = core.authorizeExecution("MOD-0001", { actor: "gaspar", role });
+    const { gaspar } = approvedModule(core, sign, privateKeyPem);
+    recordAttestations(core, gaspar);
+    const worker = openTestSession(core, "belthazar", "MOD-0001");
+    for (const role of ["gaspar", "glenn", "PO", "mallory"]) {
+      const res = core.authorizeExecution("MOD-0001", { actor: "gaspar", role, session: worker });
       expect(res.ok).toBe(false);
       expect(res.error?.code).toBe("VALIDATION_ERROR");
     }
@@ -280,9 +354,10 @@ describe("Execution authorization", () => {
         timestamp: FIXED_TIME,
         signature: signApprovalPayload(buildApprovalPayload({ ...fields, timestamp: FIXED_TIME }), privateKeyPem),
       });
-      approvedModule(plain, plainSign);
-      recordAttestations(plain);
-      const res = plain.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar" });
+      const { gaspar: plainGaspar } = approvedModule(plain, plainSign, privateKeyPem);
+      recordAttestations(plain, plainGaspar);
+      const plainWorker = openTestSession(plain, "belthazar", "MOD-0001");
+      const res = plain.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar", session: plainWorker, requesterSession: plainGaspar.session });
       expect(res.ok).toBe(false);
       expect(res.error?.code).toBe("CONFIG_ERROR");
     } finally {
@@ -333,6 +408,7 @@ describe("Dispatch grants (session binding)", () => {
   function clockedCore(clockTime: string, skipInit = false): {
     core: ChronoCore;
     sign: SignFn;
+    poPrivateKey: string;
     restoreTty: () => void;
   } {
     const restoreTty = fakeInteractiveTerminalLocal();
@@ -353,7 +429,7 @@ describe("Dispatch grants (session binding)", () => {
           privateKeyPem
         ),
       });
-      return { core, sign, restoreTty };
+      return { core, sign, poPrivateKey: privateKeyPem, restoreTty };
     }
     // Reopened project: key material persists. This sign closure is never
     // invoked (the test only presents the previously issued grant); any
@@ -362,42 +438,50 @@ describe("Dispatch grants (session binding)", () => {
       timestamp: "2026-06-01T00:00:00.000Z",
       signature: "unused",
     });
-    return { core, sign: reopenedSign, restoreTty };
+    return { core, sign: reopenedSign, poPrivateKey: "unused", restoreTty };
   }
 
   function approvedWithGrant(
     core: ChronoCore,
     sign: SignFn,
+    poPrivateKey: string,
     actor: string,
     role: string
-  ): string {
-    approvedModule(core, sign);
-    recordAttestations(core);
-    const authz = core.authorizeExecution("MOD-0001", { actor, role });
+  ): { grantId: string; worker: { id: string; token: string }; gaspar: CallerAuth } {
+    const { gaspar } = approvedModule(core, sign, poPrivateKey);
+    recordAttestations(core, gaspar);
+    const worker = openTestSession(core, role, "MOD-0001");
+    const authz = core.authorizeExecution("MOD-0001", {
+      actor,
+      role,
+      session: worker,
+      ...(actor === role ? {} : { requesterSession: gaspar.session }),
+    });
     expect(authz.ok).toBe(true);
-    return authz.value!.grantId;
+    return { grantId: authz.value!.grantId, worker, gaspar };
   }
 
   it("enacts dispatch only with its grant, as the assigned role", () => {
-    const { core, sign, restoreTty: restoreGrantTty } = clockedCore(T0);
+    const { core, sign, poPrivateKey, restoreTty: restoreGrantTty } = clockedCore(T0);
     try {
-      const grantId = approvedWithGrant(core, sign, "gaspar", "belthazar");
+      const { grantId, worker } = approvedWithGrant(core, sign, poPrivateKey, "gaspar", "belthazar");
       expect(grantId).toMatch(/^GRANT-\d{4,}$/);
       // No grant presented → denied before any authorization reasoning.
       expect(
-        core.transitionState("MOD-0001", "ExecutionStarted", { actor: "belthazar" }).error?.code
+        core.transitionState("MOD-0001", "ExecutionStarted", { actor: "belthazar", session: worker }).error?.code
       ).toBe("MISSING_REQUIRED_ARTIFACT");
       // Forged grant id → denied.
       expect(
-        core.transitionState("MOD-0001", "ExecutionStarted", { actor: "belthazar", grantId: "GRANT-9999" }).error?.code
+        core.transitionState("MOD-0001", "ExecutionStarted", { actor: "belthazar", session: worker, grantId: "GRANT-9999" }).error?.code
       ).toBe("REFERENCE_UNRESOLVABLE");
       // Wrong role → denied.
+      const melchior = openTestSession(core, "melchior", "MOD-0001");
       expect(
-        core.transitionState("MOD-0001", "ExecutionStarted", { actor: "melchior", grantId }).error?.code
+        core.transitionState("MOD-0001", "ExecutionStarted", { actor: "melchior", session: melchior, grantId }).error?.code
       ).toBe("EXECUTION_DENIED");
       // Assigned role → dispatch opens and consumes the grant.
       expect(
-        core.transitionState("MOD-0001", "ExecutionStarted", { actor: "belthazar", grantId }).ok
+        core.transitionState("MOD-0001", "ExecutionStarted", { actor: "belthazar", session: worker, grantId }).ok
       ).toBe(true);
       expect(core.getArtifact("MOD-0001").status).toBe("EXECUTING");
     } finally {
@@ -409,9 +493,13 @@ describe("Dispatch grants (session binding)", () => {
   it("denies expired grants", () => {
     const first = clockedCore(T0);
     const restoreFirst = first.restoreTty;
+    const firstPrivateKey = first.poPrivateKey;
     let grantId: string;
+    let worker: { id: string; token: string };
     try {
-      grantId = approvedWithGrant(first.core, first.sign, "gaspar", "belthazar");
+      const issued = approvedWithGrant(first.core, first.sign, firstPrivateKey, "gaspar", "belthazar");
+      grantId = issued.grantId;
+      worker = issued.worker;
     } finally {
       restoreFirst();
       first.core.close();
@@ -421,6 +509,7 @@ describe("Dispatch grants (session binding)", () => {
     try {
       const res = second.core.transitionState("MOD-0001", "ExecutionStarted", {
         actor: "belthazar",
+        session: worker,
         grantId,
       });
       expect(res.ok).toBe(false);
@@ -432,25 +521,53 @@ describe("Dispatch grants (session binding)", () => {
     }
   });
 
-  it("binds grants to one session; gaspar may orchestrate", () => {
-    const { core, sign, restoreTty: restoreSessionTty } = clockedCore(T0);
+  it("binds grants to the exact session; orchestrators cannot enact worker grants", () => {
+    const { core, sign, poPrivateKey, restoreTty: restoreSessionTty } = clockedCore(T0);
     try {
-      approvedModule(core, sign);
-      recordAttestations(core);
+      const { gaspar } = approvedModule(core, sign, poPrivateKey);
+      recordAttestations(core, gaspar);
+      // Authorize naming the executor session explicitly.
+      const worker = openTestSession(core, "belthazar", "MOD-0001");
       const authz = core.authorizeExecution("MOD-0001", {
-        actor: "opencode:sess-1",
+        actor: "gaspar",
         role: "belthazar",
+        session: worker,
+        requesterSession: gaspar.session,
       });
       expect(authz.ok).toBe(true);
       const grantId = authz.value!.grantId;
-      // A different session may not enact it.
+      // A different session may not enact it, even with the right role.
+      const other = openTestSession(core, "belthazar", "MOD-0001");
       expect(
-        core.transitionState("MOD-0001", "ExecutionStarted", { actor: "claude:sess-2", grantId }).error?.code
+        core.transitionState("MOD-0001", "ExecutionStarted", { actor: "belthazar", session: other, grantId }).error?.code
+      ).toBe("EXECUTION_DENIED");
+      // Neither gaspar nor PO may consume a worker's grant from their own
+      // sessions: orchestration names the executor, it never spends the
+      // executor's grant.
+      expect(
+        core.transitionState("MOD-0001", "ExecutionStarted", { actor: "gaspar", session: gaspar.session, grantId }).error?.code
       ).toBe("EXECUTION_DENIED");
       // The bound session may.
       expect(
-        core.transitionState("MOD-0001", "ExecutionStarted", { actor: "opencode:sess-1", grantId }).ok
+        core.transitionState("MOD-0001", "ExecutionStarted", { actor: "belthazar", session: worker, grantId }).ok
       ).toBe(true);
+      // Gaspar requesting through a fresh grant still cannot enact it from
+      // a different session: orchestration names the executor, it does not
+      // consume the executor's grant.
+      const authz2 = core.authorizeExecution("MOD-0001", {
+        actor: "gaspar",
+        role: "belthazar",
+        session: worker,
+        requesterSession: gaspar.session,
+      });
+      expect(authz2.ok).toBe(true);
+      expect(
+        core.transitionState("MOD-0001", "ImplementationComplete", {
+          actor: "gaspar",
+          session: gaspar.session,
+          grantId: authz2.value!.grantId,
+        }).error?.code
+      ).toBe("EXECUTION_DENIED");
     } finally {
       restoreSessionTty();
       core.close();
@@ -458,13 +575,14 @@ describe("Dispatch grants (session binding)", () => {
   });
 
   it("rejects cross-scope grant reuse", () => {
-    const { core, sign, restoreTty: restoreScopeTty } = clockedCore(T0);
+    const { core, sign, poPrivateKey, restoreTty: restoreScopeTty } = clockedCore(T0);
     try {
-      const grantId = approvedWithGrant(core, sign, "gaspar", "belthazar");
+      const { grantId, gaspar } = approvedWithGrant(core, sign, poPrivateKey, "gaspar", "belthazar");
+      const ctx = { actor: "gaspar", session: gaspar.session };
       expect(
-        core.registerModule("MOD-0002", "DRAFT", { id: "MOD-0002", name: "M2", purpose: "P", specs: ["SP-0001"] }, "gaspar").ok
+        core.registerModule("MOD-0002", "DRAFT", { id: "MOD-0002", name: "M2", purpose: "P", specs: ["SP-0001"] }, gaspar).ok
       ).toBe(true);
-      expect(core.transitionState("MOD-0002", "ModulePlanned", ACTOR).ok).toBe(true);
+      expect(core.transitionState("MOD-0002", "ModulePlanned", ctx).ok).toBe(true);
       const rev = core.getArtifact("MOD-0002").revision;
       const { signature, timestamp } = sign({
         action: "module-approval",
@@ -484,10 +602,12 @@ describe("Dispatch grants (session binding)", () => {
           signature,
         }).ok
       ).toBe(true);
-      expect(core.transitionState("MOD-0002", "ModuleApproved", ACTOR).ok).toBe(true);
-      // MOD-0001's grant presented for MOD-0002 → scope mismatch.
+      expect(core.transitionState("MOD-0002", "ModuleApproved", ctx).ok).toBe(true);
+      // MOD-0001's grant presented for MOD-0002 by a MOD-0002-scoped
+      // session → grant scope mismatch (not session scope).
+      const worker2 = openTestSession(core, "belthazar", "MOD-0002");
       expect(
-        core.transitionState("MOD-0002", "ExecutionStarted", { actor: "belthazar", grantId }).error?.code
+        core.transitionState("MOD-0002", "ExecutionStarted", { actor: "belthazar", session: worker2, grantId }).error?.code
       ).toBe("INCONSISTENT_REFERENCE");
     } finally {
       restoreScopeTty();
@@ -503,18 +623,66 @@ describe("Completion authorization", () => {
   let sign: SignFn;
   let privateKeyPem: string;
 
+  interface CompletionFixture {
+    revision: string;
+    gaspar: CallerAuth;
+    belthazar: CallerAuth;
+    lucca: CallerAuth;
+    glenn: CallerAuth;
+    spekkio: CallerAuth;
+  }
+
   /** Drive MOD-0001 to VERIFYING with attestations current. */
-  function verifyingModule(): string {
-    approvedModule(core, sign);
-    recordAttestations(core);
-    expect(core.recordSecurityProfile({ title: "P", threats: [] }, "glenn").ok).toBe(true);
-    const authz = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar" });
-    expect(authz.ok).toBe(true);
+  function verifyingModule(): CompletionFixture {
+    const { gaspar } = approvedModule(core, sign, privateKeyPem);
+    recordAttestations(core, gaspar);
+    const glenn = { actor: "glenn", session: openTestSession(core, "glenn", "MOD-0001") };
+    expect(core.recordSecurityProfile({ title: "P", threats: [] }, glenn).ok).toBe(true);
+    const belthazar = { actor: "belthazar", session: openTestSession(core, "belthazar", "MOD-0001") };
+    const lucca = { actor: "lucca", session: openTestSession(core, "lucca", "MOD-0001") };
+    const spekkio = { actor: "spekkio", session: openTestSession(core, "spekkio", "MOD-0001") };
+    const start = core.authorizeExecution("MOD-0001", { actor: "belthazar", role: "belthazar", session: belthazar.session });
+    expect(start.ok).toBe(true);
     expect(
-      core.transitionState("MOD-0001", "ExecutionStarted", { actor: "belthazar", grantId: authz.value!.grantId }).ok
+      core.transitionState("MOD-0001", "ExecutionStarted", { actor: "belthazar", session: belthazar.session, grantId: start.value!.grantId }).ok
     ).toBe(true);
-    expect(core.transitionState("MOD-0001", "ImplementationComplete", ACTOR).ok).toBe(true);
-    return core.getArtifact("MOD-0001").revision;
+    const progress = core.authorizeExecution("MOD-0001", { actor: "belthazar", role: "belthazar", session: belthazar.session });
+    expect(progress.ok).toBe(true);
+    expect(
+      core.transitionState("MOD-0001", "ImplementationComplete", { actor: "belthazar", session: belthazar.session, grantId: progress.value!.grantId }).ok
+    ).toBe(true);
+    return { revision: core.getArtifact("MOD-0001").revision, gaspar, belthazar, lucca, glenn, spekkio };
+  }
+
+  function authorizeWorkerStep(fx: CompletionFixture): string {
+    const authz = core.authorizeExecution("MOD-0001", {
+      actor: "belthazar",
+      role: "belthazar",
+      session: fx.belthazar.session,
+    });
+    expect(authz.ok).toBe(true);
+    return authz.value!.grantId;
+  }
+
+  function authorizeVerdict(fx: CompletionFixture): string {
+    const authz = core.authorizeExecution("MOD-0001", {
+      actor: "spekkio",
+      role: "spekkio",
+      session: fx.spekkio.session,
+    });
+    expect(authz.ok).toBe(true);
+    return authz.value!.grantId;
+  }
+
+  function passVerification(fx: CompletionFixture): void {
+    testEvidence(core, fx.lucca, fx.revision, "unit");
+    testEvidence(core, fx.glenn, fx.revision, "review");
+    approve(core, sign, "implementation-security", "MOD-0001", fx.revision);
+    expect(core.recordVerification("MOD-0001", "PASS", "spekkio", [], [], [], fx.spekkio).ok).toBe(true);
+    const grantId = authorizeVerdict(fx);
+    expect(
+      core.transitionState("MOD-0001", "SpekkioPassed", { actor: "spekkio", session: fx.spekkio.session, grantId }).ok
+    ).toBe(true);
   }
 
   beforeEach(() => {
@@ -538,34 +706,33 @@ describe("Completion authorization", () => {
   });
 
   it("denies completion without current evidence", () => {
-    const revision = verifyingModule();
-    approve(core, sign, "implementation-security", "MOD-0001", revision);
-    expect(core.recordVerification("MOD-0001", "PASS", "spekkio").ok).toBe(true);
-    expect(core.transitionState("MOD-0001", "SpekkioPassed", ACTOR).ok).toBe(true);
-    const res = core.authorizeCompletion("MOD-0001", "gaspar");
+    const fx = verifyingModule();
+    approve(core, sign, "implementation-security", "MOD-0001", fx.revision);
+    expect(core.recordVerification("MOD-0001", "PASS", "spekkio", [], [], [], fx.spekkio).ok).toBe(true);
+    const grantId = authorizeVerdict(fx);
+    expect(
+      core.transitionState("MOD-0001", "SpekkioPassed", { actor: "spekkio", session: fx.spekkio.session, grantId }).ok
+    ).toBe(true);
+    const res = core.authorizeCompletion("MOD-0001", fx.gaspar);
     expect(res.ok).toBe(false);
     expect(res.error?.code).toBe("EVIDENCE_MISSING");
   });
 
   it("denies without a bound Spekkio PASS", () => {
-    verifyingModule();
-    const res = core.authorizeCompletion("MOD-0001", "gaspar");
+    const fx = verifyingModule();
+    const res = core.authorizeCompletion("MOD-0001", fx.gaspar);
     expect(res.ok).toBe(false);
     expect(res.error?.code).toBe("COMPLETION_DENIED");
   });
 
   it("completes the full lifecycle to COMPLETE", () => {
-    const revision = verifyingModule();
-    testEvidence(core, "lucca", revision, "unit");
-    testEvidence(core, "glenn", revision, "review");
-    approve(core, sign, "implementation-security", "MOD-0001", revision);
-    expect(core.recordVerification("MOD-0001", "PASS", "spekkio").ok).toBe(true);
-    expect(core.transitionState("MOD-0001", "SpekkioPassed", ACTOR).ok).toBe(true);
+    const fx = verifyingModule();
+    passVerification(fx);
 
-    const authz = core.authorizeCompletion("MOD-0001", "gaspar");
+    const authz = core.authorizeCompletion("MOD-0001", fx.gaspar);
     expect(authz.ok).toBe(true);
 
-    const done = core.completeModule("MOD-0001", "gaspar");
+    const done = core.completeModule("MOD-0001", fx.gaspar);
     expect(done.ok).toBe(true);
     expect(done.value?.state).toBe("COMPLETE");
     expect(core.getArtifact("MOD-0001").status).toBe("COMPLETE");
@@ -576,10 +743,10 @@ describe("Completion authorization", () => {
   });
 
   it("denies with an open blocking defect, allows after correction", () => {
-    const revision = verifyingModule();
-    testEvidence(core, "lucca", revision, "unit");
-    testEvidence(core, "glenn", revision, "review");
-    approve(core, sign, "implementation-security", "MOD-0001", revision);
+    const fx = verifyingModule();
+    testEvidence(core, fx.lucca, fx.revision, "unit");
+    testEvidence(core, fx.glenn, fx.revision, "review");
+    approve(core, sign, "implementation-security", "MOD-0001", fx.revision);
     const defect = core.recordDefect(
       {
         classification: "IMPLEMENTATION_DEFECT",
@@ -590,35 +757,44 @@ describe("Completion authorization", () => {
         blockingScope: "MOD-0001",
         reproInfo: null,
       },
-      "spekkio"
+      fx.spekkio
     );
     expect(defect.ok).toBe(true);
-    expect(core.recordVerification("MOD-0001", "FAILED", "spekkio", [defect.value!.id]).ok).toBe(true);
-    expect(core.transitionState("MOD-0001", "SpekkioFailed", ACTOR).ok).toBe(true);
+    expect(core.recordVerification("MOD-0001", "FAILED", "spekkio", [defect.value!.id], [], [], fx.spekkio).ok).toBe(true);
+    const failGrant = authorizeVerdict(fx);
+    expect(
+      core.transitionState("MOD-0001", "SpekkioFailed", { actor: "spekkio", session: fx.spekkio.session, grantId: failGrant }).ok
+    ).toBe(true);
 
     // FAILED modules cannot complete.
-    expect(core.authorizeCompletion("MOD-0001", "gaspar").ok).toBe(false);
+    expect(core.authorizeCompletion("MOD-0001", fx.gaspar).ok).toBe(false);
 
-    // Correct, re-verify, and complete.
-    expect(core.resolveDefect(defect.value!.id, "belthazar").ok).toBe(true);
-    expect(core.transitionState("MOD-0001", "CorrectionComplete", ACTOR).ok).toBe(true);
-    expect(core.transitionState("MOD-0001", "ImplementationComplete", ACTOR).ok).toBe(true);
-    expect(core.recordVerification("MOD-0001", "PASS", "spekkio").ok).toBe(true);
-    expect(core.transitionState("MOD-0001", "SpekkioPassed", ACTOR).ok).toBe(true);
-    expect(core.authorizeCompletion("MOD-0001", "gaspar").ok).toBe(true);
+    // Correct, re-verify, and complete (each forward step re-authorizes).
+    expect(core.resolveDefect(defect.value!.id, fx.belthazar).ok).toBe(true);
+    const correctGrant = authorizeWorkerStep(fx);
+    expect(
+      core.transitionState("MOD-0001", "CorrectionComplete", { actor: "belthazar", session: fx.belthazar.session, grantId: correctGrant }).ok
+    ).toBe(true);
+    const progressGrant = authorizeWorkerStep(fx);
+    expect(
+      core.transitionState("MOD-0001", "ImplementationComplete", { actor: "belthazar", session: fx.belthazar.session, grantId: progressGrant }).ok
+    ).toBe(true);
+    expect(core.recordVerification("MOD-0001", "PASS", "spekkio", [], [], [], fx.spekkio).ok).toBe(true);
+    const passGrant = authorizeVerdict(fx);
+    expect(
+      core.transitionState("MOD-0001", "SpekkioPassed", { actor: "spekkio", session: fx.spekkio.session, grantId: passGrant }).ok
+    ).toBe(true);
+    expect(core.authorizeCompletion("MOD-0001", fx.gaspar).ok).toBe(true);
   });
 
   it("lets a valid waiver cover a security blocker at completion", () => {
-    const revision = verifyingModule();
-    testEvidence(core, "lucca", revision, "unit");
-    testEvidence(core, "glenn", revision, "review");
-    approve(core, sign, "implementation-security", "MOD-0001", revision);
-    expect(core.recordVerification("MOD-0001", "PASS", "spekkio").ok).toBe(true);
-    expect(core.transitionState("MOD-0001", "SpekkioPassed", ACTOR).ok).toBe(true);
+    const fx = verifyingModule();
+    const revision = fx.revision;
+    passVerification(fx);
     expect(
-      core.raiseBlocker("SECURITY_BLOCKER", "glenn", ["MOD-0001"], "residual risk").ok
+      core.raiseBlocker("SECURITY_BLOCKER", ["MOD-0001"], "residual risk", fx.glenn).ok
     ).toBe(true);
-    expect(core.authorizeCompletion("MOD-0001", "gaspar").error?.code).toBe("SECURITY_BLOCKER");
+    expect(core.authorizeCompletion("MOD-0001", fx.gaspar).error?.code).toBe("SECURITY_BLOCKER");
 
     // A waiver signed by the registered PO key, covering this revision,
     // lets completion proceed; WAIVED stays distinct from PASS.
@@ -652,6 +828,6 @@ describe("Completion authorization", () => {
       signature: waiverSig,
     });
     expect(waived.ok).toBe(true);
-    expect(core.authorizeCompletion("MOD-0001", "gaspar").ok).toBe(true);
+    expect(core.authorizeCompletion("MOD-0001", fx.gaspar).ok).toBe(true);
   });
 });

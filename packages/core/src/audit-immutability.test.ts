@@ -10,9 +10,11 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 import Database from "better-sqlite3";
 import {
   buildApprovalPayload,
+  buildSessionAuthorizationPayload,
   computeRevisionHash,
   generateApprovalKeyPair,
   signApprovalPayload,
@@ -54,13 +56,60 @@ function fakeInteractiveTerminal(): () => void {
 
   let tempDir: string;
   let core: ChronoCore;
+  let poPrivateKey: string;
+  let gaspar: { actor: string; session: { id: string; token: string } };
+
+  function openTestSession(role: string, scopeModule?: string): { id: string; token: string } {
+    if (role === "gaspar" || role === "PO") {
+      throw new Error("Privileged test sessions require a PO-signed bootstrap");
+    }
+    const res = core.openSession(
+      {
+        role,
+        adapter: "test-adapter",
+        runtime: "test-runtime",
+        ...(scopeModule !== undefined ? { scopeModule } : {}),
+        ttlSeconds: 3600,
+      },
+      { interactive: true }
+    );
+    expect(res.ok).toBe(true);
+    return { id: res.value!.id, token: res.value!.token };
+  }
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "chrono-audit-test-"));
     core = new ChronoCore({ projectPath: tempDir });
     expect(core.init().ok).toBe(true);
     restoreTty = fakeInteractiveTerminal();
-    expect(core.registerSpec("SP-0001", "DRAFT", { id: "SP-0001", title: "T", purpose: "P" }, "gaspar").ok).toBe(true);
+    const pair = generateApprovalKeyPair();
+    expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+    poPrivateKey = pair.privateKeyPem;
+    const nonce = randomBytes(16).toString("hex");
+    const timestamp = "2026-09-11T00:00:00.000Z";
+    const rationale = "test privileged-session bootstrap";
+    const signature = signApprovalPayload(
+      buildSessionAuthorizationPayload({
+        sessionRole: "gaspar",
+        adapter: "test-adapter",
+        runtime: "test-runtime",
+        scopeModule: null,
+        scopeWp: null,
+        ttlSeconds: 3600,
+        nonce,
+        authority: "PO",
+        rationale,
+        timestamp,
+      }),
+      pair.privateKeyPem
+    );
+    const opened = core.openSession(
+      { role: "gaspar", adapter: "test-adapter", runtime: "test-runtime", ttlSeconds: 3600 },
+      { poAuthorization: { nonce, authority: "PO", rationale, timestamp, signature } }
+    );
+    expect(opened.ok).toBe(true);
+    gaspar = { actor: "gaspar", session: { id: opened.value!.id, token: opened.value!.token } };
+    expect(core.registerSpec("SP-0001", "DRAFT", { id: "SP-0001", title: "T", purpose: "P" }, gaspar).ok).toBe(true);
   });
 
   afterEach(() => {
@@ -82,7 +131,7 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   it("rejects UPDATE and DELETE on artifact_revision history", () => {
-    core.transitionState("SP-0001", "SpecSubmittedForReview", { actor: "gaspar" });
+    core.transitionState("SP-0001", "SpecSubmittedForReview", { actor: "gaspar", session: gaspar.session });
     const historyBefore = core.artifactHistory("SP-0001");
     expect(historyBefore).toHaveLength(2);
 
@@ -99,6 +148,9 @@ function fakeInteractiveTerminal(): () => void {
 
   it("rejects UPDATE and DELETE on evidence", () => {
     const targetRevision = `sha256:${"b".repeat(64)}`;
+    // The tamper test targets the triggers; producer binding is covered
+    // elsewhere, so the producing role records through its own session.
+    const lucca = { actor: "lucca", session: openTestSession("lucca", "default") };
     expect(
       core.recordEvidence({
         producer: "lucca",
@@ -112,7 +164,7 @@ function fakeInteractiveTerminal(): () => void {
           diagnostics: null,
           target_revision: targetRevision,
         }),
-      }).ok,
+      }, lucca).ok,
     ).toBe(true);
 
     const raw = rawDb(tempDir);
@@ -125,8 +177,6 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   it("rejects approval rewrites but allows the revocation flag 0 → 1", () => {
-    const pair = generateApprovalKeyPair();
-    expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
     const revision = core.getArtifact("SP-0001").revision;
     const timestamp = "2026-06-01T00:00:00.000Z";
     const signature = signApprovalPayload(
@@ -138,7 +188,7 @@ function fakeInteractiveTerminal(): () => void {
         rationale: "test",
         timestamp,
       }),
-      pair.privateKeyPem
+      poPrivateKey
     );
     const created = core.recordApproval({
       action: "module-approval",

@@ -79,6 +79,8 @@ export interface BlockerRecord {
   id: string;
   type: string;
   issuer: string;
+  issuerRole: string | null;
+  issuerSession: string | null;
   targetIds: string[];
   reason: string;
   evidenceRefs: string[];
@@ -243,6 +245,8 @@ interface BlockerRow {
   id: unknown;
   type: unknown;
   issuer: unknown;
+  issuer_role: unknown;
+  issuer_session: unknown;
   target_ids: unknown;
   reason: unknown;
   evidence_refs: unknown;
@@ -660,6 +664,14 @@ export class ArtifactRepository {
     return this.findByRevision(id, revision).content;
   }
 
+  /** Owning artifact id for a recorded revision, or null when unknown. */
+  findArtifactIdByRevision(revision: string): string | null {
+    const row = this.db
+      .prepare("SELECT id FROM artifact_revision WHERE revision = ? LIMIT 1")
+      .get(revision) as { id: string } | undefined;
+    return row?.id ?? null;
+  }
+
   /** Mark deleted (tombstone) — preserves references [DOM §2.4] */
   softDelete(id: string): void {
     this.db.prepare("UPDATE artifact SET deleted = 1 WHERE id = ?").run(id);
@@ -852,6 +864,25 @@ export class ApprovalRepository {
     return row === undefined ? null : this.mapApprovalRow(row);
   }
 
+  /** Find any approval row by id (for grant binding revalidation). */
+  findById(id: string): ApprovalRecord {
+    const row = this.db
+      .prepare("SELECT * FROM approval WHERE id = ?")
+      .get(id) as ApprovalRow | undefined;
+
+    if (row === undefined) {
+      throw new ChronoError({
+        code: ErrorCode.ENTITY_NOT_FOUND,
+        severity: Severity.ERROR,
+        message: `Approval ${id} not found`,
+        invariantRef: "DOM §3.16",
+        affectedTarget: id,
+      });
+    }
+
+    return this.mapApprovalRow(row);
+  }
+
   /** Check if any approval exists for an artifact revision (any action) */
   existsForRevision(artifactId: string, revision: string): boolean {
     const row = this.db
@@ -901,6 +932,8 @@ export class BlockerRepository {
     id: string;
     type: string;
     issuer: string;
+    issuerRole?: string | null;
+    issuerSession?: string | null;
     targetIds: string[];
     reason: string;
     evidenceRefs: string[];
@@ -908,11 +941,12 @@ export class BlockerRepository {
   }): BlockerRecord {
     const now = new Date().toISOString();
     this.db.prepare(
-      `INSERT INTO blocker (id, type, issuer, target_ids, reason, evidence_refs,
+      `INSERT INTO blocker (id, type, issuer, issuer_role, issuer_session, target_ids, reason, evidence_refs,
          created_at, resolved_at, resolved_by, resolved, prior_state)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?)`
     ).run(
       blocker.id, blocker.type, blocker.issuer,
+      blocker.issuerRole ?? null, blocker.issuerSession ?? null,
       JSON.stringify(blocker.targetIds), blocker.reason,
       JSON.stringify(blocker.evidenceRefs), now,
       blocker.priorState ?? null
@@ -993,6 +1027,8 @@ export class BlockerRepository {
       id: row.id as string,
       type: row.type as string,
       issuer: row.issuer as string,
+      issuerRole: row.issuer_role as string | null,
+      issuerSession: row.issuer_session as string | null,
       targetIds: JSON.parse(row.target_ids as string),
       reason: row.reason as string,
       evidenceRefs: JSON.parse(row.evidence_refs as string),
@@ -1368,13 +1404,21 @@ export class QaRepository {
 /** Dispatch grant record [DOM §2.2, Remediation §3A]. */
 export interface GrantRecord {
   id: string;
+  projectId: string | null;
   moduleId: string;
   workPackageId: string | null;
   moduleRevision: string;
-  specRevisions: string[];
+  workPackageRevision: string | null;
+  specRevisions: Record<string, string>;
+  harnessBindings: Array<{ specId: string; specRevision: string; contentHash: string }>;
   role: string;
   session: string | null;
   requestedBy: string;
+  rtkAttestationId: string | null;
+  skillAttestationId: string | null;
+  moduleApprovalId: string | null;
+  archApprovalId: string | null;
+  policyVersion: string | null;
   issuedAt: string;
   expiresAt: string;
   consumed: boolean;
@@ -1382,13 +1426,21 @@ export interface GrantRecord {
 
 interface GrantRow {
   id: unknown;
+  project_id: unknown;
   module_id: unknown;
   work_package_id: unknown;
   module_revision: unknown;
+  work_package_revision: unknown;
   spec_revisions: unknown;
+  harness_bindings: unknown;
   role: unknown;
   session: unknown;
   requested_by: unknown;
+  rtk_attestation_id: unknown;
+  skill_attestation_id: unknown;
+  module_approval_id: unknown;
+  arch_approval_id: unknown;
+  policy_version: unknown;
   issued_at: unknown;
   expires_at: unknown;
   consumed: unknown;
@@ -1396,31 +1448,44 @@ interface GrantRow {
 
 /**
  * Repository for execution dispatch grants. Grants are single-use and
- * expiring: consume() moves 0 → 1, never back; no other mutation exists.
+ * expiring: consumption is one conditional UPDATE (`WHERE consumed = 0`)
+ * and succeeds only when exactly one row flips, so concurrent connections
+ * cannot double-consume.
  */
 export class GrantRepository {
   constructor(private readonly db: Database) {}
 
   create(grant: {
     id: string;
+    projectId: string;
     moduleId: string;
     workPackageId: string | null;
     moduleRevision: string;
-    specRevisions: string[];
+    workPackageRevision: string | null;
+    specRevisions: Record<string, string>;
+    harnessBindings: Array<{ specId: string; specRevision: string; contentHash: string }>;
     role: string;
     session: string | null;
     requestedBy: string;
+    rtkAttestationId: string | null;
+    skillAttestationId: string | null;
+    moduleApprovalId: string | null;
+    archApprovalId: string | null;
+    policyVersion: string;
     issuedAt: string;
     expiresAt: string;
   }): GrantRecord {
     this.db.prepare(
-      `INSERT INTO execution_grant (id, module_id, work_package_id, module_revision,
-         spec_revisions, role, session, requested_by, issued_at, expires_at, consumed)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+      `INSERT INTO execution_grant (id, project_id, module_id, work_package_id, module_revision,
+         work_package_revision, spec_revisions, harness_bindings, role, session, requested_by,
+         rtk_attestation_id, skill_attestation_id, module_approval_id, arch_approval_id,
+         policy_version, issued_at, expires_at, consumed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
     ).run(
-      grant.id, grant.moduleId, grant.workPackageId, grant.moduleRevision,
-      JSON.stringify(grant.specRevisions), grant.role, grant.session,
-      grant.requestedBy, grant.issuedAt, grant.expiresAt
+      grant.id, grant.projectId, grant.moduleId, grant.workPackageId, grant.moduleRevision,
+      grant.workPackageRevision, JSON.stringify(grant.specRevisions), JSON.stringify(grant.harnessBindings),
+      grant.role, grant.session, grant.requestedBy, grant.rtkAttestationId, grant.skillAttestationId,
+      grant.moduleApprovalId, grant.archApprovalId, grant.policyVersion, grant.issuedAt, grant.expiresAt
     );
 
     return this.findById(grant.id);
@@ -1445,10 +1510,29 @@ export class GrantRepository {
     return this.mapGrantRow(row);
   }
 
-  /** Consume a grant (single-use). Second consumption fails closed. */
+  /**
+   * Consume a grant atomically: exactly one row must flip from
+   * unconsumed, otherwise the grant is missing, already consumed, or
+   * raced — all fail closed.
+   */
   consume(id: string): GrantRecord {
-    const current = this.findById(id);
-    if (current.consumed) {
+    const info = this.db
+      .prepare("UPDATE execution_grant SET consumed = 1 WHERE id = ? AND consumed = 0")
+      .run(id);
+    if (info.changes !== 1) {
+      const row = this.db
+        .prepare("SELECT consumed FROM execution_grant WHERE id = ?")
+        .get(id) as { consumed: number } | undefined;
+      if (row === undefined) {
+        throw new ChronoError({
+          code: ErrorCode.ENTITY_NOT_FOUND,
+          severity: Severity.ERROR,
+          message: `Dispatch grant ${id} not found`,
+          invariantRef: "INV §10.2",
+          affectedTarget: id,
+          suggestedAction: "Authorize execution to issue a grant first",
+        });
+      }
       throw new ChronoError({
         code: ErrorCode.EXECUTION_DENIED,
         severity: Severity.BLOCKER,
@@ -1458,23 +1542,236 @@ export class GrantRepository {
         suggestedAction: "Authorize execution again for a fresh grant",
       });
     }
-    this.db.prepare("UPDATE execution_grant SET consumed = 1 WHERE id = ?").run(id);
     return this.findById(id);
   }
 
   private mapGrantRow(row: GrantRow): GrantRecord {
+    const parseMap = (value: unknown): Record<string, string> => {
+      if (typeof value !== "string") {
+        return {};
+      }
+      const parsed: unknown = JSON.parse(value);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        return {};
+      }
+      const out: Record<string, string> = {};
+      for (const [key, entry] of Object.entries(parsed)) {
+        if (typeof entry === "string") {
+          out[key] = entry;
+        }
+      }
+      return out;
+    };
+    const parseBindings = (value: unknown): Array<{ specId: string; specRevision: string; contentHash: string }> => {
+      if (typeof value !== "string") {
+        return [];
+      }
+      const parsed: unknown = JSON.parse(value);
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      return parsed.filter(
+        (entry): entry is { specId: string; specRevision: string; contentHash: string } =>
+          typeof entry === "object" &&
+          entry !== null &&
+          typeof (entry as Record<string, unknown>)["specId"] === "string" &&
+          typeof (entry as Record<string, unknown>)["specRevision"] === "string" &&
+          typeof (entry as Record<string, unknown>)["contentHash"] === "string"
+      );
+    };
     return {
       id: row.id as string,
+      projectId: row.project_id as string | null,
       moduleId: row.module_id as string,
       workPackageId: row.work_package_id as string | null,
       moduleRevision: row.module_revision as string,
-      specRevisions: JSON.parse(row.spec_revisions as string),
+      workPackageRevision: row.work_package_revision as string | null,
+      specRevisions: parseMap(row.spec_revisions),
+      harnessBindings: parseBindings(row.harness_bindings),
       role: row.role as string,
       session: row.session as string | null,
       requestedBy: row.requested_by as string,
+      rtkAttestationId: row.rtk_attestation_id as string | null,
+      skillAttestationId: row.skill_attestation_id as string | null,
+      moduleApprovalId: row.module_approval_id as string | null,
+      archApprovalId: row.arch_approval_id as string | null,
+      policyVersion: row.policy_version as string | null,
       issuedAt: row.issued_at as string,
       expiresAt: row.expires_at as string,
       consumed: Boolean(row.consumed),
+    };
+  }
+}
+
+/** One-time privileged-session authorization [Remediation §3A]. */
+export interface SessionAuthorizationRecord {
+  nonce: string;
+  role: string;
+  authority: string;
+  usedAt: string;
+}
+
+/**
+ * Repository for consumed privileged-session bootstrap nonces. Insert is
+ * the replay defense: a reused authorization nonce collides on the primary
+ * key and denies before any session is issued.
+ */
+export class SessionAuthorizationRepository {
+  constructor(private readonly db: Database) {}
+
+  consume(authorization: {
+    nonce: string;
+    role: string;
+    authority: string;
+    usedAt: string;
+  }): SessionAuthorizationRecord {
+    try {
+      this.db.prepare(
+        `INSERT INTO session_authorization (nonce, role, authority, used_at)
+         VALUES (?, ?, ?, ?)`
+      ).run(authorization.nonce, authorization.role, authorization.authority, authorization.usedAt);
+    } catch {
+      throw new ChronoError({
+        code: ErrorCode.DUPLICATE_IDENTITY,
+        severity: Severity.BLOCKER,
+        message: "Privileged-session authorization was already used: replay denied",
+        invariantRef: "INV §10.1",
+        affectedTarget: authorization.nonce,
+        suggestedAction: "Request a fresh signed privileged-session authorization",
+      });
+    }
+    return { ...authorization };
+  }
+}
+
+/** Authenticated adapter session record [DOM §2.2, Remediation §3A]. */
+export interface AgentSessionRecord {
+  id: string;
+  tokenHash: string;
+  role: string;
+  adapter: string;
+  runtime: string;
+  projectId: string;
+  scopeModule: string | null;
+  scopeWp: string | null;
+  parentId: string | null;
+  issuedAt: string;
+  expiresAt: string;
+  revoked: boolean;
+  lastSeen: string;
+}
+
+interface AgentSessionRow {
+  id: unknown;
+  token_hash: unknown;
+  role: unknown;
+  adapter: unknown;
+  runtime: unknown;
+  project_id: unknown;
+  scope_module: unknown;
+  scope_wp: unknown;
+  parent_id: unknown;
+  issued_at: unknown;
+  expires_at: unknown;
+  revoked: unknown;
+  last_seen: unknown;
+}
+
+/**
+ * Repository for authenticated adapter sessions. Only the SHA-256 of the
+ * bearer token persists; tokens are returned once at issuance and never
+ * stored. Revocation is terminal (no un-revoke path).
+ */
+export class SessionRepository {
+  constructor(private readonly db: Database) {}
+
+  create(session: {
+    id: string;
+    tokenHash: string;
+    role: string;
+    adapter: string;
+    runtime: string;
+    projectId: string;
+    scopeModule: string | null;
+    scopeWp: string | null;
+    parentId: string | null;
+    issuedAt: string;
+    expiresAt: string;
+  }): AgentSessionRecord {
+    this.db.prepare(
+      `INSERT INTO agent_session (id, token_hash, role, adapter, runtime, project_id,
+         scope_module, scope_wp, parent_id, issued_at, expires_at, revoked, last_seen)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
+    ).run(
+      session.id, session.tokenHash, session.role, session.adapter, session.runtime,
+      session.projectId, session.scopeModule, session.scopeWp, session.parentId,
+      session.issuedAt, session.expiresAt, session.issuedAt
+    );
+
+    return this.findById(session.id);
+  }
+
+  findById(id: string): AgentSessionRecord {
+    const row = this.db
+      .prepare("SELECT * FROM agent_session WHERE id = ?")
+      .get(id) as AgentSessionRow | undefined;
+
+    if (row === undefined) {
+      throw new ChronoError({
+        code: ErrorCode.ENTITY_NOT_FOUND,
+        severity: Severity.ERROR,
+        message: `Session ${id} not found`,
+        invariantRef: "INV §10.2",
+        affectedTarget: id,
+        suggestedAction: "Open an authenticated session first",
+      });
+    }
+
+    return this.mapSessionRow(row);
+  }
+
+  findByTokenHash(tokenHash: string): AgentSessionRecord {
+    const row = this.db
+      .prepare("SELECT * FROM agent_session WHERE token_hash = ?")
+      .get(tokenHash) as AgentSessionRow | undefined;
+
+    if (row === undefined) {
+      throw new ChronoError({
+        code: ErrorCode.REFERENCE_UNRESOLVABLE,
+        severity: Severity.ERROR,
+        message: "Session token unknown: forged tokens deny",
+        invariantRef: "INV §10.2",
+        suggestedAction: "Open an authenticated session first",
+      });
+    }
+
+    return this.mapSessionRow(row);
+  }
+
+  touch(id: string, at: string): void {
+    this.db.prepare("UPDATE agent_session SET last_seen = ? WHERE id = ?").run(at, id);
+  }
+
+  revoke(id: string): AgentSessionRecord {
+    this.db.prepare("UPDATE agent_session SET revoked = 1 WHERE id = ?").run(id);
+    return this.findById(id);
+  }
+
+  private mapSessionRow(row: AgentSessionRow): AgentSessionRecord {
+    return {
+      id: row.id as string,
+      tokenHash: row.token_hash as string,
+      role: row.role as string,
+      adapter: row.adapter as string,
+      runtime: row.runtime as string,
+      projectId: row.project_id as string,
+      scopeModule: row.scope_module as string | null,
+      scopeWp: row.scope_wp as string | null,
+      parentId: row.parent_id as string | null,
+      issuedAt: row.issued_at as string,
+      expiresAt: row.expires_at as string,
+      revoked: Boolean(row.revoked),
+      lastSeen: row.last_seen as string,
     };
   }
 }
