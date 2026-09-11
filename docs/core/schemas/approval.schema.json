@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/approval.schema.json",
+  "title": "CHRONO Approval",
+  "description": "Schema for an Approval event. Citations: [FW §13], [P2.10]\n\nApprovals are append-only, human-interactive, cryptographically signed, and bound to exact action + scope + revision + signer + timestamp.",
+  "type": "object",
+  "required": [
+    "id",
+    "action",
+    "scopeArtifactId",
+    "scopeRevision",
+    "authority",
+    "signer",
+    "signature",
+    "rationale",
+    "timestamp"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^APR-[0-9]{4}$"
+    },
+    "action": {
+      "type": "string",
+      "enum": ["module-approval", "waiver", "risk-acceptance", "architecture-security", "implementation-security"]
+    },
+    "scopeArtifactId": {
+      "type": "string",
+      "description": "Bound artifact identity"
+    },
+    "scopeRevision": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "Exact revision hash [FW §13]"
+    },
+    "authority": {
+      "type": "string",
+      "description": "Who may make this decision"
+    },
+    "signer": {
+      "type": "string",
+      "description": "PO identity"
+    },
+    "signature": {
+      "type": "string",
+      "description": "Cryptographic signature over canonical payload [FW §13]"
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC"
+    },
+    "revoked": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "additionalProperties": false
+}

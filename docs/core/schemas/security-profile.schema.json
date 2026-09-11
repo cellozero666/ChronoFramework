@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/security-profile.schema.json",
+  "title": "CHRONO Security Profile",
+  "description": "Schema for a Security Profile. Citations: [P1.5, P6.5, FW §9, REF §27]\n\nVersion is a monotonic integer; each new version supersedes the previous.",
+  "type": "object",
+  "required": [
+    "id",
+    "version",
+    "assets",
+    "threatActors",
+    "trustBoundaries",
+    "dataClassification",
+    "authn",
+    "authz",
+    "secretsPolicy",
+    "dependencyPolicy",
+    "infraExposure",
+    "loggingPrivacy",
+    "abuseCases",
+    "controls",
+    "residualRisks",
+    "testStrategy",
+    "evidenceRequirements"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^SEC-[0-9]{4}$"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic integer [P1.5]"
+    },
+    "assets": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "threatActors": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "trustBoundaries": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "dataClassification": {
+      "type": "object"
+    },
+    "authn": {
+      "type": "string"
+    },
+    "authz": {
+      "type": "string"
+    },
+    "secretsPolicy": {
+      "type": "string"
+    },
+    "dependencyPolicy": {
+      "type": "string",
+      "description": "Dependency provenance requirements [FW §10]"
+    },
+    "infraExposure": {
+      "type": "string"
+    },
+    "loggingPrivacy": {
+      "type": "string"
+    },
+    "abuseCases": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "controls": {
+      "type": "object",
+      "required": ["recommended", "implemented"],
+      "properties": {
+        "recommended": { "type": "array", "items": { "type": "string" } },
+        "implemented": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "residualRisks": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "testStrategy": {
+      "type": "string"
+    },
+    "evidenceRequirements": {
+      "type": "string"
+    },
+    "provenance": {
+      "type": ["string", "null"]
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

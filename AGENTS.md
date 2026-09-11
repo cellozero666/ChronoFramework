@@ -9,9 +9,10 @@ Produce the complete, release-ready CHRONO v1 described by this repository. The 
 Before changing implementation files, read completely:
 
 1. `docs/reference/FRAMEWORK-DEFINITION.md`
-2. every document in `docs/protocols/`, in numeric order
-3. `docs/architecture/REFERENCE-ARCHITECTURE.md`
-4. `docs/implementation/IMPLEMENTATION-PLAN.md`
+2. `docs/product/SDD-INNOVATION-STANDARD.md`
+3. every document in `docs/protocols/`, in numeric order
+4. `docs/architecture/REFERENCE-ARCHITECTURE.md`
+5. `docs/implementation/IMPLEMENTATION-PLAN.md`
 
 `docs/history/PROTOCOL-AUTHORING-BRIEF.md` is provenance only and cannot override current normative documents.
 
@@ -28,7 +29,8 @@ Before changing implementation files, read completely:
 - Do not leave stubs, TODO-only behavior, skipped mandatory tests, simulated integrations, or silent fallbacks.
 - Do not publish, push, create a release, or modify the remote without explicit Product Owner authorization.
 - Preserve the root Apache-2.0 `LICENSE`, `NOTICE`, third-party licenses, attribution, and provenance. Generated package metadata MUST use the SPDX identifier `Apache-2.0`.
+- Before final completion, implement and pass the Innovation Verification Gate in `docs/product/SDD-INNOVATION-STANDARD.md`; claims of technology agnosticism require polyglot, non-web, and cross-runtime evidence.
 
 ## Required completion evidence
 
-Report the exact files changed, checks run, conformance/security results, remaining PO decisions, and release blockers. Final completion requires all conditions in the implementation plan, including fresh-install fixtures, upgrade/recovery tests, signed-package preparation, documentation synchronization, and no known bypass of a mandatory gate.
+Report the exact files changed, checks run, conformance/security/innovation results, remaining PO decisions, and release blockers. Final completion requires all conditions in the implementation plan, including fresh-install fixtures, polyglot/non-web fixtures, upgrade/recovery tests, signed-package preparation, documentation synchronization, and no known bypass of a mandatory gate.

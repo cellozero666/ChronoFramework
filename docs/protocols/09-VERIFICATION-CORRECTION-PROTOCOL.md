@@ -67,7 +67,7 @@ Verification and correction agents MUST use a current SkillAttestation for the p
 
 ## 9. Definition of Done
 
-A Module may become `COMPLETE` only when implementation matches approved Specs, criteria are verified, required tests pass, Lucca and Glenn evidence is current, blockers are resolved or validly waived, documentation is synchronized, no blocking defect remains, the PO implementation-security decision is current, RTKAttestation and SkillAttestation are current, Spekkio issued `PASS`, traceability is intact, and the state transition is legal.
+A Module may become `COMPLETE` only when implementation matches approved Specs, criteria are verified, required tests pass, Lucca and Glenn evidence is current, blockers are resolved or validly waived, documentation is synchronized, no blocking defect remains, the PO implementation-security decision is current, RTKAttestation and SkillAttestation are current, Spekkio issued `PASS`, traceability is intact, and the state transition is legal. Final v1 release additionally requires Spekkio's current `INNOVATION_PASS` and the complete evidence set defined by the [SDD Innovation Standard](../product/SDD-INNOVATION-STANDARD.md).
 
 ## 10. Completion record
 

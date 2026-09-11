@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/waiver.schema.json",
+  "title": "CHRONO Waiver",
+  "description": "Schema for a Waiver. Citations: [P2.8, FW §6]\n\nOnly the Product Owner MAY accept residual security or product risk. Must record issue, scope, rationale, evidence, compensating controls, follow-up, and expiry/review condition.",
+  "type": "object",
+  "required": [
+    "id",
+    "issue",
+    "scopeArtifactId",
+    "scopeRevision",
+    "acceptingAuthority",
+    "expiryReviewCondition",
+    "timestamp",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^WAIVER-[0-9]{4}$"
+    },
+    "issue": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scopeArtifactId": {
+      "type": "string"
+    },
+    "scopeRevision": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidenceRef": {
+      "type": ["string", "null"],
+      "pattern": "^EVD-[0-9]{4}$"
+    },
+    "acceptingAuthority": {
+      "type": "string",
+      "description": "PO identity [P2.8]"
+    },
+    "compensatingControls": {
+      "type": ["string", "null"]
+    },
+    "followUpTaskId": {
+      "type": ["string", "null"],
+      "pattern": "^TASK-[0-9]{4}$"
+    },
+    "expiryReviewCondition": {
+      "type": "string",
+      "minLength": 1,
+      "description": "[P2.8]"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "expired", "invalidated"],
+      "default": "active"
+    },
+    "signature": {
+      "type": "string",
+      "description": "Cryptographic signature over canonical payload [FW §13]"
+    }
+  },
+  "additionalProperties": false
+}

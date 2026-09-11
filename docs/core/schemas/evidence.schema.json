@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/evidence.schema.json",
+  "title": "CHRONO Evidence",
+  "description": "Schema for an Evidence record. Citations: [P9.2]\n\nEvidence binds to an exact target revision and identifies producer, tool, timestamp, result, diagnostics, and integrity hash.",
+  "type": "object",
+  "required": [
+    "id",
+    "producer",
+    "timestamp",
+    "targetRevision",
+    "checkName",
+    "result",
+    "integrityHash"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^EVD-[0-9]{4}$"
+    },
+    "producer": {
+      "type": "string",
+      "description": "Agent/tool identity [P9.2]"
+    },
+    "tool": {
+      "type": ["string", "null"],
+      "description": "Tool/model as configured; never hardcoded [DOM §3.19]"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "targetRevision": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "Revision proven by this evidence [P3.4]"
+    },
+    "checkName": {
+      "type": "string"
+    },
+    "result": {
+      "type": "string",
+      "enum": ["pass", "fail", "value"]
+    },
+    "diagnostics": {
+      "type": ["string", "null"]
+    },
+    "integrityHash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "Content integrity hash [P9.2]"
+    },
+    "runtime": {
+      "type": ["string", "null"],
+      "description": "Runtime that produced this evidence [FW §22]"
+    }
+  },
+  "additionalProperties": false
+}

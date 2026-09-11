@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/blocker.schema.json",
+  "title": "CHRONO Blocker",
+  "description": "Schema for a Blocker. Citations: [P3.3, FW §7]\n\nA blocker is a condition preventing a defined gate or target.",
+  "type": "object",
+  "required": [
+    "id",
+    "type",
+    "issuer",
+    "targetIds",
+    "reason",
+    "createdAt"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^BLK-[0-9]{4}$"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "PRODUCT_BLOCKER",
+        "SECURITY_BLOCKER",
+        "APPROVAL_REQUIRED",
+        "EXECUTION_DENIED",
+        "COMPLETION_DENIED",
+        "BLOCKED_RTK",
+        "BLOCKED_PROCESS_SKILL"
+      ]
+    },
+    "issuer": {
+      "type": "string",
+      "description": "Agent identity or system [P3.3]"
+    },
+    "targetIds": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "description": "Affected artifact(s) [P3.3]"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidenceRefs": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^EVD-[0-9]{4}$" },
+      "default": []
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "resolvedAt": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "resolvedBy": {
+      "type": ["string", "null"]
+    },
+    "resolved": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "additionalProperties": false
+}

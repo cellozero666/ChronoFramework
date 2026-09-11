@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/spec.schema.json",
+  "title": "CHRONO Specification",
+  "description": "Schema for a CHRONO Specification artifact. Citations: [P5.3], [FW §17]\n\nA Specification is a coherent, verifiable system contract with a status lifecycle: DRAFT → REVIEW → READY → SUPERSEDED.",
+  "type": "object",
+  "required": [
+    "id",
+    "title",
+    "purpose",
+    "revision",
+    "status",
+    "inScope",
+    "functionalRequirements",
+    "nonFunctionalRequirements",
+    "businessRules",
+    "architecture",
+    "adrs",
+    "dependencies",
+    "dataImpact",
+    "interfaces",
+    "securityRequirements",
+    "scenarios",
+    "acceptanceCriteria",
+    "testEvidenceRequirements",
+    "changeControl"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^SP-[0-9]{4}$",
+      "description": "Unique identifier within project scope [P3.2]"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "[FW §17]"
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "Deterministic content hash [DOM §2.3]"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["DRAFT", "REVIEW", "READY", "SUPERSEDED"],
+      "description": "[P3.9, FW §11]"
+    },
+    "inScope": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "outOfScope": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "functionalRequirements": {
+      "type": "array",
+      "items": { "$ref": "requirement.schema.json#/definitions/requirement_ref" }
+    },
+    "nonFunctionalRequirements": {
+      "type": "array",
+      "items": { "$ref": "requirement.schema.json#/definitions/requirement_ref" }
+    },
+    "businessRules": {
+      "type": "array",
+      "items": { "$ref": "business-rule.schema.json#/definitions/ref" }
+    },
+    "architecture": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["revision"],
+        "properties": {
+          "revision": {
+            "type": "object",
+            "required": ["id", "hash"],
+            "properties": {
+              "id": { "type": "string" },
+              "hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+            }
+          }
+        }
+      },
+      "description": "Reference(s) to approved architecture revision [P5.1]"
+    },
+    "adrs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^ADR-[0-9]{4}$" }
+        }
+      },
+      "description": "Applicable ADRs [P5.1, FW §17]"
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "revision"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^SP-[0-9]{4}$" },
+          "revision": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+        }
+      },
+      "description": "Dependent Spec references forming a DAG [P5.3]"
+    },
+    "dataImpact": {
+      "type": "string",
+      "description": "[P5.3]"
+    },
+    "interfaces": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "contracts": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "securityRequirements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "version"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^SEC-[0-9]{4}$" },
+          "version": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "scenarios": {
+      "type": "object",
+      "required": ["normal", "error", "abuse", "boundary", "recovery"],
+      "properties": {
+        "normal": { "type": "array", "items": { "type": "string" } },
+        "error": { "type": "array", "items": { "type": "string" } },
+        "abuse": { "type": "array", "items": { "type": "string" } },
+        "boundary": { "type": "array", "items": { "type": "string" } },
+        "recovery": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "acceptanceCriteria": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^AC-[0-9]{4}$" }
+    },
+    "testEvidenceRequirements": {
+      "type": "string"
+    },
+    "changeControl": {
+      "type": "string"
+    },
+    "revisionOf": {
+      "type": ["string", "null"],
+      "description": "Previous revision this supersedes [P3.5]"
+    },
+    "supersedes": {
+      "type": ["string", "null"]
+    }
+  },
+  "additionalProperties": false
+}

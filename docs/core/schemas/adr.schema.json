@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/adr.schema.json",
+  "title": "CHRONO ADR",
+  "description": "Schema for an Architecture Decision Record. Citations: [P4.5, P3.3]",
+  "type": "object",
+  "required": [
+    "id",
+    "title",
+    "status",
+    "context",
+    "decision",
+    "alternatives",
+    "consequences",
+    "authority"
+  ],
+  "properties": {
+    "id": { "type": "string", "pattern": "^ADR-[0-9]{4}$" },
+    "title": { "type": "string", "minLength": 1 },
+    "status": {
+      "type": "string",
+      "enum": ["proposed", "accepted", "rejected", "superseded", "deprecated"]
+    },
+    "context": { "type": "string" },
+    "decision": { "type": "string" },
+    "alternatives": { "type": "string" },
+    "consequences": { "type": "string" },
+    "affectedArtifacts": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "authority": { "type": "string" },
+    "approval": { "type": ["string", "null"], "description": "Approval reference when required [P4.7]" },
+    "securityImpact": { "type": "string" },
+    "supersededBy": { "type": ["string", "null"] },
+    "provenance": { "type": ["string", "null"] }
+  },
+  "additionalProperties": false
+}

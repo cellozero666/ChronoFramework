@@ -49,6 +49,7 @@ Findings MUST cite affected artifacts and evidence and MUST be persisted. An age
 - Execution Authorization requires valid module approval, satisfied dependencies, no blocker, current Harness, current RTKAttestation, and current SkillAttestation.
 - Verification requires current test/security evidence and implementation-security decision.
 - Completion requires Spekkio `PASS`, or separately recorded failures/waivers according to policy without representing them as pass.
+- Final v1 release additionally requires current Innovation Review evidence and `INNOVATION_PASS` under the [SDD Innovation Standard](../product/SDD-INNOVATION-STANDARD.md).
 
 ## 6. Validation loop
 

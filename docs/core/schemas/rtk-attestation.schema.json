@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/rtk-attestation.schema.json",
+  "title": "CHRONO RTK Attestation",
+  "description": "Schema for an RTKAttestation. Citations: [P6.5, P1.37, REF §13, DOM §3.27]\n\nProves the RTK binary is genuine Rust Token Killer from https://github.com/rtk-ai/rtk, with routing self-test passed.",
+  "type": "object",
+  "required": [
+    "id",
+    "binaryPath",
+    "binaryIdentity",
+    "version",
+    "provenance",
+    "routingTestPassed",
+    "gained",
+    "validUntil",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^RTK-[0-9]{4}$"
+    },
+    "binaryPath": {
+      "type": "string",
+      "description": "Path to the RTK binary [DOM §3.27]"
+    },
+    "binaryIdentity": {
+      "type": "string",
+      "description": "Identity string from rtk --version"
+    },
+    "version": {
+      "type": "string"
+    },
+    "provenance": {
+      "type": "string",
+      "enum": ["https://github.com/rtk-ai/rtk"],
+      "description": "Canonical and only accepted upstream [P6.5, REF §13]"
+    },
+    "integrationMode": {
+      "type": ["string", "null"]
+    },
+    "routingTestPassed": {
+      "type": "boolean",
+      "description": "Routing self-test result [P8.7]"
+    },
+    "routingTestLog": {
+      "type": ["string", "null"]
+    },
+    "gained": {
+      "type": "boolean",
+      "description": "rtk gain succeeded — proves not a collision package [P1.37, REF §123]"
+    },
+    "savingsEvidence": {
+      "type": ["object", "null"],
+      "description": "Token savings evidence (NOT billing savings) [REF §1192]"
+    },
+    "bypassEvents": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "validUntil": {
+      "type": "string",
+      "format": "date-time",
+      "description": "TTL expiry timestamp [P6.5]"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["current", "stale", "invalid"],
+      "description": "[P6.5, P7.3]"
+    }
+  },
+  "additionalProperties": false
+}

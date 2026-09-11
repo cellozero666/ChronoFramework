@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/schemas-index.json",
+  "title": "CHRONO Schema Index",
+  "description": "Index of all JSON schemas for CHRONO artifacts. Citations: [P5.7, P7.2]\n\nThe Core uses these schemas to validate artifact structure before acceptance. Schema validation failures produce VALIDATION_ERROR [INV §14.4].",
+  "type": "object",
+  "properties": {
+    "schemas": {
+      "type": "object",
+      "properties": {
+        "spec": { "$ref": "spec.schema.json" },
+        "harness": { "$ref": "harness.schema.json" },
+        "approval": { "$ref": "approval.schema.json" },
+        "waiver": { "$ref": "waiver.schema.json" },
+        "evidence": { "$ref": "evidence.schema.json" },
+        "blocker": { "$ref": "blocker.schema.json" },
+        "qa-report": { "$ref": "qa-report.schema.json" },
+        "security-profile": { "$ref": "security-profile.schema.json" },
+        "rtk-attestation": { "$ref": "rtk-attestation.schema.json" },
+        "skill-attestation": { "$ref": "skill-attestation.schema.json" },
+        "event": { "$ref": "event.schema.json" },
+        "requirement": { "$ref": "requirement.schema.json" },
+        "business-rule": { "$ref": "business-rule.schema.json" },
+        "adr": { "$ref": "adr.schema.json" }
+      },
+      "required": [
+        "spec", "harness", "approval", "waiver", "evidence",
+        "blocker", "qa-report", "security-profile", "rtk-attestation",
+        "skill-attestation", "event", "requirement", "business-rule", "adr"
+      ]
+    }
+  },
+  "required": ["schemas"]
+}

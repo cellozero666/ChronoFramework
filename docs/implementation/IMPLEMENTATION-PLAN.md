@@ -266,7 +266,11 @@ Required negative tests:
 
 Add recovery, atomicity, migrations, audit history, adversarial/compliance tests, RTK adoption/savings measurement, signed releases, checksums, SBOM, provenance, license/NOTICE validation, and user documentation. Publish the free Apache-2.0 framework through npm and GitHub Releases for macOS, Linux, and Windows. Package metadata MUST use `Apache-2.0`; source and binary distributions MUST include `LICENSE`, `NOTICE`, applicable third-party licenses, and attribution. The release MUST require no paid service or server dependency.
 
+Implement and verify the mandatory v1 capabilities from the [SDD Innovation Standard](../product/SDD-INNOVATION-STANDARD.md): explainable gates, deterministic dry run, drift/scoped invalidation, portable audit export, privacy-preserving local metrics, progressive output, bounded loops, and technology-agnostic conformance. Provide a stable rigor-profile and policy-pack boundary without expanding bundled post-v1 scope.
+
 Each adapter must pass identical lifecycle, security, RTK, restart, authorization, evidence, and correction-loop tests. Adapter-specific hooks translate runtime behavior; they never own CHRONO policy. Codex and Gemini remain later adapters.
+
+**Final innovation gate:** Gaspar's Innovation Review, Lucca's mandatory capability tests, Glenn's security/privacy review, and Spekkio's independent `INNOVATION_PASS` MUST all reference current evidence. Polyglot, non-web, deterministic replay, drift, audit-redaction, bounded-loop, and cross-runtime tests are release blocking.
 
 Do not build a dashboard, remote orchestrator, database server, custom LLM provider, distributed scheduler or plugin marketplace before evidence shows it is necessary.
 
@@ -285,6 +289,6 @@ Do not build a dashboard, remote orchestrator, database server, custom LLM provi
 
 ## Definition of implementation success
 
-CHRONO reaches final v1 when the global launcher and pinned local Core install cleanly, the complete lifecycle works through OpenCode, Claude Code, and Kiro, all conformance/security/upgrade/recovery/license tests pass, signed cross-platform packages include the required Apache-2.0 and third-party notices, and a fresh user can initialize and complete a fixture project without relying on conversation memory. The PO-selected model generates the implementation but owns no policy decision.
+CHRONO reaches final v1 when the global launcher and pinned local Core install cleanly, the complete lifecycle works through OpenCode, Claude Code, and Kiro, all conformance/security/innovation/upgrade/recovery/license tests pass, signed cross-platform packages include the required Apache-2.0 and third-party notices, and fresh polyglot/non-web fixtures complete without relying on conversation memory. The PO-selected model generates the implementation but owns no policy decision.
 
 No MVP is complete unless the PO has made both required security decisions from recorded evidence, the Core has proven that missing/stale security state, unresolved blockers, and unauthorized risk acceptance fail closed, OpenCode/Claude Code/Kiro agent execution demonstrably uses RTK without bypass, and every CHRONO agent demonstrably activates the pinned Karpathy Guidelines skill. MVP completion is only the gate into hardening; final v1 requires every Phase 7 exit condition above.

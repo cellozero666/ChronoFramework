@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/qa-report.schema.json",
+  "title": "CHRONO QA Report",
+  "description": "Schema for a QA Report from Spekkio. Citations: [P3.3, P9.4, FW §6]\n\nWAIVED is distinct from PASSED [FW §6].",
+  "type": "object",
+  "required": [
+    "id",
+    "verdict",
+    "reviewer",
+    "timestamp"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^QA-[0-9]{4}$"
+    },
+    "moduleId": {
+      "type": ["string", "null"],
+      "pattern": "^MOD-[0-9]{4}$"
+    },
+    "workPackageId": {
+      "type": ["string", "null"],
+      "pattern": "^WP-[0-9]{4}$"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["PASS", "FAILED", "WAIVED"],
+      "description": "[FW §6, P9.4]"
+    },
+    "reviewedEvidence": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^EVD-[0-9]{4}$" },
+      "default": []
+    },
+    "defectIds": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^DEF-[0-9]{4}$" },
+      "description": "When FAILED [P9.5]"
+    },
+    "waiverIds": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^WAIVER-[0-9]{4}$" },
+      "description": "When WAIVED [P2.8]"
+    },
+    "reviewer": {
+      "type": "string",
+      "enum": ["spekkio"],
+      "description": "Spekkio role identity [P3.3]"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

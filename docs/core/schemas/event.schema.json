@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/event.schema.json",
+  "title": "CHRONO Event",
+  "description": "Schema for an event in the event_log table. Citations: [FW §13, DOM §5]\n\nEvery event carries a monotonic sequence number, actor identity, timestamp, and optional state transition.",
+  "type": "object",
+  "required": [
+    "seq",
+    "event_type",
+    "entity_id",
+    "payload",
+    "actor",
+    "timestamp"
+  ],
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic sequence number"
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "ArtifactCreated",
+        "ArtifactRevised",
+        "StateTransition",
+        "ApprovalGranted",
+        "WaiverGranted",
+        "BlockerRaised",
+        "BlockerResolved",
+        "DefectRaised",
+        "DefectResolved",
+        "EvidenceRecorded",
+        "RtKAttested",
+        "SkillAttested",
+        "ModuleCompleted",
+        "ProjectInitialized",
+        "DENIED"
+      ]
+    },
+    "entity_id": {
+      "type": "string"
+    },
+    "payload": {
+      "type": "object",
+      "description": "Event-specific data (JSON)"
+    },
+    "actor": {
+      "type": "string",
+      "description": "Agent identity or 'PO' [DOM §2.2]"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC"
+    },
+    "prior_state": {
+      "type": ["string", "null"]
+    },
+    "new_state": {
+      "type": ["string", "null"]
+    },
+    "reasoning": {
+      "type": ["string", "null"]
+    }
+  },
+  "additionalProperties": false
+}

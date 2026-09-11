@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/requirement.schema.json",
+  "title": "CHRONO Requirement",
+  "description": "Schema for a Requirement artifact. Citations: [P3.3, FW §17]\n\nA Requirement is an approved need or quality obligation.",
+  "definitions": {
+    "requirement_ref": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^REQ-[0-9]{4}$" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "required": ["id", "type", "description", "status"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^REQ-[0-9]{4}$"
+    },
+    "type": {
+      "type": "string",
+      "enum": ["functional", "non-functional", "quality"]
+    },
+    "description": { "type": "string", "minLength": 1 },
+    "priority": { "type": ["string", "null"] },
+    "criticality": { "type": ["string", "null"] },
+    "source": { "type": "string" },
+    "status": {
+      "type": "string",
+      "description": "Must be 'approved' before Specs consume it [DOM §3.2]"
+    }
+  },
+  "additionalProperties": false
+}

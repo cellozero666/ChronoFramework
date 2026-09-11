@@ -12,4 +12,4 @@ Read these documents in order:
 8. [Roadmap and Execution](08-ROADMAP-EXECUTION-PROTOCOL.md)
 9. [Verification and Correction](09-VERIFICATION-CORRECTION-PROTOCOL.md)
 
-All nine are normative. Runtime adapters, prompts, skills, generated agent definitions, and model output remain subordinate to them.
+All nine are normative. They operate together with the normative [SDD Innovation Standard](../product/SDD-INNOVATION-STANDARD.md), which defines final product and technology-agnostic acceptance evidence. Runtime adapters, prompts, skills, generated agent definitions, and model output remain subordinate to these documents.

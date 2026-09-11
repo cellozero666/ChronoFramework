@@ -1396,6 +1396,8 @@ The first version should prioritize:
 19. Context budgeting and mandatory RTK installation, routing, and attestation
 20. Mandatory Karpathy Guidelines installation, conversion, activation, and attestation
 21. Runtime and model independence
+22. Explainable gates, deterministic dry run, drift detection, audit export, bounded loops, and privacy-preserving metrics
+23. Technology-agnostic conformance across polyglot, non-web, and required-runtime fixtures
 ```
 
 The first end-to-end milestone is:
@@ -1449,6 +1451,8 @@ The framework should not initially be judged by the number of agents, automation
 Its initial purpose is to prove that CHRONO can conduct software development in a way that is:
 
 > **understood, specified, approved, executable, traceable, context-aware, and verifiable.**
+
+The final v1 MUST additionally satisfy the normative [SDD Innovation Standard](../product/SDD-INNOVATION-STANDARD.md). Technology-agnostic and governance claims require black-box evidence; architectural intent alone is insufficient.
 
 The architectural boundary remains:
 

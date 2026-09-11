@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/harness.schema.json",
+  "title": "CHRONO Harness",
+  "description": "Schema for a Harness — minimal curated execution context for one executable Spec revision. Citations: [P6.1]\n\nA Harness is stale when any referenced artifact changes materially [P6.7].",
+  "type": "object",
+  "required": [
+    "specRevision",
+    "relevantRequirements",
+    "relevantBusinessRules",
+    "relevantConstraints",
+    "relevantAdrs",
+    "dependentSpecs",
+    "sourcePaths",
+    "conventions",
+    "acceptanceCriteria",
+    "definitionOfReady",
+    "definitionOfDone",
+    "assignedRoles",
+    "rtkAttestationReference",
+    "skillAttestationReference",
+    "revision"
+  ],
+  "properties": {
+    "specRevision": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "Exact Spec revision hash [P6.1]"
+    },
+    "relevantRequirements": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^REQ-[0-9]{4}$" }
+    },
+    "relevantBusinessRules": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^BR-[0-9]{4}$" }
+    },
+    "relevantConstraints": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^CON-[0-9]{4}$" }
+    },
+    "relevantAdrs": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^ADR-[0-9]{4}$" }
+    },
+    "dependentSpecs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "revision", "state"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^SP-[0-9]{4}$" },
+          "revision": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+          "state": { "type": "string", "enum": ["DRAFT", "REVIEW", "READY", "SUPERSEDED"] }
+        }
+      }
+    },
+    "architectureExcerpts": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "sourcePaths": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "revision"],
+        "properties": {
+          "path": { "type": "string" },
+          "revision": { "type": "string", "description": "Git commit hash" }
+        }
+      }
+    },
+    "conventions": {
+      "type": "string"
+    },
+    "acceptanceCriteria": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^AC-[0-9]{4}$" }
+    },
+    "definitionOfReady": {
+      "type": "string"
+    },
+    "definitionOfDone": {
+      "type": "string"
+    },
+    "assignedRoles": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["gaspar", "belthazar", "melchior", "prometheus", "luca", "glenn", "spekkio", "agent"]
+      }
+    },
+    "securityProfileReference": {
+      "type": "object",
+      "required": ["id", "version"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^SEC-[0-9]{4}$" },
+        "version": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "rtkAttestationReference": {
+      "type": "string",
+      "pattern": "^RTK-[0-9]{4}$",
+      "description": "Current RTKAttestation reference [P6.7]"
+    },
+    "skillAttestationReference": {
+      "type": "string",
+      "pattern": "^SKILL-[0-9]{4}$",
+      "description": "Current SkillAttestation reference [P6.7]"
+    },
+    "moduleApprovalContext": {
+      "type": "string"
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "Content hash of the Harness itself [P3.4]"
+    }
+  },
+  "additionalProperties": false
+}

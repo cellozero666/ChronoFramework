@@ -1632,6 +1632,10 @@ And additionally:
 > **A runtime adapter may change how CHRONO executes, but never what
 > CHRONO means.**
 
+> **Technology agnosticism is a tested Core boundary, not a marketing claim.**
+
+The final implementation MUST pass the explainability, dry-run, drift, audit-export, metrics/privacy, bounded-loop, polyglot, non-web, and cross-runtime requirements in the [SDD Innovation Standard](../product/SDD-INNOVATION-STANDARD.md). These capabilities belong to the Core or stable ports; adapters and project templates MUST NOT encode them as technology-specific exceptions.
+
 ------------------------------------------------------------------------
 
 ## 38. Definition of CHRONO
@@ -1647,6 +1651,8 @@ The intended framework can be summarized as:
 > AI agents working autonomously and in parallel under deterministic
 > gates, traceable authority, automated testing, security review and
 > independent verification.**
+
+Conformance additionally requires a current `INNOVATION_PASS`; without it, CHRONO MUST NOT claim final v1 compliance.
 
 The purpose is not autonomous code generation.
 

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/business-rule.schema.json",
+  "title": "CHRONO Business Rule",
+  "description": "Schema for a BusinessRule artifact. Citations: [P3.3, FW §17]",
+  "definitions": {
+    "ref": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^BR-[0-9]{4}$" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "required": ["id", "description", "status"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^BR-[0-9]{4}$"
+    },
+    "description": { "type": "string", "minLength": 1 },
+    "status": { "type": "string" }
+  },
+  "additionalProperties": false
+}

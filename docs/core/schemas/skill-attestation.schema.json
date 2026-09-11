@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chrono-framework.org/schemas/skill-attestation.schema.json",
+  "title": "CHRONO Skill Attestation",
+  "description": "Schema for a SkillAttestation. Citations: [P6.6, P1.41, REF §13, DOM §3.28]\n\nProves the Karpathy Guidelines skill from https://github.com/multica-ai/andrej-karpathy-skills is pinned, deterministic, licensed, discoverable, permitted, and activated.",
+  "type": "object",
+  "required": [
+    "id",
+    "upstream",
+    "pinnedCommit",
+    "sourceHash",
+    "generatedHashes",
+    "converterVersion",
+    "licenseStatus",
+    "discoveryResult",
+    "permissionResult",
+    "activationSmokeTestPassed",
+    "validUntil",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^SKILL-[0-9]{4}$"
+    },
+    "upstream": {
+      "type": "string",
+      "enum": ["https://github.com/multica-ai/andrej-karpathy-skills"],
+      "description": "Canonical and only accepted upstream [P6.6, REF §1196]"
+    },
+    "pinnedCommit": {
+      "type": "string",
+      "description": "Immutable reviewed commit hash [P1.41, REF §1196]"
+    },
+    "sourceHash": {
+      "type": "string",
+      "description": "Hash of skills/karpathy-guidelines/SKILL.md [DOM §3.28]"
+    },
+    "generatedHashes": {
+      "type": "object",
+      "description": "Per-runtime artifact hashes (Claude, OpenCode, Kiro) [REF §13, P8.6]"
+    },
+    "converterVersion": {
+      "type": "string"
+    },
+    "licenseStatus": {
+      "type": "string",
+      "description": "MIT license and attribution preserved [P6.6, REF §1196]"
+    },
+    "attribution": {
+      "type": ["string", "null"]
+    },
+    "runtimeIdentity": {
+      "type": ["string", "null"]
+    },
+    "agentIdentity": {
+      "type": ["string", "null"]
+    },
+    "discoveryResult": {
+      "type": "string",
+      "description": "Skill discoverable in runtime [P6.6]"
+    },
+    "permissionResult": {
+      "type": "string",
+      "description": "Skill permitted to activate [P6.6]"
+    },
+    "activationSmokeTestPassed": {
+      "type": "boolean",
+      "description": "Skill is active (not just discoverable) [P6.6, P8.6]"
+    },
+    "bypassEvents": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "validUntil": {
+      "type": "string",
+      "format": "date-time",
+      "description": "TTL expiry timestamp [P6.6]"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["current", "stale", "invalid"],
+      "description": "[P6.6, P7.3]"
+    }
+  },
+  "additionalProperties": false
+}
