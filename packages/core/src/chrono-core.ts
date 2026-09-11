@@ -20,6 +20,7 @@ import {
   type QaRepository,
   type HarnessRepository,
   type AgentSessionRecord,
+  type SkillAttestationDetail,
 } from "@chrono/persistence";
 import {
   validateTransition,
@@ -5198,5 +5199,18 @@ export class ChronoCore {
       id: latest.id,
       validUntil: latest.validUntil,
     };
+  }
+
+  /**
+   * Latest skill attestation with its provenance binding, for
+   * re-verification divergence checks (read-only) [CORE §11.1].
+   */
+  describeSkillAttestation(): SkillAttestationDetail | null {
+    return this.db.skillAttestations().latestFull();
+  }
+
+  /** PO-selected project runtime identifier, or null when unset (read-only). */
+  projectRuntime(): string | null {
+    return this.projects.findById("default").runtime;
   }
 }

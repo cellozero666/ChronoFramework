@@ -2049,6 +2049,15 @@ export class RtkRepository {
 /**
  * Repository for Karpathy Guidelines skill attestations [DOM §3.28, CORE §11].
  */
+export interface SkillAttestationDetail {
+  id: string;
+  upstream: string;
+  pinnedCommit: string;
+  sourceHash: string;
+  generatedHashes: string;
+  converterVersion: string;
+}
+
 export class SkillRepository {
   constructor(private readonly db: Database) {}
 
@@ -2091,6 +2100,35 @@ export class SkillRepository {
     return row === undefined
       ? null
       : { id: row.id, validUntil: row.valid_until, status: row.status, bypassEvents: JSON.parse(row.bypass_events) };
+  }
+
+  /**
+   * Latest attestation with its provenance binding, for divergence checks
+   * at re-verification time [CORE §11.1]: a stored row that no longer
+   * matches the pinned release must never be recorded over silently.
+   */
+  latestFull(): SkillAttestationDetail | null {
+    const row = this.db
+      .prepare("SELECT * FROM skill_attestation ORDER BY valid_until DESC, rowid DESC LIMIT 1")
+      .get() as {
+        id: string;
+        upstream: string;
+        pinned_commit: string;
+        source_hash: string;
+        generated_hashes: string;
+        converter_version: string;
+      } | undefined;
+
+    return row === undefined
+      ? null
+      : {
+        id: row.id,
+        upstream: row.upstream,
+        pinnedCommit: row.pinned_commit,
+        sourceHash: row.source_hash,
+        generatedHashes: row.generated_hashes,
+        converterVersion: row.converter_version,
+      };
   }
 }
 

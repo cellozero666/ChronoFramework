@@ -46,6 +46,7 @@ export {
   type QaReportRecord,
   type SecurityProfileRecord,
   type SessionAuthorizationRecord,
+  type SkillAttestationDetail,
   type WaiverRecord,
   type Database,
 } from "./repositories.js";

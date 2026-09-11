@@ -9,8 +9,11 @@
 import { Command } from "commander";
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { get } from "node:https";
+import { dirname, join } from "node:path";
 import { ChronoCore } from "@chrono/core";
-import { RTK_UPSTREAM, buildApprovalPayload, buildSessionAuthorizationPayload, buildWaiverPayload, computeRevisionHash, generateApprovalKeyPair, signApprovalPayload } from "@chrono/domain";
+import { RTK_UPSTREAM, SKILL_RELEASE, SKILL_RUNTIME_PATHS, buildApprovalPayload, buildSessionAuthorizationPayload, buildWaiverPayload, computeRevisionHash, convertSkillSource, generateApprovalKeyPair, parseSkillFrontmatter, signApprovalPayload, skillGeneratedHashes, skillVendorPath, verifySkillRelease, type SkillRuntime } from "@chrono/domain";
 import { CHRONO_VERSION } from "./version.js";
 import {
   MemoryKeyStore,
@@ -928,17 +931,75 @@ export function runRtkVerify(
 }
 
 /**
- * Skill re-verification. Fail-closed until pinned release metadata exists:
- * without an immutable pinned commit to compare against, provenance is
- * unverifiable, so nothing is recorded and dispatch stays denied. The
- * Core.recordSkillAttestation path remains fully tested; this command
- * becomes functional when release metadata lands (Slice 8).
+ * Skill verification against the PO-approved release pin (Slice 7,
+ * [CORE §11, PL Phase 4, FW §1222]): fetch the immutable commit, verify
+ * the byte-exact source hash, validate frontmatter, refuse on divergence
+ * from the latest stored attestation, emit vendor + runtime artifacts
+ * deterministically, prove discovery + activation at rest, and record the
+ * SkillAttestation through the Core. No LLM rewriting anywhere; the fetch
+ * is injectable so tests never touch the network.
  */
-export function runSkillVerify(
+export interface SkillVerifyOptions extends OutputOptions {
+  readonly as?: string | undefined;
+  readonly session?: { id: string; token: string } | undefined;
+  readonly ttlSeconds?: number | undefined;
+}
+
+export function defaultFetchSkillSource(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const request = get(
+      url,
+      { timeout: 30000 },
+      (response) => {
+        if (response.statusCode !== 200) {
+          response.resume();
+          reject(new Error(`Skill fetch failed: HTTP ${String(response.statusCode)} for ${url}`));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let size = 0;
+        response.on("data", (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > 1024 * 1024) {
+            request.destroy(new Error("Skill source exceeds the 1 MiB size cap"));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        response.on("end", () => {
+          resolve(Buffer.concat(chunks).toString("utf8"));
+        });
+        response.on("error", reject);
+      }
+    );
+    request.on("error", reject);
+    request.on("timeout", () => {
+      request.destroy(new Error("Skill fetch timed out after 30s"));
+    });
+  });
+}
+
+export async function runSkillVerify(
   projectPath: string,
-  options: OutputOptions = {}
-): CliOutput {
+  options: SkillVerifyOptions = {},
+  fetchSource: (url: string) => Promise<string> = defaultFetchSkillSource
+): Promise<CliOutput> {
   const asJson = options.json === true;
+  const fail = (exitCode: number, code: string, reason: string): CliOutput =>
+    asJson
+      ? { exitCode, stdout: JSON.stringify({ ok: false, error: { code, message: reason } }, null, 2), stderr: "" }
+      : { exitCode, stdout: "", stderr: `Error [${code}]: ${reason}` };
+  if (options.as === undefined || options.as.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "skill verify requires --as <gaspar|PO> matching the caller session");
+  }
+  if (options.session === undefined) {
+    return fail(2, "VALIDATION_ERROR", "skill verify requires --session-token");
+  }
+  const ttlSeconds = options.ttlSeconds ?? 86400;
+  if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
+    return fail(2, "VALIDATION_ERROR", "skill verify requires a positive --ttl");
+  }
+  const caller = { actor: options.as, session: options.session };
   let core: ChronoCore;
   try {
     core = new ChronoCore({ projectPath });
@@ -946,25 +1007,118 @@ export function runSkillVerify(
     return constructionFailure(e, asJson);
   }
   try {
-    const status = core.attestationCurrency("skill");
-    const reason =
-      `Karpathy Guidelines skill is ${status.state}: no pinned release metadata to verify provenance against; ` +
-      "recording is refused until release metadata lands";
-    if (asJson) {
-      return {
-        exitCode: 1,
-        stdout: JSON.stringify(
-          { ok: false, error: { code: "BLOCKED_PROCESS_SKILL", severity: "BLOCKER", message: reason } },
+    let fetched: string;
+    try {
+      fetched = await fetchSource(
+        `https://raw.githubusercontent.com/multica-ai/andrej-karpathy-skills/${SKILL_RELEASE.pinnedCommit}/${SKILL_RELEASE.sourcePath}`
+      );
+    } catch (e) {
+      return fail(1, "BLOCKED_PROCESS_SKILL", `skill source fetch failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    let canonical: string;
+    try {
+      canonical = verifySkillRelease(fetched);
+    } catch (e) {
+      return fail(1, skillErrorCode(e), skillErrorMessage(e));
+    }
+    const artifacts = convertSkillSource(canonical);
+    const generatedHashes = skillGeneratedHashes(artifacts);
+    const latest = core.describeSkillAttestation();
+    if (latest !== null) {
+      const diverged =
+        latest.pinnedCommit !== SKILL_RELEASE.pinnedCommit ||
+        latest.sourceHash !== SKILL_RELEASE.sourceHash ||
+        latest.generatedHashes !== generatedHashes ||
+        latest.converterVersion !== SKILL_RELEASE.converterVersion;
+      if (diverged) {
+        return fail(
+          1,
+          "SKILL_PROVENANCE_FAILURE",
+          "Stored skill attestation diverges from the pinned release: refusing to record over divergence"
+        );
+      }
+    }
+    const targets: Array<[SkillRuntime, string]> = [
+      ["claude", join(projectPath, SKILL_RUNTIME_PATHS.claude)],
+      ["opencode", join(projectPath, SKILL_RUNTIME_PATHS.opencode)],
+      ["kiro", join(projectPath, SKILL_RUNTIME_PATHS.kiro)],
+    ];
+    const vendorTarget = join(projectPath, skillVendorPath(SKILL_RELEASE.pinnedCommit));
+    try {
+      mkdirSync(dirname(vendorTarget), { recursive: true });
+      writeFileSync(vendorTarget, canonical, "utf8");
+      for (const [, target] of targets) {
+        mkdirSync(dirname(target), { recursive: true });
+      }
+      writeFileSync(targets[0]![1], artifacts.claude, "utf8");
+      writeFileSync(targets[1]![1], artifacts.opencode, "utf8");
+      writeFileSync(targets[2]![1], artifacts.kiro, "utf8");
+    } catch (e) {
+      return fail(1, "BLOCKED_PROCESS_SKILL", `skill artifact emission failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    // Discovery + activation at rest: every emitted file must read back
+    // byte-identical with the MIT license preserved. A corrupt or
+    // rewritten file fails here, before anything is recorded.
+    try {
+      const vendorBack = readFileSync(vendorTarget, "utf8");
+      if (vendorBack !== canonical) {
+        return fail(1, "SKILL_ACTIVATION_FAILURE", "vendor source failed round-trip verification");
+      }
+      for (const [runtime, target] of targets) {
+        const back = readFileSync(target, "utf8");
+        if (back !== artifacts[runtime]) {
+          return fail(1, "SKILL_ACTIVATION_FAILURE", `runtime artifact '${target}' failed round-trip verification`);
+        }
+        if (parseSkillFrontmatter(back).license !== SKILL_RELEASE.license) {
+          return fail(1, "SKILL_ACTIVATION_FAILURE", `runtime artifact '${target}' lost its MIT license`);
+        }
+      }
+    } catch (e) {
+      return fail(1, "SKILL_ACTIVATION_FAILURE", `skill discovery failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const recorded = core.recordSkillAttestation(caller, {
+      upstream: SKILL_RELEASE.upstream,
+      pinnedCommit: SKILL_RELEASE.pinnedCommit,
+      sourceHash: SKILL_RELEASE.sourceHash,
+      generatedHashes,
+      converterVersion: SKILL_RELEASE.converterVersion,
+      licenseStatus: SKILL_RELEASE.license,
+      attribution: "multica-ai/andrej-karpathy-skills (MIT)",
+      runtimeIdentity: core.projectRuntime(),
+      agentIdentity: "chrono-skill-verify",
+      discoveryResult: "found",
+      permissionResult: "granted",
+      activationTestPassed: true,
+      ttlSeconds,
+    });
+    if (!recorded.ok) {
+      return coreError(recorded.error, asJson);
+    }
+    const body = asJson
+      ? JSON.stringify(
+          { ok: true, id: recorded.value?.id, pinnedCommit: SKILL_RELEASE.pinnedCommit, sourceHash: SKILL_RELEASE.sourceHash },
           null,
           2
-        ),
-        stderr: "",
-      };
-    }
-    return { exitCode: 1, stdout: "", stderr: `Error [BLOCKED_PROCESS_SKILL] (BLOCKER): ${reason}` };
+        )
+      : `Skill verified (${SKILL_RELEASE.pinnedCommit}); attestation '${recorded.value?.id}'. Runtime artifacts emitted for claude, opencode, kiro.`;
+    return { exitCode: 0, stdout: body, stderr: "" };
   } finally {
     core.close();
   }
+}
+
+function skillErrorCode(e: unknown): string {
+  if (typeof e === "object" && e !== null && "code" in e && typeof e.code === "string") {
+    return e.code;
+  }
+  return "BLOCKED_PROCESS_SKILL";
+}
+
+function skillErrorMessage(e: unknown): string {
+  if (typeof e === "object" && e !== null && "message" in e && typeof e.message === "string") {
+    return e.message;
+  }
+  return String(e);
 }
 
 function rtkBlocked(reason: string, asJson: boolean): CliOutput {  if (asJson) {
@@ -1548,13 +1702,25 @@ export function createProgram(cwd: string): Command {
 
   skill
     .command("verify")
-    .description("Re-verify the pinned Karpathy Guidelines skill (fail-closed until release metadata lands)")
+    .description("Verify the pinned Karpathy Guidelines skill and record the attestation")
+    .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--ttl <seconds>", "attestation lifetime in seconds (default 86400)")
     .option("--json", "machine-readable JSON output")
-    .action((opts: CommandOpts) => {
+    .action(async (opts: CommandOpts) => {
       const projectPath = typeof opts.path === "string" ? opts.path : cwd;
-      emitProgramResult(program, runSkillVerify(projectPath, { json: opts.json === true }));
+      const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
+      const ttl = typeof opts.ttl === "string" ? Number(opts.ttl) : undefined;
+      emitProgramResult(
+        program,
+        await runSkillVerify(projectPath, {
+          ...(typeof opts.as === "string" ? { as: opts.as } : {}),
+          ...(token === null ? {} : { session: token }),
+          ...(ttl !== undefined && Number.isFinite(ttl) ? { ttlSeconds: ttl } : {}),
+          json: opts.json === true,
+        })
+      );
     });
 
   program

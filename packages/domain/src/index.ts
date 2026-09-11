@@ -134,6 +134,20 @@ export {
   type ParsedArtifactId,
 } from "./identity.js";
 
+// Release metadata: PO-approved external trust pins [FW §22, PL Phase 4]
+export {
+  SKILL_RELEASE,
+  SKILL_RUNTIME_PATHS,
+  convertSkillSource,
+  hashSkillSource,
+  parseSkillFrontmatter,
+  skillGeneratedHashes,
+  skillVendorPath,
+  verifySkillRelease,
+  type SkillFrontmatter,
+  type SkillRuntime,
+} from "./release.js";
+
 // Revision hashing
 export {
   canonicalize,
