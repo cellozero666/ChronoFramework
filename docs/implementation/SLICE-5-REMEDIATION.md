@@ -1,7 +1,9 @@
 # Slice 5 Remediation Gate
 
-**Status:** BLOCKING  
-**Scope:** domain, persistence, Core, CLI, packaging, and tests created through Slice 5  
+**Status:** COMPLETE
+**Completed:** 2026-09-11
+**Verified:** clean `npm ci` + lint + typecheck + build + 149/149 tests on Node v22.21.1 and v24.20.0; packed-tarball global `chrono` lifecycle; adversarial suites with no skips and no manual links.
+**Scope:** domain, persistence, Core, CLI, packaging, and tests created through Slice 5
 **Rule:** Do not start or claim completion of Slice 6 until every exit criterion below passes from a clean checkout.
 
 ## Purpose
@@ -50,6 +52,28 @@ ambiguous, record the conflict and request a Product Owner decision.
   unable to impersonate the PO.
 - Preserve separate architecture-security, module, implementation-security,
   waiver, and residual-risk decisions. Generic approval cannot substitute.
+
+### 3A. Agent identity and role authority
+
+- Use the canonical machine identifiers `gaspar`, `belthazar`, `melchior`,
+  `prometheus`, `lucca`, `glenn`, and `spekkio`. Reject `luca`, `agent`, unknown
+  roles, and case variants rather than silently normalizing them.
+- Model `AgentRole`, `ActorIdentity`, `HumanIdentity`, `AdapterIdentity`,
+  `RuntimeIdentity`, `SessionIdentity`, `ModelIdentity`, and `ToolIdentity` as
+  distinct concepts. A union with unrestricted `string` MUST NOT erase the
+  closed agent-role set.
+- Implement one deny-by-default, Core-owned authority/capability matrix derived
+  from the Authority Protocol and Framework Definition. Persist its policy
+  version with authorization evidence.
+- Bind an authorized dispatch to an authenticated adapter session and exactly
+  one assigned CHRONO role. Validate actor, role, assignment, scope, revision,
+  operation, and session freshness on every protected Core command.
+- Enforce role ownership for analysis/architecture, implementation, UX,
+  infrastructure, testing evidence, security evidence/blockers, and independent
+  verification. Spekkio independence and PO-only authority cannot be delegated.
+- Do not postpone this policy to Phase 5. Phase 4 implements and tests the
+  runtime-neutral mechanism; Phase 5 only maps it to real OpenCode, Claude Code,
+  and Kiro definitions and hooks.
 
 ### 4. Revision history, references, and audit immutability
 
@@ -103,6 +127,8 @@ Tests must prove rejection, not only successful paths:
 - forged, malformed, stale, non-interactive, wrong-authority, and wrong-scope
   approvals;
 - direct transition attempts that omit each required guard;
+- unknown roles, `luca`, generic `agent`, role spoofing, cross-role operations,
+  session replay, adapter/agent identity confusion, and PO impersonation;
 - update/delete attempts against append-only records;
 - resolution of current and historical exact revisions;
 - missing/orphan/stale references and cyclic dependencies;
@@ -133,11 +159,14 @@ This remediation is complete only when all of the following are evidenced:
    manually created workspace link.
 4. No public API can persist a gated state or valid approval while bypassing the
    same Core decision required by the CLI.
-5. Audit/revision tamper attempts fail, and historical exact revisions remain
+5. Every protected operation denies unknown, unassigned, wrong-role,
+   stale-session, and impersonated actors; all seven canonical roles have
+   positive and negative authority tests.
+6. Audit/revision tamper attempts fail, and historical exact revisions remain
    resolvable.
-6. Documentation, schemas, migrations, package metadata, and observed runtime
+7. Documentation, schemas, migrations, package metadata, and observed runtime
    behavior agree.
-7. The implementation report lists commands, exact results, files changed,
+8. The implementation report lists commands, exact results, files changed,
    unresolved PO decisions, and any remaining blocker. Do not report “complete”
    while a required capability is a stub, comment, mock-only proof, or future
    slice placeholder.

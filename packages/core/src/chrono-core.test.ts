@@ -8,7 +8,69 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SCHEMA_VERSION } from "@chrono/persistence";
+import {
+  buildApprovalPayload,
+  generateApprovalKeyPair,
+  signApprovalPayload,
+} from "@chrono/domain";
 import { ChronoCore } from "./chrono-core.js";
+
+/**
+ * Test PO identity: a fresh Ed25519 keypair per test, registered through
+ * the production trust-on-first-use path. Signatures are real; only the
+ * key custody differs from production (generated in-test instead of the
+ * OS keychain behind an interactive terminal).
+ */
+function setupTestPo(core: ChronoCore): {
+  sign: (fields: {
+    action: string;
+    scopeArtifactId: string;
+    scopeRevision: string;
+    authority: string;
+    rationale: string;
+  }) => { signature: string; timestamp: string };
+  restoreTty: () => void;
+} {
+  const pair = generateApprovalKeyPair();
+  const restoreTty = fakeInteractiveTerminal();
+  expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+  return {
+    sign: (fields) => {
+      const timestamp = "2026-06-01T00:00:00.000Z";
+      const payload = buildApprovalPayload({ ...fields, timestamp });
+      return { signature: signApprovalPayload(payload, pair.privateKeyPem), timestamp };
+    },
+    restoreTty,
+  };
+}
+
+
+/**
+ * TEST-ONLY terminal simulation. Production authority requires a live
+ * human terminal (Core TTY rule); CI processes have none, so tests that
+ * exercise the signed-authority path simulate terminal presence locally
+ * and restore the real descriptors afterwards. This helper never ships:
+ * it lives only in *.test.ts files. Refusal paths are tested WITHOUT it.
+ */
+function fakeInteractiveTerminal(): () => void {
+  const stdinDesc = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  const stdoutDesc = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  return () => {
+    if (stdinDesc !== undefined) {
+      Object.defineProperty(process.stdin, "isTTY", stdinDesc);
+    } else {
+      delete (process.stdin as { isTTY?: boolean }).isTTY;
+    }
+    if (stdoutDesc !== undefined) {
+      Object.defineProperty(process.stdout, "isTTY", stdoutDesc);
+    } else {
+      delete (process.stdout as { isTTY?: boolean }).isTTY;
+    }
+  };
+}
 
 describe("Persistence: state survives process restart", () => {
   let tempDir: string;
@@ -31,15 +93,15 @@ describe("Persistence: state survives process restart", () => {
     const initResult = core.init();
     expect(initResult.ok).toBe(true);
 
-    const specResult = core.registerSpec("SP-001", "DRAFT", {
-      id: "SP-001",
+    const specResult = core.registerSpec("SP-0001", "DRAFT", {
+      id: "SP-0001",
       title: "Test Spec",
       purpose: "Testing",
       revision: "sha256:abc",
       status: "DRAFT",
       inScope: [],
       dependencies: [],
-    });
+    }, "gaspar");
     expect(specResult.ok).toBe(true);
 
     // Close the first instance
@@ -57,8 +119,8 @@ describe("Persistence: state survives process restart", () => {
     core = new ChronoCore({ projectPath: tempDir });
     core.init();
 
-    const moduleResult = core.registerModule("MOD-001", "AWAITING_APPROVAL", {
-      id: "MOD-001",
+    const moduleResult = core.registerModule("MOD-0001", "DRAFT", {
+      id: "MOD-0001",
       name: "Test Module",
       purpose: "Testing",
       specs: [],
@@ -66,20 +128,27 @@ describe("Persistence: state survives process restart", () => {
       dependencies: [],
       risks: [],
       securityStatus: "pending",
-    });
+    }, "gaspar");
     expect(moduleResult.ok).toBe(true);
     const revision = moduleResult.value;
 
-    // Record an approval
-    const approvalResult = core.recordApproval({
-      id: "APR-001",
+    // Record a signed approval (real Ed25519 signature, test key).
+    const po = setupTestPo(core);
+    const { signature, timestamp } = po.sign({
       action: "module-approval",
-      scopeArtifactId: "MOD-001",
+      scopeArtifactId: "MOD-0001",
       scopeRevision: revision!,
       authority: "PO",
-      signer: "product-owner@example.com",
-      signature: "test-signature",
       rationale: "Approved for testing",
+    });
+    const approvalResult = core.recordApproval({
+      action: "module-approval",
+      scopeArtifactId: "MOD-0001",
+      scopeRevision: revision!,
+      authority: "PO",
+      rationale: "Approved for testing",
+      timestamp,
+      signature,
     });
     expect(approvalResult.ok).toBe(true);
 
@@ -90,16 +159,17 @@ describe("Persistence: state survives process restart", () => {
     // Approval should still be valid
     // Should fail because ModuleApproved transition hasn't happened
     // but it should find the approval
-    const hasApproval = core.hasValidApproval("MOD-001", revision!, "module-approval");
+    const hasApproval = core.hasValidApproval("MOD-0001", revision!, "module-approval");
     expect(hasApproval).toBe(true);
+    po.restoreTty();
   });
 
   it("blockers persist across restart and block execution", () => {
     core = new ChronoCore({ projectPath: tempDir });
     core.init();
 
-    core.registerModule("MOD-001", "DRAFT", {
-      id: "MOD-001",
+    const moduleResult = core.registerModule("MOD-0001", "DRAFT", {
+      id: "MOD-0001",
       name: "Test Module",
       purpose: "Testing",
       specs: [],
@@ -107,21 +177,29 @@ describe("Persistence: state survives process restart", () => {
       dependencies: [],
       risks: [],
       securityStatus: "pending",
-    });
+    }, "gaspar");
+    expect(moduleResult.ok).toBe(true);
 
-    const result = core.recordApproval({
-      id: "APR-001",
+    const po = setupTestPo(core);
+    const { signature, timestamp } = po.sign({
       action: "module-approval",
-      scopeArtifactId: "MOD-001",
-      scopeRevision: "sha256:draft",
+      scopeArtifactId: "MOD-0001",
+      scopeRevision: moduleResult.value!,
       authority: "PO",
-      signer: "po@example.com",
-      signature: "sig",
       rationale: "test",
+    });
+    const result = core.recordApproval({
+      action: "module-approval",
+      scopeArtifactId: "MOD-0001",
+      scopeRevision: moduleResult.value!,
+      authority: "PO",
+      rationale: "test",
+      timestamp,
+      signature,
     });
     expect(result.ok).toBe(true);
 
-    core.raiseBlocker("PRODUCT_BLOCKER", "gaspar", ["MOD-001"], "Missing requirement");
+    core.raiseBlocker("PRODUCT_BLOCKER", "gaspar", ["MOD-0001"], "Missing requirement");
 
     // Close and reopen
     core.close();
@@ -131,27 +209,30 @@ describe("Persistence: state survives process restart", () => {
     const status = core.status();
     expect(status.value?.activeBlockers).toBe(1);
     expect(status.value?.state).toBe("BLOCKED");
+    po.restoreTty();
   });
 
   it("event log persists in order and survives restart", () => {
     core = new ChronoCore({ projectPath: tempDir });
     core.init();
 
-    core.registerSpec("SP-001", "DRAFT", { id: "SP-001", title: "S1", status: "DRAFT" });
-    core.transitionState("SP-001", "SpecSubmittedForReview");
+    core.registerSpec("SP-0001", "DRAFT", { id: "SP-0001", title: "S1", purpose: "P", status: "DRAFT" }, "gaspar");
+    core.transitionState("SP-0001", "SpecSubmittedForReview", { actor: "gaspar" });
 
     core.close();
 
-    // Reopen and verify events
+    // Reopen and verify events through the read-only Core API.
     core = new ChronoCore({ projectPath: tempDir });
-    const events = core.getDatabase().prepare(
-      "SELECT event_type, entity_id FROM event_log ORDER BY seq"
-    ).all() as { event_type: string; entity_id: string }[];
+    const events = core.listEvents().map((e) => ({ eventType: e.eventType, entityId: e.entityId }));
 
-    expect(events).toContainEqual({ event_type: "ProjectInitialized", entity_id: "default" });
-    expect(events).toContainEqual({ event_type: "ArtifactCreated", entity_id: "SP-001" });
-    expect(events).toContainEqual({ event_type: "StateTransition", entity_id: "SP-001" });
+    expect(events).toContainEqual({ eventType: "ProjectInitialized", entityId: "default" });
+    expect(events).toContainEqual({ eventType: "ArtifactCreated", entityId: "SP-0001" });
+    expect(events).toContainEqual({ eventType: "StateTransition", entityId: "SP-0001" });
     expect(events.length).toBeGreaterThanOrEqual(3);
+
+    // Sequence numbers are monotonic.
+    const seqs = core.listEvents().map((e) => e.seq);
+    expect([...seqs].sort((a, b) => a - b)).toEqual(seqs);
   });
 });
 
@@ -173,24 +254,19 @@ describe("Persistence: SQLite schema", () => {
   it("schema version is recorded after migration", () => {
     core = new ChronoCore({ projectPath: tempDir });
 
-    const row = core.getDatabase().prepare(
-      "SELECT version, applied_at, migration_sql FROM schema_version ORDER BY version DESC LIMIT 1"
-    ).get() as { version: number; applied_at: string; migration_sql: string } | undefined;
-
-    expect(row).toBeDefined();
-    expect(row!.version).toBeGreaterThanOrEqual(1);
-    expect(row!.migration_sql.length).toBeGreaterThan(0);
+    // The Core migrates fully on construction; no raw handle is exposed.
+    expect(core.getSchemaVersion()).toBe(SCHEMA_VERSION);
   });
 
   it("event log is append-only and ordered", () => {
     core = new ChronoCore({ projectPath: tempDir });
     core.init();
-    core.registerSpec("SP-001", "DRAFT", { id: "SP-001" });
+    core.registerSpec("SP-0001", "DRAFT", { id: "SP-0001", title: "S1", purpose: "P" }, "gaspar");
 
-    const count1 = core.getDatabase().prepare("SELECT COUNT(*) as c FROM event_log").get() as { c: number };
-    core.registerSpec("SP-002", "DRAFT", { id: "SP-002" });
-    const count2 = core.getDatabase().prepare("SELECT COUNT(*) as c FROM event_log").get() as { c: number };
+    const count1 = core.listEvents().length;
+    core.registerSpec("SP-0002", "DRAFT", { id: "SP-0002", title: "S2", purpose: "P" }, "gaspar");
+    const count2 = core.listEvents().length;
 
-    expect(count2.c).toBe(count1.c + 1);
+    expect(count2).toBe(count1 + 1);
   });
 });

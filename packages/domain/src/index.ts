@@ -18,7 +18,16 @@ export {
 
 // State definitions
 export {
+  ADAPTER_SESSION_PATTERN,
   ENTITY_STATE_SETS,
+  isAdapterSession,
+  isAgentRole,
+  parseActorIdentity,
+  toRuntimeIdentity,
+  toSessionIdentity,
+  toToolIdentity,
+  type ActorKind,
+  type AdapterIdentity,
   type AdrState,
   type AgentRole,
   type ArchitectureState,
@@ -28,9 +37,16 @@ export {
   type DecisionState,
   type DefectState,
   type EntityType,
-  type ProjectState,
-  type SpecificationState,
+  type HumanIdentity,
+  type ModelIdentity,
   type ModuleState,
+  type ParsedActor,
+  type ProjectState,
+  type RuntimeIdentity,
+  type SessionIdentity,
+  type SystemIdentity,
+  type ToolIdentity,
+  type SpecificationState,
   type StateSet,
   type StateOf,
   type VerificationState,
@@ -60,14 +76,67 @@ export {
 export {
   isValidState,
   projectProjectState,
-  validateBlockerTransition,
   validateTransition,
   type ProjectProjectionInput,
 } from "./validator.js";
 
+// Authority/capability matrix [DOM §2.2, Remediation §3A]
+export {
+  AUTHORITY_POLICY_VERSION,
+  EVENT_ROLE_ALLOWLIST,
+  ROLE_CAPABILITIES,
+  isCapable,
+  mayEnactEvent,
+  type CapabilityHolder,
+  type CoreOperation,
+} from "./capabilities.js";
+
+// Registration rules (entry states, required fields)
+export {
+  BLOCKER_TYPES,
+  DEFECT_ROUTING,
+  ENTRY_STATES,
+  REQUIRED_ARTIFACT_FIELDS,
+  assertBlockerType,
+  assertRequiredFields,
+  assertValidInitialState,
+  type BlockerType,
+  type DefectClassification,
+  type RegistrableFamily,
+} from "./registration.js";
+
+// Human-authority cryptography [ADR-003, CORE §8]
+export {
+  APPROVAL_ACTIONS,
+  RTK_UPSTREAM,
+  SKILL_UPSTREAM,
+  buildApprovalPayload,
+  buildWaiverPayload,
+  generateApprovalKeyPair,
+  parseApprovalPublicKey,
+  signApprovalPayload,
+  verifyApprovalSignature,
+  type ApprovalAction,
+  type ApprovalKeyPair,
+  type ApprovalPayload,
+  type WaiverPayload,
+} from "./authority.js";
+
+// Artifact identity [CORE §3.1, INV §10.1]
+export {
+  ARTIFACT_ID_FAMILIES,
+  formatArtifactId,
+  isValidArtifactId,
+  parseArtifactId,
+  type ArtifactIdFamily,
+  type ParsedArtifactId,
+} from "./identity.js";
+
 // Revision hashing
 export {
+  canonicalize,
   computeRevisionHash,
+  isRevisionHash,
   isStaleReference,
   verifyRevisionHash,
 } from "./revision.js";

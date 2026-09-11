@@ -54,6 +54,31 @@ CR         ChangeRequest               Submitting agent
 
 Every artifact MUST carry a unique identifier within the project scope `[P3.2]`. Composite identity keys (e.g., `SP-002@revision`) MAY be used when revision binding is required `[P3.2]`.
 
+#### Canonical agent-role identity
+
+CHRONO defines exactly seven canonical agent-role identifiers:
+
+| Display name | Machine identifier | Authority domain |
+|---|---|---|
+| Gaspar | `gaspar` | analysis, architecture, specification, orchestration |
+| Belthazar | `belthazar` | implementation |
+| Melchior | `melchior` | user experience |
+| Prometheus | `prometheus` | infrastructure and operations |
+| Lucca | `lucca` | testing and behavioral evidence |
+| Glenn | `glenn` | security |
+| Spekkio | `spekkio` | independent verification |
+
+`PO` is a human authority identity, not an agent role. Adapter, runtime, model,
+session, tool, and human identities are separate concepts and MUST NOT be
+accepted as agent roles. Free-form strings, including `agent` and the misspelled
+`luca`, MUST NOT pass role validation. The Core MUST authenticate the actor,
+bind an authorized dispatch to one role and session, and enforce the role's
+allowed operations independently of prompts or adapter claims.
+
+The Core owns this role catalog and its authority checks. Runtime adapters may
+translate the canonical roles into runtime-specific agent definitions, but may
+not add authority, rename roles, or substitute their own authorization policy.
+
 ### 2.3 Revision identity
 
 Every authoritative artifact MUST have a revision identifier computed as a deterministic content hash of its canonical serialized form `[P3.5]`. The exact algorithm is specified in the Core Specification. The model requires:

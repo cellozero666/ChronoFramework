@@ -1,7 +1,7 @@
 # CHRONO Framework — Runtime Contract
 
 **Status:** Normative — Phase 3 deliverable
-**Source authority:** `docs/reference/FRAMEWORK-DEFINITION.md`, `docs/protocols/01-PROTOCOL-STACK.md`, `docs/protocols/04-AUTHORITY-DECISION-PROTOCOL.md`, `docs/protocols/06-AGENT-ORCHESTRATION-PROTOCOL.md`, `docs/protocols/08-ROADMAP-EXECUTION-PROTOCOL.md`, `docs/architecture/REFERENCE-ARCHITECTURE.md`, `docs/core/CORE-SPECIFICATION.md`
+**Source authority:** `docs/reference/FRAMEWORK-DEFINITION.md`, `docs/protocols/01-SYSTEM-ANALYSIS-PROTOCOL.md`, `docs/protocols/02-AUTHORITY-DECISION-PROTOCOL.md`, `docs/protocols/08-ROADMAP-EXECUTION-PROTOCOL.md`, `docs/architecture/REFERENCE-ARCHITECTURE.md`, `docs/core/CORE-SPECIFICATION.md`
 **Scope:** This document defines the contract between the deterministic Core and all runtime adapters (Claude Code, OpenCode, Kiro, and future runtimes). It specifies the command protocol, event schema, dispatch authorization flow, in-runtime hook interface, and conformance requirements. It contains no runtime-specific defaults or hardcodes.
 
 ---
@@ -25,12 +25,19 @@ Every interaction with the Core identifies the actor:
 | Belthazar | `belthazar` | Implementation agent |
 | Melchior | `melchior` | UX agent |
 | Prometheus | `prometheus` | Infra agent |
-| Lucca | `luca` | Testing agent |
+| Lucca | `lucca` | Testing agent |
 | Glenn | `glenn` | Security agent |
 | Spekkio | `spekkio` | Quality verifier |
 | Adapter | `<runtime>:<session_id>` | e.g., `claude-code:abc-123` |
 
 Identity is verified by the Core via the CLI environment, not by the agent prompt. No agent MAY claim to be the PO.
+
+The identity strings in this table are the canonical, case-sensitive machine
+identifiers. Human-facing output uses the display names in the first column.
+`luca` is not an alias for `lucca` and MUST be rejected. A generic `agent`
+identity is not a CHRONO role and MUST NOT satisfy a role or authority check.
+Adapter/session identity is distinct from agent role: an authenticated runtime
+session may act only under the single role assigned by an authorized dispatch.
 
 Reference: `[FW §194-255]`, `[DOM §2.2]`.
 

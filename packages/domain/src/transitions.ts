@@ -115,11 +115,17 @@ export const ARCHITECTURE_TRANSITIONS: readonly LegalTransition[] = [
 /**
  * Decision transitions [STATE §2.6]
  * [P2.5, P3.3]
+ *
+ * Reconciliation note [Remediation §6]: STATE §1.1 fixes the Decision state
+ * set to proposed | approved | rejected (no `superseded` state). A later
+ * decision replaces an earlier one through the `supersedes` reference
+ * recorded on the Decision (P2.5), not through a state transition. There is
+ * therefore no approved → superseded transition: supersession is a
+ * reference, and any such transition attempt is rejected as INVALID_STATE.
  */
 export const DECISION_TRANSITIONS: readonly LegalTransition[] = [
   { fromState: "proposed", toState: "approved", eventType: "DecisionApproved" },
   { fromState: "proposed", toState: "rejected", eventType: "DecisionRejected" },
-  { fromState: "approved", toState: "superseded", eventType: "DecisionSuperseded" },
 ];
 
 /**

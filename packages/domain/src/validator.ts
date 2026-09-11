@@ -89,24 +89,6 @@ export function validateTransition(
 }
 
 /**
- * Validate that a state transition preserves the "ANY → BLOCKED" invariant
- * for BlockerRaised events. [STATE §2.2]
- */
-export function validateBlockerTransition(
-  fromState: string,
-  toState: string,
-  eventType: string
-): void {
-  if (eventType === "BlockerRaised") {
-    if (toState !== "BLOCKED" && fromState !== "BLOCKED") {
-      // BlockerRaised can target any entity, causing BLOCKED state.
-      // If the entity doesn't have a BLOCKED state in its transition table,
-      // the general validateTransition call will catch it.
-    }
-  }
-}
-
-/**
  * Project state is a deterministic projection [STATE §3]
  * This function must be called by the Core after any state change.
  * The domain provides the projection algorithm; the Core provides the data.

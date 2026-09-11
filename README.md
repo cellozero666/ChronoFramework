@@ -149,9 +149,6 @@ That is one of its primary use cases. CHRONO preserves the creative speed of AI-
 
 The CHRONO implementation uses TypeScript and Node.js, but the projects it governs are not limited to that stack. Technology agnosticism is a required conformance property tested with polyglot and non-web fixtures.
 
-### Is CHRONO ready for production use?
-
-Yes. Published CHRONO releases have passed the documented security, adapter, recovery, installation, audit, packaging, and innovation gates with version-bound evidence. Use the latest stable npm package or GitHub Release and review its release notes, checksums, provenance, and SBOM before adoption.
 
 ## Build with CHRONO
 

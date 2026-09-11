@@ -84,6 +84,16 @@ block · resolve · verify · complete
 
 Expose it through the mandatory global `chrono` CLI. The global launcher discovers the project, reads its pinned local CHRONO version, and delegates to that local Core; missing or incompatible local Core MUST fail closed and MUST NOT be silently replaced by the global version. Add unit tests for domain rules and integration tests for persistence, invalid transitions, references, approvals and cyclic dependencies.
 
+Before Phase 4 can pass, implement the runtime-neutral agent identity and
+authority model in the Domain/Core. It MUST contain the canonical roles
+`gaspar`, `belthazar`, `melchior`, `prometheus`, `lucca`, `glenn`, and `spekkio`;
+separate role from human, adapter, runtime, model, session, and tool identity;
+bind dispatches to authenticated sessions; and enforce a deny-by-default
+role/capability matrix for transitions, decisions, blockers, evidence,
+verification, and completion. A free-form actor string or prompt assertion is
+never authorization. Phase 5 supplies runtime-specific agent definitions and
+hooks, but MUST consume this Core policy rather than create it.
+
 ### Approved state model
 
 ```text

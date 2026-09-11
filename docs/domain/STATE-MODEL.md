@@ -167,8 +167,17 @@ Event / Trigger                           Legal Transition
 Proposed by authority                      proposed
 Approved                                   proposed → approved
 Rejected                                   proposed → rejected
-Superseded by later decision               approved → superseded (via supersession reference)
+Superseded by later decision               (reference only — no state transition;
+                                            record `supersedes` on the new Decision)
 ```
+
+> `[P2.5, P3.3]` Conflicting active decisions block readiness `[P2.5]`.
+>
+> Reconciliation note (Slice 5 remediation §6): the §1.1 state set
+> (`proposed | approved | rejected`) contains no `superseded` state, so
+> supersession is recorded exclusively through the supersession reference
+> required by P2.5 — never through a state transition. No new lifecycle
+> is introduced.
 
 > `[P2.5, P3.3]` Conflicting active decisions block readiness `[P2.5]`.
 

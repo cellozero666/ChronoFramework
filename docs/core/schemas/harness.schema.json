@@ -87,7 +87,7 @@
       "type": "array",
       "items": {
         "type": "string",
-        "enum": ["gaspar", "belthazar", "melchior", "prometheus", "luca", "glenn", "spekkio", "agent"]
+        "enum": ["gaspar", "belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio"]
       }
     },
     "securityProfileReference": {

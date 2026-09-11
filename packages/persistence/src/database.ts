@@ -9,6 +9,24 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { SCHEMA_VERSION, MIGRATIONS } from "./schema.js";
+import {
+  ApprovalRepository,
+  ArtifactRepository,
+  BlockerRepository,
+  DefectRepository,
+  EvidenceRepository,
+  EventLogRepository,
+  GrantRepository,
+  HarnessRepository,
+  ProjectRepository,
+  QaRepository,
+  RtkRepository,
+  RuntimeConfigRepository,
+  SecurityProfileRepository,
+  SequenceRepository,
+  SkillRepository,
+  WaiverRepository,
+} from "./repositories.js";
 
 export interface DatabaseOptions {
   readonly path: string;
@@ -38,15 +56,25 @@ export class ChronoDatabase {
       readonly: this.isReadonly,
     });
 
-    // Enable WAL mode for concurrent reads and crash safety
-    this.db.pragma("journal_mode = WAL");
+    try {
+      // Enable WAL mode for concurrent reads and crash safety
+      this.db.pragma("journal_mode = WAL");
+    } catch (e) {
+      this.db.close();
+      throw e;
+    }
   }
 
-  /** Run pending schema migrations. [CORE §5.1] */
-  migrate(): MigrationResult[] {
+  /**
+   * Run pending schema migrations. [CORE §5.1]
+   *
+   * `targetVersion` caps the migration run. Production always migrates to
+   * SCHEMA_VERSION; tests use the cap to build an older schema and then
+   * prove the upgrade path.
+   */
+  migrate(targetVersion: number = SCHEMA_VERSION): MigrationResult[] {
     const results: MigrationResult[] = [];
     const currentVersion = this.getSchemaVersion();
-    const targetVersion = SCHEMA_VERSION;
 
     if (currentVersion >= targetVersion) {
       return results;
@@ -96,30 +124,89 @@ export class ChronoDatabase {
     }
   }
 
-  /** Raw SQL execution — used internally by repositories. */
-  exec(sql: string): void {
-    this.db.exec(sql);
+  /** Get current schema version (read-only). */
+  schemaVersion(): number {
+    return this.getSchemaVersion();
   }
 
-  /** Prepare a statement. */
-  prepare(sql: string): Database.Statement {
-    return this.db.prepare(sql);
-  }
-
-  /** Run a transaction. */
+  /** Run a transaction. No raw SQL crosses this boundary. */
   transaction<T>(fn: () => T): T {
     const tx = this.db.transaction(fn);
     return tx();
   }
 
+  /**
+   * Typed repository accessors. The raw better-sqlite3 handle never
+   * leaves this class: repositories are constructed internally and only
+   * their typed methods are reachable [Remediation §2].
+   */
+  projects(): ProjectRepository {
+    return new ProjectRepository(this.db);
+  }
+
+  artifacts(): ArtifactRepository {
+    return new ArtifactRepository(this.db);
+  }
+
+  events(): EventLogRepository {
+    return new EventLogRepository(this.db);
+  }
+
+  approvals(): ApprovalRepository {
+    return new ApprovalRepository(this.db);
+  }
+
+  blockers(): BlockerRepository {
+    return new BlockerRepository(this.db);
+  }
+
+  evidence(): EvidenceRepository {
+    return new EvidenceRepository(this.db);
+  }
+
+  grants(): GrantRepository {
+    return new GrantRepository(this.db);
+  }
+
+  sequences(): SequenceRepository {
+    return new SequenceRepository(this.db);
+  }
+
+  waivers(): WaiverRepository {
+    return new WaiverRepository(this.db);
+  }
+
+  defects(): DefectRepository {
+    return new DefectRepository(this.db);
+  }
+
+  qaReports(): QaRepository {
+    return new QaRepository(this.db);
+  }
+
+  harnesses(): HarnessRepository {
+    return new HarnessRepository(this.db);
+  }
+
+  runtimeConfig(): RuntimeConfigRepository {
+    return new RuntimeConfigRepository(this.db);
+  }
+
+  securityProfiles(): SecurityProfileRepository {
+    return new SecurityProfileRepository(this.db);
+  }
+
+  rtkAttestations(): RtkRepository {
+    return new RtkRepository(this.db);
+  }
+
+  skillAttestations(): SkillRepository {
+    return new SkillRepository(this.db);
+  }
+
   /** Close the database. */
   close(): void {
     this.db.close();
-  }
-
-  /** Get the underlying Database instance for repositories. */
-  getDb(): Database.Database {
-    return this.db;
   }
 
   /** Get the database path. */

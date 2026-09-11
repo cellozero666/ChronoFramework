@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runInit, runStatus, runValidate, createProgram } from "./index.js";
@@ -32,7 +32,7 @@ describe("CLI: init", () => {
     expect(runInit(tempDir).exitCode).toBe(0);
     const second = runInit(tempDir);
     expect(second.exitCode).toBe(1);
-    expect(second.stderr).toContain("DUPLICATE_IDENTITY");
+    expect(second.stderr).toContain("PROJECT_EXISTS");
   });
 
   it("emits parseable JSON with --json", () => {
@@ -131,6 +131,37 @@ describe("CLI: end-to-end init → status → validate", () => {
   });
 });
 
+describe("CLI: construction failures", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-cli-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("returns structured exit-2 failure when the store cannot be created", () => {
+    // A regular file where the project directory should be: mkdir fails.
+    const blocker = join(tempDir, "file");
+    writeFileSync(blocker, "not a directory");
+    const out = runStatus(join(blocker, "child"));
+    expect(out.exitCode).toBe(2);
+    expect(out.stderr).toContain("CORE_INIT_FAILURE");
+  });
+
+  it("emits JSON on construction failure with --json", () => {
+    const blocker = join(tempDir, "file");
+    writeFileSync(blocker, "not a directory");
+    const out = runValidate(join(blocker, "child"), { json: true });
+    expect(out.exitCode).toBe(2);
+    const parsed = JSON.parse(out.stdout) as { ok: boolean; error: { code: string } };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error.code).toBe("CORE_INIT_FAILURE");
+  });
+});
+
 describe("CLI: program wiring", () => {
   it("registers init, status, and validate commands", () => {
     const program = createProgram("/tmp");
@@ -138,5 +169,11 @@ describe("CLI: program wiring", () => {
     expect(names).toContain("init");
     expect(names).toContain("status");
     expect(names).toContain("validate");
+    expect(names).toContain("approve");
+    expect(names).toContain("waive");
+    expect(names).toContain("keys");
+    expect(names).toContain("gate");
+    expect(names).toContain("rtk");
+    expect(names).toContain("skill");
   });
 });

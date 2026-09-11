@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 6;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -243,5 +243,228 @@ export const MIGRATIONS: Record<number, string> = {
       value  TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+  `,
+  2: `
+    -- Collision-safe Core-assigned identifier sequences [CORE §3.1, Remediation §4]
+    -- One monotonic counter per identity family; allocation is a single
+    -- atomic UPSERT ... RETURNING statement (no wall-clock derivation).
+    CREATE TABLE id_sequence (
+      family TEXT PRIMARY KEY,
+      next   INTEGER NOT NULL CHECK (next >= 1)
+    );
+
+    -- Immutable artifact revision history [DOM §2.3, P3.5, Remediation §4]
+    -- Every revision ever persisted; resolving <ID>@<revision> reads here,
+    -- so a new revision never overwrites the row an old reference needs.
+    -- Rows are append-only (UPDATE/DELETE forbidden by trigger, migration 3).
+    CREATE TABLE artifact_revision (
+      id           TEXT NOT NULL,
+      revision     TEXT NOT NULL,
+      type         TEXT NOT NULL,
+      status       TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      content      TEXT NOT NULL,
+      created_at   TEXT NOT NULL,
+      PRIMARY KEY (id, revision)
+    );
+
+    CREATE INDEX idx_revision_id ON artifact_revision(id);
+
+    -- Re-entry target for BLOCKED artifacts [STATE §2.2, Remediation §4]
+    -- Records the pre-BLOCKED status so BlockerResolved returns to the
+    -- validated prior state instead of an arbitrary one.
+    ALTER TABLE blocker ADD COLUMN prior_state TEXT;
+  `,
+  3: `
+    -- Append-only and immutability triggers [DOM §5.2, P3.5, FW §13, Remediation §4]
+    -- Critical events, approvals, waivers, evidence, attestations, revision
+    -- history, and audit records are protected against UPDATE/DELETE through
+    -- every SQL path, including raw connections. Corrections and revocations
+    -- append new events/state instead of rewriting facts.
+
+    -- event_log: pure append-only
+    CREATE TRIGGER trg_event_log_no_update BEFORE UPDATE ON event_log
+    BEGIN
+      SELECT RAISE(ABORT, 'event_log is append-only: UPDATE forbidden');
+    END;
+    CREATE TRIGGER trg_event_log_no_delete BEFORE DELETE ON event_log
+    BEGIN
+      SELECT RAISE(ABORT, 'event_log is append-only: DELETE forbidden');
+    END;
+
+    -- artifact_revision: pure append-only revision history
+    CREATE TRIGGER trg_artifact_revision_no_update BEFORE UPDATE ON artifact_revision
+    BEGIN
+      SELECT RAISE(ABORT, 'artifact_revision is append-only: UPDATE forbidden');
+    END;
+    CREATE TRIGGER trg_artifact_revision_no_delete BEFORE DELETE ON artifact_revision
+    BEGIN
+      SELECT RAISE(ABORT, 'artifact_revision is append-only: DELETE forbidden');
+    END;
+
+    -- evidence: immutable proof records
+    CREATE TRIGGER trg_evidence_no_update BEFORE UPDATE ON evidence
+    BEGIN
+      SELECT RAISE(ABORT, 'evidence is immutable: UPDATE forbidden');
+    END;
+    CREATE TRIGGER trg_evidence_no_delete BEFORE DELETE ON evidence
+    BEGIN
+      SELECT RAISE(ABORT, 'evidence is immutable: DELETE forbidden');
+    END;
+
+    -- approval: immutable except the revocation flag 0 → 1, all other
+    -- columns frozen [CORE §8.2: revocation appends state, keeps history]
+    CREATE TRIGGER trg_approval_no_delete BEFORE DELETE ON approval
+    BEGIN
+      SELECT RAISE(ABORT, 'approval rows cannot be deleted: revoke instead');
+    END;
+    CREATE TRIGGER trg_approval_update_guard BEFORE UPDATE ON approval
+    WHEN NOT (
+      OLD.revoked = 0 AND NEW.revoked = 1
+      AND OLD.id IS NEW.id
+      AND OLD.action IS NEW.action
+      AND OLD.scope_artifact_id IS NEW.scope_artifact_id
+      AND OLD.scope_revision IS NEW.scope_revision
+      AND OLD.authority IS NEW.authority
+      AND OLD.signer IS NEW.signer
+      AND OLD.signature IS NEW.signature
+      AND OLD.rationale IS NEW.rationale
+      AND OLD.timestamp IS NEW.timestamp
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'approval rows are immutable except revocation (revoked 0 to 1)');
+    END;
+
+    -- waiver: immutable except status active → expired | invalidated [STATE §2.7]
+    CREATE TRIGGER trg_waiver_no_delete BEFORE DELETE ON waiver
+    BEGIN
+      SELECT RAISE(ABORT, 'waiver rows cannot be deleted');
+    END;
+    CREATE TRIGGER trg_waiver_update_guard BEFORE UPDATE ON waiver
+    WHEN NOT (
+      OLD.status = 'active'
+      AND (NEW.status = 'expired' OR NEW.status = 'invalidated')
+      AND OLD.id IS NEW.id
+      AND OLD.issue IS NEW.issue
+      AND OLD.scope_artifact_id IS NEW.scope_artifact_id
+      AND OLD.scope_revision IS NEW.scope_revision
+      AND OLD.rationale IS NEW.rationale
+      AND OLD.evidence_ref IS NEW.evidence_ref
+      AND OLD.accepting_authority IS NEW.accepting_authority
+      AND OLD.compensating_controls IS NEW.compensating_controls
+      AND OLD.follow_up_task_id IS NEW.follow_up_task_id
+      AND OLD.expiry_review_condition IS NEW.expiry_review_condition
+      AND OLD.timestamp IS NEW.timestamp
+      AND OLD.signature IS NEW.signature
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'waiver rows are immutable except status active to expired|invalidated');
+    END;
+
+    -- attestations: status lifecycle only, all identity columns frozen
+    CREATE TRIGGER trg_rtk_attestation_no_delete BEFORE DELETE ON rtk_attestation
+    BEGIN
+      SELECT RAISE(ABORT, 'rtk_attestation rows cannot be deleted');
+    END;
+    CREATE TRIGGER trg_rtk_attestation_update_guard BEFORE UPDATE ON rtk_attestation
+    WHEN NOT (
+      OLD.id IS NEW.id
+      AND OLD.binary_path IS NEW.binary_path
+      AND OLD.binary_identity IS NEW.binary_identity
+      AND OLD.version IS NEW.version
+      AND OLD.provenance IS NEW.provenance
+      AND OLD.integration_mode IS NEW.integration_mode
+      AND OLD.routing_test_passed IS NEW.routing_test_passed
+      AND OLD.routing_test_log IS NEW.routing_test_log
+      AND OLD.gained IS NEW.gained
+      AND OLD.savings_evidence IS NEW.savings_evidence
+      AND OLD.bypass_events IS NEW.bypass_events
+      AND OLD.valid_until IS NEW.valid_until
+      AND (
+        (OLD.status = 'current' AND (NEW.status = 'stale' OR NEW.status = 'invalid'))
+        OR (OLD.status = 'stale' AND NEW.status = 'invalid')
+      )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'rtk_attestation identity columns are immutable: re-attest with a new row');
+    END;
+    CREATE TRIGGER trg_skill_attestation_no_delete BEFORE DELETE ON skill_attestation
+    BEGIN
+      SELECT RAISE(ABORT, 'skill_attestation rows cannot be deleted');
+    END;
+    CREATE TRIGGER trg_skill_attestation_update_guard BEFORE UPDATE ON skill_attestation
+    WHEN NOT (
+      OLD.id IS NEW.id
+      AND OLD.upstream IS NEW.upstream
+      AND OLD.pinned_commit IS NEW.pinned_commit
+      AND OLD.source_hash IS NEW.source_hash
+      AND OLD.generated_hashes IS NEW.generated_hashes
+      AND OLD.converter_version IS NEW.converter_version
+      AND OLD.license_status IS NEW.license_status
+      AND OLD.attribution IS NEW.attribution
+      AND OLD.runtime_identity IS NEW.runtime_identity
+      AND OLD.agent_identity IS NEW.agent_identity
+      AND OLD.discovery_result IS NEW.discovery_result
+      AND OLD.permission_result IS NEW.permission_result
+      AND OLD.activation_test_passed IS NEW.activation_test_passed
+      AND OLD.bypass_events IS NEW.bypass_events
+      AND OLD.valid_until IS NEW.valid_until
+      AND (
+        (OLD.status = 'current' AND (NEW.status = 'stale' OR NEW.status = 'invalid'))
+        OR (OLD.status = 'stale' AND NEW.status = 'invalid')
+      )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'skill_attestation identity columns are immutable: re-attest with a new row');
+    END;
+  `,
+  4: `
+    -- QA revision binding [DOM §3.20, P9.3, Remediation §6]
+    -- A verdict proves a specific implementation revision; guards join the
+    -- verdict to the module/work-package revision it assessed.
+    ALTER TABLE qa_report ADD COLUMN module_revision TEXT;
+    ALTER TABLE qa_report ADD COLUMN work_package_revision TEXT;
+  `,
+  5: `
+    -- Canonical role rename luca → lucca [RUNTIME §2, Remediation §3A].
+    -- Explicit audited migration (never a silent substitution): every
+    -- stored producer/owner/reviewer value using the misspelled identity
+    -- is rewritten, and the rewrite is recorded in schema_version.
+    -- The evidence immutability triggers are dropped and recreated around
+    -- the rewrite inside this same atomic migration; outside it, no path
+    -- may UPDATE evidence rows.
+    DROP TRIGGER IF EXISTS trg_evidence_no_update;
+    DROP TRIGGER IF EXISTS trg_evidence_no_delete;
+    UPDATE evidence SET producer = 'lucca' WHERE producer = 'luca';
+    UPDATE defect SET owner = 'lucca' WHERE owner = 'luca';
+    UPDATE qa_report SET reviewer = 'lucca' WHERE reviewer = 'luca';
+    CREATE TRIGGER trg_evidence_no_update BEFORE UPDATE ON evidence
+    BEGIN
+      SELECT RAISE(ABORT, 'evidence is immutable: UPDATE forbidden');
+    END;
+    CREATE TRIGGER trg_evidence_no_delete BEFORE DELETE ON evidence
+    BEGIN
+      SELECT RAISE(ABORT, 'evidence is immutable: DELETE forbidden');
+    END;
+  `,
+  6: `
+    -- Dispatch grants: authorized dispatches bound to one session and one
+    -- assigned role [DOM §2.2, Remediation §3A]. Single-use, expiring,
+    -- scope-checked. Grants are consumed, never rewritten (consumed flag
+    -- moves 0 → 1 only).
+    CREATE TABLE execution_grant (
+      id               TEXT PRIMARY KEY,
+      module_id        TEXT NOT NULL,
+      work_package_id  TEXT,
+      module_revision  TEXT NOT NULL,
+      spec_revisions   TEXT NOT NULL DEFAULT '[]',
+      role             TEXT NOT NULL,
+      session          TEXT,
+      requested_by     TEXT NOT NULL,
+      issued_at        TEXT NOT NULL,
+      expires_at       TEXT NOT NULL,
+      consumed         INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX idx_grant_module ON execution_grant(module_id);
   `,
 };

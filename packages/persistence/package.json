@@ -1,7 +1,7 @@
 {
   "name": "@chrono/persistence",
   "version": "0.1.0",
-  "description": "CHRONO Framework \u2014 SQLite persistence layer for transactional operational state",
+  "description": "CHRONO Framework — SQLite persistence layer for transactional operational state",
   "license": "Apache-2.0",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -13,15 +13,19 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "!dist/**/*.test.js",
+    "!dist/**/*.test.d.ts",
+    "!dist/**/*.test.js.map",
+    "!dist/**/*.test.d.ts.map"
   ],
   "scripts": {
     "build": "tsc -b",
     "clean": "rimraf dist"
   },
   "dependencies": {
-    "@chrono/domain": "workspace:*",
-    "better-sqlite3": "^9.6.0"
+    "@chrono/domain": "^0.1.0",
+    "better-sqlite3": "^12.11.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

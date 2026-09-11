@@ -5,7 +5,6 @@ export default defineConfig({
   test: {
     include: ["packages/*/src/**/*.test.ts"],
     testEnvironment: "node",
-    passWithNoTests: true,
   },
   resolve: {
     alias: {
