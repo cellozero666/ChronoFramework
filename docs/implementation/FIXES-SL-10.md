@@ -10,11 +10,13 @@ remain open on real-runtime acceptance (see §4).
 
 **Method:** line-by-line review of the Slice 10 diff against
 `SLICE-10.md` §§1–11 and the normative chain; hermetic reproduction of
-every suspected defect before fixing; full suite (`30 files / 297
+every suspected defect before fixing; full suite (`30 files / 300
 tests`), lint, typecheck, build, and `git diff --check` after each fix;
 clean-export matrix on Node 22.21.1, 24.4.1, and 24.20.0 (×5
-consecutive); packed-tarball install with global-CLI, `npx`-form, and
-live-gate hook verification.
+consecutive on 24.20.0, ×3 on the final tree); packed-tarball install
+with global-CLI, `npx`-form, and live-gate hook verification. A second
+verification pass re-checked every item below against the final tree
+and added the findings in §5.
 
 ## 1. Execution failures found and fixed
 
@@ -61,19 +63,25 @@ denied the legitimate setup flow: proofs are submitted before any
 adapter is approved. Deeper analysis showed the check is security
 theater — adapter labels are self-asserted at `openSession`, so a
 label check cannot bear weight, while revoked adapters are already
-neutralized by the Slice 9 session-revocation cascade. Reverted;
-documented in code. The enforced boundary remains: valid session +
-approved proof target at submission, full re-validation at dispatch.
+neutralized by the Slice 9 session-revocation cascade. Reverted during
+this same pass (no trace remains in code or tests). The enforced
+boundary is: valid session at submission, full re-validation at
+dispatch.
 
 ### F7. Proof target required a registered adapter (ordering conflict)
 `recordRoutingProof` resolved the adapter row, but setup proves routing
 *before* the PO's adapter-approval decision (normative step order:
-RTK before adapters). Fix: record time validates id shape only, so
+RTK before adapters). Fix: record time validates id shape only
+(`^[a-z0-9][a-z0-9_-]*$`, same pattern as adapter registration), so
 evidence precedes approval — the approver reviews evidence, not
 promises. Dispatch-time checks (registered, active, entrypoint,
 attestation, binary hash, expiry) are unchanged and re-validated per
 dispatch; proofs for unknown, pending, or revoked adapters can never
-authorize execution.
+authorize execution. Covered by a dedicated test (record ok for a
+pending adapter, dispatch denies `RTK_ROUTING_FAILURE` naming the
+adapter and its real status — the denial message was itself sharpened
+in this pass, since it previously misreported unknown adapters as
+"no longer approved").
 
 ### F8. Template-escaping slip emitted unparseable plugin bytes
 A literal newline inside a double-quoted string of the generated
@@ -149,7 +157,7 @@ removed from all procedures.
   known runtimes; unknown adapter ids keep shared assets (never guessed).
 
 ## 3. Evidence after fixes
-- `npm run test:clean`: PASS — 30 files / 297 tests, exit 0, zero
+- `npm run test:clean`: PASS — 30 files / 300 tests, exit 0, zero
   failed/skipped/todo, zero unhandled errors, zero worker crashes
   (working tree and clean exports).
 - Clean-export matrix: Node 22.21.1 (ABI 127), 24.4.1 and 24.20.0
@@ -186,3 +194,29 @@ removed from all procedures.
    but experimental OpenCode namespace.
 6. Gain-dashboard statistics persist in RTK attestations as savings
    evidence — tool-generated counters, accepted residual.
+
+## 5. Update roadmap (filled)
+
+Second verification pass (this turn) re-checked every §1 item against
+the final tree. Status legend: DONE (verified in tree + tests),
+OPEN (blocked on external authorization or runtime), FUTURE
+(enhancement, not a defect).
+
+| ID | Item | Status | Evidence / notes |
+|---|---|---|---|
+| V1 | Sync stale `recordRoutingProof` docstring with shape-only record semantics | DONE | docstring rewritten; dispatch guarantees unchanged |
+| V2 | Correct `rtk prove --adapter` help text (registration no longer required) | DONE | `index.ts` message updated |
+| V3 | Routing denial names the adapter and its real status | DONE | `requireCurrentRoutingProof` distinguishes unknown/pending/revoked; test asserts `pending-ad` |
+| V4 | Pre-registration dispatch-denial test | DONE | `authorization.test.ts`: record ok for pending adapter, dispatch denies `RTK_ROUTING_FAILURE` |
+| V5 | Shared skill-fixture hash test | DONE | `init-flow.test.ts` pins `FIXTURE_SKILL_MD` to the release hash |
+| V6 | Multi-runtime init/entry coverage (opencode + claude-code) | DONE | `init-flow.test.ts`: two adapters active, per-adapter proofs, cross-adapter redeem; `project.runtime` stays null |
+| V7 | Three-Node matrix on the final tree | DONE | 22.21.1, 24.4.1, 24.20.0 (×3 consecutive) clean exports: 30/300, lint/typecheck/build exit 0 |
+| V8 | F6/F7 narrative corrected in this file | DONE | this section |
+| U1 | Live real-runtime acceptance (all three runtimes, paid models, provider login) | OPEN — PO authorization required | hermetic assets + enforcement tests pass; exit criteria 4 and 9 stay open |
+| U2 | Kiro runtime conformance | OPEN — Kiro binary absent on this host | hook logic proven; acceptance procedure in `SLICE-9-REPORT.md` §8 |
+| U3 | Tighter proof command (adapter-interception routing vs `gain` identity) | FUTURE | proof format already binds arbitrary commands; no format change needed |
+| U4 | Kiro SessionStart stdout-injection verification | FUTURE — needs Kiro runtime | hook degrades loudly by design; context injection there is not claimed |
+| U5 | Windows CI leg (paths, line endings, keychain absence) | FUTURE | contract-only coverage on darwin host |
+| U6 | OpenCode `experimental.chat.system.transform` namespace tracking | FUTURE | upstream rename would silently drop injection; enforcement never depends on it |
+| U7 | Single-command broker rotation UX (currently revoke + issue) | FUTURE | single-active invariant already enforced; rotation is two audited steps |
+| U8 | Attestation `savingsEvidence` redaction review | ACCEPTED | tool-generated counters only; re-review if RTK output format changes |
