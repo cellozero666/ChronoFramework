@@ -2119,8 +2119,12 @@ export function runAdapterRevoke(
       return coreError(result.error, asJson);
     }
     const body = asJson
-      ? JSON.stringify({ ok: true, id: options.id, status: "revoked" }, null, 2)
-      : `Adapter '${options.id}' revoked.`;
+      ? JSON.stringify(
+          { ok: true, id: options.id, status: "revoked", revokedSessions: result.value?.revokedSessions ?? 0 },
+          null,
+          2
+        )
+      : `Adapter '${options.id}' revoked (sessions revoked: ${String(result.value?.revokedSessions ?? 0)}).`;
     return { exitCode: 0, stdout: body, stderr: "" };
   } finally {
     core.close();

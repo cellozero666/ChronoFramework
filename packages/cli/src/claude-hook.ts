@@ -70,19 +70,24 @@ export function mergeClaudeSettings(existing: string | null): { merged: string; 
   if (!Array.isArray(pre)) {
     throw new Error("Existing .claude/settings.json 'hooks.PreToolUse' is not an array: refusing to overwrite user configuration");
   }
-  for (const group of pre) {
-    if (typeof group !== "object" || group === null) {
-      continue;
+  // Recursive scan: the managed command may hide inside a group with
+  // extra nesting or unknown keys. Finding it anywhere means already
+  // installed — appending again would duplicate enforcement.
+  const containsCommand = (node: unknown): boolean => {
+    if (typeof node !== "object" || node === null) {
+      return false;
     }
-    const inner = (group as Record<string, unknown>)["hooks"];
-    if (!Array.isArray(inner)) {
-      continue;
+    if (Array.isArray(node)) {
+      return node.some(containsCommand);
     }
-    for (const hook of inner) {
-      if (typeof hook === "object" && hook !== null && (hook as Record<string, unknown>)["command"] === command) {
-        return { merged: existing, changed: false };
-      }
+    const record = node as Record<string, unknown>;
+    if (record["command"] === command) {
+      return true;
     }
+    return Object.values(record).some(containsCommand);
+  };
+  if (containsCommand(pre)) {
+    return { merged: existing, changed: false };
   }
   return {
     merged: JSON.stringify({ ...doc, hooks: { ...table, PreToolUse: [...pre, entry] } }, null, 2),

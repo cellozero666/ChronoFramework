@@ -1910,6 +1910,19 @@ export class SessionRepository {
     return this.findById(id);
   }
 
+  /**
+   * Revoke every live session bound to an adapter. Used as a cascade when
+   * the adapter itself is revoked: a revoked adapter's sessions must not
+   * survive to submit proofs, record evidence, or delegate new sessions.
+   * Returns the number of sessions revoked (0 when none were live).
+   */
+  revokeByAdapter(adapter: string): number {
+    const result = this.db
+      .prepare("UPDATE agent_session SET revoked = 1 WHERE adapter = ? AND revoked = 0")
+      .run(adapter);
+    return Number(result.changes);
+  }
+
   private mapSessionRow(row: AgentSessionRow): AgentSessionRecord {
     return {
       id: row.id as string,

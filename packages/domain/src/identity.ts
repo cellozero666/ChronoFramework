@@ -6,8 +6,10 @@
  * sequence assigned by the Core. Sequences are allocated from a persisted
  * counter, never derived from wall-clock time (collision-prone).
  * `GRANT` covers operational dispatch grants (Core-owned locks, not
- * reviewable artifacts); the protocol family list is non-exhaustive
- * ("such as", P3.7). No runtime-specific concepts [FW §22].
+ * reviewable artifacts); `RTE` covers routing-proof evidence rows and
+ * `SES` covers authenticated adapter sessions (both Core-owned
+ * operational records, same precedent); the protocol family list is
+ * non-exhaustive ("such as", P3.7). No runtime-specific concepts [FW §22].
  */
 
 import { ChronoError, ErrorCode, Severity } from "./errors.js";
@@ -35,12 +37,14 @@ export const ARTIFACT_ID_FAMILIES = [
   "OPEN",
   "RTK",
   "SKILL",
+  "RTE",
+  "SES",
   "GRANT",
 ] as const;
 
 export type ArtifactIdFamily = (typeof ARTIFACT_ID_FAMILIES)[number];
 
-const ID_PATTERN = /^(REQ|BR|CON|DEC|ADR|SP|AC|MOD|WP|TASK|APR|BLK|DEF|EVD|QA|SEC|WAIVER|CR|OPEN|RTK|SKILL|GRANT)-(\d{4,})$/;
+const ID_PATTERN = /^(REQ|BR|CON|DEC|ADR|SP|AC|MOD|WP|TASK|APR|BLK|DEF|EVD|QA|SEC|WAIVER|CR|OPEN|RTK|SKILL|RTE|SES|GRANT)-(\d{4,})$/;
 
 export interface ParsedArtifactId {
   readonly family: ArtifactIdFamily;

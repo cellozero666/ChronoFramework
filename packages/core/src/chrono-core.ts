@@ -2082,25 +2082,35 @@ export class ChronoCore {
   }
 
   /** Revoke an adapter registration (terminal; PO only). Revocation is audited. */
-  revokeAdapter(id: string, auth: CallerAuth): CoreResult<void> {
+  revokeAdapter(id: string, auth: CallerAuth): CoreResult<{ revokedSessions: number }> {
     try {
       const caller = this.resolveCaller(auth, "revoke adapter");
       this.requireCapability("adapter.revoke", caller);
       const current = this.db.adapters().findById(id);
       if (current.status === "revoked") {
-        return { ok: true, value: undefined };
+        return { ok: true, value: { revokedSessions: 0 } };
       }
-      this.db.adapters().revoke(id);
-      this.events.append({
-        eventType: "StateTransition",
-        entityId: id,
-        payload: { entityType: "ADAPTER", eventType: "AdapterRevoked" },
-        actor: caller.auditActor,
-        priorState: current.status,
-        newState: "revoked",
-        reasoning: "Adapter revoked",
+      // Revocation cascades: live sessions bound to this adapter die with
+      // it, atomically. Otherwise a revoked adapter's sessions would
+      // survive to submit routing proofs, record evidence, or delegate new
+      // sessions through a stale parent. Grants are burned lazily at use;
+      // sessions cannot be lazy because every protected operation trusts a
+      // validated session.
+      let revokedSessions = 0;
+      this.db.transaction(() => {
+        this.db.adapters().revoke(id);
+        revokedSessions = this.db.sessions().revokeByAdapter(id);
+        this.events.append({
+          eventType: "StateTransition",
+          entityId: id,
+          payload: { entityType: "ADAPTER", eventType: "AdapterRevoked", revokedSessions },
+          actor: caller.auditActor,
+          priorState: current.status,
+          newState: "revoked",
+          reasoning: "Adapter revoked with live-session cascade",
+        });
       });
-      return { ok: true, value: undefined };
+      return { ok: true, value: { revokedSessions } };
     } catch (e) {
       return this.handleError(e);
     }
@@ -2209,6 +2219,26 @@ export class ChronoCore {
     }
     this.assertExecutableEntrypoint(adapter.entrypoint, id);
     return adapter;
+  }
+
+  /**
+   * Approval check without entrypoint liveness: for submitter-side policy
+   * ("an approved adapter session may submit") the entrypoint of the
+   * submitter's own adapter is irrelevant — only its approval state
+   * matters. Unknown ids deny via findById; non-active states deny here.
+   */
+  private requireApprovedAdapter(id: string, operation: string): void {
+    const adapter = this.db.adapters().findById(id);
+    if (adapter.status !== "active") {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Adapter '${id}' is ${adapter.status}: ${operation} requires a session of an approved adapter`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Register and approve the adapter before submitting through its sessions",
+      });
+    }
   }
 
   /**
@@ -4237,6 +4267,11 @@ export class ChronoCore {
     try {
       const caller = this.resolveCaller(auth, "record routing proof");
       const session = caller.session;
+      // Slice 9 §9.3: only an approved adapter session may submit a proof.
+      // The proof's adapter is checked below; the submitter's own adapter
+      // must independently be approved, so sessions of revoked or never
+      // registered adapters cannot mint proofs for other adapters.
+      this.requireApprovedAdapter(session.adapter, "routing-proof submission");
       const adapter = this.getAdapterForDispatch(input.adapterId);
       const attestation = this.db.rtkAttestations().latest();
       const attestationState = this.attestationState(attestation, Date.parse(this.now()));

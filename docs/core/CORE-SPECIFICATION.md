@@ -65,6 +65,9 @@ CR-<seq>         e.g., CR-001
 OPEN-<seq>       e.g., OPEN-001
 RTK-<seq>        e.g., RTK-001
 SKILL-<seq>      e.g., SKILL-001
+RTE-<seq>        e.g., RTE-001 (operational: routing-proof evidence rows)
+SES-<seq>        e.g., SES-001 (operational: authenticated adapter sessions)
+GRANT-<seq>      e.g., GRANT-001 (operational: dispatch grants)
 ```
 
 `<seq>` is a zero-padded 4-digit decimal sequence, assigned by the Core on creation.

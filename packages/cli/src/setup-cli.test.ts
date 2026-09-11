@@ -512,6 +512,20 @@ function enrollTestPo(
     expect(readFileSync(settingsPath, "utf8")).toBe("{not json");
   });
 
+  it("does not duplicate the hook when nested inside unknown structure", async () => {
+    const settingsPath = join(tempDir, CLAUDE_SETTINGS_RELATIVE_PATH);
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    const nested = {
+      hooks: { PreToolUse: [{ matcher: "*", wrapper: { hooks: [{ type: "command", command: "node .chrono/hooks/chrono-claude-gate.js" }] } }] },
+    };
+    writeFileSync(settingsPath, JSON.stringify(nested, null, 2), "utf8");
+    expect(runSetup(tempDir, { adapter: "fixture", rtkBinary, json: true }).exitCode).toBe(0);
+    const merged = JSON.parse(readFileSync(settingsPath, "utf8")) as {
+      hooks: { PreToolUse: unknown[] };
+    };
+    expect(merged.hooks.PreToolUse).toHaveLength(1);
+  });
+
   it("fails closed on every missing proof", async () => {
     expect(runSetup(tempDir, { adapter: "ghost", rtkBinary, json: true }).exitCode).toBe(1);
     const badRtk = runSetup(tempDir, { adapter: "fixture", rtkBinary: join(tempDir, "missing.sh"), json: true });

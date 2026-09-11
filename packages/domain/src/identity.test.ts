@@ -23,6 +23,17 @@ describe("Artifact identity format [CORE §3.1]", () => {
     expect(parseArtifactId("MOD-0012")).toEqual({ family: "MOD", seq: 12 });
   });
 
+  it("accepts Core-minted operational families (routing proofs, sessions, grants)", () => {
+    // The Core allocates RTE (routing proofs), SES (adapter sessions),
+    // and GRANT (dispatch grants) outside the reviewable-artifact tables;
+    // the validator must recognize what the Core itself mints [CORE §3.1].
+    expect(isValidArtifactId("RTE-0001")).toBe(true);
+    expect(isValidArtifactId("SES-0001")).toBe(true);
+    expect(isValidArtifactId("GRANT-0001")).toBe(true);
+    expect(parseArtifactId("RTE-0007")).toEqual({ family: "RTE", seq: 7 });
+    expect(parseArtifactId("SES-0042")).toEqual({ family: "SES", seq: 42 });
+  });
+
   it("rejects malformed identifiers", () => {
     // Widened sequences stay valid: format conformance is syntactic;
     // collision safety comes from Core allocation (SequenceRepository),
