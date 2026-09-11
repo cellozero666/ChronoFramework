@@ -18,8 +18,10 @@ correction round. No Slice 10 functionality was implemented.
 | `249b15e` | Slice 9 correction: deterministic teardown lifecycle + clean-test gate |
 | `01aa2e1` | Slice 9 correction: eslint Node globals for scripts/ gates |
 | `6386c75` | Slice 9 correction: better-sqlite3 12.11.1 → 13.0.3 (N-API teardown fix) |
+| `1e34d65` | Slice 9 correction: final report with root cause, fix, and matrix evidence |
+| `6b6a205` | Slice 9 bug review: revocation cascade, proof-submitter binding, identity families |
 
-48 files changed, 4686 insertions(+), 701 deletions(-) (`git diff
+51 files changed, 5041 insertions(+), 719 deletions(-) (`git diff
 --stat f21c313..HEAD` — the lockfile churn from dropping
 `prebuild-install` dominates the deletion count). Full name list:
 
@@ -222,9 +224,9 @@ prebuild removes ABI coupling structurally.
 
 | Env | Executable / ABI / npm | npm ci | test:clean (files/tests) | lint | typecheck | build |
 |---|---|---|---|---|---|---|
-| Node 22.21.1 (`/tmp/f22`) | ServBay `…/22/22.21.1/bin/node`, ABI 127, npm 11.18.0 | 0 | PASS — 25 files, 242 tests, exit 0, 0 unhandled, 0 crashes, 0 skips | 0 | 0 | 0 |
-| Node 24.4.1 (`/tmp/f2441`) | Homebrew `/opt/homebrew/Cellar/node/24.4.1/bin/node`, ABI 137, npm 11.4.2 | 0 | PASS — 25 files, 242 tests, exit 0, 0 unhandled, 0 crashes, 0 skips | 0 | 0 | 0 |
-| Node 24.20.0 (`/tmp/f2420`) | portable `node-v24.20.0-darwin-arm64/bin/node`, ABI 137, npm 11.19.0 | 0 | PASS ×5 consecutive — 25 files, 242 tests, exit 0, 0 unhandled, 0 crashes, 0 skips | 0 | 0 | 0 |
+| Node 22.21.1 (`/tmp/g22`) | ServBay `…/22/22.21.1/bin/node`, ABI 127, npm 11.18.0 | 0 | PASS — 25 files, 246 tests, exit 0, 0 unhandled, 0 crashes, 0 skips | 0 | 0 | 0 |
+| Node 24.4.1 (`/tmp/g2441`) | Homebrew `/opt/homebrew/Cellar/node/24.4.1/bin/node`, ABI 137, npm 11.4.2 | 0 | PASS — 25 files, 246 tests, exit 0, 0 unhandled, 0 crashes, 0 skips | 0 | 0 | 0 |
+| Node 24.20.0 (`/tmp/g2420`) | portable `node-v24.20.0-darwin-arm64/bin/node`, ABI 137, npm 11.19.0 | 0 | PASS ×5 consecutive — 25 files, 246 tests, exit 0, 0 unhandled, 0 crashes, 0 skips | 0 | 0 | 0 |
 
 8 further consecutive PASS runs on 24.20.0 were recorded in the
 pre-commit trial tree (identical code and dependency versions): **13
@@ -232,9 +234,11 @@ consecutive clean 24.20.0 runs total**, plus repeated full-suite,
 single-file, and `--no-isolate` runs during diagnosis — zero markers in
 every run.
 
-Baseline is unchanged at 25 files / 242 tests (the correction round
-adds guards and a dependency upgrade, no test-count change). Source-repo
-`git diff --check`: clean (exit 0).
+Baseline is at 25 files / 246 tests (242 at the correction round plus 4
+from the pre-review bug sweep: unapproved-submitter denial, revocation
+cascade, nested-duplicate merge, operational identity families).
+`test:clean` enforces the floor (now 246) and fails on any Vitest
+`Errors` section. Source-repo `git diff --check`: clean (exit 0).
 
 ## 6. Packed-package / global CLI evidence (from the Node 24.20.0 export)
 
@@ -298,8 +302,51 @@ stays open until that procedure passes.
   paths, or `.skip`/`.todo`/`.only` markers (gate-enforced).
 - Session tokens never enter child environments (`runDispatch`); secrets
   are redacted from evidence/diagnostics paths per Core invariants.
+  (`rtk gain` dashboard statistics persist in RTK attestations as
+  savings evidence — tool-generated counters, accepted residual.)
 
-## 10. Remaining blockers and external authorizations needed
+## 10. Pre-review bug sweep (2026-09-11, commit `6b6a205`)
+
+A line-by-line re-review of the Slice 9 diff found and fixed four
+issues before independent review; two further candidates were
+investigated and closed with no change:
+
+1. **Revocation did not cascade to sessions (fixed).** `revokeAdapter`
+   burned grants lazily but left the adapter's sessions valid, so a
+   revoked adapter's sessions could still submit routing proofs, record
+   evidence, and — via `parentSession` delegation — mint new sessions
+   indefinitely. Fix: revocation now revokes live bound sessions
+   atomically in the same transaction (`SessionRepository.revokeByAdapter`),
+   audited with the cascade count, surfaced as `revokedSessions` through
+   the Core result and `chrono adapter revoke` output. Tests: cascade
+   death (`was revoked`), delegation failure, survivor-adapter isolation.
+2. **Cross-adapter proof submission (fixed).** `recordRoutingProof`
+   checked the *proof's* adapter but not the *submitter's*: any valid
+   session could mint proofs for any approved adapter. Fix: the
+   submitter's session adapter must independently be approved
+   (`requireApprovedAdapter`, spec-literal §9.3), without demanding
+   submitter/proof identity (multi-runtime operators keep working).
+   Tests: ghost (never-registered) and pending submitters deny;
+   approved submitters pass; two fixtures corrected to the enforced
+   semantics (both adapters approved).
+3. **Core-minted IDs outside the validated families (fixed).**
+   `sequences.allocate("RTE"/"SES")` minted routing-proof and session IDs
+   that `parseArtifactId`/`isValidArtifactId` rejected (operational tables
+   are never validated, so latent, not live). Fix: `RTE`/`SES` added to
+   `ARTIFACT_ID_FAMILIES` and `ID_PATTERN` under the documented GRANT
+   precedent, with identity tests and the CORE §3.1 table synced.
+4. **Claude-settings duplicate via malformed nesting (fixed).**
+   `mergeClaudeSettings` could append a second entry when the managed
+   command hid inside an unparseable group. Fix: recursive command scan;
+   dead structural walk removed; nested-duplicate test added.
+5. **`runRtkProve` CLI (no change).** Verified airtight: command must
+   start with the resolved RTK binary, `--version` + `gain` identity
+   checks precede execution, exit 0 required, hashes computed from actual
+   argv/stdout, only hashes (never raw output) persisted.
+6. **`projectId: "default" `(no change).** Single-project v1 design,
+   consistent across enrollment, proofs, grants, and sessions — not a bug.
+
+## 11. Remaining blockers and external authorizations needed
 
 1. **Independent Slice 9 review disposition** — implementation + second
    pass are committed; `COMPLETE` marking belongs to independent review
@@ -314,7 +361,7 @@ stays open until that procedure passes.
 5. Slice 10 and IMPLEMENTER-TASKS 3–7 are untouched per instructions
    (remain on Slice 9).
 
-## 11. Documentation synchronization
+## 12. Documentation synchronization
 
 `AGENTS.md`, `docs/README.md`, `IMPLEMENTATION-PLAN.md`,
 `IMPLEMENTER-TASKS.md`, `SLICE-9.md` (still `READY FOR IMPLEMENTATION`),
