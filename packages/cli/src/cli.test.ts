@@ -193,6 +193,32 @@ describe("CLI: program wiring", () => {
     expect(names).toContain("adapter");
     expect(names).toContain("setup");
     expect(names).toContain("session");
+    expect(names).toContain("doctor");
+    expect(names).toContain("broker");
+    expect(names).toContain("entry");
+    expect(names).toContain("uninstall");
+  });
+
+  it("runs init --dry-run end to end without writing state", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "chrono-wiring-"));
+    try {
+      const program = createProgram(dir);
+      program.exitOverride();
+      const lines: string[] = [];
+      const originalLog = console.log;
+      console.log = (text: unknown): void => {
+        lines.push(String(text));
+      };
+      try {
+        await program.parseAsync(["init", "--dry-run", "--path", dir], { from: "user" });
+      } finally {
+        console.log = originalLog;
+      }
+      expect(lines.join("\n")).toContain("Dry run");
+      expect(existsSync(join(dir, ".chrono"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("marks rendered failures so bin.ts adds no second JSON envelope", async () => {

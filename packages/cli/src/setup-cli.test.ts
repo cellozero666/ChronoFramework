@@ -326,6 +326,95 @@ describe("OpenCode pre-tool enforcement", () => {
   });
 });
 
+describe("OpenCode automatic Gaspar entry", () => {
+  let tempDir: string;
+  let pluginPath: string;
+  let savedEnv: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-entry-test-"));
+    mkdirSync(join(tempDir, ".chrono", "hooks"), { recursive: true });
+    writeFileSync(join(tempDir, ".chrono", "chrono.db"), "", "utf8");
+    pluginPath = join(tempDir, "chrono-gate.js");
+    writeFileSync(pluginPath, buildOpencodePlugin(), "utf8");
+    // Fixture entry script: prints a canned projection, never a token.
+    writeFileSync(
+      join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"),
+      "#!/bin/sh\necho '{\"ok\":true,\"projection\":{\"projectState\":\"ANALYZING\"}}'\n",
+      "utf8"
+    );
+    chmodSync(join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"), 0o755);
+    savedEnv = { ...process.env };
+    delete process.env["CHRONO_BIN"];
+    delete process.env["CHRONO_ENTRY_ADAPTER"];
+  });
+
+  afterEach(() => {
+    for (const key of ["CHRONO_BIN", "CHRONO_ENTRY_ADAPTER"]) {
+      if (savedEnv[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = savedEnv[key];
+      }
+    }
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  async function fullHooks(directory: string): Promise<{
+    event: (event: unknown) => Promise<unknown>;
+    transform: (input: unknown, output: { system: unknown[] }) => Promise<unknown>;
+  }> {
+    const module = (await import(pathToFileURL(pluginPath).href)) as {
+      ChronoGatePlugin: (ctx: unknown) => Promise<{
+        event: (event: unknown) => Promise<unknown>;
+        "experimental.chat.system.transform": (input: unknown, output: { system: unknown[] }) => Promise<unknown>;
+      }>;
+    };
+    const hooks = await module.ChronoGatePlugin({ directory });
+    return { event: hooks.event, transform: hooks["experimental.chat.system.transform"] };
+  }
+
+  it("injects the entry projection once on session.created", async () => {
+    const { event, transform } = await fullHooks(tempDir);
+    await event({ event: { type: "session.created", properties: { sessionID: "s1" } } });
+    const output = { system: [] as unknown[] };
+    await transform({ sessionID: "s1" }, output);
+    expect(output.system).toHaveLength(1);
+    expect(String(output.system[0])).toContain("chrono-entry");
+    expect(String(output.system[0])).toContain("ANALYZING");
+    // Second transform does not re-inject.
+    await transform({ sessionID: "s1" }, output);
+    expect(output.system).toHaveLength(1);
+  });
+
+  it("degrades silently outside projects and without the entry script", async () => {
+    const plain = mkdtempSync(join(tmpdir(), "chrono-plain-"));
+    try {
+      const { event, transform } = await fullHooks(plain);
+      await event({ event: { type: "session.created", properties: { sessionID: "s1" } } });
+      const output = { system: [] as unknown[] };
+      await transform({ sessionID: "s1" }, output);
+      expect(output.system).toHaveLength(0);
+    } finally {
+      rmSync(plain, { recursive: true, force: true });
+    }
+    rmSync(join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"));
+    const { event, transform } = await fullHooks(tempDir);
+    await event({ event: { type: "session.created", properties: { sessionID: "s2" } } });
+    const output = { system: [] as unknown[] };
+    await transform({ sessionID: "s2" }, output);
+    expect(output.system).toHaveLength(0);
+  });
+
+  it("ignores non-session events", async () => {
+    const { event, transform } = await fullHooks(tempDir);
+    await event({ event: { type: "message.updated" } });
+    const output = { system: [] as unknown[] };
+    await transform({ sessionID: "s9" }, output);
+    expect(output.system).toHaveLength(0);
+  });
+});
+
 describe("CLI setup", () => {
   let tempDir: string;
   let restoreTty: () => void;
