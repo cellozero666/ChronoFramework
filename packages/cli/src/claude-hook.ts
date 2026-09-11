@@ -21,6 +21,74 @@
  */
 
 export const CLAUDE_HOOK_RELATIVE_PATH = ".chrono/hooks/chrono-claude-gate.js";
+export const CLAUDE_SETTINGS_RELATIVE_PATH = ".claude/settings.json";
+
+/** Project-relative hook command registered in Claude settings. */
+export function claudeHookCommand(): string {
+  return "node .chrono/hooks/chrono-claude-gate.js";
+}
+
+/**
+ * Merge the CHRONO PreToolUse entry into `.claude/settings.json`
+ * without disturbing unrelated user configuration [REF §13 adapter
+ * ownership]. `existing` is the current file content or null when
+ * absent. Returns the merged document and whether it changed. Throws
+ * on malformed or ambiguous content — setup must fail with an
+ * explainable remediation path rather than overwrite blindly.
+ */
+export function mergeClaudeSettings(existing: string | null): { merged: string; changed: boolean } {
+  const command = claudeHookCommand();
+  const entry = { matcher: "*", hooks: [{ type: "command", command, timeout: 30 }] };
+  if (existing === null) {
+    return {
+      merged: JSON.stringify({ hooks: { PreToolUse: [entry] } }, null, 2),
+      changed: true,
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(existing);
+  } catch {
+    throw new Error("Existing .claude/settings.json is not parseable JSON: refusing to overwrite user configuration");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("Existing .claude/settings.json is not a JSON object: refusing to overwrite user configuration");
+  }
+  const doc = parsed as Record<string, unknown>;
+  const hooks = doc["hooks"];
+  if (hooks === undefined) {
+    return { merged: JSON.stringify({ ...doc, hooks: { PreToolUse: [entry] } }, null, 2), changed: true };
+  }
+  if (typeof hooks !== "object" || hooks === null || Array.isArray(hooks)) {
+    throw new Error("Existing .claude/settings.json 'hooks' is not an object: refusing to overwrite user configuration");
+  }
+  const table = hooks as Record<string, unknown>;
+  const pre = table["PreToolUse"];
+  if (pre === undefined) {
+    return { merged: JSON.stringify({ ...doc, hooks: { ...table, PreToolUse: [entry] } }, null, 2), changed: true };
+  }
+  if (!Array.isArray(pre)) {
+    throw new Error("Existing .claude/settings.json 'hooks.PreToolUse' is not an array: refusing to overwrite user configuration");
+  }
+  for (const group of pre) {
+    if (typeof group !== "object" || group === null) {
+      continue;
+    }
+    const inner = (group as Record<string, unknown>)["hooks"];
+    if (!Array.isArray(inner)) {
+      continue;
+    }
+    for (const hook of inner) {
+      if (typeof hook === "object" && hook !== null && (hook as Record<string, unknown>)["command"] === command) {
+        return { merged: existing, changed: false };
+      }
+    }
+  }
+  return {
+    merged: JSON.stringify({ ...doc, hooks: { ...table, PreToolUse: [...pre, entry] } }, null, 2),
+    changed: true,
+  };
+}
 
 const CLAUDE_READ_TOOLS = ["Glob", "Grep", "LS", "Read", "TodoWrite"];
 const CLAUDE_MUTATE_TOOLS = [

@@ -21,16 +21,57 @@
  */
 
 export const KIRO_HOOK_RELATIVE_PATH = ".chrono/hooks/chrono-kiro-gate.js";
+export const KIRO_HOOK_REGISTRATION_RELATIVE_PATH = ".kiro/hooks/chrono-gate.json";
 
-const KIRO_READ_TOOLS = ["listFiles", "readFile", "search"];
+/**
+ * Kiro canonical PreToolUse tool names (lowercased for matching).
+ * Sources: https://kiro.dev/docs/cli/hooks/ and
+ * https://kiro.dev/docs/cli/v3/hooks (matcher examples `write|read`,
+ * 2.x `Write|Edit`), plus the alias table (`fs_write`/`write`,
+ * `execute_bash`/`shell`) in the KiroCrew hooks reference. Any tool not
+ * listed here — future built-ins, `mcp_*`, custom tools — is denied
+ * until classified in a reviewed Core policy release.
+ */
+const KIRO_READ_TOOLS = ["glob", "grep", "ls", "read", "todowrite"];
 const KIRO_MUTATE_TOOLS = [
   "deploy",
-  "editFile",
-  "executeCommand",
-  "network",
+  "edit",
+  "execute_bash",
+  "fs_write",
+  "multiedit",
   "package",
-  "writeFile",
+  "shell",
+  "task",
+  "webfetch",
+  "websearch",
+  "write",
 ];
+
+/**
+ * CHRONO-owned Kiro hook registration. Kiro loads every
+ * `.kiro/hooks/*.json` file automatically; this file registers the gate
+ * script for `PreToolUse` with an always-match matcher so the script
+ * itself performs Core-owned classification (deny-by-default). The
+ * command is project-relative: Kiro executes hook commands with the
+ * project root as the working directory.
+ */
+export function buildKiroHookRegistration(): string {
+  return JSON.stringify(
+    {
+      version: "v1",
+      hooks: [
+        {
+          name: "chrono-gate",
+          trigger: "PreToolUse",
+          matcher: ".*",
+          action: { type: "command", command: "node .chrono/hooks/chrono-kiro-gate.js" },
+        },
+      ],
+    },
+    null,
+    2
+  );
+}
 
 export function buildKiroHook(): string {
   return `#!/usr/bin/env node
@@ -54,7 +95,6 @@ import { join } from "node:path";
 
 const READ_TOOLS = new Set(${JSON.stringify(KIRO_READ_TOOLS)});
 const MUTATE_TOOLS = new Set(${JSON.stringify(KIRO_MUTATE_TOOLS)});
-
 function readEnv(name) {
   const value = process.env[name];
   return value === undefined || value === "" ? null : value;
@@ -88,7 +128,10 @@ async function main() {
   let tool = "";
   try {
     const parsed = raw.trim().length > 0 ? JSON.parse(raw) : {};
-    tool = typeof parsed.tool_name === "string" ? parsed.tool_name : "";
+    // Kiro matches tool names case-insensitively across versions
+    // (2.x Write|Edit, 3.x write|read); normalize before lookup.
+    // Unknown tools stay unknown and are denied below.
+    tool = typeof parsed.tool_name === "string" ? parsed.tool_name.toLowerCase() : "";
   } catch {
     deny("TOOL_DENIED: PreToolUse payload is not parseable JSON.");
   }

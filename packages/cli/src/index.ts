@@ -16,12 +16,12 @@ import { ChronoCore } from "@chrono/core";
 import { RTK_UPSTREAM, SKILL_RELEASE, SKILL_RUNTIME_PATHS, buildApprovalPayload, buildEnrollmentChallenge, buildEnrollmentPayload, buildSessionAuthorizationPayload, buildWaiverPayload, computeRevisionHash, convertSkillSource, fingerprintPublicKey, generateApprovalKeyPair, parseSkillFrontmatter, signApprovalPayload, skillGeneratedHashes, skillRawSourceUrl, skillVendorPath, verifySkillRelease, type SkillRuntime } from "@chrono/domain";
 import { CHRONO_VERSION } from "./version.js";
 import { buildOpencodePlugin } from "./opencode-plugin.js";
-import { CLAUDE_HOOK_RELATIVE_PATH, buildClaudeHook } from "./claude-hook.js";
-import { KIRO_HOOK_RELATIVE_PATH, buildKiroHook } from "./kiro-hook.js";
+import { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook, mergeClaudeSettings } from "./claude-hook.js";
+import { KIRO_HOOK_REGISTRATION_RELATIVE_PATH, KIRO_HOOK_RELATIVE_PATH, buildKiroHook, buildKiroHookRegistration } from "./kiro-hook.js";
 
 export { buildOpencodePlugin };
-export { CLAUDE_HOOK_RELATIVE_PATH, buildClaudeHook };
-export { KIRO_HOOK_RELATIVE_PATH, buildKiroHook };
+export { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook, mergeClaudeSettings };
+export { KIRO_HOOK_REGISTRATION_RELATIVE_PATH, KIRO_HOOK_RELATIVE_PATH, buildKiroHook, buildKiroHookRegistration };
 import {
   MemoryKeyStore,
   OsKeychainStore,
@@ -2291,6 +2291,8 @@ export function runSetup(
     const pluginPath = join(projectPath, ".opencode", "plugins", "chrono-gate.js");
     const claudeHookPath = join(projectPath, CLAUDE_HOOK_RELATIVE_PATH);
     const kiroHookPath = join(projectPath, KIRO_HOOK_RELATIVE_PATH);
+    const kiroRegistrationPath = join(projectPath, KIRO_HOOK_REGISTRATION_RELATIVE_PATH);
+    const claudeSettingsPath = join(projectPath, CLAUDE_SETTINGS_RELATIVE_PATH);
     try {
       mkdirSync(dirname(pluginPath), { recursive: true });
       writeFileSync(pluginPath, buildOpencodePlugin(), "utf8");
@@ -2298,9 +2300,41 @@ export function runSetup(
       writeFileSync(claudeHookPath, buildClaudeHook(), "utf8");
       mkdirSync(dirname(kiroHookPath), { recursive: true });
       writeFileSync(kiroHookPath, buildKiroHook(), "utf8");
+      mkdirSync(dirname(kiroRegistrationPath), { recursive: true });
+      writeFileSync(kiroRegistrationPath, buildKiroHookRegistration(), "utf8");
+      // Claude settings are user-owned: merge the managed entry, backing
+      // up before any overwrite; malformed content fails with remediation.
+      let existingSettings: string | null = null;
+      try {
+        existingSettings = readFileSync(claudeSettingsPath, "utf8");
+      } catch (e) {
+        if ((e as { code?: string }).code !== "ENOENT") {
+          throw e;
+        }
+      }
+      let mergedSettings: { merged: string; changed: boolean };
+      try {
+        mergedSettings = mergeClaudeSettings(existingSettings);
+      } catch (e) {
+        return fail(2, "VALIDATION_ERROR", e instanceof Error ? e.message : "Claude settings merge refused");
+      }
+      if (mergedSettings.changed) {
+        mkdirSync(dirname(claudeSettingsPath), { recursive: true });
+        if (existingSettings !== null) {
+          writeFileSync(`${claudeSettingsPath}.chrono-bak`, existingSettings, "utf8");
+        }
+        writeFileSync(claudeSettingsPath, mergedSettings.merged, "utf8");
+      }
     } catch (e) {
       return keychainFailure(e, asJson);
     }
+    const managedHooks = [
+      ".opencode/plugins/chrono-gate.js",
+      CLAUDE_HOOK_RELATIVE_PATH,
+      KIRO_HOOK_RELATIVE_PATH,
+      KIRO_HOOK_REGISTRATION_RELATIVE_PATH,
+      CLAUDE_SETTINGS_RELATIVE_PATH,
+    ];
     const body = asJson
       ? JSON.stringify(
           {
@@ -2312,7 +2346,7 @@ export function runSetup(
             skill: "current",
             proofsRun: proofs.length,
             plugin: ".opencode/plugins/chrono-gate.js",
-            hooks: [".opencode/plugins/chrono-gate.js", CLAUDE_HOOK_RELATIVE_PATH, KIRO_HOOK_RELATIVE_PATH],
+            hooks: managedHooks,
           },
           null,
           2
@@ -2325,7 +2359,7 @@ export function runSetup(
         "  skill: current, artifacts intact",
         `  proofs: ${String(proofs.length)} green`,
         "  plugin: .opencode/plugins/chrono-gate.js",
-        `  hooks: .opencode/plugins/chrono-gate.js, ${CLAUDE_HOOK_RELATIVE_PATH}, ${KIRO_HOOK_RELATIVE_PATH}`,
+        `  hooks: ${managedHooks.join(", ")}`,
       ].join("\n");
     return { exitCode: 0, stdout: body, stderr: "" };
   } finally {

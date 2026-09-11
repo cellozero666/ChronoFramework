@@ -30,8 +30,8 @@ import {
 } from "@chrono/domain";
 import { ChronoCore } from "@chrono/core";
 import { buildOpencodePlugin } from "./opencode-plugin.js";
-import { CLAUDE_HOOK_RELATIVE_PATH, buildClaudeHook } from "./claude-hook.js";
-import { KIRO_HOOK_RELATIVE_PATH, buildKiroHook } from "./kiro-hook.js";
+import { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook } from "./claude-hook.js";
+import { KIRO_HOOK_REGISTRATION_RELATIVE_PATH, KIRO_HOOK_RELATIVE_PATH, buildKiroHook, buildKiroHookRegistration } from "./kiro-hook.js";
 import { runSetup, runSkillVerify, splitCommandLine } from "./index.js";
 
 // Frozen fixture: byte-exact canonical SKILL.md at the pinned commit.
@@ -460,8 +460,48 @@ function enrollTestPo(
     const body = JSON.parse(out.stdout) as { hooks: string[] };
     expect(body.hooks).toContain(CLAUDE_HOOK_RELATIVE_PATH);
     expect(body.hooks).toContain(KIRO_HOOK_RELATIVE_PATH);
+    expect(body.hooks).toContain(KIRO_HOOK_REGISTRATION_RELATIVE_PATH);
+    expect(body.hooks).toContain(CLAUDE_SETTINGS_RELATIVE_PATH);
     expect(readFileSync(join(tempDir, CLAUDE_HOOK_RELATIVE_PATH), "utf8")).toBe(buildClaudeHook());
     expect(readFileSync(join(tempDir, KIRO_HOOK_RELATIVE_PATH), "utf8")).toBe(buildKiroHook());
+    expect(readFileSync(join(tempDir, KIRO_HOOK_REGISTRATION_RELATIVE_PATH), "utf8")).toBe(buildKiroHookRegistration());
+    // Kiro registration is a valid hook file that always matches PreToolUse.
+    const registration = JSON.parse(readFileSync(join(tempDir, KIRO_HOOK_REGISTRATION_RELATIVE_PATH), "utf8")) as {
+      version: string;
+      hooks: { trigger: string; action: { command: string } }[];
+    };
+    expect(registration.version).toBe("v1");
+    expect(registration.hooks[0]).toMatchObject({ trigger: "PreToolUse" });
+    expect(registration.hooks[0]!.action.command).toBe("node .chrono/hooks/chrono-kiro-gate.js");
+    // Claude settings registration survives a second run (idempotent).
+    const once = readFileSync(join(tempDir, CLAUDE_SETTINGS_RELATIVE_PATH), "utf8");
+    expect(runSetup(tempDir, { adapter: "fixture", rtkBinary, json: true }).exitCode).toBe(0);
+    expect(readFileSync(join(tempDir, CLAUDE_SETTINGS_RELATIVE_PATH), "utf8")).toBe(once);
+  });
+
+  it("merges Claude settings without losing unrelated user configuration", async () => {
+    const settingsPath = join(tempDir, CLAUDE_SETTINGS_RELATIVE_PATH);
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({ theme: "dark", hooks: { PostToolUse: [] } }, null, 2), "utf8");
+    expect(runSetup(tempDir, { adapter: "fixture", rtkBinary, json: true }).exitCode).toBe(0);
+    const merged = JSON.parse(readFileSync(settingsPath, "utf8")) as {
+      theme: string;
+      hooks: { PostToolUse: unknown[]; PreToolUse: { hooks: { command: string }[] }[] };
+    };
+    expect(merged.theme).toBe("dark");
+    expect(merged.hooks.PostToolUse).toEqual([]);
+    expect(merged.hooks.PreToolUse[0]!.hooks[0]!.command).toBe("node .chrono/hooks/chrono-claude-gate.js");
+    expect(readFileSync(`${settingsPath}.chrono-bak`, "utf8")).toContain('"theme": "dark"');
+  });
+
+  it("refuses to overwrite malformed Claude settings", async () => {
+    const settingsPath = join(tempDir, CLAUDE_SETTINGS_RELATIVE_PATH);
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, "{not json", "utf8");
+    const out = runSetup(tempDir, { adapter: "fixture", rtkBinary, json: true });
+    expect(out.exitCode).toBe(2);
+    expect(out.stdout).toContain("settings.json");
+    expect(readFileSync(settingsPath, "utf8")).toBe("{not json");
   });
 
   it("fails closed on every missing proof", async () => {

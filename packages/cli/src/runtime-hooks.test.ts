@@ -109,14 +109,14 @@ describe.each([
   });
 
   it("denies mutable tools without dispatch context", () => {
-    const mutable = filename.includes("claude") ? "Bash" : "executeCommand";
+    const mutable = filename.includes("claude") ? "Bash" : "shell";
     const out = runHook(hookPath, tempDir, mutable, {});
     expect(out.status).toBe(2);
     expect(out.stderr).toContain("without dispatch context");
   });
 
   it("obeys AUTHORIZED and DENIED gate verdicts on mutable tools", () => {
-    const mutable = filename.includes("claude") ? "Edit" : "writeFile";
+    const mutable = filename.includes("claude") ? "Edit" : "Write";
     const allowed = runHook(hookPath, tempDir, mutable, fullEnv());
     expect(allowed.status).toBe(0);
     const denied = runHook(hookPath, tempDir, mutable, fullEnv({ CHRONO_BIN: gateDeny }));
@@ -125,7 +125,7 @@ describe.each([
   });
 
   it("denies when the gate binary is missing", () => {
-    const mutable = filename.includes("claude") ? "Write" : "editFile";
+    const mutable = filename.includes("claude") ? "Write" : "fs_write";
     const out = runHook(hookPath, tempDir, mutable, fullEnv({ CHRONO_BIN: join(tempDir, "missing-gate.sh") }));
     expect(out.status).toBe(2);
     expect(out.stderr).toContain("unreachable");
