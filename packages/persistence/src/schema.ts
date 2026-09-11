@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -518,6 +518,26 @@ export const MIGRATIONS: Record<number, string> = {
       role       TEXT NOT NULL,
       authority  TEXT NOT NULL,
       used_at    TEXT NOT NULL
+    );
+  `,
+  9: `
+    -- Runtime adapter registry [RUNTIME §13, PL Phase 5].
+    -- An adapter binds a PO-selected runtime identifier to its entrypoint
+    -- and hook/proof specs. Registration is PO-only (Core-enforced);
+    -- revocation is terminal. Dispatch is allowed only for active rows
+    -- whose entrypoint is still executable.
+    CREATE TABLE adapter (
+      id                 TEXT PRIMARY KEY,
+      name               TEXT NOT NULL,
+      entrypoint         TEXT NOT NULL,
+      gate_hook          TEXT,
+      dispatch_proof     TEXT,
+      rtk_routing        TEXT,
+      skill_activation   TEXT,
+      conformance_proof  TEXT NOT NULL DEFAULT '[]',
+      status             TEXT NOT NULL DEFAULT 'active',
+      registered_by      TEXT NOT NULL,
+      registered_at      TEXT NOT NULL
     );
   `,
 };

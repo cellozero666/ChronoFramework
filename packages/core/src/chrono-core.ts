@@ -5,8 +5,10 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { accessSync, constants as fsConstants } from "node:fs";
 import {
   ChronoDatabase,
+  type AdapterRecord,
   type ProjectRepository,
   type ArtifactRepository,
   type EventLogRepository,
@@ -56,8 +58,9 @@ import type { ProjectState, EntityType, ApprovalPayload, WaiverPayload, AgentRol
 /**
  * Caller authentication bundle for every protected Core operation.
  * The session token is the credential; `actor` names the acting identity
- * for audit and must be consistent with the session (equal to the bound
- * role, or the orchestrating gaspar/PO). Bare role strings without a
+ * for audit and must equal the session's bound role. Orchestration is
+ * expressed with a separate authenticated requester where the operation
+ * allows it (e.g. `authorizeExecution`). Bare role strings without a
  * session never authorize [Remediation §3A, review finding 1].
  */
 export interface CallerAuth {
@@ -1935,6 +1938,187 @@ export class ChronoCore {
       return { ok: true, value: undefined };
     } catch (e) {
       return this.handleError(e);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Slice 6: runtime adapter registry [RUNTIME §13, PL Phase 5]
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Register a runtime adapter. PO sessions only: a new runtime is a
+   * product trust decision, never an agent self-registration. The Core
+   * verifies the registration deterministically before persisting:
+   * identifier shape, required fields, entrypoint existence and
+   * executability, and absence of provider/model/secret assignments in
+   * the declared specs [RUNTIME §11.5, INV §11.2, FW §22].
+   */
+  registerAdapter(
+    input: {
+      id: string;
+      name: string;
+      entrypoint: string;
+      gateHook?: string | null | undefined;
+      dispatchProof?: string | null | undefined;
+      rtkRouting?: string | null | undefined;
+      skillActivation?: string | null | undefined;
+      conformanceProof?: string[] | undefined;
+    },
+    auth: CallerAuth
+  ): CoreResult<{ id: string }> {
+    try {
+      const caller = this.resolveCaller(auth, "register adapter");
+      this.requireCapability("adapter.register", caller);
+      if (!/^[a-z0-9][a-z0-9_-]*$/.test(input.id)) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Adapter id '${input.id}' must match [a-z0-9][a-z0-9_-]*`,
+          invariantRef: "INV §14.4",
+          affectedTarget: input.id,
+          suggestedAction: "Use a lowercase runtime identifier such as opencode or claude-code",
+        });
+      }
+      if (input.name.trim().length === 0 || input.entrypoint.trim().length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Adapter registration requires a non-empty name and entrypoint",
+          invariantRef: "INV §14.4",
+          affectedTarget: input.id,
+          suggestedAction: "Declare the adapter name and its executable entrypoint",
+        });
+      }
+      const proof = input.conformanceProof ?? [];
+      if (!Array.isArray(proof) || proof.some((p) => typeof p !== "string" || p.trim().length === 0)) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Adapter conformanceProof must be an array of non-empty proof commands",
+          invariantRef: "INV §14.4",
+          affectedTarget: input.id,
+          suggestedAction: "List the proof commands that demonstrate conformance",
+        });
+      }
+      this.assertNoProviderModelBinding(
+        [input.name, input.entrypoint, input.gateHook, input.dispatchProof,
+          input.rtkRouting, input.skillActivation, ...proof],
+        input.id
+      );
+      this.assertExecutableEntrypoint(input.entrypoint, input.id);
+      const created = this.db.adapters().create({
+        id: input.id,
+        name: input.name,
+        entrypoint: input.entrypoint,
+        gateHook: input.gateHook ?? null,
+        dispatchProof: input.dispatchProof ?? null,
+        rtkRouting: input.rtkRouting ?? null,
+        skillActivation: input.skillActivation ?? null,
+        conformanceProof: proof,
+        registeredBy: caller.role,
+        registeredAt: this.now(),
+      });
+      this.events.append({
+        eventType: "ArtifactCreated",
+        entityId: created.id,
+        payload: { type: "ADAPTER", entrypoint: created.entrypoint },
+        actor: caller.auditActor,
+        priorState: undefined,
+        newState: "active",
+        reasoning: "Runtime adapter registered by the PO",
+      });
+      return { ok: true, value: { id: created.id } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /** Revoke an adapter registration (terminal; PO only). Revocation is audited. */
+  revokeAdapter(id: string, auth: CallerAuth): CoreResult<void> {
+    try {
+      const caller = this.resolveCaller(auth, "revoke adapter");
+      this.requireCapability("adapter.revoke", caller);
+      this.db.adapters().revoke(id);
+      this.events.append({
+        eventType: "StateTransition",
+        entityId: id,
+        payload: { entityType: "ADAPTER", eventType: "AdapterRevoked" },
+        actor: caller.auditActor,
+        priorState: "active",
+        newState: "revoked",
+        reasoning: "Adapter revoked",
+      });
+      return { ok: true, value: undefined };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /** List adapter registrations (project metadata; read-only). */
+  listAdapters(): AdapterRecord[] {
+    return this.db.adapters().listAll();
+  }
+
+  /**
+   * Resolve an adapter for dispatch, fail-closed: the registration must
+   * exist, be active, and its entrypoint must still be executable.
+   * A moved or de-permissioned binary denies dispatch until re-registered.
+   */
+  getAdapterForDispatch(id: string): AdapterRecord {
+    const adapter = this.db.adapters().findById(id);
+    if (adapter.status !== "active") {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Adapter '${id}' is ${adapter.status}: revoked adapters cannot dispatch`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Register a current adapter for this runtime",
+      });
+    }
+    this.assertExecutableEntrypoint(adapter.entrypoint, id);
+    return adapter;
+  }
+
+  /**
+   * No provider, model, or secret assignments in adapter specs
+   * [RUNTIME §11.5, INV §11.2, FW §22]. Deterministic tripwire over the
+   * declared strings; a full source audit remains a review duty.
+   */
+  private assertNoProviderModelBinding(values: Array<string | null | undefined>, target: string): void {
+    const forbidden = ["provider=", "provider:", "model=", "model:", "api_key", "apikey"];
+    for (const value of values) {
+      if (value === null || value === undefined) {
+        continue;
+      }
+      const lowered = value.toLowerCase();
+      const hit = forbidden.find((f) => lowered.includes(f));
+      if (hit !== undefined) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Adapter '${target}' declares a forbidden binding '${hit}': runtimes, providers, models, and secrets are PO configuration, never adapter defaults`,
+          invariantRef: "INV §11.2",
+          affectedTarget: target,
+          suggestedAction: "Remove provider/model/secret assignments from the adapter registration",
+        });
+      }
+    }
+  }
+
+  /** The entrypoint must exist and be executable, at registration and at dispatch. */
+  private assertExecutableEntrypoint(entrypoint: string, target: string): void {
+    try {
+      accessSync(entrypoint, fsConstants.X_OK);
+    } catch {
+      throw new ChronoError({
+        code: ErrorCode.CONFIG_ERROR,
+        severity: Severity.BLOCKER,
+        message: `Adapter '${target}' entrypoint '${entrypoint}' is missing or not executable`,
+        invariantRef: "INV §14.4",
+        affectedTarget: target,
+        suggestedAction: "Point the adapter at an existing executable entrypoint",
+      });
     }
   }
 

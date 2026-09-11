@@ -7,10 +7,10 @@
  */
 
 import { Command } from "commander";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { ChronoCore } from "@chrono/core";
-import { RTK_UPSTREAM, buildApprovalPayload, buildSessionAuthorizationPayload, buildWaiverPayload, generateApprovalKeyPair, signApprovalPayload } from "@chrono/domain";
+import { RTK_UPSTREAM, buildApprovalPayload, buildSessionAuthorizationPayload, buildWaiverPayload, computeRevisionHash, generateApprovalKeyPair, signApprovalPayload } from "@chrono/domain";
 import { CHRONO_VERSION } from "./version.js";
 import {
   MemoryKeyStore,
@@ -103,6 +103,7 @@ interface CommandOpts {
   readonly ttl?: unknown;
   readonly parentToken?: unknown;
   readonly rotate?: unknown;
+  readonly timeout?: unknown;
 }
 
 function formatCoreError(error: {
@@ -1150,6 +1151,180 @@ export function runSessionRevoke(
   }
 }
 
+export interface RunOptions {
+  readonly module: string;
+  readonly wp?: string | undefined;
+  readonly adapter: string;
+  readonly as: string;
+  readonly requesterToken: string;
+  readonly role: string;
+  readonly sessionToken?: string | undefined;
+  readonly command: string[];
+  readonly timeoutSeconds?: number | undefined;
+  readonly json?: boolean | undefined;
+}
+
+export interface SpawnResult {
+  readonly status: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly timedOut: boolean;
+}
+
+function defaultSpawn(cmd: string, args: string[], timeoutMs: number, env: Record<string, string>): SpawnResult {
+  const result = spawnSync(cmd, args, { encoding: "utf8", timeout: timeoutMs, env });
+  return {
+    status: result.status,
+    stdout: typeof result.stdout === "string" ? result.stdout : "",
+    stderr: typeof result.stderr === "string" ? result.stderr : "",
+    timedOut: result.error !== undefined && (result.error as { code?: string }).code === "ETIMEDOUT",
+  };
+}
+
+/**
+ * Authorized dispatch: `chrono run` (Slice 6, [RUNTIME §4]).
+ *
+ * The CLI owns no policy: every step is a Core decision. The flow is
+ * authorize → enact dispatch → spawn the registered adapter entrypoint
+ * (argv[0] must equal it, so a grant cannot smuggle another binary) →
+ * record evidence as the executor → advance to VERIFYING/IMPLEMENTED.
+ * A failing or timing-out command leaves the lifecycle state untouched
+ * for the correction loop; nothing is marked complete.
+ */
+export function runDispatch(
+  projectPath: string,
+  options: RunOptions,
+  spawn: (cmd: string, args: string[], timeoutMs: number, env: Record<string, string>) => SpawnResult = defaultSpawn
+): CliOutput {
+  const asJson = options.json === true;
+  const fail = (exitCode: number, code: string, reason: string): CliOutput =>
+    asJson
+      ? { exitCode, stdout: JSON.stringify({ ok: false, error: { code, message: reason } }, null, 2), stderr: "" }
+      : { exitCode, stdout: "", stderr: `Error [${code}]: ${reason}` };
+  if (options.module.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "run requires --module");
+  }
+  if (options.adapter.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "run requires --adapter <registered runtime id>");
+  }
+  if (options.as.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "run requires --as <requester identity>");
+  }
+  if (options.role.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "run requires --role <assigned role>");
+  }
+  if (options.command.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "run requires a command after --");
+  }
+  const executor = resolveSessionToken(options.sessionToken);
+  if (executor === null) {
+    return fail(2, "VALIDATION_ERROR", "run requires --session-token (or CHRONO_SESSION_TOKEN) for the executor session");
+  }
+  const requester = parseSessionToken(options.requesterToken);
+  if (requester === null) {
+    return fail(2, "VALIDATION_ERROR", "run requires --requester-token <id/token> for the requesting session");
+  }
+  const timeoutSeconds = options.timeoutSeconds ?? 600;
+  if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > 86400) {
+    return fail(2, "VALIDATION_ERROR", "run --timeout must be within 1 second and 24 hours");
+  }
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    let adapter: { id: string; entrypoint: string };
+    try {
+      adapter = core.getAdapterForDispatch(options.adapter);
+    } catch (e) {
+      return coreError(e instanceof Error ? { code: "ADAPTER_REJECTED", severity: "BLOCKER", message: e.message } : undefined, asJson);
+    }
+    if (options.command[0] !== adapter.entrypoint) {
+      return fail(2, "VALIDATION_ERROR", `run command must start with the registered entrypoint '${adapter.entrypoint}': grants cannot smuggle another binary`);
+    }
+    const target = options.wp ?? options.module;
+    const startEvent = options.wp !== undefined ? "ExecutionAssigned" : "ExecutionStarted";
+    const doneEvent = options.wp !== undefined ? "ImplementationDone" : "ImplementationComplete";
+    const authorized = core.authorizeExecution(options.module, {
+      ...(options.wp !== undefined ? { workPackageId: options.wp } : {}),
+      actor: options.as,
+      role: options.role,
+      session: executor,
+      requesterSession: requester,
+    });
+    if (!authorized.ok) {
+      return coreError(authorized.error, asJson);
+    }
+    const started = core.transitionState(target, startEvent, {
+      actor: options.role,
+      session: executor,
+      grantId: authorized.value!.grantId,
+    });
+    if (!started.ok) {
+      return coreError(started.error, asJson);
+    }
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value !== undefined) {
+        env[key] = value;
+      }
+    }
+    env["CHRONO_GRANT_ID"] = authorized.value!.grantId;
+    env["CHRONO_MODULE"] = options.module;
+    env["CHRONO_ADAPTER"] = adapter.id;
+    env["CHRONO_SESSION_TOKEN"] = `${executor.id}/${executor.token}`;
+    const [cmd, ...args] = options.command as [string, ...string[]];
+    const ran = spawn(cmd, args, Math.floor(timeoutSeconds * 1000), env);
+    if (ran.timedOut) {
+      return fail(1, "EXECUTION_DENIED", `run timed out after ${timeoutSeconds}s: '${target}' stays ${started.value!.toState} for the correction loop`);
+    }
+    if (ran.status !== 0) {
+      const detail = ran.stderr.trim().length > 0 ? ran.stderr.trim().slice(-2000) : `exit ${String(ran.status)}`;
+      return fail(1, "EXECUTION_DENIED", `run command failed: ${detail}: '${target}' stays ${started.value!.toState} for the correction loop`);
+    }
+    const output = `stdout:\n${ran.stdout}\nstderr:\n${ran.stderr}`;
+    const diagnostics = output.length > 8000 ? `${output.slice(0, 8000)}\n[truncated]` : output;
+    const targetRevision = core.getArtifact(target).revision;
+    const evidence = core.recordEvidence({
+      producer: options.role,
+      tool: adapter.id,
+      targetRevision,
+      checkName: `run:${target}`,
+      result: "pass",
+      diagnostics,
+      integrityHash: computeRevisionHash({ result: "pass", diagnostics, target_revision: targetRevision }),
+    }, { actor: options.role, session: executor });
+    if (!evidence.ok) {
+      return coreError(evidence.error, asJson);
+    }
+    const resumed = core.authorizeExecution(options.module, {
+      ...(options.wp !== undefined ? { workPackageId: options.wp } : {}),
+      actor: options.role,
+      role: options.role,
+      session: executor,
+    });
+    if (!resumed.ok) {
+      return coreError(resumed.error, asJson);
+    }
+    const done = core.transitionState(target, doneEvent, {
+      actor: options.role,
+      session: executor,
+      grantId: resumed.value!.grantId,
+    });
+    if (!done.ok) {
+      return coreError(done.error, asJson);
+    }
+    const body = asJson
+      ? JSON.stringify({ ok: true, module: options.module, state: done.value!.toState, evidenceId: evidence.value!.id }, null, 2)
+      : `Dispatched '${target}' through '${adapter.id}' → ${done.value!.toState} (evidence '${evidence.value!.id}')`;
+    return { exitCode: 0, stdout: body, stderr: "" };
+  } finally {
+    core.close();
+  }
+}
+
 /**
  * Build the commander program. The `cwd` is the default project path when
  * `--path` is not given. Actions print to console and set process exit code
@@ -1380,6 +1555,40 @@ export function createProgram(cwd: string): Command {
     .action((opts: CommandOpts) => {
       const projectPath = typeof opts.path === "string" ? opts.path : cwd;
       emitProgramResult(program, runSkillVerify(projectPath, { json: opts.json === true }));
+    });
+
+  program
+    .command("run")
+    .description("Authorize and dispatch a command through a registered adapter (Core-authorized, evidence-recorded)")
+    .requiredOption("--module <id>", "module scope")
+    .option("--wp <id>", "work-package scope")
+    .requiredOption("--adapter <id>", "registered runtime adapter id")
+    .requiredOption("--as <actor>", "requesting identity (canonical role)")
+    .requiredOption("--requester-token <id/token>", "requester session credential")
+    .requiredOption("--role <role>", "assigned implementation role (executor)")
+    .option("--session-token <id/token>", "executor session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--timeout <seconds>", "command timeout in seconds (default 600)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .argument("<command...>", "command to dispatch (must start with the adapter entrypoint)")
+    .action((command: string[], opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const timeout = typeof opts.timeout === "string" ? Number(opts.timeout) : undefined;
+      emitProgramResult(
+        program,
+        runDispatch(projectPath, {
+          module: String(opts.module ?? ""),
+          ...(typeof opts.wp === "string" ? { wp: opts.wp } : {}),
+          adapter: String(opts.adapter ?? ""),
+          as: String(opts.as ?? ""),
+          requesterToken: String(opts.requesterToken ?? ""),
+          role: String(opts.role ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          command,
+          ...(timeout !== undefined && Number.isFinite(timeout) ? { timeoutSeconds: timeout } : {}),
+          json: opts.json === true,
+        })
+      );
     });
 
   const session = program.command("session").description("authenticated session management");

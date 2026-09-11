@@ -10,6 +10,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { SCHEMA_VERSION, MIGRATIONS } from "./schema.js";
 import {
+  AdapterRepository,
   ApprovalRepository,
   ArtifactRepository,
   BlockerRepository,
@@ -168,6 +169,10 @@ export class ChronoDatabase {
 
   grants(): GrantRepository {
     return new GrantRepository(this.db);
+  }
+
+  adapters(): AdapterRepository {
+    return new AdapterRepository(this.db);
   }
 
   sessions(): SessionRepository {

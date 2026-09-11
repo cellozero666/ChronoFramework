@@ -44,6 +44,8 @@ describe("Schema migrations", () => {
     expect(db.projects().findById("default").language).toBe("en");
     // v2+ tables are usable.
     expect(db.sequences().allocate("BLK")).toBe("BLK-0001");
+    // Slice 6 registry table exists after the upgrade path.
+    expect(db.adapters().listAll()).toEqual([]);
   });
 
   it("is idempotent on a current database", () => {

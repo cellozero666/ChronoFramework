@@ -1644,6 +1644,134 @@ export class SessionAuthorizationRepository {
   }
 }
 
+/** Runtime adapter registration record [RUNTIME §13, PL Phase 5]. */
+export interface AdapterRecord {
+  id: string;
+  name: string;
+  entrypoint: string;
+  gateHook: string | null;
+  dispatchProof: string | null;
+  rtkRouting: string | null;
+  skillActivation: string | null;
+  conformanceProof: string[];
+  status: string;
+  registeredBy: string;
+  registeredAt: string;
+}
+
+interface AdapterRow {
+  id: unknown;
+  name: unknown;
+  entrypoint: unknown;
+  gate_hook: unknown;
+  dispatch_proof: unknown;
+  rtk_routing: unknown;
+  skill_activation: unknown;
+  conformance_proof: unknown;
+  status: unknown;
+  registered_by: unknown;
+  registered_at: unknown;
+}
+
+/**
+ * Repository for runtime adapter registrations. Ids are unique;
+ * revocation is terminal (`active` → `revoked`, no un-revoke path).
+ */
+export class AdapterRepository {
+  constructor(private readonly db: Database) {}
+
+  create(adapter: {
+    id: string;
+    name: string;
+    entrypoint: string;
+    gateHook: string | null;
+    dispatchProof: string | null;
+    rtkRouting: string | null;
+    skillActivation: string | null;
+    conformanceProof: string[];
+    registeredBy: string;
+    registeredAt: string;
+  }): AdapterRecord {
+    try {
+      this.db.prepare(
+        `INSERT INTO adapter (id, name, entrypoint, gate_hook, dispatch_proof,
+           rtk_routing, skill_activation, conformance_proof, status,
+           registered_by, registered_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+      ).run(
+        adapter.id, adapter.name, adapter.entrypoint, adapter.gateHook,
+        adapter.dispatchProof, adapter.rtkRouting, adapter.skillActivation,
+        JSON.stringify(adapter.conformanceProof), adapter.registeredBy,
+        adapter.registeredAt
+      );
+    } catch {
+      throw new ChronoError({
+        code: ErrorCode.DUPLICATE_IDENTITY,
+        severity: Severity.ERROR,
+        message: `Adapter '${adapter.id}' is already registered: revoke it first to replace it`,
+        invariantRef: "INV §10.1",
+        affectedTarget: adapter.id,
+        suggestedAction: "Revoke the existing registration before registering a new one",
+      });
+    }
+    return this.findById(adapter.id);
+  }
+
+  findById(id: string): AdapterRecord {
+    const row = this.db
+      .prepare("SELECT * FROM adapter WHERE id = ?")
+      .get(id) as AdapterRow | undefined;
+    if (row === undefined) {
+      throw new ChronoError({
+        code: ErrorCode.ENTITY_NOT_FOUND,
+        severity: Severity.ERROR,
+        message: `Adapter '${id}' is not registered: unregistered runtimes cannot dispatch`,
+        invariantRef: "INV §10.2",
+        affectedTarget: id,
+        suggestedAction: "Register the adapter before dispatching through it",
+      });
+    }
+    return this.mapAdapterRow(row);
+  }
+
+  listAll(): AdapterRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM adapter ORDER BY id")
+      .all() as AdapterRow[];
+    return rows.map((row) => this.mapAdapterRow(row));
+  }
+
+  revoke(id: string): AdapterRecord {
+    this.findById(id);
+    this.db.prepare("UPDATE adapter SET status = 'revoked' WHERE id = ?").run(id);
+    return this.findById(id);
+  }
+
+  private mapAdapterRow(row: AdapterRow): AdapterRecord {
+    let conformanceProof: unknown;
+    try {
+      conformanceProof = JSON.parse(row.conformance_proof as string);
+    } catch {
+      conformanceProof = [];
+    }
+    return {
+      id: row.id as string,
+      name: row.name as string,
+      entrypoint: row.entrypoint as string,
+      gateHook: row.gate_hook as string | null,
+      dispatchProof: row.dispatch_proof as string | null,
+      rtkRouting: row.rtk_routing as string | null,
+      skillActivation: row.skill_activation as string | null,
+      conformanceProof: Array.isArray(conformanceProof)
+        ? (conformanceProof as string[])
+        : [],
+      status: row.status as string,
+      registeredBy: row.registered_by as string,
+      registeredAt: row.registered_at as string,
+    };
+  }
+}
+
 /** Authenticated adapter session record [DOM §2.2, Remediation §3A]. */
 export interface AgentSessionRecord {
   id: string;

@@ -1,7 +1,8 @@
 # Slice 5 Remediation Gate
 
-**Status:** BLOCKING
+**Status:** COMPLETE
 **Reopened:** 2026-09-11 — independent review rejected the prior COMPLETE claim (10 blocking findings: syntactic-only identity/sessions, incomplete grant binding, grantless execution cycle, TTY insufficiency, destructive key generation, matrix divergence, migration audit gaps).
+**Completed:** 2026-09-11 — all exit criteria re-evidenced from clean checkouts on both declared Node.js LTS versions (see evidence table below); PO authorized completion and start of Slice 6.
 **Scope:** domain, persistence, Core, CLI, packaging, and tests created through Slice 5
 **Rule:** Do not start or claim completion of Slice 6 until every exit criterion below passes from a clean checkout.
 
@@ -169,6 +170,29 @@ This remediation is complete only when all of the following are evidenced:
    unresolved PO decisions, and any remaining blocker. Do not report “complete”
    while a required capability is a stub, comment, mock-only proof, or future
    slice placeholder.
+
+## Completion evidence (2026-09-11)
+
+Clean checkouts were built by copying the working tree (excluding
+`node_modules`, `dist`, `.git`) to `/tmp/chrono-clean` (Node 22) and
+`/tmp/chrono-clean24` (Node 24); no manual workspace links were created
+(`node_modules/@chrono/*` are npm-managed symlinks only).
+
+| # | Criterion | Evidence |
+|---|-----------|----------|
+| 1 | Clean checkout: `npm ci`, lint, typecheck, build, full suite on every declared LTS | Node v22.21.1: `npm ci` clean, `eslint .` clean, `tsc --noEmit` clean, `tsc -b packages/cli` clean, 18 files / 163 tests pass. Node v24.20.0: same sequence clean, 18 files / 163 tests pass; `better-sqlite3` native binding loads. |
+| 2 | Packed install + global `chrono` init/status/validate across restarts | `npm pack` produced 4 tarballs (dist only, 0 test files). Isolated fixture installed all four tarballs; `chrono init --runtime test-runtime` → `status` → `validate` → VALID, each in a separate process. |
+| 3 | Adversarial tests pass, no skips/todos/manual links | 163/163 pass; repo-wide grep finds no `.skip`/`.todo`/`it.only`/TODO stubs (only comments quoting the rule). |
+| 4 | No public API bypasses Core decisions | Sessions are mandatory (`CallerAuth`), grants bind exact role+session, transitions revalidate every binding; `database.ts` exposes typed repositories only. |
+| 5 | Deny unknown/unassigned/wrong-role/stale/impersonated; 7 roles ± tests | `authority-matrix.test.ts` (10), `transition-guards.test.ts` (8), `authorization.test.ts` (17) cover all seven roles positively and negatively, plus TTY-only privileged mint denial and signed-bootstrap replay denial. |
+| 6 | Tamper attempts fail; history resolvable | `audit-immutability.test.ts` (5, incl. raw-SQL UPDATE/DELETE), `revision-history.test.ts` (3), `migration.test.ts` (v1→v8, idempotent, luca→lucca audit). |
+| 7 | Docs/schemas/migrations/behavior agree | `SCHEMA_VERSION = 8` at gate time (Slice 6 later advanced it to 9 with migration-tested upgrades); CLI help/options match Core behavior (`--requester-token`, `--rotate`, `--rationale`); package metadata SPDX `Apache-2.0`, single-source version. |
+| 8 | Report | `docs/implementation/SLICE-6.md` (§5-evidence scope) records commands, results, files, PO decisions, and blockers. |
+
+**Accepted residual (fail-closed, not a bypass):** `chrono skill verify`
+refuses to record until pinned release metadata lands (Slice 8); the
+Core `recordSkillAttestation` path itself is fully implemented and
+tested, and dispatch denies without a current attestation.
 
 After this gate is independently reviewed and marked `COMPLETE`, continue with
 the remaining implementation plan. Do not publish, push, or create a release

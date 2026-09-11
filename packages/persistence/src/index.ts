@@ -11,6 +11,7 @@ export {
 } from "./database.js";
 
 export {
+  AdapterRepository,
   ArtifactRepository,
   ApprovalRepository,
   BlockerRepository,
@@ -29,6 +30,7 @@ export {
   SessionRepository,
   SkillRepository,
   WaiverRepository,
+  type AdapterRecord,
   type ArtifactRecord,
   type ArtifactRevisionRecord,
   type ApprovalRecord,
