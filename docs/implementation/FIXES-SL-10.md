@@ -183,12 +183,11 @@ removed from all procedures.
 2. Kiro binary absent on this host — Kiro conformance unproven beyond
    hook logic; exit criterion 4 stays open on this leg.
 3. `rtk gain` as the proof command proves binary identity, not
-   adapter-interception routing — Slice 9 residual, unchanged; the
-   proof format already binds arbitrary commands for a tighter future
-   command.
+   adapter-interception routing — this is an unresolved Slice 9 exit-criterion
+   gap, not a future enhancement. It is carried by `FIXES-SL-10.1.md`.
 4. Kiro SessionStart stdout injection is undocumented upstream — the
-   hook warms an authenticated session and degrades loudly; context
-   injection there is not claimed.
+   hook warms an authenticated session and degrades loudly; automatic Gaspar
+   activation remains unproven and is carried by `FIXES-SL-10.1.md`.
 5. Windows paths and line endings exercised by contract only (darwin
    host); `experimental.chat.system.transform` follows a documented
    but experimental OpenCode namespace.
@@ -239,8 +238,8 @@ authorization or runtime), FUTURE (enhancement, not a defect).
 | V8 | F6/F7 narrative corrected in this file | DONE | this section |
 | U1 | Live real-runtime acceptance (all three runtimes, paid models, provider login) | OPEN — PO authorization required | hermetic assets + enforcement tests pass; exit criteria 4 and 9 stay open |
 | U2 | Kiro runtime conformance | OPEN — Kiro binary absent on this host | hook logic proven; acceptance procedure in `SLICE-9-REPORT.md` §8 |
-| U3 | Tighter proof command (adapter-interception routing vs `gain` identity) | FUTURE | proof format already binds arbitrary commands; no format change needed |
-| U4 | Kiro SessionStart stdout-injection verification | FUTURE — needs Kiro runtime | hook degrades loudly by design; context injection there is not claimed |
+| U3 | Effective adapter-interception routing proof rather than `gain` identity | OPEN — release blocker | Slice 9 §9.3 and exit criterion 3 require routed/rewritten evidence; tracked in `FIXES-SL-10.1.md` |
+| U4 | Kiro SessionStart automatic Gaspar activation | OPEN — runtime acceptance and possible code correction | Slice 10 exit criteria 4 and 9 require proof in the real runtime; tracked in `FIXES-SL-10.1.md` |
 | U5 | Windows CI leg (paths, line endings, keychain absence) | FUTURE | contract-only coverage on darwin host |
 | U6 | OpenCode `experimental.chat.system.transform` namespace tracking | FUTURE | upstream rename would silently drop injection; enforcement never depends on it |
 | U7 | Single-command broker rotation UX (currently revoke + issue) | FUTURE | single-active invariant already enforced; rotation is two audited steps |

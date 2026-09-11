@@ -1,6 +1,6 @@
 # Slice 10 — One-Command Bootstrap and Automatic Gaspar Entry
 
-**Status:** QUEUED — starts only after Slice 9 is independently marked `COMPLETE`  
+**Status:** IMPLEMENTED — NOT COMPLETE; corrective work and real-runtime acceptance remain
 **Scope:** Convert the secured Core, setup operations, and runtime adapters into the final first-run and resume experience.  
 **Primary user journey:** install CHRONO → run `chrono init` once → open a selected AI CLI normally → Gaspar starts or resumes the governed workflow.  
 **Non-authorization:** This slice does not authorize publication, remote changes, paid model use, destructive project changes, silent global configuration changes, or acceptance of residual security risk.
@@ -382,6 +382,10 @@ Slice 10 is complete only when all of the following are true:
 10. Documentation describes the proven happy path accurately, with no manual
     hidden prerequisite or unsupported release claim.
 
-After independent review marks Slice 10 `COMPLETE`, continue with Phase 6 and
-the remaining release-candidate tasks in `IMPLEMENTER-TASKS.md`. Do not publish,
-tag, push, or declare final v1 solely because the one-command journey passes.
+Slice 10 was implemented before Slice 9 received its independent `COMPLETE`
+disposition. The code may remain, but both gates remain open. Resolve
+[`FIXES-SL-10.1.md`](FIXES-SL-10.1.md), complete the required real-runtime
+matrix, and obtain fresh independent dispositions for Slices 9 and 10 before
+continuing with Phase 6 and the remaining release-candidate tasks in
+`IMPLEMENTER-TASKS.md`. Do not publish, tag, push, or declare final v1 solely
+because the one-command journey passes.

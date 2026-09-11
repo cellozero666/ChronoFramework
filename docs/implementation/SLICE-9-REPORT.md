@@ -1,7 +1,8 @@
 # Slice 9 Implementation Report — Runtime Enforcement Closure
 
-**Status:** IMPLEMENTED ON BRANCH — not marked `COMPLETE`; `SLICE-9.md`
-remains `READY FOR IMPLEMENTATION` until independent review disposition.
+**Status:** HISTORICAL IMPLEMENTATION REPORT — Slice 9 is implemented but not
+`COMPLETE`; current disposition and remaining work are recorded in
+`SLICE-9.md` and `FIXES-SL-10.1.md`.
 **Branch:** `main` (no branch created or switched; nothing pushed, tagged,
 published, or released).
 **Report date:** 2026-09-11
@@ -358,16 +359,17 @@ investigated and closed with no change:
    acceptance requiring model spend awaits explicit PO authorization.
 4. **No push / tag / publish / release / remote changes performed**
    (unauthorized); all commits remain local on `main`.
-5. Slice 10 and IMPLEMENTER-TASKS 3–7 are untouched per instructions
-   (remain on Slice 9).
+5. At the time of this report, Slice 10 and IMPLEMENTER-TASKS 3–7 were
+   untouched. Slice 10 was implemented later; this statement is retained only
+   as historical evidence for this report's original scope.
 
 ## 12. Documentation synchronization
 
 `AGENTS.md`, `docs/README.md`, `IMPLEMENTATION-PLAN.md`,
-`IMPLEMENTER-TASKS.md`, `SLICE-9.md` (still `READY FOR IMPLEMENTATION`),
-and `SLICE-10.md` (still `QUEUED`) were reviewed: they state
-requirements and queue order, make no passing-conformance claims, and
-required no changes in this round. Runtime Contract, Core Specification,
+At the time of this report, `IMPLEMENTER-TASKS.md`, `SLICE-9.md`, and
+`SLICE-10.md` stated the then-current queue order. Their current status is now
+maintained in those files and `FIXES-SL-10.1.md`; this historical report must
+not be used as the live checkpoint. Runtime Contract, Core Specification,
 schemas, and ADRs already specify the Slice 9 gate algorithms
 (`gate_architecture_approval`, `gate_spec_ready`, `gate_verification`);
 no normative change was needed for the teardown/lint corrections.

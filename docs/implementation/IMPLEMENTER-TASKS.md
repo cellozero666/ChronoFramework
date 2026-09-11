@@ -1,7 +1,7 @@
 # Implementer Task Queue — Release-Candidate Readiness
 
 **Status:** ACTIVE  
-**Start point:** committed post-Slice-8 baseline  
+**Start point:** implemented Slices 9–10 baseline, pending corrective and real-runtime gates
 **Target:** implementation complete and ready for the Product Owner's final real-runtime verification; not published or released.
 
 ## Operating rules
@@ -20,12 +20,20 @@
 
 ## Task 1 — Execute and independently review Slice 9
 
+**Current disposition:** IMPLEMENTED, NOT COMPLETE. Resolve the applicable
+items in [`FIXES-SL-10.1.md`](FIXES-SL-10.1.md) and collect the missing
+real-runtime evidence before independent closure.
+
 Implement every section and exit criterion in [`SLICE-9.md`](SLICE-9.md).
 Create a concise Slice 9 implementation report containing exact tests,
 versions, fixtures, files, denials, and residuals. Perform a second review pass
 against the normative documents before marking it complete.
 
 ## Task 2 — Execute and independently review Slice 10
+
+**Current disposition:** IMPLEMENTED, NOT COMPLETE. Resolve the applicable
+items in [`FIXES-SL-10.1.md`](FIXES-SL-10.1.md) and collect the missing
+real-runtime evidence before independent closure.
 
 Implement every requirement and exit criterion in [`SLICE-10.md`](SLICE-10.md).
 Prove the public experience from packed installation through `chrono init` to

@@ -37,9 +37,10 @@ the current execution queue are indexed below:
 - [`implementation/SLICE-6.md`](implementation/SLICE-6.md) and [`implementation/SLICE-7.md`](implementation/SLICE-7.md) — completed implementation reports.
 - [`implementation/FIXES-SL-1-7.md`](implementation/FIXES-SL-1-7.md) and [`implementation/FIXES-SL-8.md`](implementation/FIXES-SL-8.md) — independent corrective reviews.
 - [`implementation/FIXES-SL-10.md`](implementation/FIXES-SL-10.md) — implementer bug-verification pass for Slice 10 (not an independent review).
+- [`implementation/FIXES-SL-10.1.md`](implementation/FIXES-SL-10.1.md) — current corrective gate before real-runtime acceptance and independent closure of Slices 9–10.
 - [`implementation/POST-SLICE-8-REVIEW.md`](implementation/POST-SLICE-8-REVIEW.md) — current code/documentation comparison and release-readiness findings.
-- [`implementation/SLICE-9.md`](implementation/SLICE-9.md) — next blocking implementation slice.
-- [`implementation/SLICE-10.md`](implementation/SLICE-10.md) — one-command bootstrap and automatic Gaspar start/resume experience.
+- [`implementation/SLICE-9.md`](implementation/SLICE-9.md) — implemented runtime-enforcement slice, pending corrective and real-runtime closure.
+- [`implementation/SLICE-10.md`](implementation/SLICE-10.md) — implemented one-command bootstrap and automatic Gaspar start/resume experience, pending corrective and real-runtime closure.
 - [`implementation/IMPLEMENTER-TASKS.md`](implementation/IMPLEMENTER-TASKS.md) — ordered work queue through release-candidate readiness.
 
 ## User guides

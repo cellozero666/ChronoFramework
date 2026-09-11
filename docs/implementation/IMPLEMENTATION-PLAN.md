@@ -5,13 +5,14 @@
 **Required targets:** global `chrono` CLI plus OpenCode, Claude Code, and Kiro adapters
 **Rule:** Complete and review each phase before starting the next. Do not implement the Core from the conceptual documents alone.
 
-**Current checkpoint (2026-09-11):** Slices 1–8 are committed and their
-corrective reviews are cleared. Phase 5 is not complete: RTK routing proof,
-all protected CLI gates, complete OpenCode tool coverage, and equivalent
-Claude Code/Kiro adapters remain. Continue with [`SLICE-9.md`](SLICE-9.md),
-then [`SLICE-10.md`](SLICE-10.md), and then the remaining ordered
-[`IMPLEMENTER-TASKS.md`](IMPLEMENTER-TASKS.md). Neither
-the Phase 6 MVP gate nor final v1 has been claimed.
+**Current checkpoint (2026-09-11):** Slices 1–8 and their corrective reviews
+are cleared. Slices 9 and 10 are implemented and pass the hermetic verification
+baseline, but neither is complete. Effective RTK interception/routing proof,
+fail-closed Gaspar entry projection, contract alignment for proof authority,
+and real-runtime acceptance remain in
+[`FIXES-SL-10.1.md`](FIXES-SL-10.1.md). Phase 6 must not start until fresh
+independent dispositions close both slices. Neither the Phase 6 MVP gate nor
+final v1 has been claimed.
 
 No provider, model name, or model version may be hardcoded in source, templates, adapters, tests, generated agent files, or defaults. Model selection is external configuration owned by the Product Owner. Changing the selected model MUST NOT change authority, state, gates, evidence requirements, or behavior.
 

@@ -1,8 +1,8 @@
 # Slice 9 — Runtime Enforcement Closure
 
-**Status:** READY FOR IMPLEMENTATION  
+**Status:** IMPLEMENTED — NOT COMPLETE; corrective work and real-runtime acceptance remain
 **Scope:** Close the remaining Phase 5 enforcement gaps before Phase 6 MVP proof.  
-**Prerequisites:** Slices 1–8 and their corrective reviews are committed; `POST-SLICE-8-REVIEW.md` is accepted as the current factual baseline.  
+**Prerequisites:** Slices 1–8 and their corrective reviews are committed. The current factual baseline is this specification together with `SLICE-9-REPORT.md`, `FIXES-SL-10.md`, and `FIXES-SL-10.1.md`.
 **Non-authorization:** This slice does not authorize package installation outside the project, global runtime mutation, paid model execution, publication, push, tags, releases, or security-risk acceptance.
 
 ## Objective
@@ -133,7 +133,10 @@ Slice 9 is complete only when:
    simulated mandatory integrations, or future-work placeholders in Slice 9
    scope.
 
-After independent review marks this slice `COMPLETE`, proceed to
-[`SLICE-10.md`](SLICE-10.md), then continue through the remaining ordered tasks
-in `IMPLEMENTER-TASKS.md`. Stop only at a genuinely required PO decision or
+Slice 10 was implemented before this slice received an independent `COMPLETE`
+disposition. That implementation may remain, but it does not waive this gate.
+Resolve the code and contract findings in
+[`FIXES-SL-10.1.md`](FIXES-SL-10.1.md), obtain the missing real-runtime
+evidence, and then perform a fresh independent disposition of both slices
+before continuing to Phase 6. Stop only at a genuinely required PO decision or
 external-action authorization.
