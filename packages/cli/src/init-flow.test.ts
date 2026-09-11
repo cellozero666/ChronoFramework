@@ -401,6 +401,68 @@ describe("Init happy path and resume", () => {
       expect(haystack).not.toContain(banned);
     }
   });
+
+  it("configures two runtimes with per-adapter sessions, proofs, and entry", async () => {
+    const bins = makeBins(binDir);
+    const claudeBin = join(binDir, "claude");
+    writeFileSync(claudeBin, "#!/bin/sh\necho 'claude 9.9.9-test'\n", "utf8");
+    chmodSync(claudeBin, 0o755);
+    const probes = flowProbes(bins);
+    const multi: FlowProbes = {
+      ...probes,
+      execFile: (cmd: string[]) => {
+        const [binary, ...args] = cmd as [string, ...string[]];
+        if (binary === claudeBin || binary === "claude") {
+          return { exitCode: 0, stdout: "claude 9.9.9-test\n", stderr: "" };
+        }
+        void args;
+        return probes.execFile(cmd, 120000);
+      },
+      which: (binary: string): string | null => {
+        if (binary === "claude") {
+          return claudeBin;
+        }
+        return probes.which(binary);
+      },
+    };
+    const store = new MemoryKeyStore();
+    const out = await runInitFlow(
+      tempDir,
+      { json: true, yes: true, runtimeIds: ["opencode", "claude-code"] },
+      depsOf(store),
+      multi,
+      autoConfirm([])
+    );
+    expect(out.exitCode).toBe(0);
+    expect(JSON.parse(out.stdout) as object).toMatchObject({ ok: true, ready: true });
+    const core = new ChronoCore({ projectPath: tempDir });
+    try {
+      // Multi-runtime projects keep project runtime unset (any runtime opens).
+      expect(core.status().value?.details.runtime).toBe(null);
+      const active = core.listAdapters().filter((a) => a.status === "active").map((a) => a.id).sort();
+      expect(active).toEqual(["claude-code", "opencode"]);
+      // Each adapter proved under its own runtime string.
+      for (const [adapter, runtime] of [["opencode", "opencode"], ["claude-code", "claude-code"]] as const) {
+        const proof = core.routingProofStatus(adapter, runtime);
+        expect(proof.present).toBe(true);
+        expect(proof.expired).toBe(false);
+      }
+      // Entry redeems for the second adapter with its own scope.
+      const [account, brokerId] = readFileSync(join(tempDir, ".chrono", "broker-account"), "utf8").trim().split("\n");
+      const secret = store.readKey(account ?? "");
+      expect(secret).toMatch(/^[0-9a-f]{64}$/);
+      const redeemed = core.redeemBrokerCredential({
+        brokerId: brokerId ?? "",
+        secret: secret ?? "",
+        adapterId: "claude-code",
+        runtime: "claude-code",
+      });
+      expect(redeemed.ok).toBe(true);
+      expect(redeemed.value?.projection.projectState).toBe("ANALYZING");
+    } finally {
+      core.close();
+    }
+  });
 });
 
 describe("Init plan files", () => {
