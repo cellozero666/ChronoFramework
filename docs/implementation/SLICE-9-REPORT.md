@@ -17,14 +17,17 @@ correction round. No Slice 10 functionality was implemented.
 | `53eac5b` | Slice 9: record PO trust-boundary decision (exit criterion 1) |
 | `249b15e` | Slice 9 correction: deterministic teardown lifecycle + clean-test gate |
 | `01aa2e1` | Slice 9 correction: eslint Node globals for scripts/ gates |
+| `6386c75` | Slice 9 correction: better-sqlite3 12.11.1 → 13.0.3 (N-API teardown fix) |
 
-44 files changed, 4378 insertions, 262 deletions (`git diff --stat
-f21c313..HEAD`). Full name list:
+48 files changed, 4686 insertions(+), 701 deletions(-) (`git diff
+--stat f21c313..HEAD` — the lockfile churn from dropping
+`prebuild-install` dominates the deletion count). Full name list:
 
 - `AGENTS.md`, `docs/README.md`, `docs/implementation/IMPLEMENTATION-PLAN.md`,
   `docs/implementation/IMPLEMENTER-TASKS.md`, `docs/implementation/SLICE-9.md`
   (checkpoint wording only), `docs/implementation/SLICE-10.md` (new, queued),
-  `docs/implementation/SLICE-9-PO-TRUST-DECISION.md` (new, §1 below)
+  `docs/implementation/SLICE-9-PO-TRUST-DECISION.md` (new, §1 below),
+  `docs/implementation/SLICE-9-REPORT.md` (new, this file)
 - `eslint.config.mjs`, `package.json` (`test:clean` script only),
   `scripts/verify-test-clean.mjs` (new)
 - `packages/cli/src/index.ts`, `opencode-plugin.ts`, `claude-hook.ts` (new),
@@ -126,36 +129,68 @@ PROVEN; RUNTIME REGISTRATION IMPLEMENTED; REAL-RUNTIME STATUS SPLIT
 
 ## 3. Reproducibility correction (independent-review finding)
 
-Reported symptom (clean `git archive` install, Node 24.20.0 and 24.4.1):
-`Test Files 23 passed (25)`, unhandled errors, `Worker exited
-unexpectedly`, `Assertion failed: env != nullptr`,
-`better-sqlite3 Statement::~Statement()`.
+Independent reproduction (fresh `git archive HEAD` export, Node 24.20.0):
 
-Reproduction attempt on this host: clean `git archive HEAD` exports +
-`npm ci` on Node 22.21.1 and Node 24.4.1 pass repeatedly (4 consecutive
-clean runs, exit 0, no markers). Node 24.20.0 is not installed on this
-host and was not installed (no software installation without PO
-authorization), so the exact reported crash could not be reproduced here.
+```text
+npm ci                    PASS
+npm run test:clean        FAIL — Test Files 24/25, Tests 226/242,
+                          2 unhandled errors, process exit 1
+Worker exited unexpectedly
+Assertion failed: env != nullptr
+node::RemoveEnvironmentCleanupHook
+better-sqlite3 Statement::~Statement
+```
 
-Product-correct hardening applied regardless (the crash class is live
-native handles at worker teardown):
+The missing 16 tests exactly match `gate-cli.test.ts` (16 tests): one
+forked worker aborted mid-file. The new `test:clean` gate behaved
+correctly by detecting and rejecting the failure.
 
-- `ChronoDatabase.close()` is now idempotent; overlapping
-  `finally`/`afterEach` cleanup can no longer fault teardown.
-- Every test `afterEach` guards `close` / `db.close` / `restoreTty` /
-  `rmSync` / env-restore with `typeof` checks, so a `beforeEach` failure
-  can no longer throw `TypeError` that masks the real failure (21 test
-  files).
-- New gate `npm run test:clean` (`scripts/verify-test-clean.mjs`, linted):
-  asserts exit 0, file/test counts ≥ baseline, zero failed/skipped/todo,
-  and absence of `unhandled`, `worker exited`, `assertion failed`,
-  native-teardown, and skip/todo markers. Negative control verified
-  (fails closed, exit 1, on a bogus expectation).
-- No Vitest configuration change, no suppression, no disabled suite, no
-  `passWithNoTests`, no forced exit. better-sqlite3 stays pinned at
-  12.11.1 (source-built via node-gyp on every clean install; no
-  prebuilds); a speculative major upgrade was deliberately NOT made
-  without reproduction evidence.
+### Root cause (verified against upstream)
+
+better-sqlite3 12.x inherits Node's raw `node::ObjectWrap`. Its
+constructor registers an environment cleanup hook and its destructor
+removes it. When a `Statement` object is finalized during or after
+Environment teardown — a GC-timing-dependent race, which is why one
+worker file can vanish intermittently — the destructor calls
+`RemoveEnvironmentCleanupHook` with no current Environment and Node's
+`CHECK_NOT_NULL(env)` aborts the process. References: upstream issue
+#1507 ("process aborting from terminating worker threads", fixed in
+v13.0.2) and the v13.0.0 N-API migration notes. The crash is
+independent of test logic: no leaked Core/database ownership was found
+(audit: all CLI entry points close in `finally`; all one-shot
+statements; constructor throw paths close; no `.iterate()`/`.backup()`
+handles; no cached statements).
+
+### Implemented fix
+
+better-sqlite3 `12.11.1` → `13.0.3` in `packages/core/package.json`,
+`packages/persistence/package.json` (`@types/better-sqlite3` `7.6.13` →
+`9.6.0`), and the root `allowScripts` key. Justification:
+
+- v13.0.0 migrates the addon to `node-addon-api` (N-API), structurally
+  removing the `ObjectWrap` cleanup-hook crash path; v13.0.2 explicitly
+  fixes worker-termination aborts.
+- `engines: node >= 22` covers the declared `^22.12.0 || ^24.0.0` range.
+- N-API prebuilds ship inside the package for darwin-arm64/x64,
+  linux-arm64/x64 (gnu + musl), and win32-arm64/x64 — verified present in
+  the installed tree with no `build/Release/*.node`, so supported-OS
+  installs need no compiler toolchain (and the same binary serves ABI
+  127 and 137, eliminating the ABI-mismatch class).
+- The deprecated `prebuild-install` dependency is gone (lockfile shrinks
+  accordingly).
+- API usage is unchanged (`Database`, `pragma`, `prepare`/`run`/`get`/
+  `all`, `exec`, `transaction`, `close`); typecheck passes on the new
+  types; migration, concurrency (`grants`, `sequence`), audit-immutability,
+  and tamper suites all pass unmodified — no weakened transaction,
+  concurrency, audit, or tamper guarantee.
+
+Retained hardening (still valuable, not the fix): idempotent
+`ChronoDatabase.close()` and guarded `afterEach` teardown in 21 test
+files (a `beforeEach` failure can no longer mask itself with `TypeError`).
+`test:clean` additionally fails on any Vitest `Errors N` section. No
+Vitest configuration change, no suppression, no disabled suite, no
+`passWithNoTests`, no forced exit, no count reduction, no narrowed Node
+range.
 
 ## 4. Exact versions
 
@@ -165,7 +200,7 @@ native handles at worker teardown):
 | Node.js (matrix B / current 24 on host) | v24.4.1, npm 11.4.2 |
 | Vitest | 2.1.9 |
 | TypeScript | 5.9.3 |
-| better-sqlite3 | 12.11.1 (built from source on each clean install) |
+| better-sqlite3 | 13.0.3 (N-API prebuilds bundled; `@types/better-sqlite3` 9.6.0) |
 | opencode (real binary) | 1.18.30 |
 | claude/Claude Code (real binary) | 2.1.206 |
 | rtk/Rust Token Killer (real binary) | 0.44.0 (`rtk gain` dashboard ok) |
@@ -177,18 +212,31 @@ Node 24.20.0 (reviewers' environment) is unavailable on this host.
 
 Per environment: `npm ci` → `npm run test:clean` → `npm run lint` →
 `npm run typecheck` → `npm run build` (`git diff --check` is clean in the
-source repo; a bare export has no git tree to diff).
+source repo; a bare export has no git tree to diff). Node 24.20.0 runs
+from a checksum-verified official portable binary
+(`SHASUMS256 b7bf7707…`, `/tmp`-local, no system installation); shell,
+npm, npx, the gate script, the Vitest coordinator, and forked workers
+all resolve to that single executable (`which node/npm/npx`,
+`#!/usr/bin/env node` shebang, `process.execPath` forks), and the N-API
+prebuild removes ABI coupling structurally.
 
-| Env | npm ci | test:clean (files/tests) | lint | typecheck | build |
-|---|---|---|---|---|---|
-| Node 22.21.1 (`/tmp/chrono-m22`) | 0 | PASS — 25 files, 242 tests, exit 0, 0 unhandled, 0 crashes, 0 skips | 0 | 0 | 0 |
-| Node 24.4.1 (`/tmp/chrono-m24`) | 0 | PASS — 25 files, 242 tests, exit 0, 0 unhandled, 0 crashes, 0 skips | 0 | 0 | 0 |
+| Env | Executable / ABI / npm | npm ci | test:clean (files/tests) | lint | typecheck | build |
+|---|---|---|---|---|---|---|
+| Node 22.21.1 (`/tmp/f22`) | ServBay `…/22/22.21.1/bin/node`, ABI 127, npm 11.18.0 | 0 | PASS — 25 files, 242 tests, exit 0, 0 unhandled, 0 crashes, 0 skips | 0 | 0 | 0 |
+| Node 24.4.1 (`/tmp/f2441`) | Homebrew `/opt/homebrew/Cellar/node/24.4.1/bin/node`, ABI 137, npm 11.4.2 | 0 | PASS — 25 files, 242 tests, exit 0, 0 unhandled, 0 crashes, 0 skips | 0 | 0 | 0 |
+| Node 24.20.0 (`/tmp/f2420`) | portable `node-v24.20.0-darwin-arm64/bin/node`, ABI 137, npm 11.19.0 | 0 | PASS ×5 consecutive — 25 files, 242 tests, exit 0, 0 unhandled, 0 crashes, 0 skips | 0 | 0 | 0 |
 
-Baseline is unchanged at 25 files / 242 tests (no valid new tests were
-added in the correction round beyond the teardown guards, which add no
-test count). Source-repo `git diff --check`: clean (exit 0).
+8 further consecutive PASS runs on 24.20.0 were recorded in the
+pre-commit trial tree (identical code and dependency versions): **13
+consecutive clean 24.20.0 runs total**, plus repeated full-suite,
+single-file, and `--no-isolate` runs during diagnosis — zero markers in
+every run.
 
-## 6. Packed-package / global CLI evidence (from the Node 24.4.1 export)
+Baseline is unchanged at 25 files / 242 tests (the correction round
+adds guards and a dependency upgrade, no test-count change). Source-repo
+`git diff --check`: clean (exit 0).
+
+## 6. Packed-package / global CLI evidence (from the Node 24.20.0 export)
 
 - `npm pack -w @chrono/{domain,persistence,core,cli}` → 4 tarballs;
   `chrono-cli-0.1.0.tgz` contains **0 test files** (dist only).
@@ -259,13 +307,11 @@ stays open until that procedure passes.
    Kiro real-runtime evidence.
 2. **Kiro runtime binary unavailable** on this host — environmental
    blocker for §8 acceptance (no install performed without authorization).
-3. **Node 24.20.0 unavailable** — the exact reported crash environment
-   could not be re-tested here; the fix is validated on 24.4.1.
-4. **Paid-model execution / provider login** not used — real-runtime
+3. **Paid-model execution / provider login** not used — real-runtime
    acceptance requiring model spend awaits explicit PO authorization.
-5. **No push / tag / publish / release / remote changes performed**
+4. **No push / tag / publish / release / remote changes performed**
    (unauthorized); all commits remain local on `main`.
-6. Slice 10 and IMPLEMENTER-TASKS 3–7 are untouched per instructions
+5. Slice 10 and IMPLEMENTER-TASKS 3–7 are untouched per instructions
    (remain on Slice 9).
 
 ## 11. Documentation synchronization
