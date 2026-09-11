@@ -29,19 +29,22 @@ export function claudeHookCommand(): string {
 }
 
 /**
- * Merge the CHRONO PreToolUse entry into `.claude/settings.json`
+ * Merge a CHRONO hook entry into a hook group of `.claude/settings.json`
  * without disturbing unrelated user configuration [REF §13 adapter
  * ownership]. `existing` is the current file content or null when
  * absent. Returns the merged document and whether it changed. Throws
  * on malformed or ambiguous content — setup must fail with an
  * explainable remediation path rather than overwrite blindly.
  */
-export function mergeClaudeSettings(existing: string | null): { merged: string; changed: boolean } {
-  const command = claudeHookCommand();
-  const entry = { matcher: "*", hooks: [{ type: "command", command, timeout: 30 }] };
+export function mergeClaudeHookGroup(
+  existing: string | null,
+  group: string,
+  entry: { matcher?: string | undefined; hooks: { type: string; command: string; timeout: number }[] }
+): { merged: string; changed: boolean } {
+  const command = entry.hooks[0]?.command ?? "";
   if (existing === null) {
     return {
-      merged: JSON.stringify({ hooks: { PreToolUse: [entry] } }, null, 2),
+      merged: JSON.stringify({ hooks: { [group]: [entry] } }, null, 2),
       changed: true,
     };
   }
@@ -57,18 +60,18 @@ export function mergeClaudeSettings(existing: string | null): { merged: string; 
   const doc = parsed as Record<string, unknown>;
   const hooks = doc["hooks"];
   if (hooks === undefined) {
-    return { merged: JSON.stringify({ ...doc, hooks: { PreToolUse: [entry] } }, null, 2), changed: true };
+    return { merged: JSON.stringify({ ...doc, hooks: { [group]: [entry] } }, null, 2), changed: true };
   }
   if (typeof hooks !== "object" || hooks === null || Array.isArray(hooks)) {
     throw new Error("Existing .claude/settings.json 'hooks' is not an object: refusing to overwrite user configuration");
   }
   const table = hooks as Record<string, unknown>;
-  const pre = table["PreToolUse"];
-  if (pre === undefined) {
-    return { merged: JSON.stringify({ ...doc, hooks: { ...table, PreToolUse: [entry] } }, null, 2), changed: true };
+  const current = table[group];
+  if (current === undefined) {
+    return { merged: JSON.stringify({ ...doc, hooks: { ...table, [group]: [entry] } }, null, 2), changed: true };
   }
-  if (!Array.isArray(pre)) {
-    throw new Error("Existing .claude/settings.json 'hooks.PreToolUse' is not an array: refusing to overwrite user configuration");
+  if (!Array.isArray(current)) {
+    throw new Error(`Existing .claude/settings.json 'hooks.${group}' is not an array: refusing to overwrite user configuration`);
   }
   // Recursive scan: the managed command may hide inside a group with
   // extra nesting or unknown keys. Finding it anywhere means already
@@ -86,13 +89,24 @@ export function mergeClaudeSettings(existing: string | null): { merged: string; 
     }
     return Object.values(record).some(containsCommand);
   };
-  if (containsCommand(pre)) {
+  if (command.length > 0 && containsCommand(current)) {
     return { merged: existing, changed: false };
   }
   return {
-    merged: JSON.stringify({ ...doc, hooks: { ...table, PreToolUse: [...pre, entry] } }, null, 2),
+    merged: JSON.stringify({ ...doc, hooks: { ...table, [group]: [...current, entry] } }, null, 2),
     changed: true,
   };
+}
+
+/**
+ * Merge the CHRONO PreToolUse entry into `.claude/settings.json`
+ * (same ownership and failure contract as mergeClaudeHookGroup).
+ */
+export function mergeClaudeSettings(existing: string | null): { merged: string; changed: boolean } {
+  return mergeClaudeHookGroup(existing, "PreToolUse", {
+    matcher: "*",
+    hooks: [{ type: "command", command: claudeHookCommand(), timeout: 30 }],
+  });
 }
 
 const CLAUDE_READ_TOOLS = ["Glob", "Grep", "LS", "Read", "TodoWrite"];

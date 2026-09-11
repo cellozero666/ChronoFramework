@@ -1643,7 +1643,12 @@ export class ChronoCore {
         suggestedAction: "Open a session with a canonical role",
       });
     }
-    this.db.sessions().touch(id, this.now());
+    // `last_seen` is best-effort observability, not authorization: read-only
+    // opens (detection, doctor) skip the write because SQLite enforces
+    // no-write at the file layer.
+    if (this.config.readOnly !== true) {
+      this.db.sessions().touch(id, this.now());
+    }
     return session;
   }
 
@@ -2190,11 +2195,24 @@ export class ChronoCore {
    * Returns the secret exactly once: only its SHA-256 persists. The CLI
    * must place the secret in the OS keychain; adapters present it over a
    * local stdio pipe, never in prompts, env, argv, logs, or files.
+   * Single-active: revoke the current credential before issuing a new
+   * one, so one project maps to one broker identity for hook scripts.
    */
   issueBrokerCredential(auth: CallerAuth): CoreResult<{ id: string; secret: string }> {
     try {
       const caller = this.resolveCaller(auth, "issue broker credential");
       this.requireCapability("broker.issue", caller);
+      const active = this.db.brokerCredentials().listAll().filter((c) => !c.revoked);
+      if (active.length > 0) {
+        throw new ChronoError({
+          code: ErrorCode.DUPLICATE_IDENTITY,
+          severity: Severity.ERROR,
+          message: `Broker credential '${active[0]!.id}' is still active: revoke it first to replace it`,
+          invariantRef: "INV §10.1",
+          affectedTarget: active[0]!.id,
+          suggestedAction: "Revoke the active broker credential before issuing a new one",
+        });
+      }
       const id = this.sequences.allocate("BRK");
       const secret = randomBytes(32).toString("hex");
       const secretHash = createHash("sha256").update(secret, "utf8").digest("hex");
@@ -2216,7 +2234,6 @@ export class ChronoCore {
       return this.handleError(e);
     }
   }
-
   /** Revoke a broker credential (terminal; audited). */
   revokeBrokerCredential(id: string, auth: CallerAuth): CoreResult<void> {
     try {
@@ -2238,6 +2255,38 @@ export class ChronoCore {
     } catch (e) {
       return this.handleError(e);
     }
+  }
+
+  /**
+   * Broker credential metadata for operators (read-only): identity,
+   * creation time, and revocation state. Secret hashes are never
+   * exposed. Requires a gaspar or PO session.
+   */
+  listBrokerCredentials(auth: CallerAuth): CoreResult<ReadonlyArray<{ id: string; createdAt: string; revoked: boolean }>> {
+    try {
+      const caller = this.resolveCaller(auth, "list broker credentials");
+      if (caller.role !== "gaspar" && caller.role !== "PO") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Broker listing requires a gaspar or PO session, not '${caller.role}'`,
+          invariantRef: "INV §5.1",
+          affectedTarget: caller.session.id,
+          suggestedAction: "List broker credentials through the orchestrator or PO",
+        });
+      }
+      return {
+        ok: true,
+        value: this.db.brokerCredentials().listAll().map((c) => ({ id: c.id, createdAt: c.createdAt, revoked: c.revoked })),
+      };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /** Pinned Core version recorded for this project, or null when unpinned. */
+  pinnedCoreVersion(): string | null {
+    return this.db.runtimeConfig().get("chrono.version");
   }
 
   /**
@@ -6468,6 +6517,24 @@ export class ChronoCore {
       validUntil: proof.validUntil,
       expired: Date.parse(proof.validUntil) <= Date.parse(this.now()),
     };
+  }
+
+  /**
+   * Latest routing proof per runtime for one adapter (read-only,
+   * for doctor/init reporting). Never throws for missing rows.
+   */
+  routingProofScopes(
+    adapterId: string
+  ): ReadonlyArray<{ runtime: string; id: string; validUntil: string; expired: boolean }> {
+    return this.db
+      .routingProofs()
+      .scopesFor(adapterId, "default")
+      .map((proof) => ({
+        runtime: proof.runtime,
+        id: proof.id,
+        validUntil: proof.validUntil,
+        expired: Date.parse(proof.validUntil) <= Date.parse(this.now()),
+      }));
   }
 
   /**

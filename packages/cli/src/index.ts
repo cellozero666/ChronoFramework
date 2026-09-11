@@ -9,19 +9,28 @@
 import { Command } from "commander";
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, accessSync, constants, openSync, readSync, writeSync, closeSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, accessSync, constants, openSync, readSync, writeSync, closeSync, existsSync } from "node:fs";
 import { get } from "node:https";
 import { dirname, join, delimiter as pathDelimiter } from "node:path";
 import { ChronoCore } from "@chrono/core";
 import { RTK_UPSTREAM, SKILL_RELEASE, SKILL_RUNTIME_PATHS, buildApprovalPayload, buildEnrollmentChallenge, buildEnrollmentPayload, buildSessionAuthorizationPayload, buildWaiverPayload, computeRevisionHash, convertSkillSource, fingerprintPublicKey, generateApprovalKeyPair, parseSkillFrontmatter, signApprovalPayload, skillGeneratedHashes, skillRawSourceUrl, skillVendorPath, verifySkillRelease, type SkillRuntime } from "@chrono/domain";
 import { CHRONO_VERSION } from "./version.js";
 import { buildOpencodePlugin } from "./opencode-plugin.js";
-import { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook, mergeClaudeSettings } from "./claude-hook.js";
+import { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook, mergeClaudeHookGroup, mergeClaudeSettings } from "./claude-hook.js";
 import { KIRO_HOOK_REGISTRATION_RELATIVE_PATH, KIRO_HOOK_RELATIVE_PATH, buildKiroHook, buildKiroHookRegistration } from "./kiro-hook.js";
+import {
+  ENTRY_SESSION_SCRIPT_RELATIVE_PATH,
+  GASPAR_DEFINITION_RELATIVE_PATH,
+  buildEntrySessionScript,
+  buildGasparDefinition,
+  buildKiroEntryRegistration,
+  entrySessionCommand,
+  kiroEntryRegistrationPath,
+} from "./gaspar-entry.js";
 import { constructionFailure, openReadProject, resolveProjectDir } from "./project.js";
 
 export { buildOpencodePlugin };
-export { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook, mergeClaudeSettings };
+export { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook, mergeClaudeHookGroup, mergeClaudeSettings };
 export { KIRO_HOOK_REGISTRATION_RELATIVE_PATH, KIRO_HOOK_RELATIVE_PATH, buildKiroHook, buildKiroHookRegistration };
 export { findProjectRoot, resolveProjectDir, openReadProject, constructionFailure } from "./project.js";
 import {
@@ -121,6 +130,17 @@ interface CommandOpts {
   readonly approval?: unknown;
   readonly id?: unknown;
   readonly rtkBinary?: unknown;
+  readonly yes?: unknown;
+  readonly yesFiles?: unknown;
+  readonly yesKeychain?: unknown;
+  readonly yesNetwork?: unknown;
+  readonly yesGlobal?: unknown;
+  readonly dryRun?: unknown;
+  readonly writePlan?: unknown;
+  readonly fromPlan?: unknown;
+  readonly tokenOut?: unknown;
+  readonly broker?: unknown;
+  readonly store?: unknown;
 }
 
 function formatCoreError(error: {
@@ -2113,6 +2133,8 @@ export function runAdapterRevoke(
 export interface SetupOptions {
   readonly adapter: string;
   readonly rtkBinary?: string | undefined;
+  /** Known runtime id for runtime-scoped entry assets (opencode, claude-code, kiro). */
+  readonly runtime?: string | undefined;
   readonly json?: boolean | undefined;
 }
 
@@ -2276,9 +2298,13 @@ export function runSetup(
     const kiroHookPath = join(projectPath, KIRO_HOOK_RELATIVE_PATH);
     const kiroRegistrationPath = join(projectPath, KIRO_HOOK_REGISTRATION_RELATIVE_PATH);
     const claudeSettingsPath = join(projectPath, CLAUDE_SETTINGS_RELATIVE_PATH);
+    const sessionScriptPath = join(projectPath, ENTRY_SESSION_SCRIPT_RELATIVE_PATH);
+    const gasparDefinitionPath = join(projectPath, GASPAR_DEFINITION_RELATIVE_PATH);
     try {
       mkdirSync(dirname(pluginPath), { recursive: true });
       writeFileSync(pluginPath, buildOpencodePlugin(), "utf8");
+      mkdirSync(dirname(sessionScriptPath), { recursive: true });
+      writeFileSync(sessionScriptPath, buildEntrySessionScript(), "utf8");
       mkdirSync(dirname(claudeHookPath), { recursive: true });
       writeFileSync(claudeHookPath, buildClaudeHook(), "utf8");
       mkdirSync(dirname(kiroHookPath), { recursive: true });
@@ -2303,10 +2329,40 @@ export function runSetup(
       }
       if (mergedSettings.changed) {
         mkdirSync(dirname(claudeSettingsPath), { recursive: true });
-        if (existingSettings !== null) {
+        if (existingSettings !== null && !existsSync(`${claudeSettingsPath}.chrono-bak`)) {
           writeFileSync(`${claudeSettingsPath}.chrono-bak`, existingSettings, "utf8");
         }
         writeFileSync(claudeSettingsPath, mergedSettings.merged, "utf8");
+      }
+      // Runtime-scoped entry assets, only when the adapter declares a
+      // known runtime: Claude SessionStart bootstrap, Kiro SessionStart
+      // registration, and the canonical Gaspar definition. Unknown
+      // adapter ids keep the shared assets above (never guessed). The
+      // `.chrono-bak` always preserves the pre-CHRONO original: an
+      // existing backup is never overwritten by a later merge.
+      const backUpOnce = (path: string, original: string | null): void => {
+        if (original === null || existsSync(`${path}.chrono-bak`)) {
+          return;
+        }
+        writeFileSync(`${path}.chrono-bak`, original, "utf8");
+      };
+      const runtimeId = options.runtime ?? null;
+      if (runtimeId === "claude-code") {
+        const beforeSessionStart = readFileSync(claudeSettingsPath, "utf8");
+        const sessionStart = mergeClaudeHookGroup(beforeSessionStart, "SessionStart", {
+          hooks: [{ type: "command", command: entrySessionCommand(options.adapter), timeout: 60 }],
+        });
+        if (sessionStart.changed) {
+          backUpOnce(claudeSettingsPath, existingSettings);
+          writeFileSync(claudeSettingsPath, sessionStart.merged, "utf8");
+        }
+        mkdirSync(dirname(gasparDefinitionPath), { recursive: true });
+        writeFileSync(gasparDefinitionPath, buildGasparDefinition(), "utf8");
+      }
+      if (runtimeId === "kiro") {
+        const entryRegistrationPath = join(projectPath, kiroEntryRegistrationPath(options.adapter));
+        mkdirSync(dirname(entryRegistrationPath), { recursive: true });
+        writeFileSync(entryRegistrationPath, buildKiroEntryRegistration(options.adapter), "utf8");
       }
     } catch (e) {
       return keychainFailure(e, asJson);
@@ -2317,6 +2373,9 @@ export function runSetup(
       KIRO_HOOK_RELATIVE_PATH,
       KIRO_HOOK_REGISTRATION_RELATIVE_PATH,
       CLAUDE_SETTINGS_RELATIVE_PATH,
+      ENTRY_SESSION_SCRIPT_RELATIVE_PATH,
+      ...(options.runtime === "claude-code" ? [GASPAR_DEFINITION_RELATIVE_PATH] : []),
+      ...(options.runtime === "kiro" ? [kiroEntryRegistrationPath(options.adapter)] : []),
     ];
     const body = asJson
       ? JSON.stringify(
@@ -2355,35 +2414,51 @@ export function runSetup(
  * `--path` is not given. Actions print to console and set process exit code
  * via `program.exitOverride` errors handled by the caller (bin.ts).
  */
+/** Commander collector for repeatable flags (e.g. --runtime). */
+function collectStrings(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
 export function createProgram(cwd: string): Command {
   const program = new Command();
   program.name("chrono").description("CHRONO — structured SDD framework CLI").version(CHRONO_VERSION);
-
   program
     .command("init")
-    .description("Initialize a new CHRONO project")
+    .description("One-command bootstrap: detect, plan, consent, and apply CHRONO setup with resume")
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--language <lang>", "project language (default: en)")
     .option("--gaspar-autonomy <mode>", "Gaspar autonomy mode")
-    .option("--runtime <runtime>", "runtime adapter name (recorded only, no policy)")
+    .option("--runtime <id>", "select a runtime (repeatable; default: all installed)", collectStrings, [])
+    .option("--yes", "consent to every effect listed in the plan (recorded per scope)")
+    .option("--yes-files", "consent to project-local file effects only")
+    .option("--yes-keychain", "consent to OS keychain effects only")
+    .option("--yes-network", "consent to network effects only")
+    .option("--yes-global", "consent to global effects only")
+    .option("--dry-run", "detect and render the plan with zero writes")
+    .option("--write-plan <file>", "write the reviewed plan file and exit")
+    .option("--from-plan <file>", "apply a reviewed plan file (rejected on drift)")
     .option("--json", "machine-readable JSON output")
-    .action((opts: CommandOpts) => {
+    .action(async (opts: CommandOpts) => {
       const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
-      const out = runInit(projectPath, {
+      const { runInitFlow } = await import("./init-flow.js");
+      const runtimes = Array.isArray(opts.runtime)
+        ? opts.runtime.filter((r): r is string => typeof r === "string")
+        : undefined;
+      const out = await runInitFlow(projectPath, {
+        ...(runtimes !== undefined && runtimes.length > 0 ? { runtimeIds: runtimes } : {}),
         language: typeof opts.language === "string" ? opts.language : undefined,
         gasparAutonomy: typeof opts.gasparAutonomy === "string" ? opts.gasparAutonomy : undefined,
-        runtime: typeof opts.runtime === "string" ? opts.runtime : null,
+        yes: opts.yes === true,
+        yesFiles: opts.yesFiles === true,
+        yesKeychain: opts.yesKeychain === true,
+        yesNetwork: opts.yesNetwork === true,
+        yesGlobal: opts.yesGlobal === true,
+        dryRun: opts.dryRun === true,
+        ...(typeof opts.writePlan === "string" ? { writePlan: opts.writePlan } : {}),
+        ...(typeof opts.fromPlan === "string" ? { fromPlan: opts.fromPlan } : {}),
         json: opts.json === true,
       });
-      if (out.stdout !== "") {
-        console.log(out.stdout);
-      }
-      if (out.stderr !== "") {
-        console.error(out.stderr);
-      }
-      if (out.exitCode !== 0) {
-        throw programFailureExit(out.exitCode);
-      }
+      emitProgramResult(program, out);
     });
 
   program
@@ -2854,6 +2929,192 @@ export function createProgram(cwd: string): Command {
       emitProgramResult(
         program,
         runSessionRevoke(projectPath, id, { actor: opts.as, session: token }, { json: opts.json === true })
+      );
+    });
+
+  program
+    .command("doctor")
+    .description("Read-only project diagnostics: compatibility, setup, hooks, RTK, skill, broker, entry readiness")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--as <actor>", "identity for broker inspection (gaspar or PO)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--json", "machine-readable JSON output")
+    .action(async (opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const { runDoctor } = await import("./init-flow.js");
+      const token =
+        typeof opts.sessionToken === "string" && opts.sessionToken.length > 0
+          ? resolveSessionToken(opts.sessionToken)
+          : resolveSessionToken(undefined);
+      emitProgramResult(
+        program,
+        runDoctor(projectPath, {
+          json: opts.json === true,
+          ...(typeof opts.as === "string" ? { as: opts.as } : {}),
+          ...(token !== null ? { session: token } : {}),
+        })
+      );
+    });
+
+  const broker = program.command("broker").description("Gaspar-entry broker credentials (no secret ever persists)");
+  broker
+    .command("issue")
+    .description("Issue a broker credential (secret shown once, or stored with --store)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--as <actor>", "requesting identity (gaspar or PO)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--store", "write the secret straight to the OS keychain instead of printing it")
+    .option("--json", "machine-readable JSON output")
+    .action(async (opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const { runBrokerIssue } = await import("./init-flow.js");
+      const token =
+        typeof opts.sessionToken === "string" && opts.sessionToken.length > 0
+          ? resolveSessionToken(opts.sessionToken)
+          : resolveSessionToken(undefined);
+      if (typeof opts.as !== "string" || token === null) {
+        emitProgramResult(
+          program,
+          opts.json === true
+            ? { exitCode: 2, stdout: JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: "broker issue requires --as and --session-token" } }, null, 2), stderr: "" }
+            : { exitCode: 2, stdout: "", stderr: "Error [VALIDATION_ERROR]: broker issue requires --as and --session-token" }
+        );
+        return;
+      }
+      emitProgramResult(
+        program,
+        runBrokerIssue(
+          projectPath,
+          { as: opts.as, session: token, store: opts.store === true, json: opts.json === true }
+        )
+      );
+    });
+  broker
+    .command("revoke")
+    .description("Revoke a broker credential (terminal; audited)")
+    .argument("<id>", "broker credential id")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--as <actor>", "requesting identity (gaspar or PO)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--json", "machine-readable JSON output")
+    .action(async (id: string, opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const { runBrokerRevoke } = await import("./init-flow.js");
+      const token =
+        typeof opts.sessionToken === "string" && opts.sessionToken.length > 0
+          ? resolveSessionToken(opts.sessionToken)
+          : resolveSessionToken(undefined);
+      if (typeof opts.as !== "string" || token === null) {
+        emitProgramResult(
+          program,
+          opts.json === true
+            ? { exitCode: 2, stdout: JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: "broker revoke requires --as and --session-token" } }, null, 2), stderr: "" }
+            : { exitCode: 2, stdout: "", stderr: "Error [VALIDATION_ERROR]: broker revoke requires --as and --session-token" }
+        );
+        return;
+      }
+      emitProgramResult(program, runBrokerRevoke(projectPath, { id, as: opts.as, session: token, json: opts.json === true }));
+    });
+  broker
+    .command("list")
+    .description("List broker credential metadata (never secret hashes)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--as <actor>", "requesting identity (gaspar or PO)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--json", "machine-readable JSON output")
+    .action(async (opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const { runBrokerList } = await import("./init-flow.js");
+      const token =
+        typeof opts.sessionToken === "string" && opts.sessionToken.length > 0
+          ? resolveSessionToken(opts.sessionToken)
+          : resolveSessionToken(undefined);
+      emitProgramResult(
+        program,
+        runBrokerList(projectPath, {
+          json: opts.json === true,
+          ...(typeof opts.as === "string" ? { as: opts.as } : {}),
+          ...(token !== null ? { session: token } : {}),
+        })
+      );
+    });
+
+  program
+    .command("entry")
+    .description("Redeem Gaspar entry for a runtime adapter (secret on stdin, token to --token-out only)")
+    .requiredOption("--adapter <id>", "runtime adapter id")
+    .requiredOption("--broker <id>", "broker credential id (recorded in .chrono/broker-account)")
+    .option("--runtime <name>", "adapter runtime (default: project runtime, else adapter id)")
+    .requiredOption("--token-out <path>", "0600 file receiving the session token")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action(async (opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const { runEntry } = await import("./init-flow.js");
+      if (process.stdin.isTTY === true) {
+        emitProgramResult(
+          program,
+          opts.json === true
+            ? { exitCode: 2, stdout: JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: "entry requires the broker secret piped on stdin" } }, null, 2), stderr: "" }
+            : { exitCode: 2, stdout: "", stderr: "Error [VALIDATION_ERROR]: entry requires the broker secret piped on stdin" }
+        );
+        return;
+      }
+      const { readFileSync: readStdin } = await import("node:fs");
+      let stdinText = "";
+      try {
+        stdinText = readStdin(0, "utf8");
+      } catch (e) {
+        emitProgramResult(
+          program,
+          opts.json === true
+            ? { exitCode: 2, stdout: JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: "entry could not read stdin" } }, null, 2), stderr: "" }
+            : { exitCode: 2, stdout: "", stderr: "Error [VALIDATION_ERROR]: entry could not read stdin" }
+        );
+        return;
+      }
+      emitProgramResult(
+        program,
+        runEntry(
+          projectPath,
+          {
+            adapter: String(opts.adapter ?? ""),
+            broker: String(opts.broker ?? ""),
+            ...(typeof opts.runtime === "string" ? { runtime: opts.runtime } : {}),
+            tokenOut: String(opts.tokenOut ?? ""),
+            json: opts.json === true,
+          },
+          stdinText
+        )
+      );
+    });
+
+  program
+    .command("uninstall")
+    .description("Scoped removal: hooks, broker, adapters, or project-data (destructive scope is interactive PO-only)")
+    .requiredOption("--scope <scope>", "hooks|broker|adapters|project-data")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--as <actor>", "requesting identity for broker/adapters scopes")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--json", "machine-readable JSON output")
+    .action(async (opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const { runUninstall } = await import("./init-flow.js");
+      const token =
+        typeof opts.sessionToken === "string" && opts.sessionToken.length > 0
+          ? resolveSessionToken(opts.sessionToken)
+          : resolveSessionToken(undefined);
+      emitProgramResult(
+        program,
+        runUninstall(
+          projectPath,
+          {
+            scope: String(opts.scope ?? ""),
+            ...(typeof opts.as === "string" ? { as: opts.as } : {}),
+            ...(token !== null ? { session: token } : {}),
+            json: opts.json === true,
+          }
+        )
       );
     });
 

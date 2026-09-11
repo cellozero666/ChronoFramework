@@ -47,8 +47,17 @@ export function buildOpencodePlugin(): string {
   *   CHRONO_SESSION_TOKEN and a live \`chrono gate execution\` AUTHORIZED
   *   verdict. Unknown tools are denied until classified (deny-by-default).
   *   Anything missing or DENIED throws (fail-closed).
+  *
+  * Automatic Gaspar entry (best effort, never a bypass): on
+  * \`session.created\` inside a CHRONO project the plugin runs the
+  * managed entry script, which redeems a broker session over a local
+  * channel and prints the safe Core projection. The projection is
+  * injected once into the session system prompt; the session token
+  * stays in plugin memory (never in model context). When entry is
+  * unavailable the session proceeds ungoverned and pre-tool gates keep
+  * enforcing fail-closed.
   */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -71,7 +80,70 @@ function gateFor(tool) {
 }
 
 export const ChronoGatePlugin = async (ctx) => {
+  // Entry projections stashed per OpenCode session id (process memory
+  // only). Session tokens never enter this map or model context: the
+  // entry script confines the token to a 0600 file and only the safe
+  // projection travels on stdout.
+  const entryProjections = new Map();
+  const runEntryProjection = (root, sessionId) => {
+    if (entryProjections.has(sessionId)) {
+      return;
+    }
+    try {
+      const script = join(root, ".chrono", "hooks", "chrono-entry-session.sh");
+      if (!existsSync(script)) {
+        return;
+      }
+      const adapter = readEnv("CHRONO_ENTRY_ADAPTER") ?? "opencode";
+      const chronoBin = readEnv("CHRONO_BIN") ?? "chrono";
+      const ran = spawnSync("sh", [script, adapter], {
+        encoding: "utf8",
+        timeout: 30000,
+        env: { ...process.env, CHRONO_BIN: chronoBin },
+      });
+      const out = typeof ran.stdout === "string" ? ran.stdout.trim() : "";
+      if (ran.status === 0 && out.length > 0) {
+        entryProjections.set(sessionId, out.slice(0, 8000));
+      }
+    } catch {
+      // Entry is best effort: degraded sessions proceed ungoverned and
+      // pre-tool gates keep enforcing fail-closed.
+    }
+  };
   return {
+    event: async ({ event }) => {
+      if (!event || event.type !== "session.created") {
+        return;
+      }
+      const root = (ctx && ctx.directory) || process.cwd();
+      if (!existsSync(join(root, ".chrono", "chrono.db"))) {
+        return;
+      }
+      const sessionId =
+        (event.properties && (event.properties.sessionID || event.properties.session_id)) ||
+        event.sessionID ||
+        event.session_id ||
+        "default";
+      runEntryProjection(root, String(sessionId));
+    },
+    "experimental.chat.system.transform": async (input, output) => {
+      try {
+        const sessionId =
+          (input && (input.sessionID || input.session_id)) || "default";
+        const projection = entryProjections.get(String(sessionId));
+        if (projection !== undefined && output && Array.isArray(output.system)) {
+          output.system.push(
+            "<chrono-entry>Gaspar entry projection from the project-pinned Core. " +
+              "Derive your opening strictly from it, never from chat history:\\n" +
+              projection +
+              "</chrono-entry>"
+          );
+          entryProjections.delete(String(sessionId));
+        }
+      } catch {
+        // Context injection is best effort; enforcement never depends on it.
+      }
+    },
     "tool.execute.before": async (input) => {
       const tool = input && typeof input.tool === "string" ? input.tool : "";
       const root = (ctx && ctx.directory) || process.cwd();

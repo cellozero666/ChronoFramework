@@ -2300,7 +2300,6 @@ export class RoutingProofRepository {
     }
     return this.mapRow(row);
   }
-
   /** Latest proof for one adapter/runtime/project scope (may be expired). */
   latestFor(adapterId: string, runtime: string, projectId: string): RoutingProofRecord | null {
     const row = this.db
@@ -2311,6 +2310,24 @@ export class RoutingProofRepository {
       )
       .get(adapterId, runtime, projectId) as RoutingProofRow | undefined;
     return row === undefined ? null : this.mapRow(row);
+  }
+
+  /** Latest proof per runtime for one adapter (may be expired). */
+  scopesFor(adapterId: string, projectId: string): RoutingProofRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM routing_proof AS outer_proof
+         WHERE adapter_id = ? AND project_id = ?
+           AND valid_until = (
+             SELECT MAX(valid_until) FROM routing_proof
+             WHERE adapter_id = outer_proof.adapter_id
+               AND runtime = outer_proof.runtime
+               AND project_id = outer_proof.project_id
+           )
+         ORDER BY runtime`
+      )
+      .all(adapterId, projectId) as RoutingProofRow[];
+    return rows.map((row) => this.mapRow(row));
   }
 
   private mapRow(row: RoutingProofRow): RoutingProofRecord {

@@ -7,6 +7,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, mkdirSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -192,6 +193,24 @@ describe("OpenCode plugin bytes", () => {
       expect(bytes).toContain(`"${tool}"`);
     }
     expect(bytes).toContain("TOOL_DENIED");
+  });
+
+  it("emits syntactically valid JavaScript (node --check)", () => {
+    // Regression guard: template-escaping slips produce generated files
+    // that fail to parse at import time. Checked with the running Node.
+    for (const [name, bytes] of Object.entries({
+      "chrono-gate.js": buildOpencodePlugin(),
+      "chrono-claude-gate.js": buildClaudeHook(),
+      "chrono-kiro-gate.js": buildKiroHook(),
+    })) {
+      const probe = join(mkdtempSync(join(tmpdir(), "chrono-syntax-")), name);
+      mkdirSync(dirname(probe), { recursive: true });
+      writeFileSync(probe, bytes, "utf8");
+      const checked = spawnSync(process.execPath, ["--check", probe], { encoding: "utf8" });
+      expect(`${name}: ${checked.stderr}`).toBe(`${name}: `);
+      expect(checked.status).toBe(0);
+      rmSync(dirname(probe), { recursive: true, force: true });
+    }
   });
 });
 

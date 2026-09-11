@@ -473,7 +473,7 @@ describe("Broker credentials and Gaspar entry", () => {
     expect(projection.value?.nextAction.key).toBe("resume-discovery");
   });
 
-  it("denies unknown, wrong-secret, and revoked credentials without oracle detail", () => {
+    it("denies unknown, wrong-secret, and revoked credentials without oracle detail", () => {
     const issued = core.issueBrokerCredential(gaspar);
     expect(issued.ok).toBe(true);
     const unknown = core.redeemBrokerCredential({
@@ -503,6 +503,21 @@ describe("Broker credentials and Gaspar entry", () => {
     expect(revoked.ok).toBe(false);
     expect(revoked.error?.code).toBe("EXECUTION_DENIED");
     expect(revoked.error?.message).toContain("revoked");
+  });
+
+  it("keeps a single active broker credential per project", () => {
+    const first = core.issueBrokerCredential(gaspar);
+    expect(first.ok).toBe(true);
+    const second = core.issueBrokerCredential(gaspar);
+    expect(second.ok).toBe(false);
+    expect(second.error?.code).toBe("DUPLICATE_IDENTITY");
+    expect(core.revokeBrokerCredential(first.value!.id, gaspar).ok).toBe(true);
+    const third = core.issueBrokerCredential(gaspar);
+    expect(third.ok).toBe(true);
+    expect(third.value?.id).not.toBe(first.value?.id);
+    const listed = core.listBrokerCredentials(gaspar);
+    expect(listed.ok).toBe(true);
+    expect(listed.value?.filter((c) => !c.revoked)).toHaveLength(1);
   });
 
   it("denies entry for unapproved adapters and unprepared setup", () => {

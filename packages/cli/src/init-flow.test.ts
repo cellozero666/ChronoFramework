@@ -306,7 +306,12 @@ describe("Init happy path and resume", () => {
     expect(existsSync(join(tempDir, ".opencode", "plugins", "chrono-gate.js"))).toBe(true);
     expect(existsSync(join(tempDir, ".kiro", "hooks", "chrono-gate.json"))).toBe(true);
     expect(existsSync(join(tempDir, ".chrono", "broker-account"))).toBe(true);
-    const account = readFileSync(join(tempDir, ".chrono", "broker-account"), "utf8").trim();
+    const [account, recordedBroker] = readFileSync(join(tempDir, ".chrono", "broker-account"), "utf8").trim().split("\n");
+    expect(account).toMatch(/^gaspar-entry-[0-9a-f]{16}$/);
+    expect(recordedBroker).toMatch(/^BRK-\d{4}$/);
+    if (account === undefined) {
+      throw new Error("broker account file malformed");
+    }
     const secret = store.readKey(account);
     expect(secret).toMatch(/^[0-9a-f]{64}$/);
     for (const file of walkFiles(tempDir)) {

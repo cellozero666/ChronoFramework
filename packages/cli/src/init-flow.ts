@@ -22,6 +22,7 @@ import { execFileSync } from "node:child_process";
 import {
   closeSync,
   existsSync,
+  readdirSync,
   mkdirSync,
   mkdtempSync,
   openSync,
@@ -36,10 +37,12 @@ import { ChronoCore } from "@chrono/core";
 import {
   buildSessionAuthorizationPayload,
   computeRevisionHash,
+  setupStepIndex,
   signApprovalPayload,
 } from "@chrono/domain";
 import { CHRONO_VERSION } from "./version.js";
 import {
+  buildOpencodePlugin,
   runAdapterActivate,
   runAdapterRegister,
   runApprove,
@@ -55,8 +58,18 @@ import {
   type CliOutput,
   type HumanCommandDeps,
 } from "./index.js";
+import { buildClaudeHook } from "./claude-hook.js";
+import { buildKiroHook, buildKiroHookRegistration } from "./kiro-hook.js";
+import {
+  buildEntrySessionScript,
+  buildGasparDefinition,
+  buildKiroEntryRegistration,
+  entrySessionCommand,
+  kiroEntryRegistrationPath,
+} from "./gaspar-entry.js";
 import { BROKER_KEY_SERVICE, OsKeychainStore, PO_KEY_ACCOUNT, brokerAccountFor } from "./keychain.js";
 import { constructionFailure } from "./project.js";
+import { openReadProject } from "./project.js";
 import type { KeyStore } from "./keychain.js";
 
 /** Canonical runtime identifiers (never providers or models) [FW §22]. */
@@ -1029,12 +1042,31 @@ export async function runInitFlow(
     }
 
     // Privileged sessions for the remaining steps (PO-signed, keychain-held).
-    const gasparSession = bootstrapFlowSession(core, "gaspar", "init-flow", projectRuntimeOf(core) ?? plan.runtimeIds[0] ?? "init", undefined, deps, asJson);
-    if ("failure" in gasparSession) {
+    // Each adapter gets sessions bound to its own id/runtime string so
+    // routing proofs land in the scope dispatch will look up.
+    const firstRuntime = plan.runtimeIds[0] ?? "init";
+    const gasparSessions = new Map<string, { id: string; token: string }>();
+    const openAdapterSession = (
+      adapterId: string
+    ): { session: { id: string; token: string } } | { failure: CliOutput } => {
+      const existing = gasparSessions.get(adapterId);
+      if (existing !== undefined) {
+        return { session: existing };
+      }
+      const opened = bootstrapFlowSession(core, "gaspar", adapterId, adapterId, undefined, deps, asJson);
+      if ("failure" in opened) {
+        return opened;
+      }
+      gasparSessions.set(adapterId, opened.session);
+      return { session: opened.session };
+    };
+    const primarySession = openAdapterSession(firstRuntime);
+    if ("failure" in primarySession) {
       lock.release();
-      return gasparSession.failure;
+      return primarySession.failure;
     }
-    const poSession = bootstrapFlowSession(core, "PO", "init-flow", projectRuntimeOf(core) ?? plan.runtimeIds[0] ?? "init", undefined, deps, asJson);
+    const gasparSession = primarySession;
+    const poSession = bootstrapFlowSession(core, "PO", firstRuntime, firstRuntime, undefined, deps, asJson);
     if ("failure" in poSession) {
       lock.release();
       return poSession.failure;
@@ -1072,8 +1104,6 @@ export async function runInitFlow(
         return failed;
       }
     }
-    const entryRuntime = projectRuntimeOf(core) ?? plan.runtimeIds[0] ?? "init";
-
     // RTK_VERIFIED_AND_ROUTED.
     if (need("RTK_VERIFIED_AND_ROUTED")) {
       const verify = runRtkVerify(root, { json: true, session: gasparSession.session, resolveBinary: (b) => probes.which(b) }, defaultRtkExec(probes));
@@ -1082,12 +1112,17 @@ export async function runInitFlow(
         return prefixStepFailure("RTK_VERIFIED_AND_ROUTED", verify, asJson);
       }
       for (const runtimeId of plan.runtimeIds) {
+        const adapterSession = openAdapterSession(runtimeId);
+        if ("failure" in adapterSession) {
+          lock.release();
+          return adapterSession.failure;
+        }
         const proof = runRtkProve(
           root,
           {
             adapter: runtimeId,
             as: "gaspar",
-            session: gasparSession.session,
+            session: adapterSession.session,
             binary: detection.rtk.binary ?? "rtk",
             resolveBinary: (b) => probes.which(b),
             ttlSeconds: 86400,
@@ -1214,7 +1249,11 @@ export async function runInitFlow(
     // NATIVE_HOOKS_INSTALLED.
     if (need("NATIVE_HOOKS_INSTALLED")) {
       for (const runtimeId of plan.runtimeIds) {
-        const installed = runSetup(root, { adapter: runtimeId, rtkBinary: detection.rtk.binary ?? "rtk", json: true }, defaultSetupExec(probes));
+        const installed = runSetup(
+          root,
+          { adapter: runtimeId, runtime: runtimeId, rtkBinary: detection.rtk.binary ?? "rtk", json: true },
+          defaultSetupExec(probes)
+        );
         if (installed.exitCode !== 0) {
           lock.release();
           return prefixStepFailure("NATIVE_HOOKS_INSTALLED", installed, asJson);
@@ -1254,23 +1293,41 @@ export async function runInitFlow(
     }
 
     // GASPAR_ENTRY_PREPARED: broker credential to the keychain, then prove
-    // the redeem loop and revoke the probe session (no orphans).
+    // the redeem loop and revoke the probe session (no orphans). Resume
+    // reuses a live credential whose secret is still held; a credential
+    // without its secret is revoked and replaced (audited recovery).
     if (need("GASPAR_ENTRY_PREPARED")) {
-      const issued = core.issueBrokerCredential(gasparAuth);
-      if (!issued.ok) {
-        lock.release();
-        return stepFailure("GASPAR_ENTRY_PREPARED", issued.error?.code ?? "EXECUTION_DENIED", issued.error?.message ?? "broker issue denied", asJson);
-      }
-      const brokerId = issued.value!.id;
       const account = brokerAccountFor(root);
-      try {
-        deps.store.writeKey(account, issued.value!.secret, BROKER_KEY_SERVICE);
-      } catch (e) {
-        lock.release();
-        return stepFailure("GASPAR_ENTRY_PREPARED", "KEYCHAIN_FAILURE", `Broker secret keychain write failed: ${e instanceof Error ? e.message : String(e)}`, asJson);
+      let brokerId: string | null = null;
+      const listed = core.listBrokerCredentials(gasparAuth);
+      if (listed.ok) {
+        brokerId = listed.value?.find((c) => !c.revoked)?.id ?? null;
+      }
+      const heldSecret = safeReadKey(deps.store, account, BROKER_KEY_SERVICE);
+      if (brokerId !== null && heldSecret === null) {
+        const rotated = core.revokeBrokerCredential(brokerId, gasparAuth);
+        if (!rotated.ok) {
+          lock.release();
+          return stepFailure("GASPAR_ENTRY_PREPARED", rotated.error?.code ?? "EXECUTION_DENIED", rotated.error?.message ?? "broker rotation denied", asJson);
+        }
+        brokerId = null;
+      }
+      if (brokerId === null) {
+        const issued = core.issueBrokerCredential(gasparAuth);
+        if (!issued.ok) {
+          lock.release();
+          return stepFailure("GASPAR_ENTRY_PREPARED", issued.error?.code ?? "EXECUTION_DENIED", issued.error?.message ?? "broker issue denied", asJson);
+        }
+        brokerId = issued.value!.id;
+        try {
+          deps.store.writeKey(account, issued.value!.secret, BROKER_KEY_SERVICE);
+        } catch (e) {
+          lock.release();
+          return stepFailure("GASPAR_ENTRY_PREPARED", "KEYCHAIN_FAILURE", `Broker secret keychain write failed: ${e instanceof Error ? e.message : String(e)}`, asJson);
+        }
       }
       try {
-        writeFileSync(join(root, ".chrono", "broker-account"), `${account}\n`, "utf8");
+        writeFileSync(join(root, ".chrono", "broker-account"), `${account}\n${brokerId}\n`, "utf8");
       } catch (e) {
         lock.release();
         return stepFailure("GASPAR_ENTRY_PREPARED", "EXECUTION_DENIED", `Broker account file write failed: ${e instanceof Error ? e.message : String(e)}`, asJson);
@@ -1280,7 +1337,7 @@ export async function runInitFlow(
         lock.release();
         return stepFailure("GASPAR_ENTRY_PREPARED", "KEYCHAIN_FAILURE", "Broker secret unreadable after keychain write", asJson);
       }
-      const redeemed = core.redeemBrokerCredential({ brokerId, secret, adapterId: plan.runtimeIds[0] ?? "init", runtime: entryRuntime });
+      const redeemed = core.redeemBrokerCredential({ brokerId, secret, adapterId: firstRuntime, runtime: firstRuntime });
       if (!redeemed.ok) {
         lock.release();
         return stepFailure("GASPAR_ENTRY_PREPARED", redeemed.error?.code ?? "EXECUTION_DENIED", redeemed.error?.message ?? "entry self-test denied", asJson);
@@ -1410,4 +1467,711 @@ async function resumeHealthCheck(core: ChronoCore, root: string, asJson: boolean
     ? JSON.stringify({ ok: true, resumed: true, project: root, state: status.ok ? status.value?.state : "UNKNOWN" }, null, 2)
     : `CHRONO project already ready at '${root}'. State: ${status.ok ? status.value?.state : "UNKNOWN"}.`;
   return { exitCode: 0, stdout: body, stderr: "" };
+}
+
+/* ------------------------------------------------------------------ */
+/* Doctor (read-only diagnostics)                                      */
+/* ------------------------------------------------------------------ */
+
+export interface DoctorReport {
+  readonly found: boolean;
+  readonly projectRoot: string;
+  readonly launcherVersion: string;
+  readonly pinnedVersion: string | null;
+  readonly versionMatch: boolean;
+  readonly setupStep: string | null;
+  readonly projectState: string | null;
+  readonly adapters: ReadonlyArray<{ id: string; status: string }>;
+  readonly rtk: { attested: string; routing: Record<string, string> };
+  readonly skill: { installed: boolean; state: string };
+  readonly hooks: Record<string, boolean>;
+  readonly broker: { visible: boolean; active: number; revoked: number };
+  readonly entry: { ready: boolean; reasons: string[] };
+}
+
+export interface DoctorOptions {
+  readonly json?: boolean | undefined;
+  readonly as?: string | undefined;
+  readonly session?: { id: string; token: string } | undefined;
+}
+
+/**
+ * Read-only project diagnostics [§7]: compatibility, setup state,
+ * adapters, RTK routing, skill activation, hooks, broker, and Gaspar
+ * entry readiness. Opens the Core read-only and never writes. Broker
+ * credentials are listed only with a gaspar/PO session; every other
+ * check is unauthenticated.
+ */
+export function runDoctor(projectPath: string, options: DoctorOptions = {}): CliOutput {
+  const asJson = options.json === true;
+  const root = resolve(projectPath);
+  const fail = (report: DoctorReport): CliOutput =>
+    asJson
+      ? { exitCode: 1, stdout: JSON.stringify({ ok: false, doctor: report }, null, 2), stderr: "" }
+      : { exitCode: 1, stdout: "", stderr: renderDoctor(report) };
+  const report: DoctorReport = {
+    found: false,
+    projectRoot: root,
+    launcherVersion: CHRONO_VERSION,
+    pinnedVersion: null,
+    versionMatch: false,
+    setupStep: null,
+    projectState: null,
+    adapters: [],
+    rtk: { attested: "missing", routing: {} },
+    skill: { installed: false, state: "missing" },
+    hooks: {},
+    broker: { visible: false, active: 0, revoked: 0 },
+    entry: { ready: false, reasons: ["project not found"] },
+  };
+  const opened = openReadProject(root, asJson);
+  if ("failure" in opened) {
+    return fail(report);
+  }
+  const core = opened.core;
+  try {
+    const reasons: string[] = [];
+    const pinnedVersion = core.pinnedCoreVersion();
+    const setup = core.getSetupState();
+    const setupStep = setup.ok && setup.value !== null && setup.value !== undefined ? setup.value.step : null;
+    const status = core.status();
+    const projectState = status.ok ? status.value?.state ?? null : null;
+    let adapters: { id: string; status: string }[] = [];
+    try {
+      adapters = core.listAdapters().map((a: { id: string; status: string }) => ({ id: a.id, status: a.status }));
+    } catch {
+      reasons.push("adapter registry unreadable");
+    }
+    if (!adapters.some((a) => a.status === "active")) {
+      reasons.push("no active adapter");
+    }
+    const rtkAttested = core.attestationCurrency("rtk").state;
+    if (rtkAttested !== "current") {
+      reasons.push(`RTK attestation ${rtkAttested}`);
+    }
+    const routing: Record<string, string> = {};
+    for (const adapter of adapters) {
+      if (adapter.status !== "active") {
+        continue;
+      }
+      const scopes = core.routingProofScopes(adapter.id);
+      const live = scopes.filter((proof) => !proof.expired);
+      routing[adapter.id] = live.length > 0 ? "proven" : "unproven";
+      if (live.length === 0) {
+        reasons.push(`no current routing proof for '${adapter.id}'`);
+      }
+    }
+    const skill = core.describeSkillInstallation();
+    if (!skill.installed) {
+      reasons.push(`skill ${skill.code}`);
+    }
+    const hooks: Record<string, boolean> = checkManagedHooks(
+      root,
+      adapters.filter((a) => a.status === "active").map((a) => a.id)
+    );
+    for (const [path, intact] of Object.entries(hooks)) {
+      if (!intact) {
+        reasons.push(`hook drift: ${path}`);
+      }
+    }
+    if (setupStep === null || setupStepIndex(setupStep) < setupStepIndex("ADAPTERS_REGISTERED_AND_APPROVED")) {
+      reasons.push(`setup at '${setupStep ?? "not started"}': finish chrono init`);
+    }
+    let broker = { visible: false, active: 0, revoked: 0 };
+    if (options.as !== undefined && options.session !== undefined) {
+      const listed = core.listBrokerCredentials({ actor: options.as, session: options.session });
+      if (listed.ok) {
+        const creds = listed.value ?? [];
+        const active = creds.filter((c: { revoked: boolean }) => !c.revoked).length;
+        const revoked = creds.filter((c: { revoked: boolean }) => c.revoked).length;
+        broker = { visible: true, active, revoked };
+        if (active === 0) {
+          reasons.push("no active broker credential");
+        }
+      } else {
+        reasons.push(`broker list denied (${listed.error?.code ?? "unknown"})`);
+      }
+    } else {
+      reasons.push("broker visibility needs a gaspar/PO session");
+    }
+    if (pinnedVersion !== CHRONO_VERSION) {
+      reasons.push(`pinned Core ${pinnedVersion ?? "none"} mismatches launcher ${CHRONO_VERSION}`);
+    }
+    const filled: DoctorReport = {
+      found: true,
+      projectRoot: root,
+      launcherVersion: CHRONO_VERSION,
+      pinnedVersion,
+      versionMatch: pinnedVersion === CHRONO_VERSION,
+      setupStep,
+      projectState,
+      adapters,
+      rtk: { attested: rtkAttested, routing },
+      skill: { installed: skill.installed, state: skill.installed ? "current" : skill.code },
+      hooks,
+      broker,
+      entry: { ready: reasons.length === 0, reasons },
+    };
+    const body = asJson ? JSON.stringify({ ok: filled.entry.ready, doctor: filled }, null, 2) : renderDoctor(filled);
+    return filled.entry.ready
+      ? { exitCode: 0, stdout: body, stderr: "" }
+      : { exitCode: 1, stdout: asJson ? body : "", stderr: asJson ? "" : body };
+  } finally {
+    core.close();
+  }
+}
+
+/** Byte-exact verification of managed hook/registration/definition assets. */
+export function checkManagedHooks(
+  projectRoot: string,
+  activeAdapterIds: string[] = []
+): Record<string, boolean> {
+  const checkBytes = (relative: string, expected: string): boolean => {
+    try {
+      return readFileSync(join(projectRoot, relative), "utf8") === expected;
+    } catch {
+      return false;
+    }
+  };
+  const checkContains = (relative: string, marker: string): boolean => {
+    try {
+      return readFileSync(join(projectRoot, relative), "utf8").includes(marker);
+    } catch {
+      return false;
+    }
+  };
+  const checkPresent = (relative: string): boolean => {
+    try {
+      readFileSync(join(projectRoot, relative), "utf8");
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const checks: Record<string, boolean> = {
+    // Shared assets: every setup installs these.
+    ".opencode/plugins/chrono-gate.js": checkBytes(".opencode/plugins/chrono-gate.js", buildOpencodePlugin()),
+    ".chrono/hooks/chrono-claude-gate.js": checkBytes(".chrono/hooks/chrono-claude-gate.js", buildClaudeHook()),
+    ".chrono/hooks/chrono-kiro-gate.js": checkBytes(".chrono/hooks/chrono-kiro-gate.js", buildKiroHook()),
+    ".chrono/hooks/chrono-entry-session.sh": checkBytes(
+      ".chrono/hooks/chrono-entry-session.sh",
+      buildEntrySessionScript()
+    ),
+    ".kiro/hooks/chrono-gate.json": checkBytes(".kiro/hooks/chrono-gate.json", buildKiroHookRegistration()),
+    ".chrono/broker-account": checkPresent(".chrono/broker-account"),
+    // The PreToolUse merge runs on every setup (shared enforcement
+    // baseline); SessionStart and the agent definition are
+    // Claude-scoped below.
+    ".claude/settings.json:PreToolUse": checkContains(".claude/settings.json", "chrono-claude-gate.js"),
+  };
+  // Runtime-scoped assets apply only to active adapters carrying a known
+  // runtime id (init registers adapters under runtime ids). Custom adapter
+  // ids keep the shared assets; nothing is guessed for them.
+  const runtimes = activeAdapterIds.filter((id): id is RuntimeId => (RUNTIME_IDS as readonly string[]).includes(id));
+  if (runtimes.includes("claude-code")) {
+    checks[".claude/agents/gaspar.md"] = checkBytes(".claude/agents/gaspar.md", buildGasparDefinition());
+    checks[".claude/settings.json:SessionStart"] = checkContains(
+      ".claude/settings.json",
+      entrySessionCommand("claude-code")
+    );
+  }
+  if (runtimes.includes("kiro")) {
+    checks[".kiro/hooks/chrono-entry-kiro.json"] = checkBytes(
+      kiroEntryRegistrationPath("kiro"),
+      buildKiroEntryRegistration("kiro")
+    );
+  }
+  return checks;
+}
+
+function renderDoctor(report: DoctorReport): string {
+  const lines = [
+    `project: ${report.projectRoot} (${report.found ? "found" : "missing"})`,
+    `core: launcher ${report.launcherVersion}, pinned ${report.pinnedVersion ?? "none"} (${report.versionMatch ? "match" : "MISMATCH"})`,
+    `setup: ${report.setupStep ?? "not started"}  state: ${report.projectState ?? "unknown"}`,
+    `adapters: ${report.adapters.map((a) => `${a.id}[${a.status}]`).join(", ") || "none"}`,
+    `rtk: ${report.rtk.attested} (${Object.entries(report.rtk.routing).map(([k, v]) => `${k}=${v}`).join(", ") || "no adapters"})`,
+    `skill: ${report.skill.state}`,
+    `hooks: ${Object.entries(report.hooks).map(([k, v]) => `${k}=${v ? "ok" : "DRIFT"}`).join(", ")}`,
+    report.broker.visible
+      ? `broker: ${String(report.broker.active)} active, ${String(report.broker.revoked)} revoked`
+      : "broker: hidden (pass a gaspar/PO session to inspect)",
+    report.entry.ready ? "entry: READY" : `entry: BLOCKED (${report.entry.reasons.join("; ")})`,
+  ];
+  return lines.join("\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Broker commands                                                     */
+/* ------------------------------------------------------------------ */
+
+export interface BrokerAuth {
+  readonly as: string;
+  readonly session: { id: string; token: string };
+}
+
+/**
+ * Issue a broker credential. Prints the secret exactly once; with
+ * `--store` it goes straight to the OS keychain under the broker
+ * service (plus the non-secret account file for hook scripts) instead
+ * of stdout. Either way the Core never sees the secret again.
+ */
+export function runBrokerIssue(
+  projectPath: string,
+  options: { json?: boolean | undefined; store?: boolean | undefined } & Partial<BrokerAuth>,
+  deps: HumanCommandDeps = productionDeps()
+): CliOutput {
+  const asJson = options.json === true;
+  const fail = (exitCode: number, code: string, reason: string): CliOutput =>
+    asJson
+      ? { exitCode, stdout: JSON.stringify({ ok: false, error: { code, message: reason } }, null, 2), stderr: "" }
+      : { exitCode, stdout: "", stderr: `Error [${code}]: ${reason}` };
+  if (options.as === undefined || options.as.length === 0 || options.session === undefined) {
+    return fail(2, "VALIDATION_ERROR", "broker issue requires --as <gaspar|PO> and --session-token");
+  }
+  const root = resolve(projectPath);
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath: root, pinnedVersion: CHRONO_VERSION });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    const issued = core.issueBrokerCredential({ actor: options.as, session: options.session });
+    if (!issued.ok) {
+      return fail(1, issued.error?.code ?? "EXECUTION_DENIED", issued.error?.message ?? "broker issue denied");
+    }
+    const account = brokerAccountFor(root);
+    if (options.store === true) {
+      try {
+        deps.store.writeKey(account, issued.value!.secret, BROKER_KEY_SERVICE);
+        writeFileSync(join(root, ".chrono", "broker-account"), `${account}\n${issued.value!.id}\n`, "utf8");
+      } catch (e) {
+        return fail(1, "KEYCHAIN_FAILURE", `Broker secret store failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      const body = asJson
+        ? JSON.stringify({ ok: true, id: issued.value?.id, stored: true, account }, null, 2)
+        : `Broker credential '${issued.value?.id}' issued and stored in the OS keychain (account '${account}'). The secret was never printed.`;
+      return { exitCode: 0, stdout: body, stderr: "" };
+    }
+    const body = asJson
+      ? JSON.stringify({ ok: true, id: issued.value?.id, secret: issued.value?.secret, account }, null, 2)
+      : [
+          `Broker credential '${issued.value?.id}' issued (account '${account}').`,
+          `SECRET (shown once — place it in the OS keychain now, never in files or prompts): ${issued.value?.secret ?? ""}`,
+        ].join("\n");
+    return { exitCode: 0, stdout: body, stderr: "" };
+  } finally {
+    core.close();
+  }
+}
+
+/** Revoke a broker credential (terminal; audited). */
+export function runBrokerRevoke(
+  projectPath: string,
+  options: { id: string; json?: boolean | undefined } & Partial<BrokerAuth>
+): CliOutput {
+  const asJson = options.json === true;
+  const fail = (exitCode: number, code: string, reason: string): CliOutput =>
+    asJson
+      ? { exitCode, stdout: JSON.stringify({ ok: false, error: { code, message: reason } }, null, 2), stderr: "" }
+      : { exitCode, stdout: "", stderr: `Error [${code}]: ${reason}` };
+  if (options.id.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "broker revoke requires --id");
+  }
+  if (options.as === undefined || options.as.length === 0 || options.session === undefined) {
+    return fail(2, "VALIDATION_ERROR", "broker revoke requires --as <gaspar|PO> and --session-token");
+  }
+  const root = resolve(projectPath);
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath: root, pinnedVersion: CHRONO_VERSION });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    const revoked = core.revokeBrokerCredential(options.id, { actor: options.as, session: options.session });
+    if (!revoked.ok) {
+      return fail(1, revoked.error?.code ?? "EXECUTION_DENIED", revoked.error?.message ?? "broker revoke denied");
+    }
+    const body = asJson
+      ? JSON.stringify({ ok: true, id: options.id, revoked: true }, null, 2)
+      : `Broker credential '${options.id}' revoked.`;
+    return { exitCode: 0, stdout: body, stderr: "" };
+  } finally {
+    core.close();
+  }
+}
+
+/** List broker credential metadata (never secret hashes). */
+export function runBrokerList(
+  projectPath: string,
+  options: { json?: boolean | undefined } & Partial<BrokerAuth>
+): CliOutput {
+  const asJson = options.json === true;
+  const opened = openReadProject(resolve(projectPath), asJson);
+  if ("failure" in opened) {
+    return opened.failure;
+  }
+  const core = opened.core;
+  try {
+    if (options.as === undefined || options.as.length === 0 || options.session === undefined) {
+      const body = asJson
+        ? JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: "broker list requires --as <gaspar|PO> and --session-token" } }, null, 2)
+        : "Error [VALIDATION_ERROR]: broker list requires --as <gaspar|PO> and --session-token";
+      return { exitCode: 2, stdout: asJson ? body : "", stderr: asJson ? "" : body };
+    }
+    const listed = core.listBrokerCredentials({ actor: options.as, session: options.session });
+    if (!listed.ok) {
+      const body = asJson
+        ? JSON.stringify({ ok: false, error: listed.error }, null, 2)
+        : `Error [${listed.error?.code ?? "EXECUTION_DENIED"}]: ${listed.error?.message ?? "denied"}`;
+      return { exitCode: 1, stdout: asJson ? body : "", stderr: asJson ? "" : body };
+    }
+    const body = asJson
+      ? JSON.stringify({ ok: true, credentials: listed.value }, null, 2)
+      : (listed.value?.length ?? 0) === 0
+        ? "No broker credentials."
+        : (listed.value ?? []).map((c) => `${c.id} [${c.revoked ? "revoked" : "active"}] issued ${c.createdAt}`).join("\n");
+    return { exitCode: 0, stdout: body, stderr: "" };
+  } finally {
+    core.close();
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Gaspar entry (adapter side)                                         */
+/* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* Gaspar entry (adapter side)                                         */
+/* ------------------------------------------------------------------ */
+
+export interface EntryOptions {
+  readonly adapter: string;
+  readonly broker: string;
+  readonly runtime?: string | undefined;
+  readonly tokenOut: string;
+  readonly json?: boolean | undefined;
+}
+
+/**
+ * Redeem Gaspar entry for a runtime adapter [§5.1]. The broker credential
+ * id travels as `--broker` (public metadata, also kept in
+ * `.chrono/broker-account` beside the keychain account name); the secret
+ * arrives exclusively on stdin (piped by the adapter hook from the OS
+ * keychain) and never appears in argv, env, logs, or output. The minted
+ * session token is written to `--token-out` with 0600 permissions for
+ * the adapter process; stdout carries only the safe entry projection.
+ */
+export function runEntry(projectPath: string, options: EntryOptions, stdinText: string): CliOutput {
+  const asJson = options.json === true;
+  const fail = (exitCode: number, code: string, reason: string): CliOutput =>
+    asJson
+      ? { exitCode, stdout: JSON.stringify({ ok: false, error: { code, message: reason } }, null, 2), stderr: "" }
+      : { exitCode, stdout: "", stderr: `Error [${code}]: ${reason}` };
+  if (options.adapter.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "entry requires --adapter <runtime adapter id>");
+  }
+  if (options.broker.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "entry requires --broker <credential id> (recorded in .chrono/broker-account)");
+  }
+  if (options.tokenOut.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "entry requires --token-out <path>: session tokens never print to stdout");
+  }
+  const secret = stdinText.trim();
+  if (secret.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "entry requires the broker secret on stdin");
+  }
+  const root = resolve(projectPath);
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath: root, pinnedVersion: CHRONO_VERSION });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    // Runtime defaults to the project's configured runtime (single-runtime
+    // projects), else to the adapter id (multi-runtime convention from
+    // setup, where each adapter proves under its own runtime string).
+    let runtime = options.runtime;
+    if (runtime === undefined) {
+      const status = core.status();
+      const configured = status.ok ? status.value?.details.runtime ?? null : null;
+      runtime = configured ?? options.adapter;
+    }
+    const redeemed = core.redeemBrokerCredential({
+      brokerId: options.broker,
+      secret,
+      adapterId: options.adapter,
+      runtime,
+    });
+    if (!redeemed.ok) {
+      return fail(1, redeemed.error?.code ?? "EXECUTION_DENIED", redeemed.error?.message ?? "entry denied");
+    }
+    try {
+      writeFileSync(options.tokenOut, `${redeemed.value!.session.id}/${redeemed.value!.session.token}\n`, { mode: 0o600 });
+    } catch (e) {
+      return fail(1, "EXECUTION_DENIED", `Entry session token file write failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const projection = redeemed.value!.projection;
+    const body = asJson
+      ? JSON.stringify({ ok: true, sessionId: redeemed.value!.session.id, projection }, null, 2)
+      : [
+          `Gaspar entry: session '${redeemed.value!.session.id}' (expires ${redeemed.value!.session.expiresAt}).`,
+          `state: ${projection.projectState}  next: ${projection.nextAction.key} — ${projection.nextAction.summary}`,
+          ...projection.requiredDecisions.map((d) => `decision required: ${d}`),
+        ].join("\n");
+    return { exitCode: 0, stdout: body, stderr: "" };
+  } finally {
+    core.close();
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Uninstall / removal (scoped, never silent about data)               */
+/* ------------------------------------------------------------------ */
+
+export type UninstallScope = "hooks" | "broker" | "adapters" | "project-data";
+
+export interface UninstallOptions {
+  readonly scope: string;
+  readonly as?: string | undefined;
+  readonly session?: { id: string; token: string } | undefined;
+  readonly json?: boolean | undefined;
+}
+
+/** Project-local managed files owned by setup (never user data). */
+const MANAGED_ASSET_PATTERNS: ReadonlyArray<{ dir: string; prefix: string; suffix: string }> = [
+  { dir: ".opencode/plugins", prefix: "chrono-gate.", suffix: ".js" },
+  { dir: ".chrono/hooks", prefix: "chrono-", suffix: ".js" },
+  { dir: ".chrono/hooks", prefix: "chrono-", suffix: ".sh" },
+  { dir: ".kiro/hooks", prefix: "chrono-", suffix: ".json" },
+  { dir: ".claude/agents", prefix: "gaspar.", suffix: ".md" },
+];
+
+function removeManagedAssets(root: string): string[] {
+  const removed: string[] = [];
+  for (const pattern of MANAGED_ASSET_PATTERNS) {
+    let entries: string[];
+    try {
+      entries = readdirSync(join(root, pattern.dir));
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.startsWith(pattern.prefix) && entry.endsWith(pattern.suffix)) {
+        try {
+          rmSync(join(root, pattern.dir, entry));
+          removed.push(join(pattern.dir, entry));
+        } catch {
+          // Best effort per file; the report lists what left.
+        }
+      }
+    }
+  }
+  for (const relative of [".chrono/broker-account", ".chrono/init.lock"]) {
+    try {
+      rmSync(join(root, relative));
+      removed.push(relative);
+    } catch {
+      // Absent files are not an error.
+    }
+  }
+  return removed;
+}
+
+/** Strip CHRONO-managed entries from Claude settings, restoring backup. */
+function removeClaudeManagedEntries(root: string): { removed: boolean; restored: boolean } {
+  const settingsPath = join(root, ".claude", "settings.json");
+  const backupPath = `${settingsPath}.chrono-bak`;
+  let current: string;
+  try {
+    current = readFileSync(settingsPath, "utf8");
+  } catch {
+    return { removed: false, restored: false };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(current);
+  } catch {
+    return { removed: false, restored: false };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { removed: false, restored: false };
+  }
+  const doc = parsed as Record<string, unknown>;
+  const hooks = doc["hooks"];
+  if (typeof hooks !== "object" || hooks === null || Array.isArray(hooks)) {
+    return { removed: false, restored: false };
+  }
+  const table = { ...(hooks as Record<string, unknown>) };
+  const isManaged = (node: unknown): boolean => {
+    if (typeof node !== "object" || node === null) {
+      return false;
+    }
+    if (Array.isArray(node)) {
+      return node.some(isManaged);
+    }
+    const record = node as Record<string, unknown>;
+    if (typeof record["command"] === "string" && record["command"].includes(".chrono/hooks/")) {
+      return true;
+    }
+    return Object.values(record).some(isManaged);
+  };
+  let changed = false;
+  for (const group of ["PreToolUse", "SessionStart"]) {
+    const entries = table[group];
+    if (!Array.isArray(entries)) {
+      continue;
+    }
+    const kept = entries.filter((entry) => !isManaged(entry));
+    if (kept.length !== entries.length) {
+      changed = true;
+      if (kept.length === 0) {
+        delete table[group];
+      } else {
+        table[group] = kept;
+      }
+    }
+  }
+  if (!changed) {
+    return { removed: false, restored: false };
+  }
+  if (Object.keys(table).length === 0) {
+    delete doc["hooks"];
+  } else {
+    doc["hooks"] = table;
+  }
+  // Prefer the pre-CHRONO backup when it exists; otherwise persist the
+  // stripped document. Either way the backup is consumed.
+  try {
+    const backup = readFileSync(backupPath, "utf8");
+    JSON.parse(backup);
+    writeFileSync(settingsPath, backup, "utf8");
+    rmSync(backupPath);
+    return { removed: true, restored: true };
+  } catch {
+    // No usable backup: persist stripped settings.
+  }
+  writeFileSync(settingsPath, JSON.stringify(doc, null, 2), "utf8");
+  try {
+    rmSync(backupPath, { force: true });
+  } catch {
+    // Best effort.
+  }
+  return { removed: true, restored: false };
+}
+
+/**
+ * Scoped removal [§7]: hooks (generated assets + backup restoration),
+ * broker (credential revocation), adapters (PO-only revocation), and
+ * project-data (interactive PO-only destruction of `.chrono` with an
+ * explicit typed challenge). Package uninstall never touches projects:
+ * there are no install/uninstall lifecycle hooks, asserted by test.
+ */
+export function runUninstall(
+  projectPath: string,
+  options: UninstallOptions,
+  deps: HumanCommandDeps = productionDeps(),
+  confirm: (planText: string, challenge: string) => string | null = promptInitConsent
+): CliOutput {
+  const asJson = options.json === true;
+  const fail = (exitCode: number, code: string, reason: string): CliOutput =>
+    asJson
+      ? { exitCode, stdout: JSON.stringify({ ok: false, error: { code, message: reason } }, null, 2), stderr: "" }
+      : { exitCode, stdout: "", stderr: `Error [${code}]: ${reason}` };
+  const root = resolve(projectPath);
+  const scope = options.scope;
+  if (scope !== "hooks" && scope !== "broker" && scope !== "adapters" && scope !== "project-data") {
+    return fail(2, "VALIDATION_ERROR", "uninstall requires --scope hooks|broker|adapters|project-data");
+  }
+  if (scope === "hooks") {
+    const removed = removeManagedAssets(root);
+    const claude = removeClaudeManagedEntries(root);
+    const body = asJson
+      ? JSON.stringify({ ok: true, scope, removed, claudeSettingsRestored: claude.restored }, null, 2)
+      : [`Removed ${String(removed.length)} managed asset(s).`, claude.restored ? "Claude settings restored from backup." : "Claude settings: no CHRONO entries found."].join("\n");
+    return { exitCode: 0, stdout: body, stderr: "" };
+  }
+  if (scope === "project-data") {
+    if (!deps.interactive) {
+      return fail(2, "CONSENT_REQUIRED", "Removing project data requires an interactive PO with a typed challenge");
+    }
+    const fingerprint = createHash("sha256").update(root, "utf8").digest("hex").slice(0, 8);
+    const challenge = `delete project data ${fingerprint}`;
+    const typed = confirm(
+      `DANGER: this permanently deletes '${join(root, ".chrono")}' including approvals, evidence, and audit history. This cannot be undone.`,
+      challenge
+    );
+    if (typed === null) {
+      return fail(2, "CONSENT_REQUIRED", "Project-data removal requires a controlling terminal with typed confirmation");
+    }
+    if (typed !== challenge) {
+      return fail(2, "VALIDATION_ERROR", "Project-data confirmation does not match: nothing was deleted");
+    }
+    try {
+      rmSync(join(root, ".chrono"), { recursive: true });
+    } catch (e) {
+      return fail(1, "EXECUTION_DENIED", `Project-data removal failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const body = asJson
+      ? JSON.stringify({ ok: true, scope, removed: [".chrono"], warning: "Authoritative project data deleted with PO confirmation" }, null, 2)
+      : "Deleted '.chrono' with PO confirmation. This cannot be undone.";
+    return { exitCode: 0, stdout: body, stderr: "" };
+  }
+  // broker + adapters scopes need an authorized session (no new minting).
+  if (options.as === undefined || options.as.length === 0 || options.session === undefined) {
+    return fail(2, "VALIDATION_ERROR", `uninstall --scope ${scope} requires --as <gaspar|PO> and --session-token`);
+  }
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath: root, pinnedVersion: CHRONO_VERSION });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    if (scope === "broker") {
+      const listed = core.listBrokerCredentials({ actor: options.as, session: options.session });
+      if (!listed.ok) {
+        return fail(1, listed.error?.code ?? "EXECUTION_DENIED", listed.error?.message ?? "broker list denied");
+      }
+      const revoked: string[] = [];
+      for (const cred of listed.value ?? []) {
+        if (cred.revoked) {
+          continue;
+        }
+        const res = core.revokeBrokerCredential(cred.id, { actor: options.as, session: options.session });
+        if (!res.ok) {
+          return fail(1, res.error?.code ?? "EXECUTION_DENIED", res.error?.message ?? "broker revoke denied");
+        }
+        revoked.push(cred.id);
+      }
+      try {
+        deps.store.deleteKey(brokerAccountFor(root), BROKER_KEY_SERVICE);
+      } catch {
+        // Keychain absence is not fatal to revocation.
+      }
+      const body = asJson
+        ? JSON.stringify({ ok: true, scope, revoked }, null, 2)
+        : `Revoked ${String(revoked.length)} broker credential(s).`;
+      return { exitCode: 0, stdout: body, stderr: "" };
+    }
+    // adapters scope: PO-only revocation of every active adapter.
+    const adapters = core.listAdapters().filter((a) => a.status === "active");
+    const revoked: string[] = [];
+    for (const adapter of adapters) {
+      const res = core.revokeAdapter(adapter.id, { actor: options.as, session: options.session });
+      if (!res.ok) {
+        return fail(1, res.error?.code ?? "EXECUTION_DENIED", res.error?.message ?? `adapter revoke denied for '${adapter.id}'`);
+      }
+      revoked.push(adapter.id);
+    }
+    const body = asJson
+      ? JSON.stringify({ ok: true, scope, revoked }, null, 2)
+      : `Revoked ${String(revoked.length)} adapter(s).`;
+    return { exitCode: 0, stdout: body, stderr: "" };
+  } finally {
+    core.close();
+  }
 }

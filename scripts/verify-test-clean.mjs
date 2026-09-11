@@ -29,8 +29,8 @@ function flag(name, fallback) {
   }
   return v;
 }
-const EXPECTED_FILES = flag("--expected-files", 25);
-const EXPECTED_TESTS = flag("--expected-tests", 246);
+const EXPECTED_FILES = flag("--expected-files", 30);
+const EXPECTED_TESTS = flag("--expected-tests", 293);
 
 const violations = [];
 
