@@ -23,7 +23,9 @@ describe("Schema migrations", () => {
     } catch {
       // Already closed or never opened.
     }
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("upgrades v1 to current preserving data", () => {

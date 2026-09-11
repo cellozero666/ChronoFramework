@@ -19,8 +19,12 @@ describe("GrantRepository", () => {
   });
 
   afterEach(() => {
-    db.close();
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof db !== "undefined") {
+      db.close();
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   function grant(id: string) {

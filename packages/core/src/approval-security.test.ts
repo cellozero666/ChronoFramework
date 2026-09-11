@@ -143,9 +143,15 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   afterEach(() => {
-    restoreTty();
-    core.close();
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof restoreTty !== "undefined") {
+      restoreTty();
+    }
+    if (typeof core !== "undefined") {
+      core.close();
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("refuses authority without an interactive terminal, even with a valid key", () => {
@@ -430,8 +436,12 @@ describe("PO enrollment ceremony [SLICE-9 §9.1]", () => {
     if (restoreTty !== null) {
       restoreTty();
     }
-    core.close();
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof core !== "undefined") {
+      core.close();
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   function withTty(): void {

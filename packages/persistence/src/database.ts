@@ -46,6 +46,7 @@ export class ChronoDatabase {
   private readonly db: Database.Database;
   private readonly path: string;
   private readonly isReadonly: boolean;
+  private closed = false;
 
   constructor(options: DatabaseOptions) {
     this.path = options.path;
@@ -224,8 +225,17 @@ export class ChronoDatabase {
     return new SkillRepository(this.db);
   }
 
-  /** Close the database. */
+  /**
+   * Close the database. Idempotent: CLI entry points close in `finally`
+   * blocks and tests close in `afterEach`, so a second close from an
+   * overlapping cleanup path must be a no-op rather than a native-layer
+   * error during teardown.
+   */
   close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
     this.db.close();
   }
 

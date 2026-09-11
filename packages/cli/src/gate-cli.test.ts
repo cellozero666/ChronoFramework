@@ -188,8 +188,12 @@ describe("CLI gate", () => {
   });
 
   afterEach(() => {
-    restoreTty();
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof restoreTty !== "undefined") {
+      restoreTty();
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("requires an explicit actor identity", () => {
@@ -537,8 +541,12 @@ describe("CLI gates (Slice 9: real Core decisions)", () => {
   });
 
   afterEach(() => {
-    restoreTty();
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof restoreTty !== "undefined") {
+      restoreTty();
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   function gate(options: Record<string, unknown>): { exitCode: number; body: { result: string; code?: string; reason?: string } } {

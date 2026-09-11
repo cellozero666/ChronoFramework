@@ -217,14 +217,18 @@ describe("OpenCode pre-tool enforcement", () => {
   });
 
   afterEach(() => {
-    for (const key of ["CHRONO_BIN", "CHRONO_GATE_MODULE", "CHRONO_GATE_WP", "CHRONO_SESSION_TOKEN", "CHRONO_GATE_AS", "CHRONO_GATE_ROLE", "CHRONO_REQUESTER_TOKEN"]) {
-      if (savedEnv[key] === undefined) {
-        delete process.env[key];
-      } else {
-        process.env[key] = savedEnv[key];
+    if (typeof savedEnv !== "undefined") {
+      for (const key of ["CHRONO_BIN", "CHRONO_GATE_MODULE", "CHRONO_GATE_WP", "CHRONO_SESSION_TOKEN", "CHRONO_GATE_AS", "CHRONO_GATE_ROLE", "CHRONO_REQUESTER_TOKEN"]) {
+        if (savedEnv[key] === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = savedEnv[key];
+        }
       }
     }
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   async function hookFor(directory: string): Promise<{
@@ -442,8 +446,12 @@ function enrollTestPo(
   });
 
   afterEach(() => {
-    restoreTty();
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof restoreTty !== "undefined") {
+      restoreTty();
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("completes setup and installs the byte-identical plugin", async () => {

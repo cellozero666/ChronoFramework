@@ -148,7 +148,9 @@ describe("Persistence: state survives process restart", () => {
     if (core !== undefined) {
       core.close();
     }
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("project state persists across Core instance restart", () => {
@@ -315,7 +317,9 @@ describe("Persistence: SQLite schema", () => {
     if (core !== undefined) {
       core.close();
     }
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("schema version is recorded after migration", () => {

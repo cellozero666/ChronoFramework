@@ -19,8 +19,12 @@ describe("SequenceRepository", () => {
   });
 
   afterEach(() => {
-    db.close();
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof db !== "undefined") {
+      db.close();
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("allocates monotonic zero-padded identifiers per family", () => {

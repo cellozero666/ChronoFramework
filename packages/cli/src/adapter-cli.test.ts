@@ -190,8 +190,12 @@ function enrollTestPo(
   });
 
   afterEach(() => {
-    restoreTty();
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof restoreTty !== "undefined") {
+      restoreTty();
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   function approveAdapter(adapterId: string): string {

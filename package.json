@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "license": "Apache-2.0",
-  "description": "CHRONO Framework — Spec-Driven Development orchestration for AI-assisted software engineering",
+  "description": "CHRONO Framework \u2014 Spec-Driven Development orchestration for AI-assisted software engineering",
   "workspaces": [
     "packages/*"
   ],
@@ -12,6 +12,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:clean": "node scripts/verify-test-clean.mjs",
     "test:watch": "vitest",
     "clean": "rimraf packages/*/dist packages/*/tsconfig.tsbuildinfo tsconfig.tsbuildinfo"
   },

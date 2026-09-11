@@ -5823,7 +5823,8 @@ export class ChronoCore {
   }
 
   /**
-   * Close the database connection.
+   * Close the database connection. Idempotent via the database handle:
+   * overlapping `finally`/`afterEach` cleanup paths must not fail teardown.
    */
   close(): void {
     this.db.close();

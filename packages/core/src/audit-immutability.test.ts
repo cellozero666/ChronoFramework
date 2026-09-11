@@ -155,9 +155,15 @@ function fakeInteractiveTerminal(): () => void {
   });
 
   afterEach(() => {
-    restoreTty();
-    core.close();
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof restoreTty !== "undefined") {
+      restoreTty();
+    }
+    if (typeof core !== "undefined") {
+      core.close();
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("rejects UPDATE and DELETE on event_log", () => {

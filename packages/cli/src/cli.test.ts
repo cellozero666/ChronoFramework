@@ -18,7 +18,9 @@ describe("CLI: init", () => {
   });
 
   afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("initializes a fresh project", () => {
@@ -52,7 +54,9 @@ describe("CLI: status", () => {
   });
 
   afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("fails closed when no project exists", () => {
@@ -87,7 +91,9 @@ describe("CLI: validate", () => {
   });
 
   afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("validates a fresh project as VALID", () => {
@@ -111,7 +117,9 @@ describe("CLI: end-to-end init → status → validate", () => {
   });
 
   afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("completes the Slice 5 lifecycle with independent Core instances", () => {
@@ -139,7 +147,9 @@ describe("CLI: construction failures", () => {
   });
 
   afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("returns structured exit-2 failure when the store cannot be created", () => {

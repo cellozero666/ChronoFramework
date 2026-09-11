@@ -459,9 +459,15 @@ describe("Execution authorization", () => {
   });
 
   afterEach(() => {
-    restoreTty();
-    core.close();
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof restoreTty !== "undefined") {
+      restoreTty();
+    }
+    if (typeof core !== "undefined") {
+      core.close();
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("denies when the module is not approved", () => {
@@ -633,7 +639,9 @@ describe("Dispatch grants (session binding)", () => {
   });
 
   afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   const T0 = "2026-09-11T00:00:00.000Z";
@@ -1010,9 +1018,15 @@ describe("Completion authorization", () => {
   });
 
   afterEach(() => {
-    restoreTty();
-    core.close();
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof restoreTty !== "undefined") {
+      restoreTty();
+    }
+    if (typeof core !== "undefined") {
+      core.close();
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("denies completion without current evidence", () => {

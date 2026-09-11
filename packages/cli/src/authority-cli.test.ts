@@ -148,7 +148,9 @@ describe("CLI human-only authority", () => {
   });
 
   afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("refuses approve/waive/keys-generate without a TTY and persists nothing", () => {
@@ -351,7 +353,9 @@ describe("CLI PO enrollment ceremony [SLICE-9 §9.1]", () => {
   });
 
   afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("enrolls with typed confirmation and never exposes the private key", () => {
