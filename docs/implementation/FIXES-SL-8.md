@@ -86,4 +86,6 @@ RTK telemetry store).
   runtime-specific adapter work.
 - Per-command `rtk exec` wrapping and `chrono setup` installers beyond
   project-local assets remain future work.
-- Slice 8 files are uncommitted; commit was not requested.
+- At the time of the audit report the Slice 8 files were uncommitted. They are
+  now committed in repository history; no publication or release authorization
+  is implied.

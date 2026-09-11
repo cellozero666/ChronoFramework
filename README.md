@@ -95,7 +95,7 @@ The Product Owner remains outside this party hierarchy as the human authority. A
 
 The names are a fan tribute to *Chrono Trigger*. CHRONO Framework is an independent open-source project and is not affiliated with or endorsed by Square Enix.
 
-## Non-negotiable v1 properties
+## Non-negotiable v1 release contract
 
 - mandatory global `chrono` launcher delegating to a project-pinned local Core;
 - TypeScript monorepo on supported Node.js LTS releases;
@@ -121,9 +121,9 @@ The normative reading order is:
 
 The [protocol-authoring brief](docs/history/PROTOCOL-AUTHORING-BRIEF.md) is retained only for provenance and is not normative.
 
-## Core capabilities
+## v1 capabilities
 
-CHRONO provides a global `chrono` CLI, a project-pinned deterministic Core, local Markdown/YAML and SQLite state, signed Product Owner decisions, explainable execution gates, drift detection, audit export, bounded correction loops, and adapter conformance across OpenCode, Claude Code, and Kiro.
+The CHRONO v1 release is required to provide a global `chrono` CLI, a project-pinned deterministic Core, local Markdown/YAML and SQLite state, signed Product Owner decisions, explainable execution gates, drift detection, audit export, bounded correction loops, and adapter conformance across OpenCode, Claude Code, and Kiro. Repository source must not be presented as a conformant v1 release until the cross-runtime and final innovation gates pass.
 
 Every release is held to the same standard: no stubs, simulated integrations, bypassable controls, skipped conformance tests, or undocumented behavior. A feature is complete only when its contract, implementation, tests, security evidence, and independent verification agree.
 
@@ -152,7 +152,7 @@ The CHRONO implementation uses TypeScript and Node.js, but the projects it gover
 
 ## Build with CHRONO
 
-Use CHRONO when you need **AI coding agents**, **agentic software development**, **Spec-Driven Development**, **secure vibe coding**, **multi-agent orchestration**, **AI DevSecOps**, or **model-agnostic developer tools** without giving up architectural control. Install the latest stable distribution through npm or GitHub Releases, initialize it in a new or existing repository, select your supported AI runtime and model, and let Gaspar begin repository discovery.
+Use CHRONO when you need **AI coding agents**, **agentic software development**, **Spec-Driven Development**, **secure vibe coding**, **multi-agent orchestration**, **AI DevSecOps**, or **model-agnostic developer tools** without giving up architectural control. Stable releases are installed through npm or GitHub Releases once their published artifacts pass the repository's release gates; repository builds remain subject to the implementation status recorded in the documentation index.
 
 CHRONO will guide the project from intent to verified implementation while preserving the Product Owner's authority at every material decision. Contributions should focus on measurable conformance rather than unverified autonomy or surface-level integrations.
 

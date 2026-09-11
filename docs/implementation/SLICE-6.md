@@ -122,8 +122,9 @@ clean, 20 files / 173 tests pass. Loop terminated: zero findings.
    require those runtimes plus PO approval for global config changes.
 3. Carried from Slice 5: `chrono skill verify` stays fail-closed until
    pinned release metadata lands.
-4. No publish/push/release performed; uncommitted Slice 6 files await PO
-   disposition (commit was not requested).
+4. At the time of this report no publish/push/release was performed. These
+   Slice 6 files were committed later; this sentence is retained as historical
+   execution evidence, not a statement about the current working tree.
 
 ## 6. PO decisions recorded
 
@@ -132,7 +133,7 @@ clean, 20 files / 173 tests pass. Loop terminated: zero findings.
   runtime mappings deferred).
 - No security-policy waivers granted; all denials remain fail-closed.
 
-## 7. Files changed (uncommitted, Slice 6 only)
+## 7. Files changed (Slice 6 scope; committed later)
 
 - `docs/core/RUNTIME-CONTRACT.md` (command table)
 - `docs/implementation/SLICE-5-REMEDIATION.md` (COMPLETE + evidence)

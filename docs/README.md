@@ -30,6 +30,12 @@ docs/
     └── RUNTIME-CONTRACT.md
 ```
 
-These files exist and govern the implementation. Current corrective work and
-its blocking acceptance gate are documented in
-[`implementation/SLICE-5-REMEDIATION.md`](implementation/SLICE-5-REMEDIATION.md).
+These files exist and govern the implementation. Historical slice reports and
+the current execution queue are indexed below:
+
+- [`implementation/SLICE-5-REMEDIATION.md`](implementation/SLICE-5-REMEDIATION.md) — closed remediation gate for Slices 1–5.
+- [`implementation/SLICE-6.md`](implementation/SLICE-6.md) and [`implementation/SLICE-7.md`](implementation/SLICE-7.md) — completed implementation reports.
+- [`implementation/FIXES-SL-1-7.md`](implementation/FIXES-SL-1-7.md) and [`implementation/FIXES-SL-8.md`](implementation/FIXES-SL-8.md) — independent corrective reviews.
+- [`implementation/POST-SLICE-8-REVIEW.md`](implementation/POST-SLICE-8-REVIEW.md) — current code/documentation comparison and release-readiness findings.
+- [`implementation/SLICE-9.md`](implementation/SLICE-9.md) — next blocking implementation slice.
+- [`implementation/IMPLEMENTER-TASKS.md`](implementation/IMPLEMENTER-TASKS.md) — ordered work queue through release-candidate readiness.

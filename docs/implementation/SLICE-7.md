@@ -87,7 +87,8 @@ hash above. The production fetch path was additionally proven live against
    proves discovery + activation at rest. → adapter work.
 2. Carried: per-command `rtk exec` wrapping, `chrono setup`/installers,
    live runtime hook conformance.
-3. Slice 7 files are uncommitted; commit was not requested.
+3. At the time of this report the Slice 7 files were uncommitted. They were
+   committed later; no publication or release authorization is implied.
 
 ## 5. PO decisions recorded
 
@@ -95,7 +96,7 @@ hash above. The production fetch path was additionally proven live against
 - Slice 7 scope as §2 (metadata + pipeline + verify; live activation deferred).
 - No security-policy waivers; all denials fail-closed.
 
-## 6. Files changed (uncommitted, Slice 7 only)
+## 6. Files changed (Slice 7 scope; committed later)
 
 - `packages/domain/src/release.ts` (new), `index.ts` (exports),
   `skill-release.test.ts` (new, 6 tests)

@@ -18,6 +18,12 @@ If `docs/implementation/SLICE-5-REMEDIATION.md` exists and its status is not
 `COMPLETE`, read it next and satisfy its blocking gate before continuing with
 later implementation slices.
 
+After the mandatory normative reading, read the current execution checkpoint in
+`docs/implementation/POST-SLICE-8-REVIEW.md`, then execute
+`docs/implementation/SLICE-9.md` and the ordered
+`docs/implementation/IMPLEMENTER-TASKS.md`. Historical slice reports are
+evidence, not authority to skip a current gate.
+
 `docs/history/PROTOCOL-AUTHORING-BRIEF.md` is provenance only and cannot override current normative documents.
 
 ## Execution contract
