@@ -44,6 +44,7 @@ export {
   type HarnessRecord,
   type ProjectRecord,
   type QaReportRecord,
+  type RtkAttestationDetail,
   type SecurityProfileRecord,
   type SessionAuthorizationRecord,
   type SkillAttestationDetail,

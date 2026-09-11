@@ -54,6 +54,8 @@ Reference: `[FW §194-255]`, `[DOM §2.2]`.
 | `chrono approve` | PO | Record interactive signed approval |
 | `chrono waive` | PO | Record interactive signed waiver |
 | `chrono run` | Adapter | Authorized dispatch through a registered adapter (authorize → enact → spawn → evidence → advance) |
+| `chrono setup` | Adapter | Verify an adapter end to end, install project-local hook assets (fail-closed) |
+| `chrono adapter` | PO | Register/list/activate/revoke runtime adapters (approval-gated) |
 | `chrono rtk status` | Any | Check RTK attestation |
 | `chrono rtk verify` | Any | Re-verify and re-record RTK attestation |
 | `chrono skill status` | Any | Check skill attestation |

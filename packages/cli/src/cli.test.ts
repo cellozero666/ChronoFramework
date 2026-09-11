@@ -177,6 +177,21 @@ describe("CLI: program wiring", () => {
     expect(names).toContain("skill");
     expect(names).toContain("run");
     expect(names).toContain("adapter");
+    expect(names).toContain("setup");
     expect(names).toContain("session");
+  });
+
+  it("marks rendered failures so bin.ts adds no second JSON envelope", async () => {
+    const program = createProgram("/tmp");
+    program.exitOverride();
+    const failure = await program
+      .parseAsync(["gate", "teleport"], { from: "user" })
+      .then(
+        () => null,
+        (e: unknown) => e
+      );
+    expect(failure).not.toBeNull();
+    expect((failure as { exitCode?: number }).exitCode).toBe(2);
+    expect((failure as { chronoEmitted?: boolean }).chronoEmitted).toBe(true);
   });
 });

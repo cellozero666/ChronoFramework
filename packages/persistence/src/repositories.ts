@@ -2031,6 +2031,13 @@ export interface AttestationRecord {
  * New verification writes a new row; status lifecycle runs through the
  * guarded transitions (trigger-checked).
  */
+export interface RtkAttestationDetail {
+  id: string;
+  version: string;
+  provenance: string;
+  routingTestPassed: boolean;
+}
+
 export class RtkRepository {
   constructor(private readonly db: Database) {}
 
@@ -2068,6 +2075,30 @@ export class RtkRepository {
     return row === undefined
       ? null
       : { id: row.id, validUntil: row.valid_until, status: row.status, bypassEvents: JSON.parse(row.bypass_events) };
+  }
+
+  /**
+   * Latest attestation with its provenance binding, for setup reporting
+   * and future routing enforcement (read-only).
+   */
+  latestFull(): RtkAttestationDetail | null {
+    const row = this.db
+      .prepare("SELECT * FROM rtk_attestation ORDER BY valid_until DESC, rowid DESC LIMIT 1")
+      .get() as {
+        id: string;
+        version: string;
+        provenance: string;
+        routing_test_passed: number;
+      } | undefined;
+
+    return row === undefined
+      ? null
+      : {
+        id: row.id,
+        version: row.version,
+        provenance: row.provenance,
+        routingTestPassed: row.routing_test_passed === 1,
+      };
   }
 }
 

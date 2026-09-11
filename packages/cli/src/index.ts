@@ -15,6 +15,9 @@ import { dirname, join } from "node:path";
 import { ChronoCore } from "@chrono/core";
 import { RTK_UPSTREAM, SKILL_RELEASE, SKILL_RUNTIME_PATHS, buildApprovalPayload, buildSessionAuthorizationPayload, buildWaiverPayload, computeRevisionHash, convertSkillSource, generateApprovalKeyPair, parseSkillFrontmatter, signApprovalPayload, skillGeneratedHashes, skillRawSourceUrl, skillVendorPath, verifySkillRelease, type SkillRuntime } from "@chrono/domain";
 import { CHRONO_VERSION } from "./version.js";
+import { buildOpencodePlugin } from "./opencode-plugin.js";
+
+export { buildOpencodePlugin };
 import {
   MemoryKeyStore,
   OsKeychainStore,
@@ -110,6 +113,7 @@ interface CommandOpts {
   readonly file?: unknown;
   readonly approval?: unknown;
   readonly id?: unknown;
+  readonly rtkBinary?: unknown;
 }
 
 function formatCoreError(error: {
@@ -926,7 +930,7 @@ export function runRtkVerify(
     }
     const body = asJson
       ? JSON.stringify({ ok: true, id: recorded.value?.id, version, routingProven: false }, null, 2)
-      : `RTK verified (${version}); attestation '${recorded.value?.id}'. Adapter routing unproven: execution still denies until Slice 8.`;
+      : `RTK verified (${version}); attestation '${recorded.value?.id}'. Routing is recorded unproven: per-command routing enforcement is adapter duty (see RUNTIME §6.3).`;
     return { exitCode: 0, stdout: body, stderr: "" };
   } finally {
     core.close();
@@ -1755,6 +1759,204 @@ export function runAdapterRevoke(
   }
 }
 
+export interface SetupOptions {
+  readonly adapter: string;
+  readonly rtkBinary?: string | undefined;
+  readonly json?: boolean | undefined;
+}
+
+export interface SetupExecResult {
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/**
+ * Minimal quotes-aware command-line splitter for registered proof
+ * commands (single/double quotes, backslash escapes). Returns null on
+ * unbalanced quotes instead of guessing.
+ */
+export function splitCommandLine(command: string): string[] | null {
+  const argv: string[] = [];
+  let current = "";
+  let quote: string | null = null;
+  let escaped = false;
+  let hasToken = false;
+  for (const char of command) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      hasToken = true;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote !== null) {
+      if (char === quote) {
+        quote = null;
+      } else {
+        current += char;
+      }
+      hasToken = true;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      hasToken = true;
+      continue;
+    }
+    if (char === " " || char === "\t") {
+      if (hasToken) {
+        argv.push(current);
+        current = "";
+        hasToken = false;
+      }
+      continue;
+    }
+    current += char;
+    hasToken = true;
+  }
+  if (escaped || quote !== null) {
+    return null;
+  }
+  if (hasToken) {
+    argv.push(current);
+  }
+  return argv;
+}
+
+function defaultSetupExec(cmd: string[], timeoutMs: number): SetupExecResult {
+  const [binary, ...args] = cmd as [string, ...string[]];
+  try {
+    const result = spawnSync(binary, args, { encoding: "utf8", timeout: timeoutMs });
+    return {
+      exitCode: result.status ?? 1,
+      stdout: typeof result.stdout === "string" ? result.stdout : "",
+      stderr: typeof result.stderr === "string" ? result.stderr : "",
+    };
+  } catch (e) {
+    return { exitCode: 1, stdout: "", stderr: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Adapter setup: `chrono setup` (Slice 8, [PL Phase 5]).
+ *
+ * Verifies an adapter end to end and installs its project-local
+ * enforcement assets — all fail-closed, nothing global touched:
+ * active approved registration with a live entrypoint, genuine RTK
+ * (`--version` + `gain`, same bar as `rtk verify`) with a current
+ * attestation, current skill installation with intact artifacts, every
+ * registered conformance proof executed green, and the OpenCode
+ * pre-tool plugin written byte-identically. No state is persisted
+ * beyond the installed files: the proofs themselves (adapter row,
+ * attestations, skill files) are the persisted state.
+ */
+export function runSetup(
+  projectPath: string,
+  options: SetupOptions,
+  exec: (cmd: string[], timeoutMs: number) => SetupExecResult = defaultSetupExec
+): CliOutput {
+  const asJson = options.json === true;
+  const fail = (exitCode: number, code: string, reason: string): CliOutput =>
+    asJson
+      ? { exitCode, stdout: JSON.stringify({ ok: false, error: { code, message: reason } }, null, 2), stderr: "" }
+      : { exitCode, stdout: "", stderr: `Error [${code}]: ${reason}` };
+  if (options.adapter.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "setup requires --adapter <registered runtime id>");
+  }
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    let adapter: { id: string; entrypoint: string; dispatchProof: string | null; conformanceProof: string[] };
+    try {
+      adapter = core.getAdapterForDispatch(options.adapter);
+    } catch (e) {
+      const code =
+        typeof e === "object" && e !== null && "code" in e && typeof e.code === "string"
+          ? e.code
+          : "ADAPTER_REJECTED";
+      return fail(1, code, e instanceof Error ? e.message : "Adapter rejected for dispatch");
+    }
+    const live = exec([adapter.entrypoint, "--version"], 30000);
+    if (live.exitCode !== 0) {
+      return fail(1, "CONFIG_ERROR", `adapter entrypoint '${adapter.entrypoint}' did not respond to --version`);
+    }
+    const rtkBinary = options.rtkBinary ?? "rtk";
+    const rtkVersion = exec([rtkBinary, "--version"], 30000);
+    if (rtkVersion.exitCode !== 0) {
+      return fail(1, "BLOCKED_RTK", `RTK binary '${rtkBinary}' not found or not genuine: install Rust Token Killer from ${RTK_UPSTREAM}`);
+    }
+    const gain = exec([rtkBinary, "gain"], 120000);
+    if (gain.exitCode !== 0) {
+      return fail(1, "BLOCKED_RTK", "RTK_NAME_COLLISION: installed rtk is not Rust Token Killer (rtk gain failed)");
+    }
+    if (core.attestationCurrency("rtk").state !== "current") {
+      return fail(1, "BLOCKED_RTK", "RTK attestation is not current: run chrono rtk verify first");
+    }
+    const rtkDetail = core.describeRtkAttestation();
+    const routingProven = rtkDetail?.routingTestPassed === true;
+    const skill = core.describeSkillInstallation();
+    if (!skill.installed) {
+      return fail(1, skill.code, skill.reason);
+    }
+    const proofs = [
+      ...(adapter.dispatchProof !== null ? [adapter.dispatchProof] : []),
+      ...adapter.conformanceProof,
+    ];
+    for (const proof of proofs) {
+      const argv = splitCommandLine(proof);
+      if (argv === null || argv.length === 0) {
+        return fail(1, "CONFIG_ERROR", `adapter conformance proof is not a parseable command: '${proof}'`);
+      }
+      const ran = exec(argv, 120000);
+      if (ran.exitCode !== 0) {
+        return fail(1, "CONFIG_ERROR", `adapter conformance proof failed: '${proof}'`);
+      }
+    }
+    const pluginPath = join(projectPath, ".opencode", "plugins", "chrono-gate.js");
+    try {
+      mkdirSync(dirname(pluginPath), { recursive: true });
+      writeFileSync(pluginPath, buildOpencodePlugin(), "utf8");
+    } catch (e) {
+      return keychainFailure(e, asJson);
+    }
+    const body = asJson
+      ? JSON.stringify(
+          {
+            ok: true,
+            adapter: adapter.id,
+            entrypoint: adapter.entrypoint,
+            rtk: rtkVersion.stdout.trim().split("\n")[0] ?? "unknown",
+            routingProven,
+            skill: "current",
+            proofsRun: proofs.length,
+            plugin: ".opencode/plugins/chrono-gate.js",
+          },
+          null,
+          2
+        )
+      : [
+        `Adapter '${adapter.id}' setup complete.`,
+        `  entrypoint: ${adapter.entrypoint} (live)`,
+        `  rtk: ${rtkVersion.stdout.trim().split("\n")[0] ?? "unknown"} (gain ok, attestation current)`,
+        `  routing: ${routingProven ? "proven" : "unproven (adapter duty, see RUNTIME §6.3)"}`,
+        "  skill: current, artifacts intact",
+        `  proofs: ${String(proofs.length)} green`,
+        "  plugin: .opencode/plugins/chrono-gate.js",
+      ].join("\n");
+    return { exitCode: 0, stdout: body, stderr: "" };
+  } finally {
+    core.close();
+  }
+}
+
 /**
  * Build the commander program. The `cwd` is the default project path when
  * `--path` is not given. Actions print to console and set process exit code
@@ -1787,7 +1989,7 @@ export function createProgram(cwd: string): Command {
         console.error(out.stderr);
       }
       if (out.exitCode !== 0) {
-        program.error("", { exitCode: out.exitCode });
+        throw programFailureExit(out.exitCode);
       }
     });
 
@@ -1806,7 +2008,7 @@ export function createProgram(cwd: string): Command {
         console.error(out.stderr);
       }
       if (out.exitCode !== 0) {
-        program.error("", { exitCode: out.exitCode });
+        throw programFailureExit(out.exitCode);
       }
     });
 
@@ -1825,7 +2027,7 @@ export function createProgram(cwd: string): Command {
         console.error(out.stderr);
       }
       if (out.exitCode !== 0) {
-        program.error("", { exitCode: out.exitCode });
+        throw programFailureExit(out.exitCode);
       }
     });
 
@@ -2130,6 +2332,25 @@ export function createProgram(cwd: string): Command {
       );
     });
 
+  program
+    .command("setup")
+    .description("Verify an adapter end to end and install its project-local enforcement assets (fail-closed)")
+    .requiredOption("--adapter <id>", "registered runtime adapter id")
+    .option("--rtk-binary <path>", "rtk binary (default: rtk from PATH)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      emitProgramResult(
+        program,
+        runSetup(projectPath, {
+          adapter: String(opts.adapter ?? ""),
+          ...(typeof opts.rtkBinary === "string" ? { rtkBinary: opts.rtkBinary } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
   const session = program.command("session").description("authenticated session management");
   session
     .command("open")
@@ -2195,8 +2416,26 @@ export function createProgram(cwd: string): Command {
   return program;
 }
 
-/** Print a CliOutput and raise the commander's exit override on failure. */
+/**
+ * Print a CliOutput and exit non-zero on failure. Failures already
+ * rendered above must NOT pass through `program.error`: commander would
+ * print its own output and bin.ts would append a second JSON envelope,
+ * corrupting machine-readable stdout. The branded error tells bin.ts the
+ * output is complete — it only sets the exit code.
+ */
+export function programFailureExit(exitCode: number): never {
+  const error = new Error("chrono command failed") as Error & {
+    exitCode: number;
+    chronoEmitted: boolean;
+  };
+  error.exitCode = exitCode;
+  error.chronoEmitted = true;
+  throw error;
+}
+
+/** Print a CliOutput and raise the branded exit on failure. */
 function emitProgramResult(program: Command, out: CliOutput): void {
+  void program;
   if (out.stdout !== "") {
     console.log(out.stdout);
   }
@@ -2204,6 +2443,6 @@ function emitProgramResult(program: Command, out: CliOutput): void {
     console.error(out.stderr);
   }
   if (out.exitCode !== 0) {
-    program.error("", { exitCode: out.exitCode });
+    throw programFailureExit(out.exitCode);
   }
 }

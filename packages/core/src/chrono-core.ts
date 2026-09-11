@@ -21,6 +21,7 @@ import {
   type QaRepository,
   type HarnessRepository,
   type AgentSessionRecord,
+  type RtkAttestationDetail,
   type SkillAttestationDetail,
 } from "@chrono/persistence";
 import {
@@ -5465,11 +5466,49 @@ export class ChronoCore {
   }
 
   /**
+   * Latest RTK attestation with its provenance binding, for setup
+   * reporting (read-only). Routing proof stays adapter duty.
+   */
+  describeRtkAttestation(): RtkAttestationDetail | null {
+    return this.db.rtkAttestations().latestFull();
+  }
+
+  /**
    * Latest skill attestation with its provenance binding, for
    * re-verification divergence checks (read-only) [CORE §11.1].
    */
   describeSkillAttestation(): SkillAttestationDetail | null {
     return this.db.skillAttestations().latestFull();
+  }
+
+  /**
+   * Skill installation report for setup flows (read-only): currency plus
+   * on-disk integrity, without authorizing anything [CORE §11, P8.6].
+   */
+  describeSkillInstallation(): { installed: boolean; code: string; reason: string } {
+    const latest = this.db.skillAttestations().latest();
+    const state = this.attestationState(latest, Date.parse(this.now()));
+    if (state !== "current") {
+      return {
+        installed: false,
+        code: "BLOCKED_PROCESS_SKILL",
+        reason: `Skill attestation ${state}: run chrono skill verify first`,
+      };
+    }
+    try {
+      this.requireIntactSkillArtifacts("project");
+    } catch (e) {
+      const code =
+        typeof e === "object" && e !== null && "code" in e && typeof e.code === "string"
+          ? e.code
+          : "BLOCKED_PROCESS_SKILL";
+      return {
+        installed: false,
+        code,
+        reason: e instanceof Error ? e.message : String(e),
+      };
+    }
+    return { installed: true, code: "OK", reason: "Skill attestation current and artifacts intact" };
   }
 
   /** PO-selected project runtime identifier, or null when unset (read-only). */
