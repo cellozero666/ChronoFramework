@@ -108,6 +108,25 @@ from session issuance. Asserted by test (token key absent from spawn env).
 **Status: ALL FIXED + verified** (workspace + both LTS clean checkouts
 green, packed install verified).
 
+## Process finding — vitest does not typecheck (2 errors caught by the tsc gate)
+
+During this fix round, the full test suite passed while `tsc --noEmit`
+reported 2 errors vitest's transpile-only pipeline cannot see. Both were
+fixed and the gate is clean. This confirms the standalone `typecheck` step
+stays mandatory in every verification loop.
+
+1. `packages/core/src/adapter-registry.test.ts(217,12): TS2554 —
+   Expected 2 arguments, but got 1.` A `registerAdapter` call in the
+   malformed-input test omitted the `po` caller auth after the signature
+   gained the auth parameter.
+   **Fix:** auth argument added; case now asserts `VALIDATION_ERROR`.
+2. `packages/core/src/authorization.test.ts(726,61): TS2339 — Property
+   'payload' does not exist` on the public `listEvents` projection while
+   digging an approval id out of events in the revoke-burn test.
+   **Fix:** test captures the approval id directly from the
+   `recordApproval` return value instead of parsing events.
+**Status: BOTH FIXED + verified** (`tsc --noEmit` clean).
+
 ## Next step (unblocked)
 
 Per the plan, next is **Slice 8: live conformance of the first runtime
