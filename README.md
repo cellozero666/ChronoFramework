@@ -154,6 +154,8 @@ The CHRONO implementation uses TypeScript and Node.js, but the projects it gover
 
 Use CHRONO when you need **AI coding agents**, **agentic software development**, **Spec-Driven Development**, **secure vibe coding**, **multi-agent orchestration**, **AI DevSecOps**, or **model-agnostic developer tools** without giving up architectural control. Stable releases are installed through npm or GitHub Releases once their published artifacts pass the repository's release gates; repository builds remain subject to the implementation status recorded in the documentation index.
 
+First run: install the package, run `chrono init` once, then open a configured runtime normally — see the [First Run Guide](docs/guides/FIRST-RUN.md), which describes only demonstrated behavior.
+
 CHRONO will guide the project from intent to verified implementation while preserving the Product Owner's authority at every material decision. Contributions should focus on measurable conformance rather than unverified autonomy or surface-level integrations.
 
 ## Contributing and security

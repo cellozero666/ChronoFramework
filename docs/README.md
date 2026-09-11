@@ -40,3 +40,7 @@ the current execution queue are indexed below:
 - [`implementation/SLICE-9.md`](implementation/SLICE-9.md) — next blocking implementation slice.
 - [`implementation/SLICE-10.md`](implementation/SLICE-10.md) — one-command bootstrap and automatic Gaspar start/resume experience.
 - [`implementation/IMPLEMENTER-TASKS.md`](implementation/IMPLEMENTER-TASKS.md) — ordered work queue through release-candidate readiness.
+
+## User guides
+
+- [`guides/FIRST-RUN.md`](guides/FIRST-RUN.md) — installation, one-command setup, normal runtime launch, re-run/repair, removal, troubleshooting, and security notes. Describes only demonstrated behavior; open acceptance items are marked as such.
