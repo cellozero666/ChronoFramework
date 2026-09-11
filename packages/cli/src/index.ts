@@ -18,10 +18,12 @@ import { CHRONO_VERSION } from "./version.js";
 import { buildOpencodePlugin } from "./opencode-plugin.js";
 import { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook, mergeClaudeSettings } from "./claude-hook.js";
 import { KIRO_HOOK_REGISTRATION_RELATIVE_PATH, KIRO_HOOK_RELATIVE_PATH, buildKiroHook, buildKiroHookRegistration } from "./kiro-hook.js";
+import { constructionFailure, openReadProject, resolveProjectDir } from "./project.js";
 
 export { buildOpencodePlugin };
 export { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook, mergeClaudeSettings };
 export { KIRO_HOOK_REGISTRATION_RELATIVE_PATH, KIRO_HOOK_RELATIVE_PATH, buildKiroHook, buildKiroHookRegistration };
+export { findProjectRoot, resolveProjectDir, openReadProject, constructionFailure } from "./project.js";
 import {
   MemoryKeyStore,
   OsKeychainStore,
@@ -201,69 +203,17 @@ export function runInit(projectPath: string, options: InitOptions = {}): CliOutp
   }
 }
 
-/**
- * Structured fatal for Core-construction failures (bad path, migration
- * failure, unreadable store). Exit 2 = system error [RUNTIME §12];
- * exit 1 is reserved for Core gate denials. JSON on every failure path
- * when --json is set [Remediation §6].
- */
-function constructionFailure(e: unknown, asJson: boolean): CliOutput {
-  const message = e instanceof Error ? e.message : String(e);
-  // Preserve a deterministic Core failure (e.g. pinned-version mismatch)
-  // instead of flattening every construction fault to CORE_INIT_FAILURE.
-  const coreFault =
-    typeof e === "object" &&
-    e !== null &&
-    "code" in e &&
-    typeof (e as { code?: unknown }).code === "string" &&
-    "severity" in e &&
-    typeof (e as { severity?: unknown }).severity === "string"
-      ? (e as { code: string; severity: string; invariantRef?: string; affectedTarget?: string; suggestedAction?: string })
-      : null;
-  if (asJson) {
-    return {
-      exitCode: 2,
-      stdout: JSON.stringify(
-        {
-          ok: false,
-          error: {
-            code: coreFault?.code ?? "CORE_INIT_FAILURE",
-            severity: coreFault?.severity ?? "ERROR",
-            message,
-            ...(coreFault?.invariantRef !== undefined ? { invariantRef: coreFault.invariantRef } : {}),
-            ...(coreFault?.affectedTarget !== undefined ? { affectedTarget: coreFault.affectedTarget } : {}),
-            suggestedAction:
-              coreFault?.suggestedAction ??
-              "Verify the project path is writable and .chrono/chrono.db is intact",
-          },
-        },
-        null,
-        2,
-      ),
-      stderr: "",
-    };
-  }
-  return {
-    exitCode: 2,
-    stdout: "",
-    stderr: [
-      `Fatal [${coreFault?.code ?? "CORE_INIT_FAILURE"}] (${coreFault?.severity ?? "ERROR"}): ${message}`,
-      `  suggested action: ${coreFault?.suggestedAction ?? "Verify the project path is writable and .chrono/chrono.db is intact"}`,
-    ].join("\n"),
-  };
-}
 
 /**
  * Show deterministic project status. Delegates to Core.status().
  */
 export function runStatus(projectPath: string, options: OutputOptions = {}): CliOutput {
   const asJson = options.json === true;
-  let core: ChronoCore;
-  try {
-    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
-  } catch (e) {
-    return constructionFailure(e, asJson);
+  const opened = openReadProject(projectPath, asJson);
+  if ("failure" in opened) {
+    return opened.failure;
   }
+  const core = opened.core;
   try {
     const result = core.status();
     if (!result.ok) {
@@ -309,12 +259,11 @@ export function runStatus(projectPath: string, options: OutputOptions = {}): Cli
  */
 export function runValidate(projectPath: string, options: OutputOptions = {}): CliOutput {
   const asJson = options.json === true;
-  let core: ChronoCore;
-  try {
-    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
-  } catch (e) {
-    return constructionFailure(e, asJson);
+  const opened = openReadProject(projectPath, asJson);
+  if ("failure" in opened) {
+    return opened.failure;
   }
+  const core = opened.core;
   try {
     const result = core.validate();
     if (!result.ok) {
@@ -961,6 +910,8 @@ export function runGate(projectPath: string, options: GateOptions): CliOutput {
       : { exitCode, stdout: exitCode === 0 ? human : "", stderr: exitCode === 0 ? "" : human };
   let core: ChronoCore;
   try {
+    // Gates authorize (minting grants) and audit every verdict, so they
+    // open read-write; pure reads use openReadProject instead.
     core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
@@ -1095,12 +1046,11 @@ export function runAttestationStatus(
   options: OutputOptions = {}
 ): CliOutput {
   const asJson = options.json === true;
-  let core: ChronoCore;
-  try {
-    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
-  } catch (e) {
-    return constructionFailure(e, asJson);
+  const opened = openReadProject(projectPath, asJson);
+  if ("failure" in opened) {
+    return opened.failure;
   }
+  const core = opened.core;
   try {
     const status = core.attestationCurrency(kind);
     const body = asJson
@@ -1121,7 +1071,11 @@ export function runAttestationStatus(
  */
 export function runRtkVerify(
   projectPath: string,
-  options: OutputOptions & { binaryPath?: string; session?: { id: string; token: string } } = {},
+  options: OutputOptions & {
+    binaryPath?: string;
+    session?: { id: string; token: string };
+    resolveBinary?: ((binary: string) => string | null) | undefined;
+  } = {},
   exec: (binary: string, args: string[]) => { exitCode: number; stdout: string } = defaultExec
 ): CliOutput {
   const asJson = options.json === true;
@@ -1139,7 +1093,16 @@ export function runRtkVerify(
       );
     }
     const caller = { actor: "gaspar", session: options.session };
-    const binary = options.binaryPath ?? "rtk";
+    const requested = options.binaryPath ?? "rtk";
+    // Resolve to an absolute path BEFORE executing or recording: the
+    // attestation's binaryPath must match the resolved path that
+    // `rtk prove` (and dispatch-time hash checks) use, or every proof
+    // fails closed on version/binary mismatch.
+    const resolve = options.resolveBinary ?? resolveExecutable;
+    const binary = resolve(requested);
+    if (binary === null) {
+      return rtkBlocked(`RTK binary '${requested}' not found: install Rust Token Killer from ${RTK_UPSTREAM}`, asJson);
+    }
     let version: string;
     try {
       const versionResult = exec(binary, ["--version"]);
@@ -1166,7 +1129,7 @@ export function runRtkVerify(
       provenance: RTK_UPSTREAM,
       integrationMode: null,
       routingTestPassed: false,
-      routingTestLog: "adapter routing self-test pending (Slice 8 adapters)",
+      routingTestLog: "attestation only: effective routing is proven per adapter through chrono rtk prove",
       gained: true,
       savingsEvidence: gain.stdout.slice(0, 2000),
       ttlSeconds: 3600,
@@ -1188,6 +1151,7 @@ export interface RtkProveOptions extends OutputOptions {
   readonly as?: string | undefined;
   readonly session?: { id: string; token: string } | undefined;
   readonly binary?: string | undefined;
+  readonly resolveBinary?: ((binary: string) => string | null) | undefined;
   readonly ttlSeconds?: number | undefined;
   readonly timeoutSeconds?: number | undefined;
   readonly command: string[];
@@ -1266,7 +1230,7 @@ export function runRtkProve(
   if (commandBinary !== binary) {
     return fail(2, "VALIDATION_ERROR", `rtk prove command must start with the RTK binary '${binary}': proofs cannot smuggle another binary`);
   }
-  const resolved = resolveExecutable(binary);
+  const resolved = (options.resolveBinary ?? resolveExecutable)(binary);
   if (resolved === null) {
     return fail(1, "BLOCKED_RTK", `RTK binary '${binary}' not found: install Rust Token Killer from ${RTK_UPSTREAM}`);
   }
@@ -2059,12 +2023,11 @@ export function runAdapterRegister(
 /** List adapter registrations (read-only project metadata). */
 export function runAdapterList(projectPath: string, options: OutputOptions = {}): CliOutput {
   const asJson = options.json === true;
-  let core: ChronoCore;
-  try {
-    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
-  } catch (e) {
-    return constructionFailure(e, asJson);
+  const opened = openReadProject(projectPath, asJson);
+  if ("failure" in opened) {
+    return opened.failure;
   }
+  const core = opened.core;
   try {
     const adapters = core.listAdapters().map((a) => ({ id: a.id, name: a.name, entrypoint: a.entrypoint, status: a.status }));
     if (asJson) {
@@ -2405,7 +2368,7 @@ export function createProgram(cwd: string): Command {
     .option("--runtime <runtime>", "runtime adapter name (recorded only, no policy)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const out = runInit(projectPath, {
         language: typeof opts.language === "string" ? opts.language : undefined,
         gasparAutonomy: typeof opts.gasparAutonomy === "string" ? opts.gasparAutonomy : undefined,
@@ -2429,7 +2392,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const out = runStatus(projectPath, { json: opts.json === true });
       if (out.stdout !== "") {
         console.log(out.stdout);
@@ -2448,7 +2411,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const out = runValidate(projectPath, { json: opts.json === true });
       if (out.stdout !== "") {
         console.log(out.stdout);
@@ -2472,7 +2435,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const out = runApprove(projectPath, {
         action: String(opts.action ?? ""),
         scope: String(opts.scope ?? ""),
@@ -2499,7 +2462,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const out = runWaive(projectPath, {
         scope: String(opts.scope ?? ""),
         revision: String(opts.revision ?? ""),
@@ -2522,7 +2485,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       emitProgramResult(
         program,
         runEnroll(projectPath, {
@@ -2542,7 +2505,7 @@ export function createProgram(cwd: string): Command {
     .option("--rationale <text>", "rationale bound into a rotation signature")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       emitProgramResult(
         program,
         runKeysGenerate(projectPath, {
@@ -2567,7 +2530,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((gate: string, opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       emitProgramResult(
         program,
         runGate(projectPath, {
@@ -2592,7 +2555,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       emitProgramResult(program, runAttestationStatus(projectPath, "rtk", { json: opts.json === true }));
     });
 
@@ -2604,7 +2567,7 @@ export function createProgram(cwd: string): Command {
     .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       emitProgramResult(
         program,
@@ -2628,7 +2591,7 @@ export function createProgram(cwd: string): Command {
     .option("--json", "machine-readable JSON output")
     .argument("<command...>", "command routed through the RTK binary (must start with it)")
     .action((command: string[], opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       const ttl = typeof opts.ttl === "string" ? Number(opts.ttl) : undefined;
       const timeout = typeof opts.timeout === "string" ? Number(opts.timeout) : undefined;
@@ -2655,7 +2618,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       emitProgramResult(program, runAttestationStatus(projectPath, "skill", { json: opts.json === true }));
     });
 
@@ -2668,7 +2631,7 @@ export function createProgram(cwd: string): Command {
     .option("--ttl <seconds>", "attestation lifetime in seconds (default 86400)")
     .option("--json", "machine-readable JSON output")
     .action(async (opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       const ttl = typeof opts.ttl === "string" ? Number(opts.ttl) : undefined;
       emitProgramResult(
@@ -2697,7 +2660,7 @@ export function createProgram(cwd: string): Command {
     .option("--json", "machine-readable JSON output")
     .argument("<command...>", "command to dispatch (must start with the adapter entrypoint)")
     .action((command: string[], opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const timeout = typeof opts.timeout === "string" ? Number(opts.timeout) : undefined;
       emitProgramResult(
         program,
@@ -2727,7 +2690,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       if (token === null || typeof opts.as !== "string" || typeof opts.file !== "string") {
         emitProgramResult(
@@ -2750,7 +2713,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       emitProgramResult(program, runAdapterList(projectPath, { json: opts.json === true }));
     });
 
@@ -2764,7 +2727,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       if (token === null || typeof opts.as !== "string") {
         emitProgramResult(
@@ -2796,7 +2759,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       if (token === null || typeof opts.as !== "string") {
         emitProgramResult(
@@ -2821,7 +2784,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       emitProgramResult(
         program,
         runSetup(projectPath, {
@@ -2847,7 +2810,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const ttl = typeof opts.ttl === "string" ? Number(opts.ttl) : undefined;
       emitProgramResult(
         program,
@@ -2877,7 +2840,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((id: string, opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       if (token === null || typeof opts.as !== "string") {
         emitProgramResult(

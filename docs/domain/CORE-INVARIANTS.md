@@ -375,6 +375,7 @@ The Core uses this taxonomy to classify and report invariant violations. Errors 
 | `VALIDATION_ERROR` | Schema, required field, or constraint violation | I-09.1 |
 | `MISSING_REQUIRED_ARTIFACT` | Required artifact (Spec, Harness, SecurityProfile, etc.) absent | I-04.6, I-05.1 |
 | `INCONSISTENT_REFERENCE` | Reference resolves but is incompatible | I-09.2, I-09.3 |
+| `UPGRADE_REQUIRED` | Legacy project needs a read-write upgrade touch (pin/migrate) before read-only use | I-04.1 |
 
 ### 14.5 Security failures
 | Code | Meaning | Invariant |

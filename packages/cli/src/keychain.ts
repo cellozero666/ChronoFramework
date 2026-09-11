@@ -9,20 +9,24 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 export const PO_KEY_SERVICE = "chrono-po-signing-key";
 export const PO_KEY_ACCOUNT = "po";
+
+/** Gaspar-entry broker custody: OS keychain service for broker secrets. */
+export const BROKER_KEY_SERVICE = "chrono-gaspar-entry";
 
 /** PO signing-key staging account for crash-safe rotation. */
 export const PO_KEY_STAGING_ACCOUNT = "po.staging";
 
 export interface KeyStore {
-  /** Read the private key PEM, or null when absent. */
-  readKey(account: string): string | null;
-  /** Create or replace the private key PEM. */
-  writeKey(account: string, privateKeyPem: string): void;
+  /** Read the stored secret, or null when absent. Service defaults to the PO key service. */
+  readKey(account: string, service?: string): string | null;
+  /** Create or replace the stored secret. Service defaults to the PO key service. */
+  writeKey(account: string, secret: string, service?: string): void;
   /** Remove a key when present; absent keys are not an error. */
-  deleteKey(account: string): void;
+  deleteKey(account: string, service?: string): void;
 }
 
 export class KeychainError extends Error {
@@ -39,12 +43,12 @@ export class KeychainError extends Error {
  * - Other platforms: fail closed with actionable instructions.
  */
 export class OsKeychainStore implements KeyStore {
-  readKey(account: string): string | null {
+  readKey(account: string, service: string = PO_KEY_SERVICE): string | null {
     if (process.platform === "darwin") {
       try {
         const out = execFileSync(
           "security",
-          ["find-generic-password", "-s", PO_KEY_SERVICE, "-a", account, "-w"],
+          ["find-generic-password", "-s", service, "-a", account, "-w"],
           { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
         );
         const pem = out.trim();
@@ -62,7 +66,7 @@ export class OsKeychainStore implements KeyStore {
       try {
         const out = execFileSync(
           "secret-tool",
-          ["lookup", "service", PO_KEY_SERVICE, "account", account],
+          ["lookup", "service", service, "account", account],
           { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
         );
         const pem = out.trim();
@@ -81,12 +85,12 @@ export class OsKeychainStore implements KeyStore {
     );
   }
 
-  writeKey(account: string, privateKeyPem: string): void {
+  writeKey(account: string, secret: string, service: string = PO_KEY_SERVICE): void {
     if (process.platform === "darwin") {
       try {
         execFileSync(
           "security",
-          ["add-generic-password", "-s", PO_KEY_SERVICE, "-a", account, "-w", privateKeyPem, "-U"],
+          ["add-generic-password", "-s", service, "-a", account, "-w", secret, "-U"],
           { stdio: ["ignore", "pipe", "pipe"] }
         );
         return;
@@ -100,8 +104,8 @@ export class OsKeychainStore implements KeyStore {
       try {
         execFileSync(
           "secret-tool",
-          ["store", "--label=CHRONO PO signing key", "service", PO_KEY_SERVICE, "account", account],
-          { input: privateKeyPem, stdio: ["pipe", "pipe", "pipe"] }
+          ["store", "--label=CHRONO secret", "service", service, "account", account],
+          { input: secret, stdio: ["pipe", "pipe", "pipe"] }
         );
         return;
       } catch (e) {
@@ -118,12 +122,12 @@ export class OsKeychainStore implements KeyStore {
     );
   }
 
-  deleteKey(account: string): void {
+  deleteKey(account: string, service: string = PO_KEY_SERVICE): void {
     if (process.platform === "darwin") {
       try {
         execFileSync(
           "security",
-          ["delete-generic-password", "-s", PO_KEY_SERVICE, "-a", account],
+          ["delete-generic-password", "-s", service, "-a", account],
           { stdio: ["ignore", "pipe", "pipe"] }
         );
         return;
@@ -184,6 +188,15 @@ function shortMessage(e: unknown): string {
 /** Interactive-terminal probe: stdin AND stdout must be TTYs [ADR-003]. */
 export function isInteractiveTerminal(): boolean {
   return process.stdin.isTTY === true && process.stdout.isTTY === true;
+}
+
+/**
+ * Broker keychain account for a project root [SLICE-10 §5.2]. The account
+ * NAME is non-secret (persisted in `.chrono/broker-account` for hook
+ * scripts); only the secret it addresses stays in the keychain.
+ */
+export function brokerAccountFor(projectRoot: string): string {
+  return `gaspar-entry-${createHash("sha256").update(projectRoot, "utf8").digest("hex").slice(0, 16)}`;
 }
 
 /** In-memory KeyStore for tests only. Never used by production paths. */

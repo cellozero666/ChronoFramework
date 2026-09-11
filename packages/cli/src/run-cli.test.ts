@@ -344,19 +344,6 @@ function enrollTestPo(
       const registrationHash = core.adapterRegistrationHash("fixture");
       const adapterApprovalId = approve(core, privateKeyPem, "adapter-registration", "fixture", registrationHash);
       expect(core.approveAdapter("fixture", adapterApprovalId, po).ok).toBe(true);
-      // The operator sessions in this fixture are bound to "test-adapter":
-      // routing-proof submission requires an approved submitter adapter, so
-      // it is registered and approved here as the second approved adapter
-      // (multi-runtime projects routinely hold several).
-      expect(
-        core.registerAdapter(
-          { id: "test-adapter", name: "Test adapter", entrypoint, conformanceProof: ["fixture --version"] },
-          po
-        ).ok
-      ).toBe(true);
-      const operatorHash = core.adapterRegistrationHash("test-adapter");
-      const operatorApprovalId = approve(core, privateKeyPem, "adapter-registration", "test-adapter", operatorHash);
-      expect(core.approveAdapter("test-adapter", operatorApprovalId, po).ok).toBe(true);
       const fixtureProofCommand = JSON.stringify([rtkBin, "gain"]);
       expect(
         core.recordRoutingProof(gaspar, {

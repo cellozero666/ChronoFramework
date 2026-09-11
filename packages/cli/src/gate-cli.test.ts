@@ -242,7 +242,7 @@ describe("CLI gate", () => {
     const throwing = (): { exitCode: number; stdout: string } => {
       throw Object.assign(new Error("spawn rtk ENOENT"), { code: "ENOENT" });
     };
-    const out = runRtkVerify(tempDir, { session: openCliSession(tempDir).session }, throwing);
+    const out = runRtkVerify(tempDir, { session: openCliSession(tempDir).session, resolveBinary: () => "/fixture/rtk" }, throwing);
     expect(out.exitCode).toBe(1);
     expect(out.stderr).toContain("BLOCKED_RTK");
   });
@@ -254,7 +254,7 @@ describe("CLI gate", () => {
       }
       return { exitCode: 1, stdout: "" };
     };
-    const out = runRtkVerify(tempDir, { session: openCliSession(tempDir).session }, fake);
+    const out = runRtkVerify(tempDir, { session: openCliSession(tempDir).session, resolveBinary: () => "/fixture/rtk" }, fake);
     expect(out.exitCode).toBe(1);
     expect(out.stderr).toContain("RTK_NAME_COLLISION");
   });
@@ -266,7 +266,7 @@ describe("CLI gate", () => {
       }
       return { exitCode: 0, stdout: "gain dashboard" };
     };
-    const out = runRtkVerify(tempDir, { session: openCliSession(tempDir).session }, fake);
+    const out = runRtkVerify(tempDir, { session: openCliSession(tempDir).session, resolveBinary: () => "/fixture/rtk" }, fake);
     expect(out.exitCode).toBe(0);
     const status = runAttestationStatus(tempDir, "rtk", { json: true });
     const parsed = JSON.parse(status.stdout) as { state: string };

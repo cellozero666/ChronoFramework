@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runInit, runStatus, runValidate, createProgram } from "./index.js";
@@ -152,23 +152,27 @@ describe("CLI: construction failures", () => {
     }
   });
 
-  it("returns structured exit-2 failure when the store cannot be created", () => {
-    // A regular file where the project directory should be: mkdir fails.
+  it("returns structured exit-1 failure when no project exists (never materializing a store)", () => {
+    // A regular file where the project directory should be.
     const blocker = join(tempDir, "file");
     writeFileSync(blocker, "not a directory");
-    const out = runStatus(join(blocker, "child"));
-    expect(out.exitCode).toBe(2);
-    expect(out.stderr).toContain("CORE_INIT_FAILURE");
+    const target = join(blocker, "child");
+    const out = runStatus(target);
+    expect(out.exitCode).toBe(1);
+    expect(out.stderr).toContain("ENTITY_NOT_FOUND");
+    expect(out.stderr).toContain("chrono init");
+    // Read paths must not create store files as a side effect.
+    expect(existsSync(join(target, ".chrono"))).toBe(false);
   });
 
-  it("emits JSON on construction failure with --json", () => {
+  it("emits JSON on missing-project failure with --json", () => {
     const blocker = join(tempDir, "file");
     writeFileSync(blocker, "not a directory");
     const out = runValidate(join(blocker, "child"), { json: true });
-    expect(out.exitCode).toBe(2);
+    expect(out.exitCode).toBe(1);
     const parsed = JSON.parse(out.stdout) as { ok: boolean; error: { code: string } };
     expect(parsed.ok).toBe(false);
-    expect(parsed.error.code).toBe("CORE_INIT_FAILURE");
+    expect(parsed.error.code).toBe("ENTITY_NOT_FOUND");
   });
 });
 

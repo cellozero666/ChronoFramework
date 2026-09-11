@@ -300,12 +300,12 @@ export class ChronoCore {
     if (recorded === null) {
       if (readOnly) {
         throw new ChronoError({
-          code: ErrorCode.CONFIG_ERROR,
+          code: ErrorCode.UPGRADE_REQUIRED,
           severity: Severity.BLOCKER,
-          message: "Project has no pinned Core version and this open is read-only: refusing to stamp",
-          invariantRef: "INV §4.1",
+          message: "Project has no pinned Core version and this open is read-only: an upgrade touch is required first",
+          invariantRef: "INV §14.4",
           affectedTarget: "CORE-VERSION",
-          suggestedAction: "Open the project read-write (chrono init) to pin its Core version first",
+          suggestedAction: "Open the project read-write (chrono init resumes and pins its Core version) before read-only use",
         });
       }
       this.db.runtimeConfig().set("chrono.version", pinnedVersion);
@@ -2104,17 +2104,6 @@ export class ChronoCore {
           suggestedAction: "Record non-secret setup progress as key/value detail",
         });
       }
-      for (const key of Object.keys(detail)) {
-        if (/secret|token|private|password|credential|keychain/i.test(key)) {
-          throw new ChronoError({
-            code: ErrorCode.SECRET_DETECTED,
-            severity: Severity.ERROR,
-            message: `Setup detail key '${key}' looks secret-bearing: progress must persist non-secret state only`,
-            invariantRef: "INV §7.9",
-            suggestedAction: "Keep keys, tokens, and credentials in the OS keychain, never in setup state",
-          });
-        }
-      }
       this.assertNoNestedSecrets(detail, "detail");
       let serialized: string;
       try {
@@ -2145,7 +2134,7 @@ export class ChronoCore {
         this.events.append({
           eventType: "StateTransition",
           entityId: "setup",
-          payload: { entityType: "SETUP", eventType: "SetupAdvanced", fromState: current?.step ?? null, toState: step },
+          payload: { entityType: "SETUP", eventType: "SetupAdvanced", fromState: current?.step ?? null, toState: step, detail },
           actor: "system",
           priorState: current?.step,
           newState: step,
@@ -2158,8 +2147,20 @@ export class ChronoCore {
     }
   }
 
-  /** Recursively reject secret-bearing keys in nested setup detail. */
+  /** Recursively reject secret-bearing keys and values in setup detail. */
   private assertNoNestedSecrets(value: unknown, path: string): void {
+    if (typeof value === "string") {
+      if (/-----BEGIN [A-Z ]*PRIVATE KEY-----|sk-(live|test)-[A-Za-z0-9]{8,}/.test(value)) {
+        throw new ChronoError({
+          code: ErrorCode.SECRET_DETECTED,
+          severity: Severity.ERROR,
+          message: `Setup detail value at '${path}' looks like secret material: progress must persist non-secret state only`,
+          invariantRef: "INV §7.9",
+          suggestedAction: "Keep keys, tokens, and credentials in the OS keychain, never in setup state",
+        });
+      }
+      return;
+    }
     if (Array.isArray(value)) {
       for (let i = 0; i < value.length; i++) {
         this.assertNoNestedSecrets(value[i], `${path}[${String(i)}]`);
@@ -2168,7 +2169,9 @@ export class ChronoCore {
     }
     if (typeof value === "object" && value !== null) {
       for (const [key, nested] of Object.entries(value)) {
-        if (/secret|token|private|password|credential|keychain/i.test(key)) {
+        // "keychain" is legitimate metadata (consent scopes, file paths);
+        // the remaining names overwhelmingly denote secret material.
+        if (/secret|token|private|password|credential/i.test(key)) {
           throw new ChronoError({
             code: ErrorCode.SECRET_DETECTED,
             severity: Severity.ERROR,
@@ -2720,26 +2723,6 @@ export class ChronoCore {
     }
     this.assertExecutableEntrypoint(adapter.entrypoint, id);
     return adapter;
-  }
-
-  /**
-   * Approval check without entrypoint liveness: for submitter-side policy
-   * ("an approved adapter session may submit") the entrypoint of the
-   * submitter's own adapter is irrelevant — only its approval state
-   * matters. Unknown ids deny via findById; non-active states deny here.
-   */
-  private requireApprovedAdapter(id: string, operation: string): void {
-    const adapter = this.db.adapters().findById(id);
-    if (adapter.status !== "active") {
-      throw new ChronoError({
-        code: ErrorCode.EXECUTION_DENIED,
-        severity: Severity.BLOCKER,
-        message: `Adapter '${id}' is ${adapter.status}: ${operation} requires a session of an approved adapter`,
-        invariantRef: "INV §5.1",
-        affectedTarget: id,
-        suggestedAction: "Register and approve the adapter before submitting through its sessions",
-      });
-    }
   }
 
   /**
@@ -4768,12 +4751,27 @@ export class ChronoCore {
     try {
       const caller = this.resolveCaller(auth, "record routing proof");
       const session = caller.session;
-      // Slice 9 §9.3: only an approved adapter session may submit a proof.
-      // The proof's adapter is checked below; the submitter's own adapter
-      // must independently be approved, so sessions of revoked or never
-      // registered adapters cannot mint proofs for other adapters.
-      this.requireApprovedAdapter(session.adapter, "routing-proof submission");
-      const adapter = this.getAdapterForDispatch(input.adapterId);
+      // Submission is gated on session validity plus a well-formed
+      // adapter scope — NOT on adapter registration: setup proves routing
+      // BEFORE the PO's adapter-approval decision, so evidence precedes
+      // approval by design (the approver reviews evidence, not promises).
+      // Dispatch independently requires a registered, active adapter,
+      // current attestation, and a live binary (re-validated per
+      // dispatch), so proofs for unknown, pending, or revoked adapters
+      // can never authorize execution. Adapter labels on sessions are
+      // self-asserted at open and cannot bear weight; revoked adapters
+      // are covered by the session-revocation cascade instead.
+      if (!/^[a-z0-9][a-z0-9_-]*$/.test(input.adapterId)) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Routing proof adapter scope '${input.adapterId}' is malformed`,
+          invariantRef: "INV §14.4",
+          affectedTarget: input.adapterId,
+          suggestedAction: "Scope the proof to the lowercase runtime adapter id",
+        });
+      }
+      const adapterId = input.adapterId;
       const attestation = this.db.rtkAttestations().latest();
       const attestationState = this.attestationState(attestation, Date.parse(this.now()));
       if (attestation === null || attestationState !== "current") {
@@ -4782,7 +4780,7 @@ export class ChronoCore {
           severity: Severity.BLOCKER,
           message: "Routing proof requires a current RTK attestation",
           invariantRef: "INV §8.5",
-          affectedTarget: adapter.id,
+          affectedTarget: adapterId,
           suggestedAction: "Verify a genuine RTK installation and record a current attestation first",
         });
       }
@@ -4793,7 +4791,7 @@ export class ChronoCore {
           severity: Severity.BLOCKER,
           message: "Routing proof version/binary must match the current RTK attestation",
           invariantRef: "INV §8.4",
-          affectedTarget: adapter.id,
+          affectedTarget: adapterId,
           suggestedAction: "Prove routing with the attested binary version",
         });
       }
@@ -4806,7 +4804,7 @@ export class ChronoCore {
           severity: Severity.ERROR,
           message: `Routing proof binary '${input.binaryPath}' is unreadable`,
           invariantRef: "INV §14.4",
-          affectedTarget: adapter.id,
+          affectedTarget: adapterId,
           suggestedAction: "Prove routing with an existing executable RTK binary",
         });
       }
@@ -4825,7 +4823,7 @@ export class ChronoCore {
           severity: Severity.ERROR,
           message: "Only successful routings prove effectiveness: exit status must be 0",
           invariantRef: "INV §14.4",
-          affectedTarget: adapter.id,
+          affectedTarget: adapterId,
           suggestedAction: "Re-run the proof command until it succeeds through RTK",
         });
       }
@@ -4838,7 +4836,7 @@ export class ChronoCore {
           suggestedAction: "Record the exact command that was routed",
         });
       }
-      this.assertFreshTimestamp(input.timestamp, adapter.id);
+      this.assertFreshTimestamp(input.timestamp, adapterId);
       const ageMs = Date.parse(this.now()) - Date.parse(input.timestamp);
       if (ageMs > ROUTING_PROOF_FRESHNESS_MS) {
         throw new ChronoError({
@@ -4846,7 +4844,7 @@ export class ChronoCore {
           severity: Severity.ERROR,
           message: "Routing proof timestamp is stale: proofs must be submitted live",
           invariantRef: "INV §14.4",
-          affectedTarget: adapter.id,
+          affectedTarget: adapterId,
           suggestedAction: "Re-run the routing proof now",
         });
       }
@@ -4863,7 +4861,7 @@ export class ChronoCore {
       const issuedAt = this.now();
       const record = this.db.routingProofs().create({
         id,
-        adapterId: adapter.id,
+        adapterId: adapterId,
         runtime: session.runtime,
         sessionId: session.id,
         projectId: "default",
@@ -4882,7 +4880,7 @@ export class ChronoCore {
       this.events.append({
         eventType: "RoutingProofRecorded",
         entityId: record.id,
-        payload: { adapterId: adapter.id, runtime: session.runtime, commandHash: input.commandHash },
+        payload: { adapterId, runtime: session.runtime, commandHash: input.commandHash },
         actor: caller.auditActor,
         priorState: undefined,
         newState: "current",

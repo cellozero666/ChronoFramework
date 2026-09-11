@@ -851,34 +851,6 @@ describe("Dispatch grants (session binding)", () => {
       expect(recorded.ok).toBe(true);
       const approvalId = recorded.value!.id;
       expect(core.approveAdapter("fixture", approvalId, poAuth).ok).toBe(true);
-      // Operator sessions in this file are bound to "test-adapter":
-      // routing-proof submission requires an approved submitter adapter,
-      // so it is approved here as the second approved adapter.
-      expect(
-        core.registerAdapter(
-          { id: "test-adapter", name: "Test adapter", entrypoint, conformanceProof: ["fixture --version"] },
-          poAuth
-        ).ok
-      ).toBe(true);
-      const operatorRevision = core.adapterRegistrationHash("test-adapter");
-      const operatorSig = sign({
-        action: "adapter-registration",
-        scopeArtifactId: "test-adapter",
-        scopeRevision: operatorRevision,
-        authority: "PO",
-        rationale: "trust",
-      });
-      const operatorRecorded = core.recordApproval({
-        action: "adapter-registration",
-        scopeArtifactId: "test-adapter",
-        scopeRevision: operatorRevision,
-        authority: "PO",
-        rationale: "trust",
-        timestamp: operatorSig.timestamp,
-        signature: operatorSig.signature,
-      });
-      expect(operatorRecorded.ok).toBe(true);
-      expect(core.approveAdapter("test-adapter", operatorRecorded.value!.id, poAuth).ok).toBe(true);
       recordAttestations(core, gaspar, poPrivateKey, T0);
       const rtkBin = join(tempDir, "fixture-rtk.sh");
       const fixtureProofCommand = JSON.stringify([rtkBin, "gain"]);
@@ -916,85 +888,6 @@ describe("Dispatch grants (session binding)", () => {
       expect(denied.error?.message).toContain("no longer approved");
     } finally {
       restoreRevokeTty();
-      core.close();
-    }
-  });
-
-  it("denies routing proofs submitted by sessions of unapproved adapters", () => {
-    const { core, sign, poPrivateKey, restoreTty: restoreProofTty } = clockedCore(T0);
-    try {
-      const { gaspar } = approvedModule(core, sign, poPrivateKey);
-      const poAuth = { actor: "PO", session: bootstrapPrivilegedSession(core, "PO", poPrivateKey) };
-      const entrypoint = join(tempDir, "fixture-runtime.sh");
-      writeFileSync(entrypoint, "#!/bin/sh\necho ok\n");
-      chmodSync(entrypoint, 0o755);
-      // Only "test-adapter" is approved; "ghost" is never registered and
-      // "pending-adapter" stays pending.
-      expect(
-        core.registerAdapter(
-          { id: "test-adapter", name: "Test adapter", entrypoint, conformanceProof: ["fixture --version"] },
-          poAuth
-        ).ok
-      ).toBe(true);
-      const revision = core.adapterRegistrationHash("test-adapter");
-      const sig = sign({
-        action: "adapter-registration",
-        scopeArtifactId: "test-adapter",
-        scopeRevision: revision,
-        authority: "PO",
-        rationale: "trust",
-      });
-      const recorded = core.recordApproval({
-        action: "adapter-registration",
-        scopeArtifactId: "test-adapter",
-        scopeRevision: revision,
-        authority: "PO",
-        rationale: "trust",
-        timestamp: sig.timestamp,
-        signature: sig.signature,
-      });
-      expect(recorded.ok).toBe(true);
-      expect(core.approveAdapter("test-adapter", recorded.value!.id, poAuth).ok).toBe(true);
-      expect(
-        core.registerAdapter(
-          { id: "pending-adapter", name: "Pending", entrypoint, conformanceProof: ["fixture --version"] },
-          poAuth
-        ).ok
-      ).toBe(true);
-      recordAttestations(core, gaspar, poPrivateKey, T0);
-      const rtkBin = join(tempDir, "fixture-rtk.sh");
-      const proofInput = {
-        adapterId: "test-adapter",
-        binaryPath: rtkBin,
-        version: "1.0.0-test",
-        proofCommand: JSON.stringify([rtkBin, "gain"]),
-        commandHash: computeRevisionHash([rtkBin, "gain"]),
-        outputHash: computeRevisionHash("fixture gain ok"),
-        exitStatus: 0,
-        gainAvailable: true,
-        timestamp: T0,
-        ttlSeconds: 3600,
-      } as const;
-      const openOn = (adapter: string): { id: string; token: string } => {
-        const res = core.openSession(
-          { role: "belthazar", adapter, runtime: "test-runtime", scopeModule: "MOD-0001", ttlSeconds: 3600 },
-          { interactive: true }
-        );
-        expect(res.ok).toBe(true);
-        return { id: res.value!.id, token: res.value!.token };
-      };
-      // Never-registered submitter adapter.
-      const ghostDenied = core.recordRoutingProof({ actor: "belthazar", session: openOn("ghost") }, { ...proofInput });
-      expect(ghostDenied.ok).toBe(false);
-      expect(ghostDenied.error?.code).toBe("ENTITY_NOT_FOUND");
-      // Pending (unapproved) submitter adapter.
-      const pendingDenied = core.recordRoutingProof({ actor: "belthazar", session: openOn("pending-adapter") }, { ...proofInput });
-      expect(pendingDenied.ok).toBe(false);
-      expect(pendingDenied.error?.code).toBe("EXECUTION_DENIED");
-      // Approved submitter adapter for the same proof: allowed.
-      expect(core.recordRoutingProof({ actor: "belthazar", session: openOn("test-adapter") }, { ...proofInput }).ok).toBe(true);
-    } finally {
-      restoreProofTty();
       core.close();
     }
   });
