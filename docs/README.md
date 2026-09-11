@@ -36,6 +36,7 @@ the current execution queue are indexed below:
 - [`implementation/SLICE-5-REMEDIATION.md`](implementation/SLICE-5-REMEDIATION.md) — closed remediation gate for Slices 1–5.
 - [`implementation/SLICE-6.md`](implementation/SLICE-6.md) and [`implementation/SLICE-7.md`](implementation/SLICE-7.md) — completed implementation reports.
 - [`implementation/FIXES-SL-1-7.md`](implementation/FIXES-SL-1-7.md) and [`implementation/FIXES-SL-8.md`](implementation/FIXES-SL-8.md) — independent corrective reviews.
+- [`implementation/FIXES-SL-10.md`](implementation/FIXES-SL-10.md) — implementer bug-verification pass for Slice 10 (not an independent review).
 - [`implementation/POST-SLICE-8-REVIEW.md`](implementation/POST-SLICE-8-REVIEW.md) — current code/documentation comparison and release-readiness findings.
 - [`implementation/SLICE-9.md`](implementation/SLICE-9.md) — next blocking implementation slice.
 - [`implementation/SLICE-10.md`](implementation/SLICE-10.md) — one-command bootstrap and automatic Gaspar start/resume experience.
