@@ -9,7 +9,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
+  buildEnrollmentChallenge,
+  buildEnrollmentPayload,
   buildSessionAuthorizationPayload,
+  fingerprintPublicKey,
   generateApprovalKeyPair,
   signApprovalPayload,
 } from "@chrono/domain";
@@ -22,6 +25,45 @@ function freshCore(tempDir: string): ChronoCore {
   const core = new ChronoCore({ projectPath: tempDir });
   expect(core.init().ok).toBe(true);
   return core;
+}
+
+/**
+ * TEST-ONLY enrollment helper: builds a valid ceremony proof with a
+ * caller-supplied timestamp (wall clock by default; pass the fixed clock
+ * time for clock-injected cores). Production callers MUST use
+ * `chrono enroll`, which adds /dev/tty confirmation and keychain custody.
+ */
+function enrollTestPo(
+  core: ChronoCore,
+  pair: { publicKeyPem: string; privateKeyPem: string },
+  timestamp = new Date().toISOString(),
+  rationale = "test enrollment"
+): void {
+  const nonce = randomBytes(16).toString("hex");
+  const fingerprint = fingerprintPublicKey(pair.publicKeyPem);
+  const confirmation = buildEnrollmentChallenge("default", fingerprint, nonce);
+  const signature = signApprovalPayload(
+    buildEnrollmentPayload({
+      projectId: "default",
+      fingerprint,
+      timestamp,
+      nonce,
+      authority: "PO",
+      rationale,
+      confirmation,
+    }),
+    pair.privateKeyPem
+  );
+  const res = core.enrollPo({
+    publicKeyPem: pair.publicKeyPem,
+    nonce,
+    timestamp,
+    rationale,
+    confirmation,
+    signature,
+  });
+  expect(res.ok).toBe(true);
+  expect(res.value?.fingerprint).toBe(fingerprint);
 }
 
 describe("Registration validation", () => {
@@ -58,7 +100,7 @@ function fakeInteractiveTerminal(): () => void {
     restoreTty = fakeInteractiveTerminal();
     core = freshCore(tempDir);
     const pair = generateApprovalKeyPair();
-    expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+    enrollTestPo(core, pair);
     const nonce = randomBytes(16).toString("hex");
     const timestamp = "2026-09-11T00:00:00.000Z";
     const rationale = "test privileged-session bootstrap";

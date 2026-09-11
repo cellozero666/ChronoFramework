@@ -8,8 +8,9 @@
 **Current checkpoint (2026-09-11):** Slices 1–8 are committed and their
 corrective reviews are cleared. Phase 5 is not complete: RTK routing proof,
 all protected CLI gates, complete OpenCode tool coverage, and equivalent
-Claude Code/Kiro adapters remain. Continue with [`SLICE-9.md`](SLICE-9.md)
-and then the ordered [`IMPLEMENTER-TASKS.md`](IMPLEMENTER-TASKS.md). Neither
+Claude Code/Kiro adapters remain. Continue with [`SLICE-9.md`](SLICE-9.md),
+then [`SLICE-10.md`](SLICE-10.md), and then the remaining ordered
+[`IMPLEMENTER-TASKS.md`](IMPLEMENTER-TASKS.md). Neither
 the Phase 6 MVP gate nor final v1 has been claimed.
 
 No provider, model name, or model version may be hardcoded in source, templates, adapters, tests, generated agent files, or defaults. Model selection is external configuration owned by the Product Owner. Changing the selected model MUST NOT change authority, state, gates, evidence requirements, or behavior.

@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -546,5 +546,30 @@ export const MIGRATIONS: Record<number, string> = {
     -- adapter (older flows) skip the adapter-liveness check; grants bound
     -- to a revoked adapter burn fail-closed at consumption.
     ALTER TABLE execution_grant ADD COLUMN adapter_id TEXT;
+  `,
+  11: `
+    -- RTK routing proofs [SLICE-9 §9.3, P8.5, INV §8.4]: append-only
+    -- evidence that a command executed effectively through the genuine RTK
+    -- binary for one adapter/runtime/project scope. Dispatch requires a
+    -- current proof; rows are never updated or deleted.
+    CREATE TABLE routing_proof (
+      id                 TEXT PRIMARY KEY,
+      adapter_id         TEXT NOT NULL,
+      runtime            TEXT NOT NULL,
+      session_id         TEXT NOT NULL,
+      project_id         TEXT NOT NULL,
+      rtk_attestation_id TEXT NOT NULL,
+      binary_path        TEXT NOT NULL,
+      binary_hash        TEXT NOT NULL,
+      version            TEXT NOT NULL,
+      proof_command      TEXT NOT NULL,
+      command_hash       TEXT NOT NULL,
+      output_hash        TEXT NOT NULL,
+      exit_status        INTEGER NOT NULL,
+      gain_available     INTEGER NOT NULL DEFAULT 0,
+      timestamp          TEXT NOT NULL,
+      valid_until        TEXT NOT NULL
+    );
+    CREATE INDEX idx_routing_proof_scope ON routing_proof(adapter_id, runtime, project_id);
   `,
 };

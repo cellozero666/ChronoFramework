@@ -10,8 +10,12 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
   buildApprovalPayload,
+  buildEnrollmentChallenge,
+  buildEnrollmentPayload,
   buildSessionAuthorizationPayload,
   buildWaiverPayload,
+  computeRevisionHash,
+  fingerprintPublicKey,
   generateApprovalKeyPair,
   signApprovalPayload,
 } from "@chrono/domain";
@@ -19,6 +23,46 @@ import { ChronoCore } from "./chrono-core.js";
 
 const FIXED_TIME = "2026-06-01T00:00:00.000Z";
 const SPEC = { id: "SP-0001", title: "T", purpose: "P" };
+
+/**
+ * TEST-ONLY enrollment helper: builds a valid ceremony proof with a
+ * caller-supplied timestamp (wall clock by default; pass the fixed clock
+ * time for clock-injected cores). Production callers MUST use
+ * `chrono enroll`, which adds /dev/tty confirmation and keychain custody.
+ */
+function enrollTestPo(
+  core: ChronoCore,
+  pair: { publicKeyPem: string; privateKeyPem: string },
+  timestamp = new Date().toISOString(),
+  rationale = "test enrollment"
+): string {
+  const nonce = randomBytes(16).toString("hex");
+  const fingerprint = fingerprintPublicKey(pair.publicKeyPem);
+  const confirmation = buildEnrollmentChallenge("default", fingerprint, nonce);
+  const signature = signApprovalPayload(
+    buildEnrollmentPayload({
+      projectId: "default",
+      fingerprint,
+      timestamp,
+      nonce,
+      authority: "PO",
+      rationale,
+      confirmation,
+    }),
+    pair.privateKeyPem
+  );
+  const res = core.enrollPo({
+    publicKeyPem: pair.publicKeyPem,
+    nonce,
+    timestamp,
+    rationale,
+    confirmation,
+    signature,
+  });
+  expect(res.ok).toBe(true);
+  expect(res.value?.fingerprint).toBe(fingerprint);
+  return res.value!.fingerprint;
+}
 
 function approvalFields(revision: string, action = "module-approval") {
   return {
@@ -69,7 +113,7 @@ function fakeInteractiveTerminal(): () => void {
     expect(core.init().ok).toBe(true);
     restoreTty = fakeInteractiveTerminal();
     const pair = generateApprovalKeyPair();
-    expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+    enrollTestPo(core, pair);
     poPrivateKey = pair.privateKeyPem;
     const nonce = randomBytes(16).toString("hex");
     const timestamp = "2026-09-11T00:00:00.000Z";
@@ -322,5 +366,190 @@ function fakeInteractiveTerminal(): () => void {
     );
     expect(core.recordWaiver({ ...fields, signature: forged }).error?.code).toBe("SIGNATURE_INVALID");
     expect(core.recordWaiver({ ...fields, issue: "  ", signature }).error?.code).toBe("VALIDATION_ERROR");
+  });
+});
+
+describe("PO enrollment ceremony [SLICE-9 §9.1]", () => {
+  let restoreTty: (() => void) | null;
+  let tempDir: string;
+  let core: ChronoCore;
+
+  function freshCore(): ChronoCore {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-enroll-test-"));
+    const c = new ChronoCore({ projectPath: tempDir });
+    expect(c.init().ok).toBe(true);
+    return c;
+  }
+
+  function validProof(
+    pair: { publicKeyPem: string; privateKeyPem: string },
+    overrides: Partial<{ nonce: string; timestamp: string; rationale: string; confirmation: string; signature: string }> = {},
+    timestamp = new Date().toISOString()
+  ): {
+    publicKeyPem: string;
+    nonce: string;
+    timestamp: string;
+    rationale: string;
+    confirmation: string;
+    signature: string;
+  } {
+    const nonce = overrides.nonce ?? randomBytes(16).toString("hex");
+    const rationale = overrides.rationale ?? "test enrollment";
+    const fingerprint = fingerprintPublicKey(pair.publicKeyPem);
+    const confirmation = overrides.confirmation ?? buildEnrollmentChallenge("default", fingerprint, nonce);
+    const signature =
+      overrides.signature ??
+      signApprovalPayload(
+        buildEnrollmentPayload({
+          projectId: "default",
+          fingerprint,
+          timestamp: overrides.timestamp ?? timestamp,
+          nonce,
+          authority: "PO",
+          rationale,
+          confirmation,
+        }),
+        pair.privateKeyPem
+      );
+    return {
+      publicKeyPem: pair.publicKeyPem,
+      nonce,
+      timestamp: overrides.timestamp ?? timestamp,
+      rationale,
+      confirmation,
+      signature,
+    };
+  }
+
+  beforeEach(() => {
+    restoreTty = null;
+    core = freshCore();
+  });
+
+  afterEach(() => {
+    if (restoreTty !== null) {
+      restoreTty();
+    }
+    core.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function withTty(): void {
+    const stdinDesc = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+    const stdoutDesc = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+    Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+    restoreTty = () => {
+      if (stdinDesc !== undefined) {
+        Object.defineProperty(process.stdin, "isTTY", stdinDesc);
+      } else {
+        delete (process.stdin as { isTTY?: boolean }).isTTY;
+      }
+      if (stdoutDesc !== undefined) {
+        Object.defineProperty(process.stdout, "isTTY", stdoutDesc);
+      } else {
+        delete (process.stdout as { isTTY?: boolean }).isTTY;
+      }
+    };
+  }
+
+  it("enrolls with a valid ceremony proof and persists key, record, and audit atomically", () => {
+    withTty();
+    const pair = generateApprovalKeyPair();
+    const eventsBefore = core.listEvents().length;
+    const res = core.enrollPo(validProof(pair));
+    expect(res.ok).toBe(true);
+    expect(res.value?.fingerprint).toBe(fingerprintPublicKey(pair.publicKeyPem));
+    expect(core.poKeyRevision()).toMatch(/^sha256:[0-9a-f]{64}$/);
+    const added = core.listEvents().slice(eventsBefore);
+    expect(added).toHaveLength(1);
+    expect(added[0]).toMatchObject({ eventType: "ArtifactCreated", entityId: "PO-KEY", actor: "PO" });
+  });
+
+  it("denies direct first registration without the ceremony", () => {
+    withTty();
+    const pair = generateApprovalKeyPair();
+    expect(core.registerPoPublicKey(pair.publicKeyPem).error?.code).toBe("APPROVAL_REQUIRED");
+    expect(core.poKeyRevision()).toBeNull();
+  });
+
+  it("denies enrollment without an interactive terminal", () => {
+    // Force non-TTY descriptors deterministically (works in CI and in a
+    // real terminal alike): redirected input must never enroll.
+    const stdinDesc = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+    const stdoutDesc = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+    try {
+      const pair = generateApprovalKeyPair();
+      expect(core.enrollPo(validProof(pair)).error?.code).toBe("NOT_INTERACTIVE");
+      expect(core.poKeyRevision()).toBeNull();
+    } finally {
+      if (stdinDesc !== undefined) {
+        Object.defineProperty(process.stdin, "isTTY", stdinDesc);
+      } else {
+        delete (process.stdin as { isTTY?: boolean }).isTTY;
+      }
+      if (stdoutDesc !== undefined) {
+        Object.defineProperty(process.stdout, "isTTY", stdoutDesc);
+      } else {
+        delete (process.stdout as { isTTY?: boolean }).isTTY;
+      }
+    }
+  });
+
+  it("denies duplicate enrollment and replays persist nothing new", () => {
+    withTty();
+    const pair = generateApprovalKeyPair();
+    const proof = validProof(pair);
+    expect(core.enrollPo(proof).ok).toBe(true);
+    const eventsBefore = core.listEvents().length;
+    // Exact replay of the same proof.
+    expect(core.enrollPo(proof).error?.code).toBe("APPROVAL_REQUIRED");
+    // Fresh nonce, different key: still denied, original key intact.
+    const other = generateApprovalKeyPair();
+    expect(core.enrollPo(validProof(other)).error?.code).toBe("APPROVAL_REQUIRED");
+    expect(core.poKeyRevision()).toBe(computeRevisionHash(pair.publicKeyPem));
+    expect(core.listEvents()).toHaveLength(eventsBefore);
+  });
+
+  it("denies forged signatures, wrong confirmation, and malformed fields", () => {
+    withTty();
+    const pair = generateApprovalKeyPair();
+    const other = generateApprovalKeyPair();
+    // Signed by a different key than the one being enrolled.
+    const forged = validProof(pair);
+    const forgedSig = signApprovalPayload(
+      buildEnrollmentPayload({
+        projectId: "default",
+        fingerprint: fingerprintPublicKey(pair.publicKeyPem),
+        timestamp: forged.timestamp,
+        nonce: forged.nonce,
+        authority: "PO",
+        rationale: forged.rationale,
+        confirmation: forged.confirmation,
+      }),
+      other.privateKeyPem
+    );
+    expect(core.enrollPo({ ...forged, signature: forgedSig }).error?.code).toBe("SIGNATURE_INVALID");
+    // Wrong typed confirmation.
+    expect(core.enrollPo(validProof(pair, { confirmation: "enroll-wrong" })).error?.code).toBe("VALIDATION_ERROR");
+    // Malformed nonce / empty rationale / garbage key.
+    expect(core.enrollPo(validProof(pair, { nonce: "xyz" })).error?.code).toBe("VALIDATION_ERROR");
+    expect(core.enrollPo(validProof(pair, { rationale: "   " })).error?.code).toBe("VALIDATION_ERROR");
+    expect(core.enrollPo({ ...validProof(pair), publicKeyPem: "not-a-key" }).error?.code).toBe("SIGNATURE_INVALID");
+    expect(core.poKeyRevision()).toBeNull();
+  });
+
+  it("denies future and stale timestamps", () => {
+    withTty();
+    const pair = generateApprovalKeyPair();
+    expect(core.enrollPo(validProof(pair, { timestamp: "2999-01-01T00:00:00.000Z" })).error?.code).toBe(
+      "VALIDATION_ERROR"
+    );
+    expect(core.enrollPo(validProof(pair, { timestamp: "2020-01-01T00:00:00.000Z" })).error?.code).toBe(
+      "VALIDATION_ERROR"
+    );
+    expect(core.poKeyRevision()).toBeNull();
   });
 });

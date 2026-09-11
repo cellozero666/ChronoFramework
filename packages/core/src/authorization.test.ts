@@ -12,9 +12,12 @@ import {
   SKILL_RELEASE,
   SKILL_RUNTIME_PATHS,
   buildApprovalPayload,
+  buildEnrollmentChallenge,
+  buildEnrollmentPayload,
   buildSessionAuthorizationPayload,
   computeRevisionHash,
   convertSkillSource,
+  fingerprintPublicKey,
   generateApprovalKeyPair,
   hashSkillSource,
   signApprovalPayload,
@@ -114,6 +117,45 @@ type SignFn = (fields: {
   rationale: string;
 }) => { signature: string; timestamp: string };
 
+/**
+ * TEST-ONLY enrollment helper: builds a valid ceremony proof with a
+ * caller-supplied timestamp (wall clock by default; pass the fixed clock
+ * time for clock-injected cores). Production callers MUST use
+ * `chrono enroll`, which adds /dev/tty confirmation and keychain custody.
+ */
+function enrollTestPo(
+  core: ChronoCore,
+  pair: { publicKeyPem: string; privateKeyPem: string },
+  timestamp = new Date().toISOString(),
+  rationale = "test enrollment"
+): void {
+  const nonce = randomBytes(16).toString("hex");
+  const fingerprint = fingerprintPublicKey(pair.publicKeyPem);
+  const confirmation = buildEnrollmentChallenge("default", fingerprint, nonce);
+  const signature = signApprovalPayload(
+    buildEnrollmentPayload({
+      projectId: "default",
+      fingerprint,
+      timestamp,
+      nonce,
+      authority: "PO",
+      rationale,
+      confirmation,
+    }),
+    pair.privateKeyPem
+  );
+  const res = core.enrollPo({
+    publicKeyPem: pair.publicKeyPem,
+    nonce,
+    timestamp,
+    rationale,
+    confirmation,
+    signature,
+  });
+  expect(res.ok).toBe(true);
+  expect(res.value?.fingerprint).toBe(fingerprint);
+}
+
 function approve(
   core: ChronoCore,
   sign: SignFn,
@@ -165,10 +207,19 @@ function approvedModule(core: ChronoCore, sign: SignFn, privateKeyPem: string): 
   return { modRev, gaspar };
 }
 
-function recordAttestations(core: ChronoCore, auth: CallerAuth): void {
+function recordAttestations(
+  core: ChronoCore,
+  auth: CallerAuth,
+  privateKeyPem: string,
+  timestamp = new Date().toISOString()
+): void {
+  // The RTK binary is a real fixture script so routing proofs can hash it.
+  const rtkBin = join(core.projectPath(), "fixture-rtk.sh");
+  writeFileSync(rtkBin, "#!/bin/sh\necho fixture-rtk 1.0.0-test\n", "utf8");
+  chmodSync(rtkBin, 0o755);
   expect(
     core.recordRtkAttestation(auth, {
-      binaryPath: "/usr/local/bin/rtk",
+      binaryPath: rtkBin,
       binaryIdentity: "rtk-test",
       version: "1.0.0-test",
       provenance: RTK_UPSTREAM,
@@ -208,6 +259,77 @@ function recordAttestations(core: ChronoCore, auth: CallerAuth): void {
     mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, FIXTURE_SKILL_MD, "utf8");
   }
+  // Approved fixture adapter plus a current routing proof: dispatch
+  // requires effective routing, not just attestation currency.
+  const po = { actor: "PO", session: bootstrapPrivilegedSession(core, "PO", privateKeyPem, undefined, timestamp) };
+  provisionRoutingProof(core, po, auth, privateKeyPem, timestamp);
+}
+
+/**
+ * Provision an approved fixture adapter plus a current routing proof so
+ * dispatch-authorized paths stay green. Idempotent per project: repeat
+ * registration resolves to the existing row, approved adapters skip the
+ * approval flow, and each call records a fresh proof. Production callers
+ * MUST use `chrono adapter register` + `chrono rtk prove`.
+ */
+function provisionRoutingProof(
+  core: ChronoCore,
+  po: CallerAuth,
+  submitter: CallerAuth,
+  privateKeyPem: string,
+  timestamp = new Date().toISOString()
+): string {
+  const root = core.projectPath();
+  const entrypoint = join(root, "fixture-runtime.sh");
+  writeFileSync(entrypoint, "#!/bin/sh\necho fixture-ok\n", "utf8");
+  chmodSync(entrypoint, 0o755);
+  const registered = core.registerAdapter(
+    { id: "test-adapter", name: "Test adapter", entrypoint, conformanceProof: ["test-adapter --version"] },
+    po
+  );
+  expect(registered.ok || registered.error?.code === "DUPLICATE_IDENTITY").toBe(true);
+  const status = core.listAdapters().find((a) => a.id === "test-adapter")?.status;
+  if (status !== "active") {
+    const revision = core.adapterRegistrationHash("test-adapter");
+    const signature = signApprovalPayload(
+      buildApprovalPayload({
+        action: "adapter-registration",
+        scopeArtifactId: "test-adapter",
+        scopeRevision: revision,
+        authority: "PO",
+        rationale: "test routing",
+        timestamp: FIXED_TIME,
+      }),
+      privateKeyPem
+    );
+    const recorded = core.recordApproval({
+      action: "adapter-registration",
+      scopeArtifactId: "test-adapter",
+      scopeRevision: revision,
+      authority: "PO",
+      rationale: "test routing",
+      timestamp: FIXED_TIME,
+      signature,
+    });
+    expect(recorded.ok).toBe(true);
+    expect(core.approveAdapter("test-adapter", recorded.value!.id, po).ok).toBe(true);
+  }
+  const rtkBin = join(root, "fixture-rtk.sh");
+  const proofCommand = JSON.stringify([rtkBin, "gain"]);
+  const proof = core.recordRoutingProof(submitter, {
+    adapterId: "test-adapter",
+    binaryPath: rtkBin,
+    version: "1.0.0-test",
+    proofCommand,
+    commandHash: computeRevisionHash([rtkBin, "gain"]),
+    outputHash: computeRevisionHash("fixture gain ok"),
+    exitStatus: 0,
+    gainAvailable: true,
+    timestamp,
+    ttlSeconds: 3600,
+  });
+  expect(proof.ok).toBe(true);
+  return proof.value!.id;
 }
 
 function bootstrapPrivilegedSession(
@@ -328,7 +450,7 @@ describe("Execution authorization", () => {
     expect(core.init().ok).toBe(true);
     const pair = generateApprovalKeyPair();
     restoreTty = fakeInteractiveTerminal();
-    expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+    enrollTestPo(core, pair);
     privateKeyPem = pair.privateKeyPem;
     sign = (fields) => ({
       timestamp: FIXED_TIME,
@@ -364,7 +486,7 @@ describe("Execution authorization", () => {
 
   it("denies without module approval even when attestations exist", () => {
     const gaspar = { actor: "gaspar", session: bootstrapPrivilegedSession(core, "gaspar", privateKeyPem) };
-    recordAttestations(core, gaspar);
+    recordAttestations(core, gaspar, privateKeyPem);
     expect(core.registerSpec("SP-0001", "DRAFT", SPEC, gaspar).ok).toBe(true);
     expect(core.registerModule("MOD-0001", "DRAFT", MOD, gaspar).ok).toBe(true);
     const worker = openTestSession(core, "belthazar", "MOD-0001");
@@ -376,7 +498,7 @@ describe("Execution authorization", () => {
 
   it("authorizes a fully qualified module and audits denials", () => {
     const { gaspar } = approvedModule(core, sign, privateKeyPem);
-    recordAttestations(core, gaspar);
+    recordAttestations(core, gaspar, privateKeyPem);
     const worker = openTestSession(core, "belthazar", "MOD-0001");
     const authorized = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar", session: worker, requesterSession: gaspar.session });
     expect(authorized.ok).toBe(true);
@@ -394,7 +516,7 @@ describe("Execution authorization", () => {
 
   it("denies stale harness and non-READY specs", () => {
     const { gaspar } = approvedModule(core, sign, privateKeyPem);
-    recordAttestations(core, gaspar);
+    recordAttestations(core, gaspar, privateKeyPem);
     const worker = openTestSession(core, "belthazar", "MOD-0001");
     const specRev = core.getArtifact("SP-0001").revision;
     expect(core.markHarnessStale(specRev, gaspar).ok).toBe(true);
@@ -405,7 +527,7 @@ describe("Execution authorization", () => {
 
   it("requires explicit work-package scope when WPs exist", () => {
     const { gaspar } = approvedModule(core, sign, privateKeyPem);
-    recordAttestations(core, gaspar);
+    recordAttestations(core, gaspar, privateKeyPem);
     expect(
       core.registerWorkPackage("WP-0001", "PLANNED", { id: "WP-0001", name: "W", module: "MOD-0001", dependsOn: [] }, gaspar).ok
     ).toBe(true);
@@ -420,7 +542,7 @@ describe("Execution authorization", () => {
 
   it("denies when emitted skill files are tampered with or missing", () => {
     const { gaspar } = approvedModule(core, sign, privateKeyPem);
-    recordAttestations(core, gaspar);
+    recordAttestations(core, gaspar, privateKeyPem);
     const worker = openTestSession(core, "belthazar", "MOD-0001");
     const request = {
       actor: "gaspar",
@@ -444,7 +566,7 @@ describe("Execution authorization", () => {
 
   it("denies execution for invalid assignment roles", () => {
     const { gaspar } = approvedModule(core, sign, privateKeyPem);
-    recordAttestations(core, gaspar);
+    recordAttestations(core, gaspar, privateKeyPem);
     const worker = openTestSession(core, "belthazar", "MOD-0001");
     for (const role of ["gaspar", "glenn", "PO", "mallory"]) {
       const res = core.authorizeExecution("MOD-0001", { actor: "gaspar", role, session: worker });
@@ -460,14 +582,14 @@ describe("Execution authorization", () => {
       plain = new ChronoCore({ projectPath: plainDir });
       expect(plain.init().ok).toBe(true);
       const pair = generateApprovalKeyPair();
-      expect(plain.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+      enrollTestPo(plain, pair);
       const privateKeyPem = pair.privateKeyPem;
       const plainSign: SignFn = (fields) => ({
         timestamp: FIXED_TIME,
         signature: signApprovalPayload(buildApprovalPayload({ ...fields, timestamp: FIXED_TIME }), privateKeyPem),
       });
       const { gaspar: plainGaspar } = approvedModule(plain, plainSign, privateKeyPem);
-      recordAttestations(plain, plainGaspar);
+      recordAttestations(plain, plainGaspar, privateKeyPem);
       const plainWorker = openTestSession(plain, "belthazar", "MOD-0001");
       const res = plain.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar", session: plainWorker, requesterSession: plainGaspar.session });
       expect(res.ok).toBe(false);
@@ -532,7 +654,7 @@ describe("Dispatch grants (session binding)", () => {
     if (!skipInit) {
       expect(core.init().ok).toBe(true);
       const pair = generateApprovalKeyPair();
-      expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+      enrollTestPo(core, pair, clockTime);
       const privateKeyPem = pair.privateKeyPem;
       const sign: SignFn = (fields) => ({
         timestamp: "2026-06-01T00:00:00.000Z",
@@ -558,10 +680,11 @@ describe("Dispatch grants (session binding)", () => {
     sign: SignFn,
     poPrivateKey: string,
     actor: string,
-    role: string
+    role: string,
+    now: string
   ): { grantId: string; worker: { id: string; token: string }; gaspar: CallerAuth } {
     const { gaspar } = approvedModule(core, sign, poPrivateKey);
-    recordAttestations(core, gaspar);
+    recordAttestations(core, gaspar, poPrivateKey, now);
     const worker = openTestSession(core, role, "MOD-0001");
     const authz = core.authorizeExecution("MOD-0001", {
       actor,
@@ -576,7 +699,7 @@ describe("Dispatch grants (session binding)", () => {
   it("enacts dispatch only with its grant, as the assigned role", () => {
     const { core, sign, poPrivateKey, restoreTty: restoreGrantTty } = clockedCore(T0);
     try {
-      const { grantId, worker } = approvedWithGrant(core, sign, poPrivateKey, "gaspar", "belthazar");
+      const { grantId, worker } = approvedWithGrant(core, sign, poPrivateKey, "gaspar", "belthazar", T0);
       expect(grantId).toMatch(/^GRANT-\d{4,}$/);
       // No grant presented → denied before any authorization reasoning.
       expect(
@@ -609,7 +732,7 @@ describe("Dispatch grants (session binding)", () => {
     let grantId: string;
     let worker: { id: string; token: string };
     try {
-      const issued = approvedWithGrant(first.core, first.sign, firstPrivateKey, "gaspar", "belthazar");
+      const issued = approvedWithGrant(first.core, first.sign, firstPrivateKey, "gaspar", "belthazar", T0);
       grantId = issued.grantId;
       worker = issued.worker;
     } finally {
@@ -637,7 +760,7 @@ describe("Dispatch grants (session binding)", () => {
     const { core, sign, poPrivateKey, restoreTty: restoreSessionTty } = clockedCore(T0);
     try {
       const { gaspar } = approvedModule(core, sign, poPrivateKey);
-      recordAttestations(core, gaspar);
+      recordAttestations(core, gaspar, poPrivateKey, T0);
       // Authorize naming the executor session explicitly.
       const worker = openTestSession(core, "belthazar", "MOD-0001");
       const authz = core.authorizeExecution("MOD-0001", {
@@ -690,7 +813,6 @@ describe("Dispatch grants (session binding)", () => {
     const { core, sign, poPrivateKey, restoreTty: restoreRevokeTty } = clockedCore(T0);
     try {
       const { gaspar } = approvedModule(core, sign, poPrivateKey);
-      recordAttestations(core, gaspar);
       const poAuth = { actor: "PO", session: bootstrapPrivilegedSession(core, "PO", poPrivateKey) };
       const entrypoint = join(tempDir, "fixture-runtime.sh");
       writeFileSync(entrypoint, "#!/bin/sh\necho ok\n");
@@ -721,6 +843,23 @@ describe("Dispatch grants (session binding)", () => {
       expect(recorded.ok).toBe(true);
       const approvalId = recorded.value!.id;
       expect(core.approveAdapter("fixture", approvalId, poAuth).ok).toBe(true);
+      recordAttestations(core, gaspar, poPrivateKey, T0);
+      const rtkBin = join(tempDir, "fixture-rtk.sh");
+      const fixtureProofCommand = JSON.stringify([rtkBin, "gain"]);
+      expect(
+        core.recordRoutingProof(gaspar, {
+          adapterId: "fixture",
+          binaryPath: rtkBin,
+          version: "1.0.0-test",
+          proofCommand: fixtureProofCommand,
+          commandHash: computeRevisionHash([rtkBin, "gain"]),
+          outputHash: computeRevisionHash("fixture gain ok"),
+          exitStatus: 0,
+          gainAvailable: true,
+          timestamp: T0,
+          ttlSeconds: 3600,
+        }).ok
+      ).toBe(true);
       const worker = openTestSession(core, "belthazar", "MOD-0001");
       const authz = core.authorizeExecution("MOD-0001", {
         actor: "gaspar",
@@ -748,7 +887,7 @@ describe("Dispatch grants (session binding)", () => {
   it("rejects cross-scope grant reuse", () => {
     const { core, sign, poPrivateKey, restoreTty: restoreScopeTty } = clockedCore(T0);
     try {
-      const { grantId, gaspar } = approvedWithGrant(core, sign, poPrivateKey, "gaspar", "belthazar");
+      const { grantId, gaspar } = approvedWithGrant(core, sign, poPrivateKey, "gaspar", "belthazar", T0);
       const ctx = { actor: "gaspar", session: gaspar.session };
       expect(
         core.registerModule("MOD-0002", "DRAFT", { id: "MOD-0002", name: "M2", purpose: "P", specs: ["SP-0001"] }, gaspar).ok
@@ -806,7 +945,7 @@ describe("Completion authorization", () => {
   /** Drive MOD-0001 to VERIFYING with attestations current. */
   function verifyingModule(): CompletionFixture {
     const { gaspar } = approvedModule(core, sign, privateKeyPem);
-    recordAttestations(core, gaspar);
+    recordAttestations(core, gaspar, privateKeyPem);
     const glenn = { actor: "glenn", session: openTestSession(core, "glenn", "MOD-0001") };
     expect(core.recordSecurityProfile({ title: "P", threats: [] }, glenn).ok).toBe(true);
     const belthazar = { actor: "belthazar", session: openTestSession(core, "belthazar", "MOD-0001") };
@@ -862,7 +1001,7 @@ describe("Completion authorization", () => {
     expect(core.init().ok).toBe(true);
     const pair = generateApprovalKeyPair();
     restoreTty = fakeInteractiveTerminal();
-    expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+    enrollTestPo(core, pair);
     privateKeyPem = pair.privateKeyPem;
     sign = (fields) => ({
       timestamp: FIXED_TIME,

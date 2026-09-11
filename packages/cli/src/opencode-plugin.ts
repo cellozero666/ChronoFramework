@@ -1,16 +1,37 @@
 /**
  * OpenCode pre-tool enforcement plugin, generated deterministically
- * (Slice 8, [RUNTIME §5]). `chrono setup` writes these exact bytes to
+ * (Slice 8–9, [RUNTIME §5]). `chrono setup` writes these exact bytes to
  * `<project>/.opencode/plugins/chrono-gate.js`; the content never embeds
  * machine-specific paths, so identical inputs always produce identical
  * bytes. Implements the native `tool.execute.before` hook contract from
  * https://opencode.ai/docs/plugins/: throwing blocks the tool.
  *
+ * Slice 9 §9.4: every OpenCode tool capable of filesystem, process,
+ * network, package, Git, credential, deployment, destructive, or
+ * production-impacting effects is gated through `chrono gate execution`.
+ * Read-only tools pass without dispatch scope. Unknown tools — including
+ * future built-ins, `mcp_*`, and custom tools — are denied until
+ * classified in a reviewed Core policy release (deny-by-default).
+ *
  * The plugin uses only `node:child_process` / `node:fs` / `node:path`
  * (available in Bun and Node), so the generated file is directly
  * importable in tests: enforcement logic runs for real, with only the
  * gate binary substituted by a fixture.
+ *
+ * Tool policy version: TOOL_POLICY_VERSION=1 (see @chrono/domain
+ * OPENCODE_TOOL_POLICY). The lists below are generated from that policy;
+ * the Core remains the authority — the plugin only shapes the intake.
  */
+
+const READ_TOOLS = ["glob", "grep", "lsp", "question", "read", "skill", "todowrite"];
+const MUTATE_TOOLS = [
+  "apply_patch",
+  "bash",
+  "edit",
+  "webfetch",
+  "websearch",
+  "write",
+];
 
 export function buildOpencodePlugin(): string {
   return `/**
@@ -20,31 +41,51 @@ export function buildOpencodePlugin(): string {
  * Enforcement contract (explicit environment, never invented identity):
  * - Outside a CHRONO project (no .chrono/chrono.db under the session
  *   directory): pass, plain OpenCode use is unaffected.
- * - Inside a CHRONO project: require CHRONO_GATE_MODULE (+ optional
- *   CHRONO_GATE_WP), CHRONO_GATE_AS, CHRONO_GATE_ROLE, and
- *   CHRONO_SESSION_TOKEN; call \`chrono gate execution\` and obey it.
- *   Anything missing or DENIED throws (fail-closed).
- * - Only the \`bash\` tool is gated in this version; broader tool mapping
- *   is runtime-specific adapter work.
- */
+  * - Inside a CHRONO project: read-only tools pass without dispatch
+  *   scope; every mutable tool requires CHRONO_GATE_MODULE (+ optional
+  *   CHRONO_GATE_WP), CHRONO_GATE_AS, CHRONO_GATE_ROLE, and
+  *   CHRONO_SESSION_TOKEN and a live \`chrono gate execution\` AUTHORIZED
+  *   verdict. Unknown tools are denied until classified (deny-by-default).
+  *   Anything missing or DENIED throws (fail-closed).
+  */
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+
+const READ_TOOLS = new Set(${JSON.stringify(READ_TOOLS)});
+const MUTATE_TOOLS = new Set(${JSON.stringify(MUTATE_TOOLS)});
 
 function readEnv(name) {
   const value = process.env[name];
   return value === undefined || value === "" ? null : value;
 }
 
+function gateFor(tool) {
+  if (READ_TOOLS.has(tool)) {
+    return "read";
+  }
+  if (MUTATE_TOOLS.has(tool)) {
+    return "mutate";
+  }
+  return "unknown";
+}
+
 export const ChronoGatePlugin = async (ctx) => {
   return {
     "tool.execute.before": async (input) => {
-      if (!input || input.tool !== "bash") {
-        return;
-      }
+      const tool = input && typeof input.tool === "string" ? input.tool : "";
       const root = (ctx && ctx.directory) || process.cwd();
       if (!existsSync(join(root, ".chrono", "chrono.db"))) {
         return;
+      }
+      const kind = gateFor(tool);
+      if (kind === "read") {
+        return;
+      }
+      if (kind === "unknown") {
+        throw new Error(
+          \`[chrono] TOOL_DENIED: tool '\${tool}' is not classified by CHRONO tool policy v1: deny-by-default until reviewed.\`
+        );
       }
       const module = readEnv("CHRONO_GATE_MODULE");
       if (module === null) {

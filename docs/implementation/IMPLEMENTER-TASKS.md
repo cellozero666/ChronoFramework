@@ -25,7 +25,15 @@ Create a concise Slice 9 implementation report containing exact tests,
 versions, fixtures, files, denials, and residuals. Perform a second review pass
 against the normative documents before marking it complete.
 
-## Task 2 — Phase 6 end-to-end MVP proof
+## Task 2 — Execute and independently review Slice 10
+
+Implement every requirement and exit criterion in [`SLICE-10.md`](SLICE-10.md).
+Prove the public experience from packed installation through `chrono init` to
+automatic Gaspar start or resume in every supported runtime. Preserve the
+advanced subcommands as recovery/diagnostic interfaces, but do not require
+ordinary users to execute them during a successful first-run journey.
+
+## Task 3 — Phase 6 end-to-end MVP proof
 
 Build disposable fixtures for:
 
@@ -45,7 +53,7 @@ without secrets. Do not use fixture runtimes where real runtime behavior is a
 release requirement. Record model identifiers only as external execution
 metadata, never defaults or policy.
 
-## Task 3 — Mandatory v1 product capabilities
+## Task 4 — Mandatory v1 product capabilities
 
 Implement and test the SDD Innovation Standard requirements:
 
@@ -64,7 +72,7 @@ Implement and test the SDD Innovation Standard requirements:
 
 Add polyglot and non-web fixtures to prove the Core is technology agnostic.
 
-## Task 4 — Reliability, upgrade, and security hardening
+## Task 5 — Reliability, upgrade, and security hardening
 
 - Test crash/restart recovery at every material lifecycle boundary.
 - Prove transactional rollback for partial setup, enrollment, approval,
@@ -79,7 +87,7 @@ Add polyglot and non-web fixtures to prove the Core is technology agnostic.
 - Ensure error codes, exit codes, JSON envelopes, help text, and recovery
   instructions are stable and documented.
 
-## Task 5 — Packaging and release-candidate preparation
+## Task 6 — Packaging and release-candidate preparation
 
 - Ensure the global launcher delegates to the compatible project-pinned local
   Core and fails closed when it cannot.
@@ -94,7 +102,7 @@ Add polyglot and non-web fixtures to prove the Core is technology agnostic.
 - Add installation, setup, upgrade, recovery, troubleshooting, security,
   adapter-authoring, and first-project documentation backed by tested commands.
 
-## Task 6 — Final consistency and innovation gate
+## Task 7 — Final consistency and innovation gate
 
 - Remove every stub, TODO-only path, simulated mandatory integration, skipped
   test, stale status, unsupported claim, and obsolete command example.

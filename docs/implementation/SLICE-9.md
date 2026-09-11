@@ -133,6 +133,7 @@ Slice 9 is complete only when:
    simulated mandatory integrations, or future-work placeholders in Slice 9
    scope.
 
-After independent review marks this slice `COMPLETE`, proceed directly through
-the ordered tasks in `IMPLEMENTER-TASKS.md`. Stop only at a genuinely required
-PO decision or external-action authorization.
+After independent review marks this slice `COMPLETE`, proceed to
+[`SLICE-10.md`](SLICE-10.md), then continue through the remaining ordered tasks
+in `IMPLEMENTER-TASKS.md`. Stop only at a genuinely required PO decision or
+external-action authorization.

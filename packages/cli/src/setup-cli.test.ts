@@ -17,8 +17,11 @@ import {
   SKILL_RUNTIME_PATHS,
   SKILL_UPSTREAM,
   buildApprovalPayload,
+  buildEnrollmentChallenge,
+  buildEnrollmentPayload,
   buildSessionAuthorizationPayload,
   convertSkillSource,
+  fingerprintPublicKey,
   generateApprovalKeyPair,
   hashSkillSource,
   signApprovalPayload,
@@ -27,6 +30,8 @@ import {
 } from "@chrono/domain";
 import { ChronoCore } from "@chrono/core";
 import { buildOpencodePlugin } from "./opencode-plugin.js";
+import { CLAUDE_HOOK_RELATIVE_PATH, buildClaudeHook } from "./claude-hook.js";
+import { KIRO_HOOK_RELATIVE_PATH, buildKiroHook } from "./kiro-hook.js";
 import { runSetup, runSkillVerify, splitCommandLine } from "./index.js";
 
 // Frozen fixture: byte-exact canonical SKILL.md at the pinned commit.
@@ -180,6 +185,14 @@ describe("OpenCode plugin bytes", () => {
     expect(bytes).toContain("CHRONO_SESSION_TOKEN");
     expect(bytes).toContain("chrono gate");
   });
+
+  it("encodes the full mutate policy and deny-by-default", () => {
+    const bytes = buildOpencodePlugin();
+    for (const tool of ["bash", "edit", "write", "apply_patch", "webfetch", "websearch"]) {
+      expect(bytes).toContain(`"${tool}"`);
+    }
+    expect(bytes).toContain("TOOL_DENIED");
+  });
 });
 
 describe("OpenCode pre-tool enforcement", () => {
@@ -235,15 +248,37 @@ describe("OpenCode pre-tool enforcement", () => {
     }
   }
 
-  it("passes outside CHRONO projects and for non-bash tools", async () => {
+  it("passes outside CHRONO projects and for read-only tools", async () => {
     const plain = mkdtempSync(join(tmpdir(), "chrono-plain-"));
     try {
       const { before } = await hookFor(plain);
       await expect(before({ tool: "bash", command: "echo hi" })).resolves.toBeUndefined();
+      await expect(before({ tool: "mcp__future_tool", command: "x" })).resolves.toBeUndefined();
       const { before: gated } = await hookFor(tempDir);
-      await expect(gated({ tool: "read", filePath: "x" })).resolves.toBeUndefined();
+      for (const tool of ["read", "grep", "glob", "skill", "todowrite", "question", "lsp"]) {
+        await expect(gated({ tool })).resolves.toBeUndefined();
+      }
     } finally {
       rmSync(plain, { recursive: true, force: true });
+    }
+  });
+
+  it("gates every mutable tool through the live verdict", async () => {
+    for (const tool of ["bash", "edit", "write", "apply_patch", "webfetch", "websearch"]) {
+      fullEnv();
+      const { before } = await hookFor(tempDir);
+      await expect(before({ tool })).resolves.toBeUndefined();
+      process.env["CHRONO_BIN"] = gateDeny;
+      const { before: denying } = await hookFor(tempDir);
+      await expect(denying({ tool })).rejects.toThrow(/EXECUTION_DENIED: nope/);
+    }
+  });
+
+  it("denies unknown and future tools deny-by-default inside projects", async () => {
+    fullEnv();
+    const { before } = await hookFor(tempDir);
+    for (const tool of ["mcp__github__create_issue", "future_builtin", "", "BASH"]) {
+      await expect(before({ tool })).rejects.toThrow(/TOOL_DENIED/);
     }
   });
 
@@ -277,6 +312,45 @@ describe("CLI setup", () => {
   let rtkBinary: string;
   let proofBinary: string;
 
+/**
+ * TEST-ONLY enrollment helper: builds a valid ceremony proof with a
+ * caller-supplied timestamp (wall clock by default; pass the fixed clock
+ * time for clock-injected cores). Production callers MUST use
+ * `chrono enroll`, which adds /dev/tty confirmation and keychain custody.
+ */
+function enrollTestPo(
+  core: ChronoCore,
+  pair: { publicKeyPem: string; privateKeyPem: string },
+  timestamp = new Date().toISOString(),
+  rationale = "test enrollment"
+): void {
+  const nonce = randomBytes(16).toString("hex");
+  const fingerprint = fingerprintPublicKey(pair.publicKeyPem);
+  const confirmation = buildEnrollmentChallenge("default", fingerprint, nonce);
+  const signature = signApprovalPayload(
+    buildEnrollmentPayload({
+      projectId: "default",
+      fingerprint,
+      timestamp,
+      nonce,
+      authority: "PO",
+      rationale,
+      confirmation,
+    }),
+    pair.privateKeyPem
+  );
+  const res = core.enrollPo({
+    publicKeyPem: pair.publicKeyPem,
+    nonce,
+    timestamp,
+    rationale,
+    confirmation,
+    signature,
+  });
+  expect(res.ok).toBe(true);
+  expect(res.value?.fingerprint).toBe(fingerprint);
+}
+
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "chrono-setup-test-"));
     const core = new ChronoCore({ projectPath: tempDir, runtime: "test-runtime" });
@@ -284,7 +358,7 @@ describe("CLI setup", () => {
       expect(core.init().ok).toBe(true);
       const pair = generateApprovalKeyPair();
       restoreTty = fakeInteractiveTerminal();
-      expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+      enrollTestPo(core, pair);
       gaspar = { actor: "gaspar", session: bootstrapSession(core, "gaspar", pair.privateKeyPem) };
       po = { actor: "PO", session: bootstrapSession(core, "PO", pair.privateKeyPem) };
       entrypoint = shellScript(join(tempDir, "fixture-runtime.sh"), "echo 'fixture-runtime 1.0.0'");
@@ -375,9 +449,19 @@ describe("CLI setup", () => {
   it("completes setup and installs the byte-identical plugin", async () => {
     const out = runSetup(tempDir, { adapter: "fixture", rtkBinary, json: true });
     expect(out.exitCode).toBe(0);
-    const body = JSON.parse(out.stdout) as { ok: boolean; proofsRun: number; plugin: string; routingProven: boolean };
+    const body = JSON.parse(out.stdout) as { ok: boolean; proofsRun: number; plugin: string; routingProven: boolean; hooks: string[] };
     expect(body).toMatchObject({ ok: true, proofsRun: 1, plugin: ".opencode/plugins/chrono-gate.js", routingProven: true });
     expect(readFileSync(join(tempDir, ".opencode", "plugins", "chrono-gate.js"), "utf8")).toBe(buildOpencodePlugin());
+  });
+
+  it("installs byte-identical Claude and Kiro hooks alongside OpenCode", async () => {
+    const out = runSetup(tempDir, { adapter: "fixture", rtkBinary, json: true });
+    expect(out.exitCode).toBe(0);
+    const body = JSON.parse(out.stdout) as { hooks: string[] };
+    expect(body.hooks).toContain(CLAUDE_HOOK_RELATIVE_PATH);
+    expect(body.hooks).toContain(KIRO_HOOK_RELATIVE_PATH);
+    expect(readFileSync(join(tempDir, CLAUDE_HOOK_RELATIVE_PATH), "utf8")).toBe(buildClaudeHook());
+    expect(readFileSync(join(tempDir, KIRO_HOOK_RELATIVE_PATH), "utf8")).toBe(buildKiroHook());
   });
 
   it("fails closed on every missing proof", async () => {

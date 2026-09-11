@@ -22,6 +22,13 @@ import type { AgentRole } from "./state.js";
 /** Version of this authority policy, persisted with authorization evidence. */
 export const AUTHORITY_POLICY_VERSION = "3";
 
+/**
+ * Version of the runtime tool-classification policy below. Bumped
+ * independently from the authority matrix: tool classification affects
+ * pre-tool gate decisions, never grant semantics.
+ */
+export const TOOL_POLICY_VERSION = "1";
+
 export type CapabilityHolder = AgentRole | "PO";
 
 /** Core operations governed by the matrix. */
@@ -127,6 +134,50 @@ export function isCapable(
     return row.includes(role);
   }
   return false;
+}
+
+/**
+ * OpenCode built-in tool classification [SLICE-9 §9.4, P8.6].
+ * Source: https://opencode.ai/docs/tools/ (names only; policy is Core-owned).
+ *
+ * - "read": local read-only tools. They cannot mutate project state, so
+ *   the gate authorizes without a dispatch scope. (Secret exfiltration via
+ *   reads is governed separately by secret redaction, INV §7.9.)
+ * - "mutate": tools capable of filesystem, process, network, package, Git,
+ *   credential, deployment, destructive, or production-impacting effects.
+ *   They require a full execution-gate decision with dispatch scope.
+ *
+ * Deny-by-default: any tool not listed here — including future built-ins,
+ * MCP tools (`mcp_*`), and custom tools — is DENIED until classified in a
+ * reviewed policy release. Tool names are adapter data, never authority.
+ */
+export type ToolClassification = "read" | "mutate";
+
+export const OPENCODE_TOOL_POLICY: Record<string, ToolClassification> = {
+  read: "read",
+  grep: "read",
+  glob: "read",
+  skill: "read",
+  todowrite: "read",
+  question: "read",
+  lsp: "read",
+  bash: "mutate",
+  edit: "mutate",
+  write: "mutate",
+  apply_patch: "mutate",
+  webfetch: "mutate",
+  websearch: "mutate",
+};
+
+/**
+ * Check an OpenCode tool name against the classification policy.
+ * Returns undefined for unlisted (hence denied) tools.
+ */
+export function classifyOpencodeTool(tool: string): ToolClassification | undefined {
+  if (tool.trim().length === 0) {
+    return undefined;
+  }
+  return OPENCODE_TOOL_POLICY[tool];
 }
 
 /**

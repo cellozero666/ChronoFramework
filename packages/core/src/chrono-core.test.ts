@@ -12,18 +12,54 @@ import { randomBytes } from "node:crypto";
 import { SCHEMA_VERSION } from "@chrono/persistence";
 import {
   buildApprovalPayload,
+  buildEnrollmentChallenge,
+  buildEnrollmentPayload,
   buildSessionAuthorizationPayload,
+  fingerprintPublicKey,
   generateApprovalKeyPair,
   signApprovalPayload,
 } from "@chrono/domain";
 import { ChronoCore } from "./chrono-core.js";
 
 /**
- * Test PO identity: a fresh Ed25519 keypair per test, registered through
- * the production trust-on-first-use path. Signatures are real; only the
- * key custody differs from production (generated in-test instead of the
- * OS keychain behind an interactive terminal).
+ * Test PO identity: a fresh Ed25519 keypair per test, enrolled through the
+ * ceremony proof path. Signatures are real; only the key custody differs
+ * from production (generated in-test instead of the OS keychain behind an
+ * interactive terminal with /dev/tty confirmation).
  */
+function enrollTestPo(
+  core: ChronoCore,
+  pair: { publicKeyPem: string; privateKeyPem: string },
+  timestamp = new Date().toISOString(),
+  rationale = "test enrollment"
+): void {
+  const nonce = randomBytes(16).toString("hex");
+  const fingerprint = fingerprintPublicKey(pair.publicKeyPem);
+  const confirmation = buildEnrollmentChallenge("default", fingerprint, nonce);
+  const signature = signApprovalPayload(
+    buildEnrollmentPayload({
+      projectId: "default",
+      fingerprint,
+      timestamp,
+      nonce,
+      authority: "PO",
+      rationale,
+      confirmation,
+    }),
+    pair.privateKeyPem
+  );
+  const res = core.enrollPo({
+    publicKeyPem: pair.publicKeyPem,
+    nonce,
+    timestamp,
+    rationale,
+    confirmation,
+    signature,
+  });
+  expect(res.ok).toBe(true);
+  expect(res.value?.fingerprint).toBe(fingerprint);
+}
+
 function setupTestPo(core: ChronoCore): {
   sign: (fields: {
     action: string;
@@ -37,7 +73,7 @@ function setupTestPo(core: ChronoCore): {
 } {
   const pair = generateApprovalKeyPair();
   const restoreTty = fakeInteractiveTerminal();
-  expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+  enrollTestPo(core, pair);
   const nonce = randomBytes(16).toString("hex");
   const sessionTimestamp = "2026-09-11T00:00:00.000Z";
   const rationale = "test privileged-session bootstrap";

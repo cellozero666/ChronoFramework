@@ -20,7 +20,7 @@ later implementation slices.
 
 After the mandatory normative reading, read the current execution checkpoint in
 `docs/implementation/POST-SLICE-8-REVIEW.md`, then execute
-`docs/implementation/SLICE-9.md` and the ordered
+`docs/implementation/SLICE-9.md`, `docs/implementation/SLICE-10.md`, and the ordered
 `docs/implementation/IMPLEMENTER-TASKS.md`. Historical slice reports are
 evidence, not authority to skip a current gate.
 

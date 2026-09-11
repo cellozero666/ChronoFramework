@@ -38,8 +38,11 @@ import {
   assertRequiredFields,
   assertValidInitialState,
   buildApprovalPayload,
+  buildEnrollmentChallenge,
+  buildEnrollmentPayload,
   buildSessionAuthorizationPayload,
   buildWaiverPayload,
+  fingerprintPublicKey,
   hashSkillSource,
   parseActorIdentity,
   parseApprovalPublicKey,
@@ -49,6 +52,8 @@ import {
   APPROVAL_ACTIONS,
   AUTHORITY_POLICY_VERSION,
   DEFECT_ROUTING,
+  ENROLLMENT_FRESHNESS_MS,
+  ROUTING_PROOF_FRESHNESS_MS,
   RTK_UPSTREAM,
   SKILL_RELEASE,
   SKILL_RUNTIME_PATHS,
@@ -94,6 +99,29 @@ export interface SessionAuthorization {
   readonly authority: string;
   readonly rationale: string;
   readonly timestamp: string;
+  readonly signature: string;
+}
+
+/**
+ * Initial PO enrollment ceremony proof [SLICE-9 §9.1].
+ *
+ * Trust-on-first-interactive-use is closed: enrolling a PO key requires
+ * (1) a live interactive terminal, (2) a signature over the canonical
+ * enrollment payload made WITH the new private key (proving key
+ * possession at enrollment time — the CLI additionally reads the
+ * typed confirmation from /dev/tty so redirected input cannot pass),
+ * (3) the exact human-typed confirmation challenge derived from
+ * project, fingerprint, and nonce, (4) a fresh timestamp inside the
+ * enrollment liveness window, and (5) a well-formed nonce. Key, record,
+ * and audit event persist atomically; a second enrollment is denied
+ * (rotate instead). Partial failure persists nothing.
+ */
+export interface PoEnrollment {
+  readonly publicKeyPem: string;
+  readonly nonce: string;
+  readonly timestamp: string;
+  readonly rationale: string;
+  readonly confirmation: string;
   readonly signature: string;
 }
 
@@ -3182,12 +3210,130 @@ export class ChronoCore {
   }
 
   /**
+   * Initial PO enrollment [SLICE-9 §9.1]. See PoEnrollment for the
+   * ceremony proof contract. Returns the enrolled key fingerprint.
+   */
+  enrollPo(input: PoEnrollment): CoreResult<{ fingerprint: string }> {
+    try {
+      this.requireInteractiveAuthority("PO enrollment");
+      if (this.db.runtimeConfig().get("po.public_key") !== null) {
+        throw new ChronoError({
+          code: ErrorCode.APPROVAL_REQUIRED,
+          severity: Severity.BLOCKER,
+          message: "PO key already enrolled: rotate the key instead of re-enrolling",
+          invariantRef: "INV §4.6",
+          affectedTarget: "PO-KEY",
+          suggestedAction: "Sign the rotation payload with the current PO key",
+        });
+      }
+      parseApprovalPublicKey(input.publicKeyPem);
+      const fingerprint = fingerprintPublicKey(input.publicKeyPem);
+      if (!/^[0-9a-f]{32,128}$/.test(input.nonce)) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Enrollment requires a 32–128 character lowercase hex nonce",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Generate a fresh random nonce for the enrollment ceremony",
+        });
+      }
+      const rationale = input.rationale.trim();
+      if (rationale.length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Enrollment requires a non-empty rationale",
+          invariantRef: "INV §14.4",
+          suggestedAction: "State why this key is being enrolled as the PO key",
+        });
+      }
+      this.assertFreshTimestamp(input.timestamp, "PO-KEY");
+      const ageMs = Date.parse(this.now()) - Date.parse(input.timestamp);
+      if (ageMs > ENROLLMENT_FRESHNESS_MS) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Enrollment proof is stale: the ceremony must complete live",
+          invariantRef: "INV §14.4",
+          affectedTarget: "PO-KEY",
+          suggestedAction: "Restart the enrollment ceremony and confirm without delay",
+        });
+      }
+      const expectedConfirmation = buildEnrollmentChallenge("default", fingerprint, input.nonce);
+      if (input.confirmation !== expectedConfirmation) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Enrollment confirmation does not match the ceremony challenge",
+          invariantRef: "INV §14.4",
+          affectedTarget: "PO-KEY",
+          suggestedAction: "Type the displayed challenge exactly as shown",
+        });
+      }
+      const payload = buildEnrollmentPayload({
+        projectId: "default",
+        fingerprint,
+        timestamp: input.timestamp,
+        nonce: input.nonce,
+        authority: "PO",
+        rationale,
+        confirmation: input.confirmation,
+      });
+      const key = parseApprovalPublicKey(input.publicKeyPem);
+      if (!verifyApprovalSignature(payload, input.signature, key)) {
+        throw new ChronoError({
+          code: ErrorCode.SIGNATURE_INVALID,
+          severity: Severity.ERROR,
+          message: "Enrollment signature invalid under the enrolled key: key possession not proven",
+          invariantRef: "INV §4.3",
+          affectedTarget: "PO-KEY",
+          suggestedAction: "Sign the enrollment payload with the private key being enrolled",
+        });
+      }
+      const record = JSON.stringify({
+        action: "po-enroll",
+        fingerprint,
+        timestamp: input.timestamp,
+        nonce: input.nonce,
+        rationale,
+      });
+      this.db.transaction(() => {
+        if (this.db.runtimeConfig().get("po.public_key") !== null) {
+          throw new ChronoError({
+            code: ErrorCode.APPROVAL_REQUIRED,
+            severity: Severity.BLOCKER,
+            message: "PO key already enrolled: rotate the key instead of re-enrolling",
+            invariantRef: "INV §4.6",
+            affectedTarget: "PO-KEY",
+            suggestedAction: "Sign the rotation payload with the current PO key",
+          });
+        }
+        this.db.runtimeConfig().set("po.public_key", input.publicKeyPem);
+        this.db.runtimeConfig().set("po.enrollment", record);
+        this.events.append({
+          eventType: "ArtifactCreated",
+          entityId: "PO-KEY",
+          payload: { type: "PO_ENROLLMENT", fingerprint, nonce: input.nonce, rationale },
+          actor: "PO",
+          priorState: undefined,
+          newState: "registered",
+          reasoning: "PO signing key enrolled with ceremony proof",
+        });
+      });
+      return { ok: true, value: { fingerprint } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
    * Register the PO Ed25519 public key (SPKI PEM) for this project.
    *
-   * First registration (trust on first interactive use) stores the key.
-   * Any later registration is a rotation and requires a valid signature
-   * from the CURRENT key over the canonical rotation payload — otherwise
-   * an agent could substitute its own key [ADR-003, INV §4.2].
+   * Rotation only: initial enrollment MUST go through the `enrollPo`
+   * ceremony [SLICE-9 §9.1] — direct first registration is denied so an
+   * agent holding a TTY cannot self-enroll as PO. Any later registration
+   * requires a valid signature from the CURRENT key over the canonical
+   * rotation payload [ADR-003, INV §4.2].
    */
   registerPoPublicKey(
     publicKeyPem: string,
@@ -3203,26 +3349,14 @@ export class ChronoCore {
       parseApprovalPublicKey(publicKeyPem);
       const existing = this.db.runtimeConfig().get("po.public_key");
       if (existing === null) {
-        if (rotation !== undefined) {
-          throw new ChronoError({
-            code: ErrorCode.VALIDATION_ERROR,
-            severity: Severity.ERROR,
-            message: "No PO key registered: rotation fields are unexpected",
-            invariantRef: "INV §14.4",
-            suggestedAction: "Register the initial PO public key without rotation fields",
-          });
-        }
-        this.db.runtimeConfig().set("po.public_key", publicKeyPem);
-        this.events.append({
-          eventType: "ArtifactCreated",
-          entityId: "PO-KEY",
-          payload: { type: "PO_PUBLIC_KEY" },
-          actor: "PO",
-          priorState: undefined,
-          newState: "registered",
-          reasoning: "PO signing key registered",
+        throw new ChronoError({
+          code: ErrorCode.APPROVAL_REQUIRED,
+          severity: Severity.BLOCKER,
+          message: "No PO key enrolled: initial trust requires the chrono enroll ceremony, not direct registration",
+          invariantRef: "INV §4.6",
+          affectedTarget: "PO-KEY",
+          suggestedAction: "Run chrono enroll interactively to prove key possession with human confirmation",
         });
-        return { ok: true, value: undefined };
       }
 
       if (rotation === undefined) {
@@ -3983,8 +4117,8 @@ export class ChronoCore {
   // identity proofs, and TTLs. The actual command execution (rtk gain,
   // routing self-test, skill discovery/activation probes) happens in the
   // CLI verify path, which runs the real commands; the Core never shells
-  // out. Until Slice 8 adapters exist, routing/activation proofs arrive
-  // through that path — the gate below denies without them.
+  // out. Routing proofs (Slice 9 §9.3) are recorded separately and
+  // enforced at dispatch: attestation currency alone no longer suffices.
   // ---------------------------------------------------------------------------
 
   /**
@@ -4068,6 +4202,157 @@ export class ChronoCore {
         reasoning: "RTK attestation recorded",
       });
       return { ok: true, value: { id } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Record an RTK routing proof: append-only evidence that a command
+   * executed effectively through the genuine RTK binary for one
+   * adapter/runtime/project scope [SLICE-9 §9.3, P8.5, INV §8.4].
+   *
+   * Any authenticated session may submit, but the proof's adapter must
+   * already be approved: unregistered or revoked adapters cannot collect
+   * proofs. The runtime, attestation, and binary bindings are derived by
+   * the Core — never trusted from caller input. The proof pins the
+   * current RTK
+   * attestation, the binary content hash, the command and output hashes,
+   * and a bounded validity window. Only successful routings (exit 0)
+   * prove effectiveness. Dispatch re-validates every binding; binary
+   * replacement or adapter revocation invalidates.
+   */
+  recordRoutingProof(auth: CallerAuth, input: {
+    adapterId: string;
+    binaryPath: string;
+    version: string;
+    proofCommand: string;
+    commandHash: string;
+    outputHash: string;
+    exitStatus: number;
+    gainAvailable: boolean;
+    timestamp: string;
+    ttlSeconds: number;
+  }): CoreResult<{ id: string }> {
+    try {
+      const caller = this.resolveCaller(auth, "record routing proof");
+      const session = caller.session;
+      const adapter = this.getAdapterForDispatch(input.adapterId);
+      const attestation = this.db.rtkAttestations().latest();
+      const attestationState = this.attestationState(attestation, Date.parse(this.now()));
+      if (attestation === null || attestationState !== "current") {
+        throw new ChronoError({
+          code: ErrorCode.BLOCKED_RTK,
+          severity: Severity.BLOCKER,
+          message: "Routing proof requires a current RTK attestation",
+          invariantRef: "INV §8.5",
+          affectedTarget: adapter.id,
+          suggestedAction: "Verify a genuine RTK installation and record a current attestation first",
+        });
+      }
+      const detail = this.db.rtkAttestations().latestFull();
+      if (detail === null || input.version !== detail.version || input.binaryPath !== detail.binaryPath) {
+        throw new ChronoError({
+          code: ErrorCode.RTK_ROUTING_FAILURE,
+          severity: Severity.BLOCKER,
+          message: "Routing proof version/binary must match the current RTK attestation",
+          invariantRef: "INV §8.4",
+          affectedTarget: adapter.id,
+          suggestedAction: "Prove routing with the attested binary version",
+        });
+      }
+      let binaryHash: string;
+      try {
+        binaryHash = createHash("sha256").update(readFileSync(input.binaryPath)).digest("hex");
+      } catch {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Routing proof binary '${input.binaryPath}' is unreadable`,
+          invariantRef: "INV §14.4",
+          affectedTarget: adapter.id,
+          suggestedAction: "Prove routing with an existing executable RTK binary",
+        });
+      }
+      if (!isRevisionHash(input.commandHash) || !isRevisionHash(input.outputHash)) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Routing proof command/output hashes must be sha256:<64 lowercase hex>",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Hash the proven command and its captured output",
+        });
+      }
+      if (input.exitStatus !== 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Only successful routings prove effectiveness: exit status must be 0",
+          invariantRef: "INV §14.4",
+          affectedTarget: adapter.id,
+          suggestedAction: "Re-run the proof command until it succeeds through RTK",
+        });
+      }
+      if (input.proofCommand.trim().length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Routing proof requires the proven command text",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Record the exact command that was routed",
+        });
+      }
+      this.assertFreshTimestamp(input.timestamp, adapter.id);
+      const ageMs = Date.parse(this.now()) - Date.parse(input.timestamp);
+      if (ageMs > ROUTING_PROOF_FRESHNESS_MS) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Routing proof timestamp is stale: proofs must be submitted live",
+          invariantRef: "INV §14.4",
+          affectedTarget: adapter.id,
+          suggestedAction: "Re-run the routing proof now",
+        });
+      }
+      if (!Number.isFinite(input.ttlSeconds) || input.ttlSeconds <= 0 || input.ttlSeconds > 86400) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Routing proof TTL must be within 1 second and 24 hours",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Request a bounded proof lifetime",
+        });
+      }
+      const id = this.sequences.allocate("RTE");
+      const issuedAt = this.now();
+      const record = this.db.routingProofs().create({
+        id,
+        adapterId: adapter.id,
+        runtime: session.runtime,
+        sessionId: session.id,
+        projectId: "default",
+        rtkAttestationId: attestation.id,
+        binaryPath: input.binaryPath,
+        binaryHash,
+        version: input.version,
+        proofCommand: input.proofCommand,
+        commandHash: input.commandHash,
+        outputHash: input.outputHash,
+        exitStatus: 0,
+        gainAvailable: input.gainAvailable,
+        timestamp: input.timestamp,
+        validUntil: new Date(Date.parse(issuedAt) + input.ttlSeconds * 1000).toISOString(),
+      });
+      this.events.append({
+        eventType: "RoutingProofRecorded",
+        entityId: record.id,
+        payload: { adapterId: adapter.id, runtime: session.runtime, commandHash: input.commandHash },
+        actor: caller.auditActor,
+        priorState: undefined,
+        newState: "current",
+        reasoning: "RTK routing proof recorded",
+      });
+      return { ok: true, value: { id: record.id } };
     } catch (e) {
       return this.handleError(e);
     }
@@ -4333,7 +4618,7 @@ export class ChronoCore {
         });
       }
 
-      this.requireCurrentRtk(moduleId);
+      this.requireCurrentRtk(moduleId, { id: executor.id, adapter: executor.adapter, runtime: executor.runtime }, options.adapterId ?? null);
       this.requireCurrentSkill(moduleId);
 
       const approval = this.approvals.findByScope(moduleId, moduleArtifact.revision, "module-approval");
@@ -4551,19 +4836,79 @@ export class ChronoCore {
     return role;
   }
 
-  /** Current RTK attestation with proven routing, else BLOCKED_RTK. */
-  private requireCurrentRtk(target: string): void {
+  /**
+   * Current RTK attestation with proven routing, else BLOCKED_RTK.
+   * Currency alone is insufficient: dispatch additionally requires a
+   * current, valid routing proof for the adapter under dispatch (the
+   * grant-bound adapter when present, else the executing session's
+   * adapter) in the session's runtime/project scope
+   * [SLICE-9 §9.3, P8.5, INV §8.4].
+   */
+  private requireCurrentRtk(
+    target: string,
+    session: { id: string; adapter: string; runtime: string },
+    adapterId: string | null
+  ): void {
     const attestation = this.db.rtkAttestations().latest();
     const state = this.attestationState(attestation, Date.parse(this.now()));
-    if (state !== "current") {
+    if (attestation === null || state !== "current") {
       throw new ChronoError({
         code: ErrorCode.BLOCKED_RTK,
         severity: Severity.BLOCKER,
-        message: `Module ${target}: RTK attestation ${state}`,
+        message: `Module ${target}: RTK attestation ${attestation === null ? "missing" : state}`,
         invariantRef: "INV §8.5",
         affectedTarget: target,
         suggestedAction: "Verify a genuine RTK installation and record a current attestation",
       });
+    }
+    this.requireCurrentRoutingProof(target, adapterId ?? session.adapter, session.runtime, attestation.id);
+  }
+
+  /**
+   * Effective routing proof for one adapter/runtime/project scope.
+   * Re-validates every binding at dispatch: proof present and unexpired,
+   * bound to the still-current attestation, adapter still approved, and
+   * the RTK binary content unchanged since the proof. Anything else
+   * denies with RTK_ROUTING_FAILURE; nothing is burned or mutated.
+   */
+  private requireCurrentRoutingProof(
+    target: string,
+    adapterId: string,
+    runtime: string,
+    attestationId: string
+  ): void {
+    const denied = (message: string): ChronoError =>
+      new ChronoError({
+        code: ErrorCode.RTK_ROUTING_FAILURE,
+        severity: Severity.BLOCKER,
+        message: `Module ${target}: ${message}`,
+        invariantRef: "INV §8.4",
+        affectedTarget: target,
+        suggestedAction: "Record a routing proof with chrono rtk prove",
+      });
+    const proof = this.db.routingProofs().latestFor(adapterId, runtime, "default");
+    if (proof === null) {
+      throw denied("no current RTK routing proof for this adapter/runtime: routing is unproven");
+    }
+    if (Date.parse(proof.validUntil) <= Date.parse(this.now())) {
+      throw denied(`routing proof '${proof.id}' expired at ${proof.validUntil}`);
+    }
+    if (proof.rtkAttestationId !== attestationId) {
+      throw denied(`routing proof '${proof.id}' binds a superseded RTK attestation`);
+    }
+    try {
+      this.getAdapterForDispatch(proof.adapterId);
+    } catch {
+      throw denied(`routing proof '${proof.id}' names an adapter that is no longer approved`);
+    }
+    let currentBinaryHash: string;
+    try {
+      currentBinaryHash = createHash("sha256").update(readFileSync(proof.binaryPath)).digest("hex");
+    } catch {
+      throw denied(`RTK binary '${proof.binaryPath}' is unreadable since the proof`);
+    }
+    if (currentBinaryHash !== proof.binaryHash) {
+      throw denied(`RTK binary '${proof.binaryPath}' changed since the proof`);
     }
   }
 
@@ -4902,7 +5247,7 @@ export class ChronoCore {
         }
       }
 
-      this.requireCurrentRtk(moduleId);
+      this.requireCurrentRtk(moduleId, { id: caller.session.id, adapter: caller.session.adapter, runtime: caller.session.runtime }, null);
       this.requireCurrentSkill(moduleId);
 
       return { ok: true, value: true };
@@ -5085,6 +5430,100 @@ export class ChronoCore {
 
       this.syncProjectState();
       return { ok: true, value: { qaId } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Evaluate the architecture-approval gate [SLICE-9 §9.2, CORE §7.2].
+   * Read-only Core decision for `chrono gate architecture-approval`:
+   * AUTHORIZED only when the project architecture is approved and a
+   * current Architecture Security Approval binds its exact revision.
+   * Any authenticated canonical role may query; nothing is persisted.
+   */
+  gateArchitectureApproval(auth: CallerAuth): CoreResult<boolean> {
+    try {
+      this.resolveCaller(auth, "architecture-approval gate");
+      const project = this.projects.findById("default");
+      const archRevision = project.architectureRevision;
+      if (archRevision === null) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: "No architecture proposed yet",
+          invariantRef: "INV §5.5",
+          affectedTarget: "ARCH",
+          suggestedAction: "Propose, review, and approve the architecture first",
+        });
+      }
+      this.requireValidApproval("ARCH", archRevision, "architecture-security");
+      if (project.architectureState !== "approved") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Architecture is '${project.architectureState ?? "unset"}', not approved`,
+          invariantRef: "INV §5.5",
+          affectedTarget: "ARCH",
+          suggestedAction: "Complete the architecture approval transition first",
+        });
+      }
+      return { ok: true, value: true };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Evaluate the spec-ready gate [SLICE-9 §9.2, CORE §7.3].
+   * Read-only Core decision for `chrono gate spec-ready`: runs the exact
+   * SpecApprovedReady prerequisite evaluation for the spec's current
+   * revision without persisting any transition.
+   */
+  gateSpecReady(specId: string, auth: CallerAuth): CoreResult<boolean> {
+    try {
+      this.resolveCaller(auth, "spec-ready gate");
+      const spec = this.artifacts.findById(specId);
+      if (spec.type !== "SP") {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Spec-ready gate requires a Specification, not '${specId}' of type ${spec.type}`,
+          invariantRef: "INV §14.4",
+          affectedTarget: specId,
+          suggestedAction: "Query the gate with a Spec identifier",
+        });
+      }
+      this.guardSpecReady(specId, spec.revision);
+      return { ok: true, value: true };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Evaluate the verification gate [SLICE-9 §9.2, CORE §7.5].
+   * Read-only Core decision for `chrono gate verification`: AUTHORIZED
+   * only when a Spekkio PASS verdict binds the target's exact current
+   * revision. Supports an optional Work Package scope.
+   */
+  gateVerification(moduleId: string, workPackageId: string | null, auth: CallerAuth): CoreResult<boolean> {
+    try {
+      this.resolveCaller(auth, "verification gate");
+      const target = workPackageId ?? moduleId;
+      const artifact = this.artifacts.findById(target);
+      if (workPackageId !== null && artifact.type !== "WP") {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Verification gate work-package scope '${workPackageId}' is not a Work Package`,
+          invariantRef: "INV §14.4",
+          affectedTarget: target,
+          suggestedAction: "Scope verification to an existing Work Package of the module",
+        });
+      }
+      this.requireQaVerdict(moduleId, artifact.revision, workPackageId, "PASS");
+      return { ok: true, value: true };
     } catch (e) {
       return this.handleError(e);
     }

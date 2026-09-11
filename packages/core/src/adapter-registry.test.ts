@@ -11,13 +11,55 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
   buildApprovalPayload,
+  buildEnrollmentChallenge,
+  buildEnrollmentPayload,
   buildSessionAuthorizationPayload,
+  fingerprintPublicKey,
   generateApprovalKeyPair,
   signApprovalPayload,
 } from "@chrono/domain";
 import { ChronoCore, type CallerAuth } from "./chrono-core.js";
 
 const APPROVAL_TIME = "2026-06-01T00:00:00.000Z";
+
+/**
+ * TEST-ONLY enrollment helper: builds a valid ceremony proof with a
+ * caller-supplied timestamp (wall clock by default; pass the fixed clock
+ * time for clock-injected cores). Production callers MUST use
+ * `chrono enroll`, which adds /dev/tty confirmation and keychain custody.
+ */
+function enrollTestPo(
+  core: ChronoCore,
+  pair: { publicKeyPem: string; privateKeyPem: string },
+  timestamp = new Date().toISOString(),
+  rationale = "test enrollment"
+): void {
+  const nonce = randomBytes(16).toString("hex");
+  const fingerprint = fingerprintPublicKey(pair.publicKeyPem);
+  const confirmation = buildEnrollmentChallenge("default", fingerprint, nonce);
+  const signature = signApprovalPayload(
+    buildEnrollmentPayload({
+      projectId: "default",
+      fingerprint,
+      timestamp,
+      nonce,
+      authority: "PO",
+      rationale,
+      confirmation,
+    }),
+    pair.privateKeyPem
+  );
+  const res = core.enrollPo({
+    publicKeyPem: pair.publicKeyPem,
+    nonce,
+    timestamp,
+    rationale,
+    confirmation,
+    signature,
+  });
+  expect(res.ok).toBe(true);
+  expect(res.value?.fingerprint).toBe(fingerprint);
+}
 
 function fakeInteractiveTerminal(): () => void {
   const stdinDesc = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
@@ -107,7 +149,7 @@ describe("Adapter registry", () => {
     expect(core.init().ok).toBe(true);
     restoreTty = fakeInteractiveTerminal();
     const pair = generateApprovalKeyPair();
-    expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+    enrollTestPo(core, pair);
     privateKeyPem = pair.privateKeyPem;
     po = bootstrapPo(core, pair.privateKeyPem);
     const gasparNonce = randomBytes(16).toString("hex");

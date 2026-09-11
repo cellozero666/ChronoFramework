@@ -22,6 +22,7 @@ import {
   ProjectRepository,
   QaRepository,
   RtkRepository,
+  RoutingProofRepository,
   RuntimeConfigRepository,
   SecurityProfileRepository,
   SequenceRepository,
@@ -213,6 +214,10 @@ export class ChronoDatabase {
 
   rtkAttestations(): RtkRepository {
     return new RtkRepository(this.db);
+  }
+
+  routingProofs(): RoutingProofRepository {
+    return new RoutingProofRepository(this.db);
   }
 
   skillAttestations(): SkillRepository {

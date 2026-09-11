@@ -12,6 +12,7 @@
  */
 
 import {
+  createHash,
   createPrivateKey,
   createPublicKey,
   generateKeyPairSync,
@@ -55,6 +56,23 @@ export interface SessionAuthorizationPayload {
   readonly authority: string;
   readonly rationale: string;
   readonly timestamp: string;
+}
+
+/**
+ * Canonical PO enrollment payload [SLICE-9 §9.1]. Binds the enrollment
+ * action to the project, the enrolled key fingerprint, a fresh nonce, the
+ * human-typed confirmation challenge, and a timestamp. Signed with the NEW
+ * private key being enrolled, which proves key possession at enrollment.
+ */
+export interface EnrollmentPayload {
+  readonly action: "po-enroll";
+  readonly project_id: string;
+  readonly fingerprint: string;
+  readonly timestamp: string;
+  readonly nonce: string;
+  readonly authority: string;
+  readonly rationale: string;
+  readonly confirmation: string;
 }
 
 /** Canonical waiver payload [CORE §8.3, DOM §3.24]. */
@@ -120,7 +138,7 @@ export function parseApprovalPublicKey(publicKeyPem: string): KeyObject {
 }
 
 /** Sign a canonical payload with an Ed25519 private key (PKCS8 PEM). Returns base64. */
-export function signApprovalPayload(payload: ApprovalPayload | WaiverPayload | SessionAuthorizationPayload, privateKeyPem: string): string {
+export function signApprovalPayload(payload: ApprovalPayload | WaiverPayload | SessionAuthorizationPayload | EnrollmentPayload, privateKeyPem: string): string {
   let key: KeyObject;
   try {
     key = createPrivateKey(privateKeyPem);
@@ -143,7 +161,7 @@ export function signApprovalPayload(payload: ApprovalPayload | WaiverPayload | S
  * false to SIGNATURE_INVALID / APPROVAL_REQUIRED.
  */
 export function verifyApprovalSignature(
-  payload: ApprovalPayload | WaiverPayload | SessionAuthorizationPayload,
+  payload: ApprovalPayload | WaiverPayload | SessionAuthorizationPayload | EnrollmentPayload,
   signatureBase64: string,
   publicKey: KeyObject
 ): boolean {
@@ -235,5 +253,47 @@ export function buildWaiverPayload(fields: {
     follow_up_task_id: fields.followUpTaskId,
     expiry_review_condition: fields.expiryReviewCondition,
     timestamp: fields.timestamp,
+  };
+}
+
+/** Enrollment ceremony liveness window: proof must be at most this fresh. */
+export const ENROLLMENT_FRESHNESS_MS = 15 * 60 * 1000;
+
+/** Routing proof submission liveness window: proofs must be submitted live. */
+export const ROUTING_PROOF_FRESHNESS_MS = 60 * 60 * 1000;
+
+/**
+ * Derive the human-typed confirmation challenge for PO enrollment
+ * [SLICE-9 §9.1]. Deterministic from project, key fingerprint, and nonce,
+ * so the Core can recompute and verify exactly what the human confirmed.
+ */
+export function buildEnrollmentChallenge(projectId: string, fingerprint: string, nonce: string): string {
+  return `enroll-${projectId}-${fingerprint.slice(0, 8)}-${nonce.slice(0, 8)}`;
+}
+
+/** Fingerprint of a candidate PO public key (SPKI PEM). */
+export function fingerprintPublicKey(publicKeyPem: string): string {
+  return createHash("sha256").update(publicKeyPem, "utf8").digest("hex");
+}
+
+/** Build the canonical PO enrollment payload [SLICE-9 §9.1]. */
+export function buildEnrollmentPayload(fields: {
+  projectId: string;
+  fingerprint: string;
+  timestamp: string;
+  nonce: string;
+  authority: string;
+  rationale: string;
+  confirmation: string;
+}): EnrollmentPayload {
+  return {
+    action: "po-enroll",
+    project_id: fields.projectId,
+    fingerprint: fields.fingerprint,
+    timestamp: fields.timestamp,
+    nonce: fields.nonce,
+    authority: fields.authority,
+    rationale: fields.rationale,
+    confirmation: fields.confirmation,
   };
 }

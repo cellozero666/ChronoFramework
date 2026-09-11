@@ -2036,6 +2036,7 @@ export interface RtkAttestationDetail {
   version: string;
   provenance: string;
   routingTestPassed: boolean;
+  binaryPath: string;
 }
 
 export class RtkRepository {
@@ -2079,7 +2080,7 @@ export class RtkRepository {
 
   /**
    * Latest attestation with its provenance binding, for setup reporting
-   * and future routing enforcement (read-only).
+   * and routing-proof binding (read-only).
    */
   latestFull(): RtkAttestationDetail | null {
     const row = this.db
@@ -2089,6 +2090,7 @@ export class RtkRepository {
         version: string;
         provenance: string;
         routing_test_passed: number;
+        binary_path: string;
       } | undefined;
 
     return row === undefined
@@ -2098,6 +2100,7 @@ export class RtkRepository {
         version: row.version,
         provenance: row.provenance,
         routingTestPassed: row.routing_test_passed === 1,
+        binaryPath: row.binary_path,
       };
   }
 }
@@ -2185,6 +2188,137 @@ export class SkillRepository {
         generatedHashes: row.generated_hashes,
         converterVersion: row.converter_version,
       };
+  }
+}
+
+/** RTK routing proof record [SLICE-9 §9.3, P8.5, INV §8.4]. */
+export interface RoutingProofRecord {
+  id: string;
+  adapterId: string;
+  runtime: string;
+  sessionId: string;
+  projectId: string;
+  rtkAttestationId: string;
+  binaryPath: string;
+  binaryHash: string;
+  version: string;
+  proofCommand: string;
+  commandHash: string;
+  outputHash: string;
+  exitStatus: number;
+  gainAvailable: boolean;
+  timestamp: string;
+  validUntil: string;
+}
+
+interface RoutingProofRow {
+  id: unknown;
+  adapter_id: unknown;
+  runtime: unknown;
+  session_id: unknown;
+  project_id: unknown;
+  rtk_attestation_id: unknown;
+  binary_path: unknown;
+  binary_hash: unknown;
+  version: unknown;
+  proof_command: unknown;
+  command_hash: unknown;
+  output_hash: unknown;
+  exit_status: unknown;
+  gain_available: unknown;
+  timestamp: unknown;
+  valid_until: unknown;
+}
+
+/**
+ * Repository for RTK routing proofs. Rows are append-only: proofs are
+ * never updated or deleted, so a recorded proof cannot be weakened after
+ * the fact. Consumers re-validate liveness (adapter, binary, attestation)
+ * at every use.
+ */
+export class RoutingProofRepository {
+  constructor(private readonly db: Database) {}
+
+  create(proof: {
+    id: string;
+    adapterId: string;
+    runtime: string;
+    sessionId: string;
+    projectId: string;
+    rtkAttestationId: string;
+    binaryPath: string;
+    binaryHash: string;
+    version: string;
+    proofCommand: string;
+    commandHash: string;
+    outputHash: string;
+    exitStatus: number;
+    gainAvailable: boolean;
+    timestamp: string;
+    validUntil: string;
+  }): RoutingProofRecord {
+    this.db.prepare(
+      `INSERT INTO routing_proof (id, adapter_id, runtime, session_id, project_id,
+         rtk_attestation_id, binary_path, binary_hash, version, proof_command,
+         command_hash, output_hash, exit_status, gain_available, timestamp, valid_until)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      proof.id, proof.adapterId, proof.runtime, proof.sessionId, proof.projectId,
+      proof.rtkAttestationId, proof.binaryPath, proof.binaryHash, proof.version,
+      proof.proofCommand, proof.commandHash, proof.outputHash, proof.exitStatus,
+      proof.gainAvailable ? 1 : 0, proof.timestamp, proof.validUntil
+    );
+    return this.findById(proof.id);
+  }
+
+  findById(id: string): RoutingProofRecord {
+    const row = this.db
+      .prepare("SELECT * FROM routing_proof WHERE id = ?")
+      .get(id) as RoutingProofRow | undefined;
+    if (row === undefined) {
+      throw new ChronoError({
+        code: ErrorCode.ENTITY_NOT_FOUND,
+        severity: Severity.ERROR,
+        message: `Routing proof ${id} not found`,
+        invariantRef: "INV §10.2",
+        affectedTarget: id,
+        suggestedAction: "Record a routing proof with chrono rtk prove first",
+      });
+    }
+    return this.mapRow(row);
+  }
+
+  /** Latest proof for one adapter/runtime/project scope (may be expired). */
+  latestFor(adapterId: string, runtime: string, projectId: string): RoutingProofRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM routing_proof
+         WHERE adapter_id = ? AND runtime = ? AND project_id = ?
+         ORDER BY valid_until DESC, rowid DESC LIMIT 1`
+      )
+      .get(adapterId, runtime, projectId) as RoutingProofRow | undefined;
+    return row === undefined ? null : this.mapRow(row);
+  }
+
+  private mapRow(row: RoutingProofRow): RoutingProofRecord {
+    return {
+      id: row.id as string,
+      adapterId: row.adapter_id as string,
+      runtime: row.runtime as string,
+      sessionId: row.session_id as string,
+      projectId: row.project_id as string,
+      rtkAttestationId: row.rtk_attestation_id as string,
+      binaryPath: row.binary_path as string,
+      binaryHash: row.binary_hash as string,
+      version: row.version as string,
+      proofCommand: row.proof_command as string,
+      commandHash: row.command_hash as string,
+      outputHash: row.output_hash as string,
+      exitStatus: row.exit_status as number,
+      gainAvailable: Boolean(row.gain_available),
+      timestamp: row.timestamp as string,
+      validUntil: row.valid_until as string,
+    };
   }
 }
 

@@ -10,7 +10,10 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
   buildApprovalPayload,
+  buildEnrollmentChallenge,
+  buildEnrollmentPayload,
   buildSessionAuthorizationPayload,
+  fingerprintPublicKey,
   generateApprovalKeyPair,
   signApprovalPayload,
 } from "@chrono/domain";
@@ -123,6 +126,45 @@ describe("CLI adapter registry", () => {
   let entrypoint: string;
   let adapterFile: string;
 
+/**
+ * TEST-ONLY enrollment helper: builds a valid ceremony proof with a
+ * caller-supplied timestamp (wall clock by default; pass the fixed clock
+ * time for clock-injected cores). Production callers MUST use
+ * `chrono enroll`, which adds /dev/tty confirmation and keychain custody.
+ */
+function enrollTestPo(
+  core: ChronoCore,
+  pair: { publicKeyPem: string; privateKeyPem: string },
+  timestamp = new Date().toISOString(),
+  rationale = "test enrollment"
+): void {
+  const nonce = randomBytes(16).toString("hex");
+  const fingerprint = fingerprintPublicKey(pair.publicKeyPem);
+  const confirmation = buildEnrollmentChallenge("default", fingerprint, nonce);
+  const signature = signApprovalPayload(
+    buildEnrollmentPayload({
+      projectId: "default",
+      fingerprint,
+      timestamp,
+      nonce,
+      authority: "PO",
+      rationale,
+      confirmation,
+    }),
+    pair.privateKeyPem
+  );
+  const res = core.enrollPo({
+    publicKeyPem: pair.publicKeyPem,
+    nonce,
+    timestamp,
+    rationale,
+    confirmation,
+    signature,
+  });
+  expect(res.ok).toBe(true);
+  expect(res.value?.fingerprint).toBe(fingerprint);
+}
+
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "chrono-adapter-cli-test-"));
     const core = new ChronoCore({ projectPath: tempDir });
@@ -130,7 +172,7 @@ describe("CLI adapter registry", () => {
       expect(core.init().ok).toBe(true);
       const pair = generateApprovalKeyPair();
       restoreTty = fakeInteractiveTerminal();
-      expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+      enrollTestPo(core, pair);
       privateKeyPem = pair.privateKeyPem;
       po = bootstrapPo(core, privateKeyPem);
     } finally {

@@ -16,8 +16,12 @@ import {
   SKILL_RUNTIME_PATHS,
   SKILL_UPSTREAM,
   buildApprovalPayload,
+  buildEnrollmentChallenge,
+  buildEnrollmentPayload,
   buildSessionAuthorizationPayload,
+  computeRevisionHash,
   convertSkillSource,
+  fingerprintPublicKey,
   generateApprovalKeyPair,
   hashSkillSource,
   signApprovalPayload,
@@ -212,6 +216,45 @@ describe("CLI dispatch", () => {
   let worker: { actor: string; session: TestSession };
   let entrypoint: string;
 
+/**
+ * TEST-ONLY enrollment helper: builds a valid ceremony proof with a
+ * caller-supplied timestamp (wall clock by default; pass the fixed clock
+ * time for clock-injected cores). Production callers MUST use
+ * `chrono enroll`, which adds /dev/tty confirmation and keychain custody.
+ */
+function enrollTestPo(
+  core: ChronoCore,
+  pair: { publicKeyPem: string; privateKeyPem: string },
+  timestamp = new Date().toISOString(),
+  rationale = "test enrollment"
+): void {
+  const nonce = randomBytes(16).toString("hex");
+  const fingerprint = fingerprintPublicKey(pair.publicKeyPem);
+  const confirmation = buildEnrollmentChallenge("default", fingerprint, nonce);
+  const signature = signApprovalPayload(
+    buildEnrollmentPayload({
+      projectId: "default",
+      fingerprint,
+      timestamp,
+      nonce,
+      authority: "PO",
+      rationale,
+      confirmation,
+    }),
+    pair.privateKeyPem
+  );
+  const res = core.enrollPo({
+    publicKeyPem: pair.publicKeyPem,
+    nonce,
+    timestamp,
+    rationale,
+    confirmation,
+    signature,
+  });
+  expect(res.ok).toBe(true);
+  expect(res.value?.fingerprint).toBe(fingerprint);
+}
+
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "chrono-run-cli-test-"));
     const core = new ChronoCore({ projectPath: tempDir, runtime: "test-runtime" });
@@ -219,7 +262,7 @@ describe("CLI dispatch", () => {
       expect(core.init().ok).toBe(true);
       const pair = generateApprovalKeyPair();
       restoreTty = fakeInteractiveTerminal();
-      expect(core.registerPoPublicKey(pair.publicKeyPem).ok).toBe(true);
+      enrollTestPo(core, pair);
       privateKeyPem = pair.privateKeyPem;
       gaspar = { actor: "gaspar", session: signedSession(core, "gaspar", privateKeyPem) };
       po = { actor: "PO", session: signedSession(core, "PO", privateKeyPem) };
@@ -241,9 +284,12 @@ describe("CLI dispatch", () => {
       approve(core, privateKeyPem, "module-approval", "MOD-0001", modRev);
       expect(core.transitionState("MOD-0001", "ModuleApproved", gaspar).ok).toBe(true);
       // Attestations + security posture for execution.
+      const rtkBin = join(tempDir, "fixture-rtk.sh");
+      writeFileSync(rtkBin, "#!/bin/sh\necho fixture-rtk 1.0.0-test\n", "utf8");
+      chmodSync(rtkBin, 0o755);
       expect(
         core.recordRtkAttestation(gaspar, {
-          binaryPath: "/usr/local/bin/rtk",
+          binaryPath: rtkBin,
           binaryIdentity: "rtk-test",
           version: "1.0.0-test",
           provenance: RTK_UPSTREAM,
@@ -298,6 +344,21 @@ describe("CLI dispatch", () => {
       const registrationHash = core.adapterRegistrationHash("fixture");
       const adapterApprovalId = approve(core, privateKeyPem, "adapter-registration", "fixture", registrationHash);
       expect(core.approveAdapter("fixture", adapterApprovalId, po).ok).toBe(true);
+      const fixtureProofCommand = JSON.stringify([rtkBin, "gain"]);
+      expect(
+        core.recordRoutingProof(gaspar, {
+          adapterId: "fixture",
+          binaryPath: rtkBin,
+          version: "1.0.0-test",
+          proofCommand: fixtureProofCommand,
+          commandHash: computeRevisionHash([rtkBin, "gain"]),
+          outputHash: computeRevisionHash("fixture gain ok"),
+          exitStatus: 0,
+          gainAvailable: true,
+          timestamp: new Date().toISOString(),
+          ttlSeconds: 86400,
+        }).ok
+      ).toBe(true);
       worker = { actor: "belthazar", session: signedSession(core, "belthazar", privateKeyPem, "MOD-0001") };
     } finally {
       core.close();

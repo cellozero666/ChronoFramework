@@ -9,15 +9,19 @@
 import { Command } from "commander";
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, accessSync, constants } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, accessSync, constants, openSync, readSync, writeSync, closeSync } from "node:fs";
 import { get } from "node:https";
-import { dirname, join } from "node:path";
+import { dirname, join, delimiter as pathDelimiter } from "node:path";
 import { ChronoCore } from "@chrono/core";
-import { RTK_UPSTREAM, SKILL_RELEASE, SKILL_RUNTIME_PATHS, buildApprovalPayload, buildSessionAuthorizationPayload, buildWaiverPayload, computeRevisionHash, convertSkillSource, generateApprovalKeyPair, parseSkillFrontmatter, signApprovalPayload, skillGeneratedHashes, skillRawSourceUrl, skillVendorPath, verifySkillRelease, type SkillRuntime } from "@chrono/domain";
+import { RTK_UPSTREAM, SKILL_RELEASE, SKILL_RUNTIME_PATHS, buildApprovalPayload, buildEnrollmentChallenge, buildEnrollmentPayload, buildSessionAuthorizationPayload, buildWaiverPayload, computeRevisionHash, convertSkillSource, fingerprintPublicKey, generateApprovalKeyPair, parseSkillFrontmatter, signApprovalPayload, skillGeneratedHashes, skillRawSourceUrl, skillVendorPath, verifySkillRelease, type SkillRuntime } from "@chrono/domain";
 import { CHRONO_VERSION } from "./version.js";
 import { buildOpencodePlugin } from "./opencode-plugin.js";
+import { CLAUDE_HOOK_RELATIVE_PATH, buildClaudeHook } from "./claude-hook.js";
+import { KIRO_HOOK_RELATIVE_PATH, buildKiroHook } from "./kiro-hook.js";
 
 export { buildOpencodePlugin };
+export { CLAUDE_HOOK_RELATIVE_PATH, buildClaudeHook };
+export { KIRO_HOOK_RELATIVE_PATH, buildKiroHook };
 import {
   MemoryKeyStore,
   OsKeychainStore,
@@ -98,6 +102,7 @@ interface CommandOpts {
   readonly followUp?: unknown;
   readonly module?: unknown;
   readonly wp?: unknown;
+  readonly spec?: unknown;
   readonly as?: unknown;
   readonly role?: unknown;
   readonly sessionToken?: unknown;
@@ -363,7 +368,7 @@ export function runApprove(
     if (privateKey === null) {
       return approvalRequired(
         "No PO signing key in the OS keychain",
-        "Generate one with chrono keys generate, then retry interactively",
+        "Run chrono enroll interactively to enroll a PO key, then retry",
         asJson
       );
     }
@@ -422,7 +427,7 @@ export function runWaive(
     if (privateKey === null) {
       return approvalRequired(
         "No PO signing key in the OS keychain",
-        "Generate one with chrono keys generate, then retry interactively",
+        "Run chrono enroll interactively to enroll a PO key, then retry",
         asJson
       );
     }
@@ -468,6 +473,191 @@ export function runWaive(
 export interface KeysGenerateOptions extends OutputOptions {
   readonly rotate?: boolean | undefined;
   readonly rationale?: string | undefined;
+}
+
+export interface EnrollOptions extends OutputOptions {
+  readonly rationale?: string | undefined;
+}
+
+/**
+ * Read one typed line from the controlling terminal (/dev/tty, CON on
+ * Windows), bypassing stdin entirely. Returns null when no controlling
+ * terminal is available or the line is empty: redirected, piped, or
+ * captured input can never satisfy human confirmation [SLICE-9 §9.1].
+ */
+export function readConfirmationFromTty(challenge: string): string | null {
+  const path = process.platform === "win32" ? "CON" : "/dev/tty";
+  let fd = -1;
+  try {
+    fd = openSync(path, "r+");
+  } catch {
+    return null;
+  }
+  try {
+    writeSync(fd, `\nCHRONO PO enrollment\nType exactly to confirm: ${challenge}\n> `);
+    let line = "";
+    const buf = Buffer.alloc(1);
+    for (;;) {
+      let n = 0;
+      try {
+        n = readSync(fd, buf, 0, 1, null);
+      } catch {
+        return null;
+      }
+      if (n === 0) {
+        break;
+      }
+      const ch = buf.toString("utf8", 0, n);
+      if (ch === "\n") {
+        break;
+      }
+      if (ch === "\r") {
+        continue;
+      }
+      line += ch;
+      if (line.length > 512) {
+        break;
+      }
+    }
+    const typed = line.trim();
+    return typed.length === 0 ? null : typed;
+  } catch {
+    return null;
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      // ignore close errors; the read result stands
+    }
+  }
+}
+
+/**
+ * Initial PO enrollment ceremony: `chrono enroll` [SLICE-9 §9.1, P2.10].
+ *
+ * The CLI-owned ceremony requires a live terminal, an explicit rationale,
+ * a human-typed confirmation read from /dev/tty (never stdin), and
+ * possession of the freshly generated private key (used to sign the
+ * enrollment proof). The private key reaches the OS keychain BEFORE the
+ * Core persists anything, and the previous keychain value is restored if
+ * enrollment fails — partial failure never bricks PO authority and never
+ * leaks key material to output, logs, or the project.
+ */
+export function runEnroll(
+  projectPath: string,
+  options: EnrollOptions = {},
+  deps: HumanCommandDeps = productionDeps(),
+  confirm: (challenge: string) => string | null = readConfirmationFromTty
+): CliOutput {
+  const asJson = options.json === true;
+  if (!deps.interactive) {
+    return humanOnlyRefusal("enroll", asJson);
+  }
+  const rationale = options.rationale?.trim() ?? "";
+  if (rationale.length === 0) {
+    return coreError(
+      { code: "VALIDATION_ERROR", severity: "ERROR", message: "enroll requires --rationale bound into the enrollment record" },
+      asJson
+    );
+  }
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    if (core.poKeyRevision() !== null) {
+      return approvalRequired(
+        "A PO key is already enrolled for this project",
+        "Rotate the active key with chrono keys generate --rotate; re-enrollment is denied",
+        asJson
+      );
+    }
+    const pair = generateApprovalKeyPair();
+    const fingerprint = fingerprintPublicKey(pair.publicKeyPem);
+    const nonce = randomBytes(16).toString("hex");
+    const timestamp = new Date().toISOString();
+    const challenge = buildEnrollmentChallenge("default", fingerprint, nonce);
+    const typed = confirm(challenge);
+    if (typed === null) {
+      return approvalRequired(
+        "PO enrollment requires a controlling terminal with typed confirmation",
+        "Run chrono enroll in a live terminal and type the displayed challenge; redirected input is denied",
+        asJson
+      );
+    }
+    if (typed !== challenge) {
+      return coreError(
+        { code: "VALIDATION_ERROR", severity: "ERROR", message: "Enrollment confirmation does not match the ceremony challenge" },
+        asJson
+      );
+    }
+    let signature: string;
+    try {
+      signature = signApprovalPayload(
+        buildEnrollmentPayload({
+          projectId: "default",
+          fingerprint,
+          timestamp,
+          nonce,
+          authority: "PO",
+          rationale,
+          confirmation: typed,
+        }),
+        pair.privateKeyPem
+      );
+    } catch {
+      return coreError(
+        { code: "SIGNATURE_INVALID", severity: "ERROR", message: "Freshly generated PO key failed to sign" },
+        asJson
+      );
+    }
+    const previous = readPoKey(deps.store);
+    try {
+      deps.store.writeKey(PO_KEY_ACCOUNT, pair.privateKeyPem);
+    } catch (e) {
+      return keychainFailure(e, asJson);
+    }
+    if (readPoKey(deps.store) !== pair.privateKeyPem) {
+      restorePreviousKey(deps.store, previous);
+      return keychainFailure(
+        new Error("Primary key verification failed before enrollment; previous custody restored."),
+        asJson
+      );
+    }
+    const enrolled = core.enrollPo({
+      publicKeyPem: pair.publicKeyPem,
+      nonce,
+      timestamp,
+      rationale,
+      confirmation: typed,
+      signature,
+    });
+    if (!enrolled.ok) {
+      restorePreviousKey(deps.store, previous);
+      return coreError(enrolled.error, asJson);
+    }
+    const body = asJson
+      ? JSON.stringify({ ok: true, fingerprint: enrolled.value?.fingerprint }, null, 2)
+      : ["PO enrolled.", `  key fingerprint: ${enrolled.value?.fingerprint ?? ""}`, "  private: OS keychain"].join("\n");
+    return { exitCode: 0, stdout: body, stderr: "" };
+  } finally {
+    core.close();
+  }
+}
+
+/** Best-effort custody restore after a failed enrollment (never throws). */
+function restorePreviousKey(store: KeyStore, previous: string | null): void {
+  try {
+    if (previous === null) {
+      store.deleteKey(PO_KEY_ACCOUNT);
+    } else {
+      store.writeKey(PO_KEY_ACCOUNT, previous);
+    }
+  } catch {
+    // ignore: the failure is already being reported
+  }
 }
 
 /**
@@ -519,6 +709,13 @@ export function runKeysGenerate(
         );
       }
     }
+    if (registeredRevision === null) {
+      return approvalRequired(
+        "No PO key enrolled for this project",
+        "Run chrono enroll interactively to complete the enrollment ceremony first",
+        asJson
+      );
+    }
 
     const pair = generateApprovalKeyPair();
     // Stage the new private key before changing project trust: if Core
@@ -529,52 +726,44 @@ export function runKeysGenerate(
     } catch (e) {
       return keychainFailure(e, asJson);
     }
-    if (registeredRevision === null) {
-      const registered = core.registerPoPublicKey(pair.publicKeyPem);
-      if (!registered.ok) {
-        cleanupStaging(deps.store);
-        return coreError(registered.error, asJson);
-      }
-    } else {
-      if (existingPrivate === null) {
-        cleanupStaging(deps.store);
-        return approvalRequired(
-          "A PO public key is already registered, but no matching private key is available",
-          "Recover the registered private key; keys generate cannot replace it without a signed rotation",
-          asJson
-        );
-      }
-      const timestamp = new Date().toISOString();
-      let signature: string;
-      try {
-        signature = signApprovalPayload(
-          buildApprovalPayload({
-            action: "key-rotation",
-            scopeArtifactId: "PO-KEY",
-            scopeRevision: registeredRevision,
-            authority: "PO",
-            rationale: options.rationale?.trim() ?? "",
-            timestamp,
-          }),
-          existingPrivate
-        );
-      } catch {
-        cleanupStaging(deps.store);
-        return coreError(
-          { code: "SIGNATURE_INVALID", severity: "ERROR", message: "Active PO key is not a valid PEM private key" },
-          asJson
-        );
-      }
-      const registered = core.registerPoPublicKey(pair.publicKeyPem, {
-        signature,
-        authority: "PO",
-        rationale: options.rationale?.trim() ?? "",
-        timestamp,
-      });
-      if (!registered.ok) {
-        cleanupStaging(deps.store);
-        return coreError(registered.error, asJson);
-      }
+    if (existingPrivate === null) {
+      cleanupStaging(deps.store);
+      return approvalRequired(
+        "A PO public key is already registered, but no matching private key is available",
+        "Recover the registered private key; keys generate cannot replace it without a signed rotation",
+        asJson
+      );
+    }
+    const timestamp = new Date().toISOString();
+    let signature: string;
+    try {
+      signature = signApprovalPayload(
+        buildApprovalPayload({
+          action: "key-rotation",
+          scopeArtifactId: "PO-KEY",
+          scopeRevision: registeredRevision,
+          authority: "PO",
+          rationale: options.rationale?.trim() ?? "",
+          timestamp,
+        }),
+        existingPrivate
+      );
+    } catch {
+      cleanupStaging(deps.store);
+      return coreError(
+        { code: "SIGNATURE_INVALID", severity: "ERROR", message: "Active PO key is not a valid PEM private key" },
+        asJson
+      );
+    }
+    const registered = core.registerPoPublicKey(pair.publicKeyPem, {
+      signature,
+      authority: "PO",
+      rationale: options.rationale?.trim() ?? "",
+      timestamp,
+    });
+    if (!registered.ok) {
+      cleanupStaging(deps.store);
+      return coreError(registered.error, asJson);
     }
 
     try {
@@ -710,6 +899,7 @@ export interface GateOptions {
   readonly gate: string;
   readonly module?: string | undefined;
   readonly wp?: string | undefined;
+  readonly spec?: string | undefined;
   readonly as?: string | undefined;
   readonly role?: string | undefined;
   readonly sessionToken?: string | undefined;
@@ -819,15 +1009,55 @@ export function runGate(projectPath: string, options: GateOptions): CliOutput {
         `DENIED [${result.error?.code ?? "COMPLETION_DENIED"}]: ${result.error?.message ?? "denied"}`
       );
     }
-    if (
-      options.gate === "architecture-approval" ||
-      options.gate === "spec-ready" ||
-      options.gate === "verification"
-    ) {
+    if (options.gate === "architecture-approval") {
+      const session = resolveSessionToken(options.sessionToken);
+      if (session === null) {
+        return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "architecture-approval gate requires --session-token (or CHRONO_SESSION_TOKEN)" }, "Error [VALIDATION_ERROR]: architecture-approval gate requires --session-token (or CHRONO_SESSION_TOKEN)");
+      }
+      const result = core.gateArchitectureApproval({ actor: options.as, session });
+      if (result.ok) {
+        return respond(0, { result: "AUTHORIZED" }, "AUTHORIZED");
+      }
       return respond(
-        2,
-        { result: "ERROR", code: "CONFIG_ERROR", reason: `gate '${options.gate}' is not implemented yet` },
-        `Error [CONFIG_ERROR]: gate '${options.gate}' is not implemented yet`
+        1,
+        { result: "DENIED", code: result.error?.code ?? "EXECUTION_DENIED", reason: result.error?.message ?? "denied" },
+        `DENIED [${result.error?.code ?? "EXECUTION_DENIED"}]: ${result.error?.message ?? "denied"}`
+      );
+    }
+    if (options.gate === "spec-ready") {
+      if (options.spec === undefined || options.spec.length === 0) {
+        return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "spec-ready gate requires --spec" }, "Error [VALIDATION_ERROR]: spec-ready gate requires --spec");
+      }
+      const session = resolveSessionToken(options.sessionToken);
+      if (session === null) {
+        return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "spec-ready gate requires --session-token (or CHRONO_SESSION_TOKEN)" }, "Error [VALIDATION_ERROR]: spec-ready gate requires --session-token (or CHRONO_SESSION_TOKEN)");
+      }
+      const result = core.gateSpecReady(options.spec, { actor: options.as, session });
+      if (result.ok) {
+        return respond(0, { result: "AUTHORIZED" }, "AUTHORIZED");
+      }
+      return respond(
+        1,
+        { result: "DENIED", code: result.error?.code ?? "EXECUTION_DENIED", reason: result.error?.message ?? "denied" },
+        `DENIED [${result.error?.code ?? "EXECUTION_DENIED"}]: ${result.error?.message ?? "denied"}`
+      );
+    }
+    if (options.gate === "verification") {
+      if (options.module === undefined || options.module.length === 0) {
+        return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "verification gate requires --module" }, "Error [VALIDATION_ERROR]: verification gate requires --module");
+      }
+      const session = resolveSessionToken(options.sessionToken);
+      if (session === null) {
+        return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "verification gate requires --session-token (or CHRONO_SESSION_TOKEN)" }, "Error [VALIDATION_ERROR]: verification gate requires --session-token (or CHRONO_SESSION_TOKEN)");
+      }
+      const result = core.gateVerification(options.module, options.wp ?? null, { actor: options.as, session });
+      if (result.ok) {
+        return respond(0, { result: "AUTHORIZED" }, "AUTHORIZED");
+      }
+      return respond(
+        1,
+        { result: "DENIED", code: result.error?.code ?? "COMPLETION_DENIED", reason: result.error?.message ?? "denied" },
+        `DENIED [${result.error?.code ?? "COMPLETION_DENIED"}]: ${result.error?.message ?? "denied"}`
       );
     }
     return respond(
@@ -931,6 +1161,144 @@ export function runRtkVerify(
     const body = asJson
       ? JSON.stringify({ ok: true, id: recorded.value?.id, version, routingProven: false }, null, 2)
       : `RTK verified (${version}); attestation '${recorded.value?.id}'. Routing is recorded unproven: per-command routing enforcement is adapter duty (see RUNTIME §6.3).`;
+    return { exitCode: 0, stdout: body, stderr: "" };
+  } finally {
+    core.close();
+  }
+}
+
+export interface RtkProveOptions extends OutputOptions {
+  readonly adapter: string;
+  readonly as?: string | undefined;
+  readonly session?: { id: string; token: string } | undefined;
+  readonly binary?: string | undefined;
+  readonly ttlSeconds?: number | undefined;
+  readonly timeoutSeconds?: number | undefined;
+  readonly command: string[];
+}
+
+/**
+ * Resolve a binary name to an absolute executable path for proof
+ * binding (PATH search, no shell). Returns null when not found.
+ */
+export function resolveExecutable(binary: string): string | null {
+  if (binary.length === 0) {
+    return null;
+  }
+  const candidates =
+    binary.includes("/") || (process.platform === "win32" && binary.includes("\\"))
+      ? [binary]
+      : (process.env["PATH"] ?? "").split(pathDelimiter).map((dir) => join(dir, binary));
+  const suffixed =
+    process.platform === "win32"
+      ? candidates.flatMap((c) => [c, `${c}.exe`, `${c}.cmd`, `${c}.bat`])
+      : candidates;
+  for (const candidate of suffixed) {
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+/**
+ * RTK routing proof: `chrono rtk prove` (Slice 9 §9.3, [P8.5, INV §8.4]).
+ *
+ * Executes a command through the genuine RTK binary (argv[0] must be that
+ * binary: grants cannot smuggle another binary, same bar as `run`) and
+ * records an append-only proof binding adapter, runtime, session scope,
+ * attestation, binary content hash, command/output hashes, and exit
+ * status. Only exit-0 routings prove effectiveness. Dispatch consumes
+ * these proofs; the `routingTestPassed` attestation flag alone never
+ * authorizes anything.
+ */
+export function runRtkProve(
+  projectPath: string,
+  options: RtkProveOptions,
+  spawn: (cmd: string, args: string[], timeoutMs: number, env: Record<string, string>) => SpawnResult = defaultSpawn
+): CliOutput {
+  const asJson = options.json === true;
+  const fail = (exitCode: number, code: string, reason: string): CliOutput =>
+    asJson
+      ? { exitCode, stdout: JSON.stringify({ ok: false, error: { code, message: reason } }, null, 2), stderr: "" }
+      : { exitCode, stdout: "", stderr: `Error [${code}]: ${reason}` };
+  if (options.adapter.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "rtk prove requires --adapter <registered runtime id>");
+  }
+  if (options.as === undefined || options.as.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "rtk prove requires --as <actor> matching the caller session");
+  }
+  if (options.session === undefined) {
+    return fail(2, "VALIDATION_ERROR", "rtk prove requires --session-token");
+  }
+  if (options.command.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "rtk prove requires a command after --");
+  }
+  const ttlSeconds = options.ttlSeconds ?? 3600;
+  if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0 || ttlSeconds > 86400) {
+    return fail(2, "VALIDATION_ERROR", "rtk prove --ttl must be within 1 second and 24 hours");
+  }
+  const timeoutSeconds = options.timeoutSeconds ?? 120;
+  if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > 3600) {
+    return fail(2, "VALIDATION_ERROR", "rtk prove --timeout must be within 1 second and 1 hour");
+  }
+  const binary = options.binary ?? "rtk";
+  const [commandBinary, ...commandArgs] = options.command as [string, ...string[]];
+  if (commandBinary !== binary) {
+    return fail(2, "VALIDATION_ERROR", `rtk prove command must start with the RTK binary '${binary}': proofs cannot smuggle another binary`);
+  }
+  const resolved = resolveExecutable(binary);
+  if (resolved === null) {
+    return fail(1, "BLOCKED_RTK", `RTK binary '${binary}' not found: install Rust Token Killer from ${RTK_UPSTREAM}`);
+  }
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    const versionResult = spawn(resolved, ["--version"], 30000, {});
+    if (versionResult.status !== 0) {
+      return fail(1, "BLOCKED_RTK", `RTK binary '${binary}' --version failed`);
+    }
+    const version = versionResult.stdout.trim().split("\n")[0] ?? "unknown";
+    const gainResult = spawn(resolved, ["gain"], 120000, {});
+    if (gainResult.status !== 0) {
+      return fail(1, "RTK_NAME_COLLISION", "rtk gain failed: the binary is not proven Rust Token Killer");
+    }
+    const ran = spawn(resolved, commandArgs, Math.floor(timeoutSeconds * 1000), {});
+    if (ran.timedOut) {
+      return fail(1, "RTK_ROUTING_FAILURE", `proof command timed out after ${timeoutSeconds}s: no routing proven`);
+    }
+    if (ran.status !== 0) {
+      return fail(1, "RTK_ROUTING_FAILURE", `proof command failed with exit ${String(ran.status)}: only successful routings prove effectiveness`);
+    }
+    const argv = [resolved, ...commandArgs];
+    const recorded = core.recordRoutingProof(
+      { actor: options.as, session: options.session },
+      {
+        adapterId: options.adapter,
+        binaryPath: resolved,
+        version,
+        proofCommand: JSON.stringify(argv),
+        commandHash: computeRevisionHash(argv),
+        outputHash: computeRevisionHash(ran.stdout),
+        exitStatus: 0,
+        gainAvailable: true,
+        timestamp: new Date().toISOString(),
+        ttlSeconds,
+      }
+    );
+    if (!recorded.ok) {
+      return coreError(recorded.error, asJson);
+    }
+    const body = asJson
+      ? JSON.stringify({ ok: true, id: recorded.value?.id, adapter: options.adapter, version }, null, 2)
+      : `Routing proven through '${binary}' (${version}) for adapter '${options.adapter}': proof '${recorded.value?.id ?? ""}'.`;
     return { exitCode: 0, stdout: body, stderr: "" };
   } finally {
     core.close();
@@ -1218,7 +1586,7 @@ export function runSessionOpen(
       if (privateKey === null) {
         return approvalRequired(
           "Privileged sessions require the PO signing key from the OS keychain",
-          "Generate one with chrono keys generate, then retry interactively with --rationale",
+          "Run chrono enroll interactively to enroll a PO key, then retry with --rationale",
           asJson
         );
       }
@@ -1921,9 +2289,15 @@ export function runSetup(
       }
     }
     const pluginPath = join(projectPath, ".opencode", "plugins", "chrono-gate.js");
+    const claudeHookPath = join(projectPath, CLAUDE_HOOK_RELATIVE_PATH);
+    const kiroHookPath = join(projectPath, KIRO_HOOK_RELATIVE_PATH);
     try {
       mkdirSync(dirname(pluginPath), { recursive: true });
       writeFileSync(pluginPath, buildOpencodePlugin(), "utf8");
+      mkdirSync(dirname(claudeHookPath), { recursive: true });
+      writeFileSync(claudeHookPath, buildClaudeHook(), "utf8");
+      mkdirSync(dirname(kiroHookPath), { recursive: true });
+      writeFileSync(kiroHookPath, buildKiroHook(), "utf8");
     } catch (e) {
       return keychainFailure(e, asJson);
     }
@@ -1938,6 +2312,7 @@ export function runSetup(
             skill: "current",
             proofsRun: proofs.length,
             plugin: ".opencode/plugins/chrono-gate.js",
+            hooks: [".opencode/plugins/chrono-gate.js", CLAUDE_HOOK_RELATIVE_PATH, KIRO_HOOK_RELATIVE_PATH],
           },
           null,
           2
@@ -1950,6 +2325,7 @@ export function runSetup(
         "  skill: current, artifacts intact",
         `  proofs: ${String(proofs.length)} green`,
         "  plugin: .opencode/plugins/chrono-gate.js",
+        `  hooks: .opencode/plugins/chrono-gate.js, ${CLAUDE_HOOK_RELATIVE_PATH}, ${KIRO_HOOK_RELATIVE_PATH}`,
       ].join("\n");
     return { exitCode: 0, stdout: body, stderr: "" };
   } finally {
@@ -2085,11 +2461,28 @@ export function createProgram(cwd: string): Command {
       emitProgramResult(program, out);
     });
 
+  program
+    .command("enroll")
+    .description("Enroll the initial PO signing key through the interactive enrollment ceremony (one time per project)")
+    .requiredOption("--rationale <text>", "rationale bound into the enrollment record")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      emitProgramResult(
+        program,
+        runEnroll(projectPath, {
+          ...(typeof opts.rationale === "string" ? { rationale: opts.rationale } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
   const keys = program.command("keys").description("PO signing-key management");
 
   keys
     .command("generate")
-    .description("Generate an Ed25519 PO key (private to OS keychain, public to project)")
+    .description("Rotate the enrolled PO key with a signed rotation (initial trust requires chrono enroll)")
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--rotate", "replace the active key with a signed rotation")
     .option("--rationale <text>", "rationale bound into a rotation signature")
@@ -2109,9 +2502,10 @@ export function createProgram(cwd: string): Command {
   program
     .command("gate")
     .description("Evaluate a Core gate (adapters and pre-tool hooks must obey the result)")
-    .argument("<gate>", "gate name (execution, completion)")
+    .argument("<gate>", "gate name (execution, completion, architecture-approval, spec-ready, verification)")
     .option("--module <id>", "module scope")
     .option("--wp <id>", "work-package scope")
+    .option("--spec <id>", "spec scope (spec-ready gate)")
     .option("--as <actor>", "requesting identity (canonical role)")
     .option("--role <role>", "assigned implementation role (execution gate)")
     .option("--session-token <id/token>", "executor session credential (or CHRONO_SESSION_TOKEN)")
@@ -2126,6 +2520,7 @@ export function createProgram(cwd: string): Command {
           gate,
           module: typeof opts.module === "string" ? opts.module : undefined,
           wp: typeof opts.wp === "string" ? opts.wp : undefined,
+          spec: typeof opts.spec === "string" ? opts.spec : undefined,
           as: typeof opts.as === "string" ? opts.as : undefined,
           role: typeof opts.role === "string" ? opts.role : undefined,
           sessionToken: typeof opts.sessionToken === "string" ? opts.sessionToken : undefined,
@@ -2162,6 +2557,38 @@ export function createProgram(cwd: string): Command {
         runRtkVerify(projectPath, {
           ...(typeof opts.binary === "string" ? { binaryPath: opts.binary } : {}),
           ...(token === null ? {} : { session: token }),
+        })
+      );
+    });
+
+  rtk
+    .command("prove")
+    .description("Execute a command through the RTK binary and record a routing proof (fail-closed)")
+    .requiredOption("--adapter <id>", "registered runtime adapter id")
+    .requiredOption("--as <actor>", "requesting identity (canonical role, matching the caller session)")
+    .option("--binary <path>", "rtk binary (default: rtk from PATH)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--ttl <seconds>", "proof lifetime in seconds (default 3600)")
+    .option("--timeout <seconds>", "command timeout in seconds (default 120)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .argument("<command...>", "command routed through the RTK binary (must start with it)")
+    .action((command: string[], opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
+      const ttl = typeof opts.ttl === "string" ? Number(opts.ttl) : undefined;
+      const timeout = typeof opts.timeout === "string" ? Number(opts.timeout) : undefined;
+      emitProgramResult(
+        program,
+        runRtkProve(projectPath, {
+          adapter: String(opts.adapter ?? ""),
+          ...(typeof opts.as === "string" ? { as: opts.as } : {}),
+          ...(token === null ? {} : { session: token }),
+          ...(typeof opts.binary === "string" ? { binary: opts.binary } : {}),
+          ...(ttl !== undefined && Number.isFinite(ttl) ? { ttlSeconds: ttl } : {}),
+          ...(timeout !== undefined && Number.isFinite(timeout) ? { timeoutSeconds: timeout } : {}),
+          command,
+          json: opts.json === true,
         })
       );
     });

@@ -10,13 +10,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
+  buildEnrollmentChallenge,
+  buildEnrollmentPayload,
   buildSessionAuthorizationPayload,
+  fingerprintPublicKey,
   generateApprovalKeyPair,
   signApprovalPayload,
 } from "@chrono/domain";
 import { ChronoCore } from "@chrono/core";
 import {
   runApprove,
+  runEnroll,
   runInit,
   runKeysGenerate,
   runWaive,
@@ -61,6 +65,51 @@ function openGasparWithKey(core: ChronoCore, privateKeyPem: string): { actor: st
   );
   expect(opened.ok).toBe(true);
   return { actor: "gaspar", session: { id: opened.value!.id, token: opened.value!.token } };
+}
+
+/**
+ * TEST-ONLY enrollment helper: builds a valid ceremony proof with a
+ * caller-supplied timestamp (wall clock by default; pass the fixed clock
+ * time for clock-injected cores). Production callers MUST use
+ * `chrono enroll`, which adds /dev/tty confirmation and keychain custody.
+ */
+function enrollTestPo(
+  core: ChronoCore,
+  pair: { publicKeyPem: string; privateKeyPem: string },
+  timestamp = new Date().toISOString(),
+  rationale = "test enrollment"
+): void {
+  const nonce = randomBytes(16).toString("hex");
+  const fingerprint = fingerprintPublicKey(pair.publicKeyPem);
+  const confirmation = buildEnrollmentChallenge("default", fingerprint, nonce);
+  const signature = signApprovalPayload(
+    buildEnrollmentPayload({
+      projectId: "default",
+      fingerprint,
+      timestamp,
+      nonce,
+      authority: "PO",
+      rationale,
+      confirmation,
+    }),
+    pair.privateKeyPem
+  );
+  const res = core.enrollPo({
+    publicKeyPem: pair.publicKeyPem,
+    nonce,
+    timestamp,
+    rationale,
+    confirmation,
+    signature,
+  });
+  expect(res.ok).toBe(true);
+  expect(res.value?.fingerprint).toBe(fingerprint);
+}
+
+/** TEST-ONLY confirmation: echoes the challenge after asserting its shape. */
+function confirmEcho(challenge: string): string {
+  expect(challenge).toMatch(/^enroll-default-[0-9a-f]{8}-[0-9a-f]{8}$/);
+  return challenge;
 }
 
 
@@ -144,11 +193,11 @@ describe("CLI human-only authority", () => {
     expect(parsed.error.code).toBe("APPROVAL_REQUIRED");
   });
 
-  it("completes keys-generate → approve end to end through the keychain store", () => {
+  it("completes enroll → approve end to end through the keychain store", () => {
     const restoreTty = fakeInteractiveTerminal();
     const store = new MemoryKeyStore();
     const deps = interactive(store);
-    expect(runKeysGenerate(tempDir, {}, deps).exitCode).toBe(0);
+    expect(runEnroll(tempDir, { rationale: "test enrollment" }, deps, confirmEcho).exitCode).toBe(0);
 
     const core = new ChronoCore({ projectPath: tempDir });
     let revision: string;
@@ -189,7 +238,7 @@ describe("CLI human-only authority", () => {
     const core = new ChronoCore({ projectPath: tempDir });
     let revision: string;
     try {
-      expect(core.registerPoPublicKey(registered.publicKeyPem).ok).toBe(true);
+      enrollTestPo(core, registered);
       const gaspar = openGasparWithKey(core, registered.privateKeyPem);
       expect(core.registerSpec("SP-0001", "DRAFT", SPEC, gaspar).ok).toBe(true);
       revision = core.getArtifact("SP-0001").revision;
@@ -210,7 +259,7 @@ describe("CLI human-only authority", () => {
     const restoreTty = fakeInteractiveTerminal();
     const store = new MemoryKeyStore();
     const deps = interactive(store);
-    expect(runKeysGenerate(tempDir, {}, deps).exitCode).toBe(0);
+    expect(runEnroll(tempDir, { rationale: "test enrollment" }, deps, confirmEcho).exitCode).toBe(0);
 
     const core = new ChronoCore({ projectPath: tempDir });
     let revision: string;
@@ -238,7 +287,7 @@ describe("CLI human-only authority", () => {
     const restoreTty = fakeInteractiveTerminal();
     const store = new MemoryKeyStore();
     const deps = interactive(store);
-    expect(runKeysGenerate(tempDir, {}, deps).exitCode).toBe(0);
+    expect(runEnroll(tempDir, { rationale: "test enrollment" }, deps, confirmEcho).exitCode).toBe(0);
     const active = store.readKey("po");
     expect(active).not.toBeNull();
 
@@ -254,7 +303,7 @@ describe("CLI human-only authority", () => {
     const restoreTty = fakeInteractiveTerminal();
     const store = new MemoryKeyStore();
     const deps = interactive(store);
-    expect(runKeysGenerate(tempDir, {}, deps).exitCode).toBe(0);
+    expect(runEnroll(tempDir, { rationale: "test enrollment" }, deps, confirmEcho).exitCode).toBe(0);
     const active = store.readKey("po");
     expect(active).not.toBeNull();
 
@@ -275,7 +324,7 @@ describe("CLI human-only authority", () => {
     const registered = generateApprovalKeyPair();
     const core = new ChronoCore({ projectPath: tempDir });
     try {
-      expect(core.registerPoPublicKey(registered.publicKeyPem).ok).toBe(true);
+      enrollTestPo(core, registered);
     } finally {
       core.close();
     }
@@ -290,5 +339,95 @@ describe("CLI human-only authority", () => {
     expect(store.readKey("po")).toBe(unrelated.privateKeyPem);
     expect(store.readKey(PO_KEY_STAGING_ACCOUNT)).toBeNull();
     restoreTty();
+  });
+});
+
+describe("CLI PO enrollment ceremony [SLICE-9 §9.1]", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-enroll-cli-test-"));
+    expect(runInit(tempDir).exitCode).toBe(0);
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("enrolls with typed confirmation and never exposes the private key", () => {
+    const restoreTty = fakeInteractiveTerminal();
+    const store = new MemoryKeyStore();
+    try {
+      const out = runEnroll(tempDir, { rationale: "first custodian" }, interactive(store), confirmEcho);
+      expect(out.exitCode).toBe(0);
+      expect(out.stdout).toContain("fingerprint");
+      const stored = store.readKey("po");
+      expect(stored).not.toBeNull();
+      expect(out.stdout).not.toContain(stored!);
+      expect(out.stderr).not.toContain(stored!);
+      expect(out.stdout).not.toContain("PRIVATE");
+      const check = new ChronoCore({ projectPath: tempDir });
+      try {
+        expect(check.poKeyRevision()).toMatch(/^sha256:[0-9a-f]{64}$/);
+      } finally {
+        check.close();
+      }
+    } finally {
+      restoreTty();
+    }
+  });
+
+  it("refuses without rationale, without TTY, and without a controlling terminal", () => {
+    const restoreTty = fakeInteractiveTerminal();
+    const store = new MemoryKeyStore();
+    try {
+      expect(runEnroll(tempDir, {}, interactive(store), confirmEcho).exitCode).toBe(1);
+      expect(runEnroll(tempDir, { rationale: "x" }, nonInteractive(store), confirmEcho).exitCode).toBe(1);
+      const noTty = runEnroll(tempDir, { rationale: "x" }, interactive(store), () => null);
+      expect(noTty.exitCode).toBe(1);
+      expect(noTty.stderr).toContain("APPROVAL_REQUIRED");
+      const check = new ChronoCore({ projectPath: tempDir });
+      try {
+        expect(check.poKeyRevision()).toBeNull();
+      } finally {
+        check.close();
+      }
+      expect(store.readKey("po")).toBeNull();
+    } finally {
+      restoreTty();
+    }
+  });
+
+  it("refuses mistyped confirmation and persists nothing", () => {
+    const restoreTty = fakeInteractiveTerminal();
+    const store = new MemoryKeyStore();
+    try {
+      const out = runEnroll(tempDir, { rationale: "x" }, interactive(store), () => "enroll-wrong");
+      expect(out.exitCode).toBe(1);
+      expect(out.stderr).toContain("VALIDATION_ERROR");
+      const check = new ChronoCore({ projectPath: tempDir });
+      try {
+        expect(check.poKeyRevision()).toBeNull();
+      } finally {
+        check.close();
+      }
+      expect(store.readKey("po")).toBeNull();
+    } finally {
+      restoreTty();
+    }
+  });
+
+  it("refuses a second enrollment and preserves existing custody on Core failure", () => {
+    const restoreTty = fakeInteractiveTerminal();
+    const store = new MemoryKeyStore();
+    try {
+      expect(runEnroll(tempDir, { rationale: "first" }, interactive(store), confirmEcho).exitCode).toBe(0);
+      const first = store.readKey("po");
+      const second = runEnroll(tempDir, { rationale: "second" }, interactive(store), confirmEcho);
+      expect(second.exitCode).toBe(1);
+      expect(store.readKey("po")).toBe(first);
+    } finally {
+      restoreTty();
+    }
   });
 });

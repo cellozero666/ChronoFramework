@@ -10,5 +10,6 @@ export {
   type CoreConfig,
   type CoreResult,
   type GateDecision,
+  type PoEnrollment,
   type SessionAuthorization,
 } from "./chrono-core.js";

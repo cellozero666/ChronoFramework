@@ -108,11 +108,16 @@ export {
 // Human-authority cryptography [ADR-003, CORE §8]
 export {
   APPROVAL_ACTIONS,
+  ENROLLMENT_FRESHNESS_MS,
+  ROUTING_PROOF_FRESHNESS_MS,
   RTK_UPSTREAM,
   SKILL_UPSTREAM,
   buildApprovalPayload,
+  buildEnrollmentChallenge,
+  buildEnrollmentPayload,
   buildSessionAuthorizationPayload,
   buildWaiverPayload,
+  fingerprintPublicKey,
   generateApprovalKeyPair,
   parseApprovalPublicKey,
   signApprovalPayload,
@@ -120,6 +125,7 @@ export {
   type ApprovalAction,
   type ApprovalKeyPair,
   type ApprovalPayload,
+  type EnrollmentPayload,
   type SessionAuthorizationPayload,
   type WaiverPayload,
 } from "./authority.js";
