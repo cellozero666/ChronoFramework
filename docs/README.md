@@ -15,9 +15,9 @@ All CHRONO-authored software and documentation in this repository are distribute
 
 If documents appear to conflict, apply the precedence above, stop affected implementation, and route a documented decision to the Product Owner. An implementation agent may clarify technical detail through the Domain/Core specifications but may not invent product policy, weaken security, or override an approved decision.
 
-## Planned generated documentation
+## Domain and Core documentation
 
-The implementation phases will add:
+The implementation phases produced the following normative specifications:
 
 ```text
 docs/
@@ -30,4 +30,6 @@ docs/
     └── RUNTIME-CONTRACT.md
 ```
 
-These files do not exist yet and MUST be produced and approved at the gates defined in the implementation plan before Core code is written.
+These files exist and govern the implementation. Current corrective work and
+its blocking acceptance gate are documented in
+[`implementation/SLICE-5-REMEDIATION.md`](implementation/SLICE-5-REMEDIATION.md).

@@ -100,6 +100,15 @@ Verification:  PENDING | RUNNING | FAILED | PASSED | WAIVED
 
 **Gate:** direct API and CLI produce the same decisions; mandatory gates cannot be bypassed by malformed state or agent instructions.
 
+### Slice 5 corrective gate
+
+The initial Core/persistence/CLI implementation MUST satisfy
+[`SLICE-5-REMEDIATION.md`](SLICE-5-REMEDIATION.md) before work proceeds to later
+execution-gate or adapter slices. A green build or a previously reported test
+count does not satisfy this gate. Fresh installation, lint, tests, adversarial
+Core tests, immutable revision/audit behavior, and fail-closed authorization
+must all pass from a clean checkout without manually created workspace links.
+
 ### Mandatory security guardrails
 
 Implement security as Core-enforced state, not prompt-only guidance:

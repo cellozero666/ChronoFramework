@@ -1,0 +1,30 @@
+{
+  "name": "@chrono/core",
+  "version": "0.1.0",
+  "description": "CHRONO Framework \u2014 deterministic Core: state, gates, authorization, approvals",
+  "license": "Apache-2.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "@chrono/domain": "workspace:*",
+    "@chrono/persistence": "workspace:*",
+    "better-sqlite3": "^9.6.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

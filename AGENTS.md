@@ -14,6 +14,10 @@ Before changing implementation files, read completely:
 4. `docs/architecture/REFERENCE-ARCHITECTURE.md`
 5. `docs/implementation/IMPLEMENTATION-PLAN.md`
 
+If `docs/implementation/SLICE-5-REMEDIATION.md` exists and its status is not
+`COMPLETE`, read it next and satisfy its blocking gate before continuing with
+later implementation slices.
+
 `docs/history/PROTOCOL-AUTHORING-BRIEF.md` is provenance only and cannot override current normative documents.
 
 ## Execution contract
