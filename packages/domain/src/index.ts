@@ -142,6 +142,7 @@ export {
   hashSkillSource,
   parseSkillFrontmatter,
   skillGeneratedHashes,
+  skillRawSourceUrl,
   skillVendorPath,
   verifySkillRelease,
   type SkillFrontmatter,

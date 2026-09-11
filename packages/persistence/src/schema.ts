@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -539,5 +539,12 @@ export const MIGRATIONS: Record<number, string> = {
       registered_by      TEXT NOT NULL,
       registered_at      TEXT NOT NULL
     );
+  `,
+  10: `
+    -- Grant adapter binding [FIXES-SL-1-7]: a dispatch grant optionally
+    -- names the adapter it was issued for. Grants issued without an
+    -- adapter (older flows) skip the adapter-liveness check; grants bound
+    -- to a revoked adapter burn fail-closed at consumption.
+    ALTER TABLE execution_grant ADD COLUMN adapter_id TEXT;
   `,
 };

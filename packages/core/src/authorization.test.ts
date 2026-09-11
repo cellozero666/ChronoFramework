@@ -4,16 +4,22 @@
  * [CORE §7.4/§7.6, DOM §6.4/§6.6, Remediation §5]
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
+  SKILL_RELEASE,
+  SKILL_RUNTIME_PATHS,
   buildApprovalPayload,
   buildSessionAuthorizationPayload,
   computeRevisionHash,
+  convertSkillSource,
   generateApprovalKeyPair,
+  hashSkillSource,
   signApprovalPayload,
+  skillGeneratedHashes,
+  skillVendorPath,
   RTK_UPSTREAM,
   SKILL_UPSTREAM,
 } from "@chrono/domain";
@@ -28,6 +34,77 @@ const SPEC = {
   acceptanceCriteria: ["ac1"],
 };
 const MOD = { id: "MOD-0001", name: "M", purpose: "P", specs: ["SP-0001"] };
+
+// Frozen fixture: byte-exact canonical SKILL.md at the pinned commit
+// (hashSkillSource === SKILL_RELEASE.sourceHash, asserted on use).
+const FIXTURE_SKILL_MD = `---
+name: karpathy-guidelines
+description: Behavioral guidelines to reduce common LLM coding mistakes. Use when writing, reviewing, or refactoring code to avoid overcomplication, make surgical changes, surface assumptions, and define verifiable success criteria.
+license: MIT
+---
+
+# Karpathy Guidelines
+
+Behavioral guidelines to reduce common LLM coding mistakes, derived from [Andrej Karpathy's observations](https://x.com/karpathy/status/2015883857489522876) on LLM coding pitfalls.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+## 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+## 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+\`\`\`
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+\`\`\`
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+`;
 
 type SignFn = (fields: {
   action: string;
@@ -106,10 +183,10 @@ function recordAttestations(core: ChronoCore, auth: CallerAuth): void {
   expect(
     core.recordSkillAttestation(auth, {
       upstream: SKILL_UPSTREAM,
-      pinnedCommit: "a".repeat(40),
-      sourceHash: `sha256:${"b".repeat(64)}`,
-      generatedHashes: "{}",
-      converterVersion: "test-1",
+      pinnedCommit: SKILL_RELEASE.pinnedCommit,
+      sourceHash: SKILL_RELEASE.sourceHash,
+      generatedHashes: skillGeneratedHashes(convertSkillSource(FIXTURE_SKILL_MD)),
+      converterVersion: SKILL_RELEASE.converterVersion,
       licenseStatus: "MIT",
       attribution: "MIT",
       runtimeIdentity: "test",
@@ -120,6 +197,17 @@ function recordAttestations(core: ChronoCore, auth: CallerAuth): void {
       ttlSeconds: 86400,
     }).ok
   ).toBe(true);
+  // Emitted skill files matching the attestation: dispatch re-hashes them.
+  expect(hashSkillSource(FIXTURE_SKILL_MD)).toBe(SKILL_RELEASE.sourceHash);
+  const root = core.projectPath();
+  const vendorTarget = join(root, skillVendorPath(SKILL_RELEASE.pinnedCommit));
+  mkdirSync(dirname(vendorTarget), { recursive: true });
+  writeFileSync(vendorTarget, FIXTURE_SKILL_MD, "utf8");
+  for (const runtime of ["claude", "opencode", "kiro"] as const) {
+    const target = join(root, SKILL_RUNTIME_PATHS[runtime]);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, FIXTURE_SKILL_MD, "utf8");
+  }
 }
 
 function bootstrapPrivilegedSession(
@@ -328,6 +416,30 @@ describe("Execution authorization", () => {
     // Un-AUTHORIZED WP scope also denies.
     const scoped = core.authorizeExecution("MOD-0001", { workPackageId: "WP-0001", actor: "gaspar", role: "belthazar", session: worker, requesterSession: gaspar.session });
     expect(scoped.ok).toBe(false);
+  });
+
+  it("denies when emitted skill files are tampered with or missing", () => {
+    const { gaspar } = approvedModule(core, sign, privateKeyPem);
+    recordAttestations(core, gaspar);
+    const worker = openTestSession(core, "belthazar", "MOD-0001");
+    const request = {
+      actor: "gaspar",
+      role: "belthazar",
+      session: worker,
+      requesterSession: gaspar.session,
+    };
+    // Rewritten runtime file → provenance failure.
+    const runtimeTarget = join(core.projectPath(), SKILL_RUNTIME_PATHS.claude);
+    writeFileSync(runtimeTarget, `${FIXTURE_SKILL_MD}\nrogue weakening`, "utf8");
+    const tampered = core.authorizeExecution("MOD-0001", request);
+    expect(tampered.ok).toBe(false);
+    expect(tampered.error?.code).toBe("SKILL_PROVENANCE_FAILURE");
+    // Missing vendor source → not installed in this checkout.
+    rmSync(join(core.projectPath(), skillVendorPath(SKILL_RELEASE.pinnedCommit)));
+    writeFileSync(runtimeTarget, FIXTURE_SKILL_MD, "utf8");
+    const missing = core.authorizeExecution("MOD-0001", request);
+    expect(missing.ok).toBe(false);
+    expect(missing.error?.code).toBe("BLOCKED_PROCESS_SKILL");
   });
 
   it("denies execution for invalid assignment roles", () => {
@@ -570,6 +682,65 @@ describe("Dispatch grants (session binding)", () => {
       ).toBe("EXECUTION_DENIED");
     } finally {
       restoreSessionTty();
+      core.close();
+    }
+  });
+
+  it("burns grants bound to an adapter revoked after issuance", () => {
+    const { core, sign, poPrivateKey, restoreTty: restoreRevokeTty } = clockedCore(T0);
+    try {
+      const { gaspar } = approvedModule(core, sign, poPrivateKey);
+      recordAttestations(core, gaspar);
+      const poAuth = { actor: "PO", session: bootstrapPrivilegedSession(core, "PO", poPrivateKey) };
+      const entrypoint = join(tempDir, "fixture-runtime.sh");
+      writeFileSync(entrypoint, "#!/bin/sh\necho ok\n");
+      chmodSync(entrypoint, 0o755);
+      expect(
+        core.registerAdapter(
+          { id: "fixture", name: "Fixture", entrypoint, conformanceProof: ["fixture --version"] },
+          poAuth
+        ).ok
+      ).toBe(true);
+      const revision = core.adapterRegistrationHash("fixture");
+      const { signature, timestamp } = sign({
+        action: "adapter-registration",
+        scopeArtifactId: "fixture",
+        scopeRevision: revision,
+        authority: "PO",
+        rationale: "trust",
+      });
+      const recorded = core.recordApproval({
+        action: "adapter-registration",
+        scopeArtifactId: "fixture",
+        scopeRevision: revision,
+        authority: "PO",
+        rationale: "trust",
+        timestamp,
+        signature,
+      });
+      expect(recorded.ok).toBe(true);
+      const approvalId = recorded.value!.id;
+      expect(core.approveAdapter("fixture", approvalId, poAuth).ok).toBe(true);
+      const worker = openTestSession(core, "belthazar", "MOD-0001");
+      const authz = core.authorizeExecution("MOD-0001", {
+        actor: "gaspar",
+        role: "belthazar",
+        session: worker,
+        requesterSession: gaspar.session,
+        adapterId: "fixture",
+      });
+      expect(authz.ok).toBe(true);
+      expect(core.revokeAdapter("fixture", poAuth).ok).toBe(true);
+      const denied = core.transitionState("MOD-0001", "ExecutionStarted", {
+        actor: "belthazar",
+        session: worker,
+        grantId: authz.value!.grantId,
+      });
+      expect(denied.ok).toBe(false);
+      expect(denied.error?.code).toBe("EXECUTION_DENIED");
+      expect(denied.error?.message).toContain("no longer approved");
+    } finally {
+      restoreRevokeTty();
       core.close();
     }
   });

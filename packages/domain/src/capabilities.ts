@@ -20,7 +20,7 @@
 import type { AgentRole } from "./state.js";
 
 /** Version of this authority policy, persisted with authorization evidence. */
-export const AUTHORITY_POLICY_VERSION = "2";
+export const AUTHORITY_POLICY_VERSION = "3";
 
 export type CapabilityHolder = AgentRole | "PO";
 
@@ -43,6 +43,7 @@ export type CoreOperation =
   | "session.revoke"
   | "attestation.record"
   | "adapter.register"
+  | "adapter.approve"
   | "adapter.revoke";
 
 const ALL_WORKERS: readonly AgentRole[] = ["belthazar", "melchior", "prometheus"];
@@ -69,6 +70,7 @@ export const ROLE_CAPABILITIES: Record<CoreOperation, readonly CapabilityHolder[
   "session.revoke": ["gaspar", "PO"],
   "attestation.record": ["gaspar", "PO"],
   "adapter.register": ["PO"],
+  "adapter.approve": ["PO"],
   "adapter.revoke": ["PO"],
 };
 

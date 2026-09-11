@@ -1414,6 +1414,7 @@ export interface GrantRecord {
   role: string;
   session: string | null;
   requestedBy: string;
+  adapterId: string | null;
   rtkAttestationId: string | null;
   skillAttestationId: string | null;
   moduleApprovalId: string | null;
@@ -1436,6 +1437,7 @@ interface GrantRow {
   role: unknown;
   session: unknown;
   requested_by: unknown;
+  adapter_id: unknown;
   rtk_attestation_id: unknown;
   skill_attestation_id: unknown;
   module_approval_id: unknown;
@@ -1467,6 +1469,7 @@ export class GrantRepository {
     role: string;
     session: string | null;
     requestedBy: string;
+    adapterId: string | null;
     rtkAttestationId: string | null;
     skillAttestationId: string | null;
     moduleApprovalId: string | null;
@@ -1478,13 +1481,13 @@ export class GrantRepository {
     this.db.prepare(
       `INSERT INTO execution_grant (id, project_id, module_id, work_package_id, module_revision,
          work_package_revision, spec_revisions, harness_bindings, role, session, requested_by,
-         rtk_attestation_id, skill_attestation_id, module_approval_id, arch_approval_id,
+         adapter_id, rtk_attestation_id, skill_attestation_id, module_approval_id, arch_approval_id,
          policy_version, issued_at, expires_at, consumed)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
     ).run(
       grant.id, grant.projectId, grant.moduleId, grant.workPackageId, grant.moduleRevision,
       grant.workPackageRevision, JSON.stringify(grant.specRevisions), JSON.stringify(grant.harnessBindings),
-      grant.role, grant.session, grant.requestedBy, grant.rtkAttestationId, grant.skillAttestationId,
+      grant.role, grant.session, grant.requestedBy, grant.adapterId, grant.rtkAttestationId, grant.skillAttestationId,
       grant.moduleApprovalId, grant.archApprovalId, grant.policyVersion, grant.issuedAt, grant.expiresAt
     );
 
@@ -1591,6 +1594,7 @@ export class GrantRepository {
       role: row.role as string,
       session: row.session as string | null,
       requestedBy: row.requested_by as string,
+      adapterId: row.adapter_id as string | null,
       rtkAttestationId: row.rtk_attestation_id as string | null,
       skillAttestationId: row.skill_attestation_id as string | null,
       moduleApprovalId: row.module_approval_id as string | null,
@@ -1697,7 +1701,7 @@ export class AdapterRepository {
         `INSERT INTO adapter (id, name, entrypoint, gate_hook, dispatch_proof,
            rtk_routing, skill_activation, conformance_proof, status,
            registered_by, registered_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
       ).run(
         adapter.id, adapter.name, adapter.entrypoint, adapter.gateHook,
         adapter.dispatchProof, adapter.rtkRouting, adapter.skillActivation,
@@ -1744,6 +1748,27 @@ export class AdapterRepository {
   revoke(id: string): AdapterRecord {
     this.findById(id);
     this.db.prepare("UPDATE adapter SET status = 'revoked' WHERE id = ?").run(id);
+    return this.findById(id);
+  }
+
+  /**
+   * Activate a pending registration after its signed PO approval.
+   * Only `pending` rows activate: already-active or revoked rows deny
+   * explicitly instead of rewriting terminal state.
+   */
+  activate(id: string): AdapterRecord {
+    const current = this.findById(id);
+    if (current.status !== "pending") {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: `Adapter '${id}' is ${current.status}, not pending: only pending registrations activate`,
+        invariantRef: "INV §14.4",
+        affectedTarget: id,
+        suggestedAction: "Register the adapter first, then approve it",
+      });
+    }
+    this.db.prepare("UPDATE adapter SET status = 'active' WHERE id = ?").run(id);
     return this.findById(id);
   }
 

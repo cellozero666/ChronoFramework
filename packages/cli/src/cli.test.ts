@@ -175,5 +175,8 @@ describe("CLI: program wiring", () => {
     expect(names).toContain("gate");
     expect(names).toContain("rtk");
     expect(names).toContain("skill");
+    expect(names).toContain("run");
+    expect(names).toContain("adapter");
+    expect(names).toContain("session");
   });
 });

@@ -8,12 +8,12 @@
 
 import { Command } from "commander";
 import { execFileSync, spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes, createHash } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync, accessSync, constants } from "node:fs";
 import { get } from "node:https";
 import { dirname, join } from "node:path";
 import { ChronoCore } from "@chrono/core";
-import { RTK_UPSTREAM, SKILL_RELEASE, SKILL_RUNTIME_PATHS, buildApprovalPayload, buildSessionAuthorizationPayload, buildWaiverPayload, computeRevisionHash, convertSkillSource, generateApprovalKeyPair, parseSkillFrontmatter, signApprovalPayload, skillGeneratedHashes, skillVendorPath, verifySkillRelease, type SkillRuntime } from "@chrono/domain";
+import { RTK_UPSTREAM, SKILL_RELEASE, SKILL_RUNTIME_PATHS, buildApprovalPayload, buildSessionAuthorizationPayload, buildWaiverPayload, computeRevisionHash, convertSkillSource, generateApprovalKeyPair, parseSkillFrontmatter, signApprovalPayload, skillGeneratedHashes, skillRawSourceUrl, skillVendorPath, verifySkillRelease, type SkillRuntime } from "@chrono/domain";
 import { CHRONO_VERSION } from "./version.js";
 import {
   MemoryKeyStore,
@@ -107,6 +107,9 @@ interface CommandOpts {
   readonly parentToken?: unknown;
   readonly rotate?: unknown;
   readonly timeout?: unknown;
+  readonly file?: unknown;
+  readonly approval?: unknown;
+  readonly id?: unknown;
 }
 
 function formatCoreError(error: {
@@ -1009,9 +1012,7 @@ export async function runSkillVerify(
   try {
     let fetched: string;
     try {
-      fetched = await fetchSource(
-        `https://raw.githubusercontent.com/multica-ai/andrej-karpathy-skills/${SKILL_RELEASE.pinnedCommit}/${SKILL_RELEASE.sourcePath}`
-      );
+      fetched = await fetchSource(skillRawSourceUrl());
     } catch (e) {
       return fail(1, "BLOCKED_PROCESS_SKILL", `skill source fetch failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -1086,6 +1087,9 @@ export async function runSkillVerify(
       attribution: "multica-ai/andrej-karpathy-skills (MIT)",
       runtimeIdentity: core.projectRuntime(),
       agentIdentity: "chrono-skill-verify",
+      // "granted" records filesystem permission proven by emission +
+      // round-trip above. Whether the live agent is permitted to use the
+      // skill inside its runtime stays adapter duty (not proven here).
       discoveryResult: "found",
       permissionResult: "granted",
       activationTestPassed: true,
@@ -1343,7 +1347,9 @@ function defaultSpawn(cmd: string, args: string[], timeoutMs: number, env: Recor
  * (argv[0] must equal it, so a grant cannot smuggle another binary) →
  * record evidence as the executor → advance to VERIFYING/IMPLEMENTED.
  * A failing or timing-out command leaves the lifecycle state untouched
- * for the correction loop; nothing is marked complete.
+ * for the correction loop; nothing is marked complete. The bearer session
+ * token never crosses into the child environment: the adapter process
+ * holds its own token and the grant id binds the dispatch.
  */
 export function runDispatch(
   projectPath: string,
@@ -1393,7 +1399,12 @@ export function runDispatch(
     try {
       adapter = core.getAdapterForDispatch(options.adapter);
     } catch (e) {
-      return coreError(e instanceof Error ? { code: "ADAPTER_REJECTED", severity: "BLOCKER", message: e.message } : undefined, asJson);
+      const code =
+        typeof e === "object" && e !== null && "code" in e && typeof e.code === "string"
+          ? e.code
+          : "ADAPTER_REJECTED";
+      const message = e instanceof Error ? e.message : "Adapter rejected for dispatch";
+      return coreError({ code, severity: "BLOCKER", message }, asJson);
     }
     if (options.command[0] !== adapter.entrypoint) {
       return fail(2, "VALIDATION_ERROR", `run command must start with the registered entrypoint '${adapter.entrypoint}': grants cannot smuggle another binary`);
@@ -1407,6 +1418,7 @@ export function runDispatch(
       role: options.role,
       session: executor,
       requesterSession: requester,
+      adapterId: adapter.id,
     });
     if (!authorized.ok) {
       return coreError(authorized.error, asJson);
@@ -1428,8 +1440,21 @@ export function runDispatch(
     env["CHRONO_GRANT_ID"] = authorized.value!.grantId;
     env["CHRONO_MODULE"] = options.module;
     env["CHRONO_ADAPTER"] = adapter.id;
-    env["CHRONO_SESSION_TOKEN"] = `${executor.id}/${executor.token}`;
+    // The bearer session token is deliberately NOT passed down: the
+    // adapter process is the session holder and authenticates its hooks
+    // with the token it was issued out-of-band. Copying it into a child
+    // environment would expose it to model context [RUNTIME §10.3].
     const [cmd, ...args] = options.command as [string, ...string[]];
+    // Narrow the check-then-spawn window: re-verify the entrypoint is
+    // still executable immediately before spawning, and bind its content
+    // hash into the evidence diagnostics for the audit trail.
+    let entrypointHash: string;
+    try {
+      entrypointHash = createHash("sha256").update(readFileSync(cmd)).digest("hex");
+      accessSync(cmd, constants.X_OK);
+    } catch {
+      return fail(1, "EXECUTION_DENIED", `adapter entrypoint '${cmd}' became unreadable or non-executable after authorization: re-verify and dispatch again`);
+    }
     const ran = spawn(cmd, args, Math.floor(timeoutSeconds * 1000), env);
     if (ran.timedOut) {
       return fail(1, "EXECUTION_DENIED", `run timed out after ${timeoutSeconds}s: '${target}' stays ${started.value!.toState} for the correction loop`);
@@ -1438,7 +1463,7 @@ export function runDispatch(
       const detail = ran.stderr.trim().length > 0 ? ran.stderr.trim().slice(-2000) : `exit ${String(ran.status)}`;
       return fail(1, "EXECUTION_DENIED", `run command failed: ${detail}: '${target}' stays ${started.value!.toState} for the correction loop`);
     }
-    const output = `stdout:\n${ran.stdout}\nstderr:\n${ran.stderr}`;
+    const output = `entrypoint-sha256:${entrypointHash}\nstdout:\n${ran.stdout}\nstderr:\n${ran.stderr}`;
     const diagnostics = output.length > 8000 ? `${output.slice(0, 8000)}\n[truncated]` : output;
     const targetRevision = core.getArtifact(target).revision;
     const evidence = core.recordEvidence({
@@ -1458,6 +1483,7 @@ export function runDispatch(
       actor: options.role,
       role: options.role,
       session: executor,
+      adapterId: adapter.id,
     });
     if (!resumed.ok) {
       return coreError(resumed.error, asJson);
@@ -1473,6 +1499,256 @@ export function runDispatch(
     const body = asJson
       ? JSON.stringify({ ok: true, module: options.module, state: done.value!.toState, evidenceId: evidence.value!.id }, null, 2)
       : `Dispatched '${target}' through '${adapter.id}' → ${done.value!.toState} (evidence '${evidence.value!.id}')`;
+    return { exitCode: 0, stdout: body, stderr: "" };
+  } finally {
+    core.close();
+  }
+}
+
+export interface AdapterFileInput {
+  readonly id: string;
+  readonly name: string;
+  readonly entrypoint: string;
+  readonly gateHook?: string | undefined;
+  readonly dispatchProof?: string | undefined;
+  readonly rtkRouting?: string | undefined;
+  readonly skillActivation?: string | undefined;
+  readonly conformanceProof?: string[] | undefined;
+}
+
+const ADAPTER_FILE_KEYS = [
+  "id",
+  "name",
+  "entrypoint",
+  "gate_hook",
+  "dispatch_proof",
+  "rtk_routing",
+  "skill_activation",
+  "conformance_proof",
+] as const;
+
+/**
+ * Strict intake parser for `RUNTIME §13` adapter registration files.
+ * Accepts only a flat subset: `key: value` lines from the §13 schema plus
+ * a `conformance_proof:` list of `- item` lines; full-line `#` comments
+ * are ignored. Anything else (indentation, nesting, anchors, unknown or
+ * duplicate keys) is rejected. The Core re-validates every field, so this
+ * parser owns no policy — it only shapes the intake.
+ */
+export function parseAdapterFile(text: string): AdapterFileInput {
+  const fields: Record<string, string> = {};
+  const proof: string[] = [];
+  let inProofList = false;
+  const seen = new Set<string>();
+  const lines = text.split("\n");
+  for (let index = 0; index < lines.length; index++) {
+    const raw = lines[index] as string;
+    const line = raw.replace(/\r$/, "");
+    if (line.trim().length === 0 || line.trimStart().startsWith("#")) {
+      continue;
+    }
+    if (line.startsWith(" ") || line.startsWith("\t")) {
+      const item = line.match(/^(\s*)-\s+(.*)$/);
+      if (inProofList && item !== null) {
+        const value = (item[2] as string).trim();
+        if (value.length === 0) {
+          throw new Error(`Adapter file line ${String(index + 1)}: empty list item`);
+        }
+        proof.push(value);
+        continue;
+      }
+      throw new Error(`Adapter file line ${String(index + 1)}: indentation is only allowed for conformance_proof items`);
+    }
+    inProofList = false;
+    const colon = line.indexOf(":");
+    if (colon <= 0) {
+      throw new Error(`Adapter file line ${String(index + 1)}: expected 'key: value'`);
+    }
+    const key = line.slice(0, colon).trim();
+    if (!(ADAPTER_FILE_KEYS as readonly string[]).includes(key)) {
+      throw new Error(`Adapter file line ${String(index + 1)}: unknown key '${key}'`);
+    }
+    if (seen.has(key)) {
+      throw new Error(`Adapter file line ${String(index + 1)}: duplicate key '${key}'`);
+    }
+    seen.add(key);
+    const rest = line.slice(colon + 1).trim();
+    if (key === "conformance_proof") {
+      if (rest.length !== 0) {
+        throw new Error(`Adapter file line ${String(index + 1)}: conformance_proof takes '- item' lines, not an inline value`);
+      }
+      inProofList = true;
+      continue;
+    }
+    fields[key] = unquoteAdapterValue(rest, index + 1);
+  }
+  const id = fields["id"] ?? "";
+  const name = fields["name"] ?? "";
+  const entrypoint = fields["entrypoint"] ?? "";
+  if (id.length === 0 || name.length === 0 || entrypoint.length === 0) {
+    throw new Error("Adapter file requires non-empty id, name, and entrypoint");
+  }
+  return {
+    id,
+    name,
+    entrypoint,
+    ...(fields["gate_hook"] !== undefined ? { gateHook: fields["gate_hook"] } : {}),
+    ...(fields["dispatch_proof"] !== undefined ? { dispatchProof: fields["dispatch_proof"] } : {}),
+    ...(fields["rtk_routing"] !== undefined ? { rtkRouting: fields["rtk_routing"] } : {}),
+    ...(fields["skill_activation"] !== undefined ? { skillActivation: fields["skill_activation"] } : {}),
+    ...(proof.length > 0 ? { conformanceProof: proof } : {}),
+  };
+}
+
+function unquoteAdapterValue(value: string, lineNumber: number): string {
+  if (value.length >= 2) {
+    const first = value[0];
+    const last = value[value.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return value.slice(1, -1);
+    }
+    if (first === '"' || first === "'" || last === '"' || last === "'") {
+      throw new Error(`Adapter file line ${String(lineNumber)}: unbalanced quotes`);
+    }
+  }
+  return value;
+}
+
+export interface AdapterCommandAuth {
+  readonly as: string;
+  readonly session: { id: string; token: string };
+}
+
+/**
+ * Register an adapter from a `RUNTIME §13` file. Creates a `pending`
+ * row and reports the registration hash the PO must sign with
+ * `chrono approve --action adapter-registration`.
+ */
+export function runAdapterRegister(
+  projectPath: string,
+  options: { file: string } & AdapterCommandAuth & OutputOptions
+): CliOutput {
+  const asJson = options.json === true;
+  let text: string;
+  try {
+    text = readFileSync(options.file, "utf8");
+  } catch (e) {
+    return coreError(
+      { code: "VALIDATION_ERROR", severity: "ERROR", message: `Adapter file unreadable: ${e instanceof Error ? e.message : String(e)}` },
+      asJson
+    );
+  }
+  let input: AdapterFileInput;
+  try {
+    input = parseAdapterFile(text);
+  } catch (e) {
+    return coreError(
+      { code: "VALIDATION_ERROR", severity: "ERROR", message: `Adapter file rejected: ${e instanceof Error ? e.message : String(e)}` },
+      asJson
+    );
+  }
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    const result = core.registerAdapter(input, { actor: options.as, session: options.session });
+    if (!result.ok) {
+      return coreError(result.error, asJson);
+    }
+    const hash = core.adapterRegistrationHash(result.value!.id);
+    const body = asJson
+      ? JSON.stringify({ ok: true, id: result.value?.id, status: "pending", registrationHash: hash }, null, 2)
+      : [`Registered adapter '${result.value?.id ?? ""}' (pending).`, `  registration hash: ${hash}`, "Activate with: chrono approve --action adapter-registration --scope <id> --revision <hash> ..."].join("\n");
+    return { exitCode: 0, stdout: body, stderr: "" };
+  } finally {
+    core.close();
+  }
+}
+
+/** List adapter registrations (read-only project metadata). */
+export function runAdapterList(projectPath: string, options: OutputOptions = {}): CliOutput {
+  const asJson = options.json === true;
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    const adapters = core.listAdapters().map((a) => ({ id: a.id, name: a.name, entrypoint: a.entrypoint, status: a.status }));
+    if (asJson) {
+      return { exitCode: 0, stdout: JSON.stringify({ ok: true, adapters }, null, 2), stderr: "" };
+    }
+    const lines = adapters.length === 0
+      ? ["No adapters registered."]
+      : adapters.map((a) => `${a.id} [${a.status}] ${a.name} (${a.entrypoint})`);
+    return { exitCode: 0, stdout: lines.join("\n"), stderr: "" };
+  } finally {
+    core.close();
+  }
+}
+
+/** Activate a pending adapter with its signed PO approval (PO only). */
+export function runAdapterActivate(
+  projectPath: string,
+  options: { id: string; approval: string } & AdapterCommandAuth & OutputOptions
+): CliOutput {
+  const asJson = options.json === true;
+  if (options.id.length === 0 || options.approval.length === 0) {
+    return coreError(
+      { code: "VALIDATION_ERROR", severity: "ERROR", message: "adapter activate requires --id and --approval" },
+      asJson
+    );
+  }
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    const result = core.approveAdapter(options.id, options.approval, { actor: options.as, session: options.session });
+    if (!result.ok) {
+      return coreError(result.error, asJson);
+    }
+    const body = asJson
+      ? JSON.stringify({ ok: true, id: options.id, status: "active" }, null, 2)
+      : `Adapter '${options.id}' active.`;
+    return { exitCode: 0, stdout: body, stderr: "" };
+  } finally {
+    core.close();
+  }
+}
+
+/** Revoke an adapter registration (terminal; PO only). */
+export function runAdapterRevoke(
+  projectPath: string,
+  options: { id: string } & AdapterCommandAuth & OutputOptions
+): CliOutput {
+  const asJson = options.json === true;
+  if (options.id.length === 0) {
+    return coreError(
+      { code: "VALIDATION_ERROR", severity: "ERROR", message: "adapter revoke requires --id" },
+      asJson
+    );
+  }
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    const result = core.revokeAdapter(options.id, { actor: options.as, session: options.session });
+    if (!result.ok) {
+      return coreError(result.error, asJson);
+    }
+    const body = asJson
+      ? JSON.stringify({ ok: true, id: options.id, status: "revoked" }, null, 2)
+      : `Adapter '${options.id}' revoked.`;
     return { exitCode: 0, stdout: body, stderr: "" };
   } finally {
     core.close();
@@ -1556,7 +1832,7 @@ export function createProgram(cwd: string): Command {
   program
     .command("approve")
     .description("Record an interactive human-only signed PO approval")
-    .requiredOption("--action <action>", "approval action (module-approval, architecture-security, implementation-security)")
+    .requiredOption("--action <action>", "approval action (module-approval, architecture-security, implementation-security, adapter-registration)")
     .requiredOption("--scope <id>", "artifact scope identifier (or ARCH)")
     .requiredOption("--revision <rev>", "exact scope revision hash")
     .requiredOption("--authority <name>", "PO signer identity")
@@ -1757,8 +2033,104 @@ export function createProgram(cwd: string): Command {
       );
     });
 
-  const session = program.command("session").description("authenticated session management");
+  const adapterCmd = program.command("adapter").description("runtime adapter registry (PO-only mutation)");
 
+  adapterCmd
+    .command("register")
+    .description("Register an adapter from a RUNTIME §13 file (creates a pending row)")
+    .requiredOption("--file <path>", "adapter registration file")
+    .requiredOption("--as <actor>", "requesting identity (PO)")
+    .requiredOption("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
+      if (token === null || typeof opts.as !== "string" || typeof opts.file !== "string") {
+        emitProgramResult(
+          program,
+          opts.json === true
+            ? { exitCode: 2, stdout: JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: "adapter register requires --file, --as, and --session-token" } }, null, 2), stderr: "" }
+            : { exitCode: 2, stdout: "", stderr: "Error [VALIDATION_ERROR]: adapter register requires --file, --as, and --session-token" }
+        );
+        return;
+      }
+      emitProgramResult(
+        program,
+        runAdapterRegister(projectPath, { file: opts.file, as: opts.as, session: token, json: opts.json === true })
+      );
+    });
+
+  adapterCmd
+    .command("list")
+    .description("List adapter registrations")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      emitProgramResult(program, runAdapterList(projectPath, { json: opts.json === true }));
+    });
+
+  adapterCmd
+    .command("activate")
+    .description("Activate a pending adapter with its signed PO approval (PO only)")
+    .requiredOption("--id <id>", "adapter id")
+    .requiredOption("--approval <id>", "adapter-registration approval id")
+    .requiredOption("--as <actor>", "requesting identity (PO)")
+    .requiredOption("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
+      if (token === null || typeof opts.as !== "string") {
+        emitProgramResult(
+          program,
+          opts.json === true
+            ? { exitCode: 2, stdout: JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: "adapter activate requires --as and --session-token" } }, null, 2), stderr: "" }
+            : { exitCode: 2, stdout: "", stderr: "Error [VALIDATION_ERROR]: adapter activate requires --as and --session-token" }
+        );
+        return;
+      }
+      emitProgramResult(
+        program,
+        runAdapterActivate(projectPath, {
+          id: String(opts.id ?? ""),
+          approval: String(opts.approval ?? ""),
+          as: opts.as,
+          session: token,
+          json: opts.json === true,
+        })
+      );
+    });
+
+  adapterCmd
+    .command("revoke")
+    .description("Revoke an adapter registration (terminal; PO only)")
+    .requiredOption("--id <id>", "adapter id")
+    .requiredOption("--as <actor>", "requesting identity (PO)")
+    .requiredOption("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : cwd;
+      const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
+      if (token === null || typeof opts.as !== "string") {
+        emitProgramResult(
+          program,
+          opts.json === true
+            ? { exitCode: 2, stdout: JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: "adapter revoke requires --as and --session-token" } }, null, 2), stderr: "" }
+            : { exitCode: 2, stdout: "", stderr: "Error [VALIDATION_ERROR]: adapter revoke requires --as and --session-token" }
+        );
+        return;
+      }
+      emitProgramResult(
+        program,
+        runAdapterRevoke(projectPath, { id: String(opts.id ?? ""), as: opts.as, session: token, json: opts.json === true })
+      );
+    });
+
+  const session = program.command("session").description("authenticated session management");
   session
     .command("open")
     .description("Open an authenticated session (interactive, or delegated from a parent session token)")

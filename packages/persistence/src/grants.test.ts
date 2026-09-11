@@ -36,6 +36,7 @@ describe("GrantRepository", () => {
       role: "belthazar",
       session: null as string | null,
       requestedBy: "gaspar",
+      adapterId: null as string | null,
       rtkAttestationId: null as string | null,
       skillAttestationId: null as string | null,
       moduleApprovalId: null as string | null,
@@ -51,6 +52,13 @@ describe("GrantRepository", () => {
     expect(db.grants().findById("GRANT-0001").consumed).toBe(false);
     expect(db.grants().consume("GRANT-0001").consumed).toBe(true);
     expect(() => db.grants().consume("GRANT-0001")).toThrow(/already consumed/);
+  });
+
+  it("round-trips the optional adapter binding", () => {
+    db.grants().create({ ...grant("GRANT-0002"), adapterId: "fixture" });
+    expect(db.grants().findById("GRANT-0002").adapterId).toBe("fixture");
+    db.grants().create(grant("GRANT-0001"));
+    expect(db.grants().findById("GRANT-0001").adapterId).toBeNull();
   });
 
   it("rejects unknown grant ids", () => {

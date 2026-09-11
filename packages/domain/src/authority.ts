@@ -27,6 +27,7 @@ export const APPROVAL_ACTIONS = [
   "module-approval",
   "architecture-security",
   "implementation-security",
+  "adapter-registration",
 ] as const;
 
 export type ApprovalAction = (typeof APPROVAL_ACTIONS)[number];

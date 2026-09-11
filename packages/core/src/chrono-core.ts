@@ -5,7 +5,8 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { accessSync, constants as fsConstants } from "node:fs";
+import { accessSync, constants as fsConstants, readFileSync } from "node:fs";
+import { join as joinPath } from "node:path";
 import {
   ChronoDatabase,
   type AdapterRecord,
@@ -38,14 +39,18 @@ import {
   buildApprovalPayload,
   buildSessionAuthorizationPayload,
   buildWaiverPayload,
+  hashSkillSource,
   parseActorIdentity,
   parseApprovalPublicKey,
+  skillVendorPath,
   toToolIdentity,
   verifyApprovalSignature,
   APPROVAL_ACTIONS,
   AUTHORITY_POLICY_VERSION,
   DEFECT_ROUTING,
   RTK_UPSTREAM,
+  SKILL_RELEASE,
+  SKILL_RUNTIME_PATHS,
   SKILL_UPSTREAM,
   isCapable,
   mayEnactEvent,
@@ -767,6 +772,14 @@ export class ChronoCore {
       errors.push(
         `Skill attestation ${skillState}: agent execution requires a current SkillAttestation`
       );
+    } else {
+      try {
+        this.requireIntactSkillArtifacts("project");
+      } catch (e) {
+        errors.push(
+          e instanceof ChronoError ? e.message : `Skill artifact integrity check failed: ${String(e)}`
+        );
+      }
     }
   }
 
@@ -1950,9 +1963,14 @@ export class ChronoCore {
    * Register a runtime adapter. PO sessions only: a new runtime is a
    * product trust decision, never an agent self-registration. The Core
    * verifies the registration deterministically before persisting:
-   * identifier shape, required fields, entrypoint existence and
-   * executability, and absence of provider/model/secret assignments in
-   * the declared specs [RUNTIME §11.5, INV §11.2, FW §22].
+   * identifier shape, required fields, at least one proof command,
+   * entrypoint existence and executability, and absence of
+   * provider/model/secret assignments in the declared specs
+   * [RUNTIME §11.5, §13, INV §11.2, FW §22].
+   *
+   * Registration creates a `pending` row: dispatch stays denied until a
+   * signed `adapter-registration` PO approval activates it via
+   * approveAdapter [RUNTIME §13].
    */
   registerAdapter(
     input: {
@@ -1991,11 +2009,11 @@ export class ChronoCore {
         });
       }
       const proof = input.conformanceProof ?? [];
-      if (!Array.isArray(proof) || proof.some((p) => typeof p !== "string" || p.trim().length === 0)) {
+      if (!Array.isArray(proof) || proof.length === 0 || proof.some((p) => typeof p !== "string" || p.trim().length === 0)) {
         throw new ChronoError({
           code: ErrorCode.VALIDATION_ERROR,
           severity: Severity.ERROR,
-          message: "Adapter conformanceProof must be an array of non-empty proof commands",
+          message: "Adapter conformanceProof must list at least one non-empty proof command",
           invariantRef: "INV §14.4",
           affectedTarget: input.id,
           suggestedAction: "List the proof commands that demonstrate conformance",
@@ -2025,8 +2043,8 @@ export class ChronoCore {
         payload: { type: "ADAPTER", entrypoint: created.entrypoint },
         actor: caller.auditActor,
         priorState: undefined,
-        newState: "active",
-        reasoning: "Runtime adapter registered by the PO",
+        newState: "pending",
+        reasoning: "Runtime adapter registered pending PO approval",
       });
       return { ok: true, value: { id: created.id } };
     } catch (e) {
@@ -2039,13 +2057,17 @@ export class ChronoCore {
     try {
       const caller = this.resolveCaller(auth, "revoke adapter");
       this.requireCapability("adapter.revoke", caller);
+      const current = this.db.adapters().findById(id);
+      if (current.status === "revoked") {
+        return { ok: true, value: undefined };
+      }
       this.db.adapters().revoke(id);
       this.events.append({
         eventType: "StateTransition",
         entityId: id,
         payload: { entityType: "ADAPTER", eventType: "AdapterRevoked" },
         actor: caller.auditActor,
-        priorState: "active",
+        priorState: current.status,
         newState: "revoked",
         reasoning: "Adapter revoked",
       });
@@ -2055,6 +2077,84 @@ export class ChronoCore {
     }
   }
 
+  /**
+   * Activate a pending adapter after its signed PO approval
+   * [RUNTIME §13]. The approval must bind this exact adapter id to the
+   * exact current registration hash and must not be revoked. Activation
+   * is audited; already-active rows are an audited no-op.
+   */
+  approveAdapter(id: string, approvalId: string, auth: CallerAuth): CoreResult<void> {
+    try {
+      const caller = this.resolveCaller(auth, "approve adapter");
+      this.requireCapability("adapter.approve", caller);
+      const current = this.db.adapters().findById(id);
+      if (current.status === "active") {
+        return { ok: true, value: undefined };
+      }
+      const expected = this.adapterRegistrationHash(id);
+      let approval: { action: string; scopeArtifactId: string; scopeRevision: string; revoked: boolean };
+      try {
+        approval = this.db.approvals().findById(approvalId);
+      } catch {
+        throw new ChronoError({
+          code: ErrorCode.REFERENCE_UNRESOLVABLE,
+          severity: Severity.ERROR,
+          message: `Approval '${approvalId}' does not exist: adapter activation requires a signed PO approval`,
+          invariantRef: "INV §10.2",
+          affectedTarget: id,
+          suggestedAction: "Record an adapter-registration approval for this exact registration first",
+        });
+      }
+      if (
+        approval.action !== "adapter-registration" ||
+        approval.scopeArtifactId !== id ||
+        approval.scopeRevision !== expected ||
+        approval.revoked
+      ) {
+        throw new ChronoError({
+          code: ErrorCode.APPROVAL_REQUIRED,
+          severity: Severity.BLOCKER,
+          message: `Adapter '${id}' lacks a valid adapter-registration approval binding ${expected}`,
+          invariantRef: "INV §5.4",
+          affectedTarget: id,
+          suggestedAction: "Record a signed adapter-registration approval for this exact registration",
+        });
+      }
+      this.db.adapters().activate(id);
+      this.events.append({
+        eventType: "StateTransition",
+        entityId: id,
+        payload: { entityType: "ADAPTER", eventType: "AdapterApproved", approvalId },
+        actor: caller.auditActor,
+        priorState: "pending",
+        newState: "active",
+        reasoning: "Adapter approved by signed PO approval",
+      });
+      return { ok: true, value: undefined };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Registration hash of an adapter: deterministic content hash over the
+   * declared fields. Approvals bind this hash, so any re-registration
+   * invalidates prior approvals [RUNTIME §13, INV §4.4].
+   */
+  adapterRegistrationHash(id: string): string {
+    const adapter = this.db.adapters().findById(id);
+    return computeRevisionHash({
+      id: adapter.id,
+      name: adapter.name,
+      entrypoint: adapter.entrypoint,
+      gateHook: adapter.gateHook,
+      dispatchProof: adapter.dispatchProof,
+      rtkRouting: adapter.rtkRouting,
+      skillActivation: adapter.skillActivation,
+      conformanceProof: adapter.conformanceProof,
+    });
+  }
+
   /** List adapter registrations (project metadata; read-only). */
   listAdapters(): AdapterRecord[] {
     return this.db.adapters().listAll();
@@ -2062,8 +2162,9 @@ export class ChronoCore {
 
   /**
    * Resolve an adapter for dispatch, fail-closed: the registration must
-   * exist, be active, and its entrypoint must still be executable.
-   * A moved or de-permissioned binary denies dispatch until re-registered.
+   * exist, be approved (active — pending rows await their signed PO
+   * approval), and its entrypoint must still be executable. A moved or
+   * de-permissioned binary denies dispatch until re-registered.
    */
   getAdapterForDispatch(id: string): AdapterRecord {
     const adapter = this.db.adapters().findById(id);
@@ -2071,10 +2172,10 @@ export class ChronoCore {
       throw new ChronoError({
         code: ErrorCode.EXECUTION_DENIED,
         severity: Severity.BLOCKER,
-        message: `Adapter '${id}' is ${adapter.status}: revoked adapters cannot dispatch`,
+        message: `Adapter '${id}' is ${adapter.status}: only approved adapters dispatch`,
         invariantRef: "INV §5.1",
         affectedTarget: id,
-        suggestedAction: "Register a current adapter for this runtime",
+        suggestedAction: "Approve the adapter registration with a signed PO approval first",
       });
     }
     this.assertExecutableEntrypoint(adapter.entrypoint, id);
@@ -2083,22 +2184,28 @@ export class ChronoCore {
 
   /**
    * No provider, model, or secret assignments in adapter specs
-   * [RUNTIME §11.5, INV §11.2, FW §22]. Deterministic tripwire over the
-   * declared strings; a full source audit remains a review duty.
+   * [RUNTIME §11.5, INV §11.2, FW §22]. Whitespace-tolerant tripwire over
+   * the declared strings; a full source audit remains a review duty.
    */
   private assertNoProviderModelBinding(values: Array<string | null | undefined>, target: string): void {
-    const forbidden = ["provider=", "provider:", "model=", "model:", "api_key", "apikey"];
+    const forbidden: RegExp[] = [
+      /provider\s*[:=]/i,
+      /model\s*[:=]/i,
+      /api[_-]?key/i,
+      /secret\s*[:=]/i,
+      /token\s*[:=]/i,
+      /password/i,
+    ];
     for (const value of values) {
       if (value === null || value === undefined) {
         continue;
       }
-      const lowered = value.toLowerCase();
-      const hit = forbidden.find((f) => lowered.includes(f));
+      const hit = forbidden.find((pattern) => pattern.test(value));
       if (hit !== undefined) {
         throw new ChronoError({
           code: ErrorCode.VALIDATION_ERROR,
           severity: Severity.ERROR,
-          message: `Adapter '${target}' declares a forbidden binding '${hit}': runtimes, providers, models, and secrets are PO configuration, never adapter defaults`,
+          message: `Adapter '${target}' declares a forbidden binding matching '${hit.source}': runtimes, providers, models, and secrets are PO configuration, never adapter defaults`,
           invariantRef: "INV §11.2",
           affectedTarget: target,
           suggestedAction: "Remove provider/model/secret assignments from the adapter registration",
@@ -2509,10 +2616,11 @@ export class ChronoCore {
    * it on staleness. Every binding recorded at issuance is re-evaluated:
    * project, module/work-package revisions, every Spec revision, every
    * Harness binding, both attestations, both approvals, the exact assigned
-   * role and executing session, and the policy version. Any material
-   * change, stale reference, replaced attestation, altered Harness, or
-   * role/session mismatch consumes (where stale) or denies. Consumption
-   * happens atomically with the transition itself.
+   * role and executing session, the adapter liveness (when bound), and the
+   * policy version. Any material change, stale reference, replaced
+   * attestation, altered Harness, revoked adapter, or role/session mismatch
+   * consumes (where stale) or denies. Consumption happens atomically with
+   * the transition itself.
    */
   private validateExecutionGrant(
     moduleId: string,
@@ -2541,6 +2649,7 @@ export class ChronoCore {
       harnessBindings: Array<{ specId: string; specRevision: string; contentHash: string }>;
       role: string;
       session: string | null;
+      adapterId: string | null;
       rtkAttestationId: string | null;
       skillAttestationId: string | null;
       moduleApprovalId: string | null;
@@ -2662,6 +2771,28 @@ export class ChronoCore {
     this.revalidateGrantAttestation(grant.skillAttestationId, "skill", grantId, target);
     this.revalidateGrantApproval(grant.moduleApprovalId, grantId, target);
     this.revalidateGrantApproval(grant.archApprovalId, grantId, target);
+    // Adapter binding: a grant issued for an adapter dies with that
+    // adapter's approval. Revocation burns the grant fail-closed; grants
+    // issued without an adapter skip this check (backward compatible).
+    if (grant.adapterId !== null) {
+      let adapterActive = false;
+      try {
+        adapterActive = this.db.adapters().findById(grant.adapterId).status === "active";
+      } catch {
+        adapterActive = false;
+      }
+      if (!adapterActive) {
+        this.burnGrant(grantId);
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Dispatch grant '${grantId}' was issued for adapter '${grant.adapterId}', which is no longer approved`,
+          invariantRef: "INV §5.1",
+          affectedTarget: target,
+          suggestedAction: "Authorize execution again through a currently approved adapter",
+        });
+      }
+    }
     // Caller binding: the exact session and assigned role bound at
     // issuance. Any other session — including another session holding the
     // same role, and including gaspar/PO — may not enact this grant.
@@ -3505,8 +3636,8 @@ export class ChronoCore {
 
   /**
    * Current revision of an approval scope: artifact rows, the ARCH
-   * architecture singleton (tracked on the project row), or null when
-   * the scope is unknown.
+   * architecture singleton (tracked on the project row), registered
+   * adapters (by registration hash), or null when the scope is unknown.
    */
   private currentRevisionOf(scopeId: string): string | null {
     if (scopeId === "ARCH") {
@@ -3515,7 +3646,12 @@ export class ChronoCore {
     try {
       return this.artifacts.findById(scopeId).revision;
     } catch {
-      return null;
+      // Adapter scopes resolve by registration hash [RUNTIME §13].
+      try {
+        return this.adapterRegistrationHash(scopeId);
+      } catch {
+        return null;
+      }
     }
   }
 
@@ -3977,6 +4113,18 @@ export class ChronoCore {
           suggestedAction: "Pin the immutable reviewed commit",
         });
       }
+      // The pin itself is enforced, not just its shape: only the
+      // PO-approved release is attestable, so a compromised orchestrator
+      // session cannot attest a forged skill release [FW §1222, INV §9.2].
+      if (input.pinnedCommit.toLowerCase() !== SKILL_RELEASE.pinnedCommit) {
+        throw new ChronoError({
+          code: ErrorCode.SKILL_PROVENANCE_FAILURE,
+          severity: Severity.BLOCKER,
+          message: `Skill commit '${input.pinnedCommit}' is not the PO-approved pin ${SKILL_RELEASE.pinnedCommit}`,
+          invariantRef: "INV §9.2",
+          suggestedAction: "Attest only the PO-approved skill release",
+        });
+      }
       if (!isRevisionHash(input.sourceHash)) {
         throw new ChronoError({
           code: ErrorCode.SKILL_PROVENANCE_FAILURE,
@@ -3984,6 +4132,24 @@ export class ChronoCore {
           message: "Skill attestation requires the canonical source revision hash",
           invariantRef: "INV §9.2",
           suggestedAction: "Hash the canonical SKILL.md source",
+        });
+      }
+      if (input.sourceHash !== SKILL_RELEASE.sourceHash) {
+        throw new ChronoError({
+          code: ErrorCode.SKILL_PROVENANCE_FAILURE,
+          severity: Severity.BLOCKER,
+          message: "Skill source hash is not the PO-approved pinned source hash",
+          invariantRef: "INV §9.2",
+          suggestedAction: "Attest only the PO-approved skill release",
+        });
+      }
+      if (input.converterVersion !== SKILL_RELEASE.converterVersion) {
+        throw new ChronoError({
+          code: ErrorCode.SKILL_PROVENANCE_FAILURE,
+          severity: Severity.BLOCKER,
+          message: `Skill converter '${input.converterVersion}' is not the approved ${SKILL_RELEASE.converterVersion}`,
+          invariantRef: "INV §9.2",
+          suggestedAction: "Generate artifacts only with the approved converter",
         });
       }
       if (input.licenseStatus !== "MIT") {
@@ -4053,8 +4219,9 @@ export class ChronoCore {
   /**
    * Evaluate execution authorization for a module (optionally scoped to one
    * Work Package) and, on success, issue a single-use dispatch grant bound
-   * to the exact revisions, one assigned role, and the executing session.
-   * Implements gate_execution [CORE §7.4, DOM §6.4].
+   * to the exact revisions, one assigned role, the executing session, and
+   * the optional adapter it was issued for. Implements gate_execution
+   * [CORE §7.4, DOM §6.4].
    *
    * Orchestration is explicit: `actor` and `requesterSession` authenticate
    * the requester, while `session` authenticates the executor that will
@@ -4075,6 +4242,7 @@ export class ChronoCore {
       role: string;
       session: { id: string; token: string };
       requesterSession?: { id: string; token: string } | undefined;
+      adapterId?: string | undefined;
     }
   ): CoreResult<{ authorized: boolean; grantId: string }> {
     const actor = options.actor;
@@ -4282,7 +4450,8 @@ export class ChronoCore {
       // All prerequisites hold: issue the single-use dispatch grant bound
       // to the project, exact module/work-package/spec revisions, Harness
       // bindings, one assigned role, the executing session, both
-      // attestations, both approvals, and the policy version.
+      // attestations, both approvals, the optional adapter, and the policy
+      // version.
       const grantId = this.issueBoundGrant({
         moduleId,
         workPackageId: options.workPackageId ?? null,
@@ -4292,6 +4461,7 @@ export class ChronoCore {
         role: assignedRole,
         sessionId: executor.id,
         requestedBy: requester.role,
+        adapterId: options.adapterId ?? null,
       });
 
       return { ok: true, value: { authorized: true, grantId } };
@@ -4315,6 +4485,7 @@ export class ChronoCore {
     role: string;
     sessionId: string;
     requestedBy: string;
+    adapterId: string | null;
   }): string {
     const grantId = this.sequences.allocate("GRANT");
     const ttlSeconds = this.config.grantTtlSeconds ?? 3600;
@@ -4346,6 +4517,7 @@ export class ChronoCore {
       role: input.role,
       session: input.sessionId,
       requestedBy: input.requestedBy,
+      adapterId: input.adapterId,
       rtkAttestationId: rtkLatest?.id ?? null,
       skillAttestationId: skillLatest?.id ?? null,
       moduleApprovalId: moduleApprovalRow?.id ?? null,
@@ -4407,6 +4579,96 @@ export class ChronoCore {
         affectedTarget: target,
         suggestedAction: "Verify the pinned Karpathy Guidelines skill and record a current attestation",
       });
+    }
+    this.requireIntactSkillArtifacts(target);
+  }
+
+  /**
+   * Emitted skill artifacts must still match the stored attestation:
+   * the vendor source must hash to the recorded sourceHash and every
+   * runtime file to its recorded generated hash [P8.6, INV §9]. Files
+   * live in agent-reachable project directories, so currency alone
+   * cannot prove they were not rewritten after verification. Missing
+   * files deny (not installed in this checkout); mismatched files deny
+   * as provenance failure. Nothing is persisted or mutated here.
+   */
+  private requireIntactSkillArtifacts(target: string): void {
+    const latest = this.db.skillAttestations().latestFull();
+    if (latest === null) {
+      throw new ChronoError({
+        code: ErrorCode.BLOCKED_PROCESS_SKILL,
+        severity: Severity.BLOCKER,
+        message: `Module ${target}: no skill attestation to bind emitted files against`,
+        invariantRef: "INV §9.7",
+        affectedTarget: target,
+        suggestedAction: "Verify the pinned Karpathy Guidelines skill and record a current attestation",
+      });
+    }
+    let expected: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(latest.generatedHashes);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new Error("not a hash map");
+      }
+      expected = parsed as Record<string, unknown>;
+    } catch {
+      throw new ChronoError({
+        code: ErrorCode.SKILL_PROVENANCE_FAILURE,
+        severity: Severity.BLOCKER,
+        message: `Module ${target}: stored skill generated-hashes are malformed`,
+        invariantRef: "INV §9.2",
+        affectedTarget: target,
+        suggestedAction: "Re-verify the pinned skill to record a well-formed attestation",
+      });
+    }
+    const readArtifact = (relativePath: string): string => {
+      try {
+        return readFileSync(joinPath(this.config.projectPath, relativePath), "utf8");
+      } catch (e) {
+        if ((e as { code?: string }).code === "ENOENT") {
+          throw new ChronoError({
+            code: ErrorCode.BLOCKED_PROCESS_SKILL,
+            severity: Severity.BLOCKER,
+            message: `Module ${target}: skill artifact '${relativePath}' is not installed in this checkout`,
+            invariantRef: "INV §9.7",
+            affectedTarget: target,
+            suggestedAction: "Run chrono skill verify in this project checkout",
+          });
+        }
+        throw new ChronoError({
+          code: ErrorCode.BLOCKED_PROCESS_SKILL,
+          severity: Severity.BLOCKER,
+          message: `Module ${target}: skill artifact '${relativePath}' is unreadable`,
+          invariantRef: "INV §9.7",
+          affectedTarget: target,
+          suggestedAction: "Fix project filesystem permissions and re-verify the skill",
+        });
+      }
+    };
+    const vendorRelative = skillVendorPath(latest.pinnedCommit);
+    if (hashSkillSource(readArtifact(vendorRelative)) !== latest.sourceHash) {
+      throw new ChronoError({
+        code: ErrorCode.SKILL_PROVENANCE_FAILURE,
+        severity: Severity.BLOCKER,
+        message: `Module ${target}: vendor skill source diverges from the attested ${latest.sourceHash}`,
+        invariantRef: "INV §9.2",
+        affectedTarget: target,
+        suggestedAction: "Re-verify the pinned skill; do not hand-edit vendor sources",
+      });
+    }
+    for (const runtime of ["claude", "opencode", "kiro"] as const) {
+      const relative = SKILL_RUNTIME_PATHS[runtime];
+      const want = expected[runtime];
+      if (typeof want !== "string" || hashSkillSource(readArtifact(relative)) !== want) {
+        throw new ChronoError({
+          code: ErrorCode.SKILL_PROVENANCE_FAILURE,
+          severity: Severity.BLOCKER,
+          message: `Module ${target}: runtime skill artifact '${relative}' diverges from the attestation`,
+          invariantRef: "INV §9.2",
+          affectedTarget: target,
+          suggestedAction: "Re-verify the pinned skill; runtime artifacts must be converter-emitted",
+        });
+      }
     }
   }
 
@@ -4874,6 +5136,7 @@ export class ChronoCore {
         role: caller.role,
         sessionId: caller.session.id,
         requestedBy: caller.role,
+        adapterId: null,
       });
 
       const result = this.transitionState(moduleId, "DefinitionOfDoneSatisfied", {
@@ -5212,5 +5475,10 @@ export class ChronoCore {
   /** PO-selected project runtime identifier, or null when unset (read-only). */
   projectRuntime(): string | null {
     return this.projects.findById("default").runtime;
+  }
+
+  /** Project root this Core instance operates on (read-only). */
+  projectPath(): string {
+    return this.config.projectPath;
   }
 }

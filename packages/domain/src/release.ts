@@ -38,6 +38,26 @@ export function skillVendorPath(pinnedCommit: string): string {
   return `vendor/karpathy-guidelines/${pinnedCommit}/SKILL.md`;
 }
 
+/**
+ * Immutable raw-file URL for the pinned source. Derived from the
+ * canonical upstream constant so the fetch target cannot drift from the
+ * enforced provenance.
+ */
+export function skillRawSourceUrl(): string {
+  const prefix = "https://github.com/";
+  if (!SKILL_RELEASE.upstream.startsWith(prefix)) {
+    throw new ChronoError({
+      code: ErrorCode.VALIDATION_ERROR,
+      severity: Severity.ERROR,
+      message: "Skill upstream is not a github.com repository URL",
+      invariantRef: "INV §14.4",
+      suggestedAction: "Pin the canonical Karpathy Guidelines upstream",
+    });
+  }
+  const repo = SKILL_RELEASE.upstream.slice(prefix.length);
+  return `https://raw.githubusercontent.com/${repo}/${SKILL_RELEASE.pinnedCommit}/${SKILL_RELEASE.sourcePath}`;
+}
+
 /** SHA-256 over raw source bytes, in revision-hash form [INV §11.1]. */
 export function hashSkillSource(bytes: Uint8Array | string): string {
   const digest = createHash("sha256").update(bytes).digest("hex");

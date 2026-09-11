@@ -47,7 +47,7 @@ hash above. The production fetch path was additionally proven live against
   fail-closed placeholder into the full pipeline: requires `--as` matching
   the caller session + `--session-token`; fetches the immutable commit
   (injectable, 30s timeout, 1 MiB cap); verifies hash/name/license;
-  refuses silently divergent stored rows (`SKILL_PROVENANCE_FAILURE`,
+  refuses divergent stored rows explicitly (`SKILL_PROVENANCE_FAILURE`,
   nothing recorded); emits vendor + claude/opencode/kiro artifacts;
   proves discovery + activation at rest by byte round-trip (MIT preserved);
   records via `core.recordSkillAttestation` (gaspar/PO capability,

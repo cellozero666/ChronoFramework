@@ -6,17 +6,23 @@
  * [RUNTIME §4, PL Phase 5]
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
   RTK_UPSTREAM,
+  SKILL_RELEASE,
+  SKILL_RUNTIME_PATHS,
   SKILL_UPSTREAM,
   buildApprovalPayload,
   buildSessionAuthorizationPayload,
+  convertSkillSource,
   generateApprovalKeyPair,
+  hashSkillSource,
   signApprovalPayload,
+  skillGeneratedHashes,
+  skillVendorPath,
 } from "@chrono/domain";
 import { ChronoCore } from "@chrono/core";
 import { runDispatch, type RunOptions, type SpawnResult } from "./index.js";
@@ -30,6 +36,77 @@ const SPEC = {
   acceptanceCriteria: ["ac1"],
 };
 const MOD = { id: "MOD-0001", name: "M", purpose: "P", specs: ["SP-0001"] };
+
+// Frozen fixture: byte-exact canonical SKILL.md at the pinned commit
+// (hashSkillSource === SKILL_RELEASE.sourceHash, asserted below).
+const FIXTURE_SKILL_MD = `---
+name: karpathy-guidelines
+description: Behavioral guidelines to reduce common LLM coding mistakes. Use when writing, reviewing, or refactoring code to avoid overcomplication, make surgical changes, surface assumptions, and define verifiable success criteria.
+license: MIT
+---
+
+# Karpathy Guidelines
+
+Behavioral guidelines to reduce common LLM coding mistakes, derived from [Andrej Karpathy's observations](https://x.com/karpathy/status/2015883857489522876) on LLM coding pitfalls.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+## 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+## 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+\`\`\`
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+\`\`\`
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+`;
 
 type TestSession = { id: string; token: string };
 
@@ -101,7 +178,7 @@ function approve(
   action: string,
   scopeArtifactId: string,
   scopeRevision: string
-): void {
+): string {
   const signature = signApprovalPayload(
     buildApprovalPayload({
       action,
@@ -123,6 +200,7 @@ function approve(
     signature,
   });
   expect(res.ok).toBe(true);
+  return res.value!.id;
 }
 
 describe("CLI dispatch", () => {
@@ -180,10 +258,10 @@ describe("CLI dispatch", () => {
       expect(
         core.recordSkillAttestation(gaspar, {
           upstream: SKILL_UPSTREAM,
-          pinnedCommit: "a".repeat(40),
-          sourceHash: `sha256:${"b".repeat(64)}`,
-          generatedHashes: "{}",
-          converterVersion: "test-1",
+          pinnedCommit: SKILL_RELEASE.pinnedCommit,
+          sourceHash: SKILL_RELEASE.sourceHash,
+          generatedHashes: skillGeneratedHashes(convertSkillSource(FIXTURE_SKILL_MD)),
+          converterVersion: SKILL_RELEASE.converterVersion,
           licenseStatus: "MIT",
           attribution: "MIT",
           runtimeIdentity: "test",
@@ -194,16 +272,32 @@ describe("CLI dispatch", () => {
           ttlSeconds: 86400,
         }).ok
       ).toBe(true);
+      // Emitted skill files matching the attestation (dispatch re-hashes).
+      expect(hashSkillSource(FIXTURE_SKILL_MD)).toBe(SKILL_RELEASE.sourceHash);
+      const vendorTarget = join(tempDir, skillVendorPath(SKILL_RELEASE.pinnedCommit));
+      mkdirSync(dirname(vendorTarget), { recursive: true });
+      writeFileSync(vendorTarget, FIXTURE_SKILL_MD, "utf8");
+      for (const runtime of ["claude", "opencode", "kiro"] as const) {
+        const target = join(tempDir, SKILL_RUNTIME_PATHS[runtime]);
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, FIXTURE_SKILL_MD, "utf8");
+      }
       const glenn = { actor: "glenn", session: signedSession(core, "glenn", privateKeyPem, "MOD-0001") };
       expect(core.recordSecurityProfile({ title: "P", threats: [] }, glenn).ok).toBe(true);
       approve(core, privateKeyPem, "implementation-security", "MOD-0001", modRev);
-      // Fixture runtime + registration.
+      // Fixture runtime + approved registration.
       entrypoint = join(tempDir, "fixture-runtime.sh");
       writeFileSync(entrypoint, "#!/bin/sh\necho fixture-ok\n");
       chmodSync(entrypoint, 0o755);
       expect(
-        core.registerAdapter({ id: "fixture", name: "Fixture", entrypoint }, po).ok
+        core.registerAdapter(
+          { id: "fixture", name: "Fixture", entrypoint, conformanceProof: ["fixture --version"] },
+          po
+        ).ok
       ).toBe(true);
+      const registrationHash = core.adapterRegistrationHash("fixture");
+      const adapterApprovalId = approve(core, privateKeyPem, "adapter-registration", "fixture", registrationHash);
+      expect(core.approveAdapter("fixture", adapterApprovalId, po).ok).toBe(true);
       worker = { actor: "belthazar", session: signedSession(core, "belthazar", privateKeyPem, "MOD-0001") };
     } finally {
       core.close();
@@ -244,6 +338,8 @@ describe("CLI dispatch", () => {
     expect(seen.env?.["CHRONO_MODULE"]).toBe("MOD-0001");
     expect(seen.env?.["CHRONO_ADAPTER"]).toBe("fixture");
     expect(seen.env?.["CHRONO_GRANT_ID"]).toMatch(/^GRANT-\d{4,}$/);
+    // The bearer session token never crosses into the child environment.
+    expect(seen.env?.["CHRONO_SESSION_TOKEN"]).toBeUndefined();
     const check = new ChronoCore({ projectPath: tempDir });
     try {
       expect(check.getArtifact("MOD-0001").status).toBe("VERIFYING");
@@ -286,5 +382,34 @@ describe("CLI dispatch", () => {
     expect(noRequester.exitCode).toBe(2);
     const noExecutor = runDispatch(tempDir, baseOptions({ sessionToken: "" }), okSpawn({}));
     expect(noExecutor.exitCode).toBe(2);
+  });
+
+  it("dispatches an authorized work package to IMPLEMENTED", () => {
+    const setup = new ChronoCore({ projectPath: tempDir });
+    try {
+      expect(
+        setup.registerWorkPackage(
+          "WP-0001",
+          "PLANNED",
+          { id: "WP-0001", name: "W", module: "MOD-0001", dependsOn: [] },
+          { actor: "gaspar", session: gaspar.session }
+        ).ok
+      ).toBe(true);
+      expect(
+        setup.transitionState("WP-0001", "WorkPackageAuthorized", { actor: "gaspar", session: gaspar.session }).ok
+      ).toBe(true);
+    } finally {
+      setup.close();
+    }
+    const seen: { env?: Record<string, string> } = {};
+    const out = runDispatch(tempDir, baseOptions({ wp: "WP-0001" }), okSpawn(seen));
+    expect(out.exitCode).toBe(0);
+    expect(out.stdout).toContain("IMPLEMENTED");
+    const check = new ChronoCore({ projectPath: tempDir });
+    try {
+      expect(check.getArtifact("WP-0001").status).toBe("IMPLEMENTED");
+    } finally {
+      check.close();
+    }
   });
 });

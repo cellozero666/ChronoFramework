@@ -375,6 +375,12 @@ conformance_proof: <list of proof commands>
 
 The Core verifies each registration before allowing dispatch. New adapters require PO approval `[FW §5, DOM §4.1]`.
 
+Lifecycle: intake (`chrono adapter register --file`) creates a `pending`
+row; a signed `adapter-registration` PO approval binding the exact
+registration hash activates it (`chrono adapter activate`); revocation is
+terminal. Only `active` adapters dispatch, and dispatch grants bound to a
+revoked adapter burn fail-closed.
+
 ---
 
 ## 14. Summary: What the Core Enforces vs. What Adapters Execute

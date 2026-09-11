@@ -16,6 +16,7 @@ import {
   hashSkillSource,
   parseSkillFrontmatter,
   skillGeneratedHashes,
+  skillRawSourceUrl,
   skillVendorPath,
   verifySkillRelease,
 } from "./release.js";
@@ -135,6 +136,12 @@ describe("Skill release pin", () => {
     expect(hashSkillSource(renamed)).not.toBe(SKILL_RELEASE.sourceHash);
     const relicensed = CANONICAL_SKILL_MD.replace("license: MIT", "license: Apache-2.0");
     expect(hashSkillSource(relicensed)).not.toBe(SKILL_RELEASE.sourceHash);
+  });
+
+  it("derives the immutable fetch URL from the upstream constant", () => {
+    expect(skillRawSourceUrl()).toBe(
+      `https://raw.githubusercontent.com/multica-ai/andrej-karpathy-skills/${SKILL_RELEASE.pinnedCommit}/${SKILL_RELEASE.sourcePath}`
+    );
   });
 
   it("derives vendor and runtime paths from the plan layout", () => {
