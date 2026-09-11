@@ -10,6 +10,15 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
+    // Plain-JS Node scripts (verification gates, release tooling) run in
+    // Node, not in a bare script scope: declare the used Node globals so
+    // `no-undef` checks them instead of failing the gate.
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      globals: { console: "readonly", process: "readonly" },
+    },
+  },
+  {
     rules: {
       // Historical intent of the previous config: allow explicit any where the
       // SQLite row-mapping boundary requires it; unused vars remain errors.
