@@ -6,9 +6,10 @@
  * sequence assigned by the Core. Sequences are allocated from a persisted
  * counter, never derived from wall-clock time (collision-prone).
  * `GRANT` covers operational dispatch grants (Core-owned locks, not
- * reviewable artifacts); `RTE` covers routing-proof evidence rows and
- * `SES` covers authenticated adapter sessions (both Core-owned
- * operational records, same precedent); the protocol family list is
+ * reviewable artifacts); `RTE` covers routing-proof evidence rows,
+ * `SES` covers authenticated adapter sessions, and `BRK` covers broker
+ * credentials for automatic Gaspar entry (all Core-owned operational
+ * records, same precedent); the protocol family list is
  * non-exhaustive ("such as", P3.7). No runtime-specific concepts [FW §22].
  */
 
@@ -39,12 +40,13 @@ export const ARTIFACT_ID_FAMILIES = [
   "SKILL",
   "RTE",
   "SES",
+  "BRK",
   "GRANT",
 ] as const;
 
 export type ArtifactIdFamily = (typeof ARTIFACT_ID_FAMILIES)[number];
 
-const ID_PATTERN = /^(REQ|BR|CON|DEC|ADR|SP|AC|MOD|WP|TASK|APR|BLK|DEF|EVD|QA|SEC|WAIVER|CR|OPEN|RTK|SKILL|RTE|SES|GRANT)-(\d{4,})$/;
+const ID_PATTERN = /^(REQ|BR|CON|DEC|ADR|SP|AC|MOD|WP|TASK|APR|BLK|DEF|EVD|QA|SEC|WAIVER|CR|OPEN|RTK|SKILL|RTE|SES|BRK|GRANT)-(\d{4,})$/;
 
 export interface ParsedArtifactId {
   readonly family: ArtifactIdFamily;

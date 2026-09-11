@@ -2335,4 +2335,131 @@ export class RoutingProofRepository {
   }
 }
 
+export interface SetupStateRecord {
+  readonly step: string;
+  readonly updatedAt: string;
+  readonly detail: string;
+}
+
+/**
+ * Resumable setup state for chrono init orchestration [SLICE-10 §3.3].
+ * Single row (`id = 'setup'`): the furthest step reached plus non-secret
+ * detail JSON. Secrets (keys, tokens, broker secrets) must never enter
+ * the detail payload.
+ */
+export class SetupRepository {
+  constructor(private readonly db: Database) {}
+
+  get(): SetupStateRecord | null {
+    const row = this.db
+      .prepare("SELECT step, updated_at, detail FROM setup_state WHERE id = 'setup'")
+      .get() as { step: string; updated_at: string; detail: string } | undefined;
+    if (row === undefined) {
+      return null;
+    }
+    return { step: row.step, updatedAt: row.updated_at, detail: row.detail };
+  }
+
+  set(step: string, updatedAt: string, detail: string): SetupStateRecord {
+    this.db
+      .prepare(
+        `INSERT INTO setup_state (id, step, updated_at, detail) VALUES ('setup', ?, ?, ?)
+         ON CONFLICT (id) DO UPDATE SET step = excluded.step, updated_at = excluded.updated_at, detail = excluded.detail`
+      )
+      .run(step, updatedAt, detail);
+    const current = this.get();
+    if (current === null) {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: "Setup state write did not persist",
+        invariantRef: "INV §14.4",
+        suggestedAction: "Verify the project database is writable",
+      });
+    }
+    return current;
+  }
+}
+
+export interface BrokerCredentialRecord {
+  readonly id: string;
+  readonly secretHash: string;
+  readonly createdAt: string;
+  readonly revoked: boolean;
+}
+
+interface BrokerCredentialRow {
+  readonly id: string;
+  readonly secret_hash: string;
+  readonly created_at: string;
+  readonly revoked: unknown;
+}
+
+/**
+ * Broker credentials for automatic Gaspar entry [SLICE-10 §5.2].
+ * Only the SHA-256 of each secret persists; verification uses a
+ * timing-safe comparison. Revocation is terminal.
+ */
+export class BrokerRepository {
+  constructor(private readonly db: Database) {}
+
+  create(credential: { id: string; secretHash: string; createdAt: string }): BrokerCredentialRecord {
+    try {
+      this.db
+        .prepare("INSERT INTO broker_credential (id, secret_hash, created_at, revoked) VALUES (?, ?, ?, 0)")
+        .run(credential.id, credential.secretHash, credential.createdAt);
+    } catch {
+      throw new ChronoError({
+        code: ErrorCode.DUPLICATE_IDENTITY,
+        severity: Severity.ERROR,
+        message: `Broker credential '${credential.id}' already exists: revoke it first to replace it`,
+        invariantRef: "INV §10.1",
+        affectedTarget: credential.id,
+        suggestedAction: "Revoke the existing broker credential before issuing a new one",
+      });
+    }
+    return this.findById(credential.id);
+  }
+
+  findById(id: string): BrokerCredentialRecord {
+    const row = this.db
+      .prepare("SELECT * FROM broker_credential WHERE id = ?")
+      .get(id) as BrokerCredentialRow | undefined;
+    if (row === undefined) {
+      throw new ChronoError({
+        code: ErrorCode.ENTITY_NOT_FOUND,
+        severity: Severity.ERROR,
+        message: `Broker credential '${id}' not found`,
+        invariantRef: "INV §10.2",
+        affectedTarget: id,
+        suggestedAction: "Issue a broker credential during setup first",
+      });
+    }
+    return {
+      id: row.id,
+      secretHash: row.secret_hash,
+      createdAt: row.created_at,
+      revoked: Boolean(row.revoked),
+    };
+  }
+
+  listAll(): BrokerCredentialRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM broker_credential ORDER BY id")
+      .all() as BrokerCredentialRow[];
+    return rows.map((row) => ({
+      id: row.id,
+      secretHash: row.secret_hash,
+      createdAt: row.created_at,
+      revoked: Boolean(row.revoked),
+    }));
+  }
+
+  revoke(id: string): BrokerCredentialRecord {
+    this.findById(id);
+    this.db.prepare("UPDATE broker_credential SET revoked = 1 WHERE id = ?").run(id);
+    return this.findById(id);
+  }
+}
+
 export { type Database };

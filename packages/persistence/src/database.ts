@@ -19,6 +19,7 @@ import {
   EventLogRepository,
   GrantRepository,
   HarnessRepository,
+  BrokerRepository,
   ProjectRepository,
   QaRepository,
   RtkRepository,
@@ -28,6 +29,7 @@ import {
   SequenceRepository,
   SessionAuthorizationRepository,
   SessionRepository,
+  SetupRepository,
   SkillRepository,
   WaiverRepository,
 } from "./repositories.js";
@@ -223,6 +225,14 @@ export class ChronoDatabase {
 
   skillAttestations(): SkillRepository {
     return new SkillRepository(this.db);
+  }
+
+  setup(): SetupRepository {
+    return new SetupRepository(this.db);
+  }
+
+  brokerCredentials(): BrokerRepository {
+    return new BrokerRepository(this.db);
   }
 
   /**

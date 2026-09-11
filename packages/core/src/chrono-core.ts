@@ -4,7 +4,7 @@
  * [FW §648] — Fail-closed semantics.
  */
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { accessSync, constants as fsConstants, readFileSync } from "node:fs";
 import { join as joinPath } from "node:path";
 import {
@@ -44,6 +44,10 @@ import {
   buildWaiverPayload,
   fingerprintPublicKey,
   hashSkillSource,
+  isLegalSetupAdvance,
+  setupStepIndex,
+  BROKER_SESSION_TTL_SECONDS,
+  GASPAR_ENTRY_ACTIONS,
   parseActorIdentity,
   parseApprovalPublicKey,
   skillVendorPath,
@@ -65,7 +69,7 @@ import {
   Severity,
   type CoreOperation,
 } from "@chrono/domain";
-import type { ProjectState, EntityType, ApprovalPayload, WaiverPayload, AgentRole } from "@chrono/domain";
+import type { ProjectState, EntityType, ApprovalPayload, WaiverPayload, AgentRole, SetupStep, GasparEntryProjection } from "@chrono/domain";
 
 /**
  * Caller authentication bundle for every protected Core operation.
@@ -153,6 +157,22 @@ export interface CoreConfig {
    * long an authorized dispatch stays enactable [Remediation §3A].
    */
   readonly grantTtlSeconds?: number;
+  /**
+   * Pinned local Core version expected by the launcher [SLICE-10 §2].
+   * When present, construction stamps it on first touch (project upgrade
+   * path) and denies when the project pins a different version — the
+   * global launcher must never silently substitute its own Core. Omitted
+   * by programmatic/test callers, which skip the check.
+   */
+  readonly pinnedVersion?: string;
+  /**
+   * Read-only open [SLICE-10 §§3, 7]: skips migration and version
+   * stamping (SQLite itself enforces no-write at the file layer, so
+   * opening a non-project path fails instead of creating a database).
+   * Version match is still enforced read-only. Detection and doctor
+   * flows must use this; init and all mutating flows must not.
+   */
+  readonly readOnly?: boolean;
 }
 
 /**
@@ -222,12 +242,24 @@ export class ChronoCore {
     this.config = config;
     this.db = new ChronoDatabase({
       path: `${config.projectPath}/.chrono/chrono.db`,
+      ...(config.readOnly === true ? { readonly: true } : {}),
     });
-    try {
-      this.db.migrate();
-    } catch (e) {
-      this.db.close();
-      throw e;
+    if (config.readOnly !== true) {
+      try {
+        this.db.migrate();
+      } catch (e) {
+        this.db.close();
+        throw e;
+      }
+    }
+    if (config.pinnedVersion !== undefined) {
+      try {
+        this.events = this.db.events();
+        this.enforcePinnedVersion(config.pinnedVersion, config.readOnly === true);
+      } catch (e) {
+        this.db.close();
+        throw e;
+      }
     }
     this.projects = this.db.projects();
     this.artifacts = this.db.artifacts();
@@ -244,6 +276,60 @@ export class ChronoCore {
   /** Current timestamp from the configured clock (wall-clock unless tests inject one). */
   private now(): string {
     return this.config.clock?.() ?? new Date().toISOString();
+  }
+
+  /**
+   * Pinned-Core gate [SLICE-10 §2, RUNTIME §14]. The launcher passes the
+   * version it was built with; the project records the version that owns
+   * its database. First touch stamps the pin (project creation or upgrade
+   * path, audited); a different pin denies construction so a global
+   * installation can never silently substitute its own Core. Exact match
+   * is required while v1 is pre-1.0; the rule is documented, never silent.
+   */
+  private enforcePinnedVersion(pinnedVersion: string, readOnly: boolean): void {
+    if (!/^\d+\.\d+\.\d+$/.test(pinnedVersion)) {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: `Pinned Core version '${pinnedVersion}' is malformed: expected MAJOR.MINOR.PATCH`,
+        invariantRef: "INV §14.4",
+        suggestedAction: "Launch chrono from a release build with a well-formed version",
+      });
+    }
+    const recorded = this.db.runtimeConfig().get("chrono.version");
+    if (recorded === null) {
+      if (readOnly) {
+        throw new ChronoError({
+          code: ErrorCode.CONFIG_ERROR,
+          severity: Severity.BLOCKER,
+          message: "Project has no pinned Core version and this open is read-only: refusing to stamp",
+          invariantRef: "INV §4.1",
+          affectedTarget: "CORE-VERSION",
+          suggestedAction: "Open the project read-write (chrono init) to pin its Core version first",
+        });
+      }
+      this.db.runtimeConfig().set("chrono.version", pinnedVersion);
+      this.events.append({
+        eventType: "ArtifactCreated",
+        entityId: "CORE-VERSION",
+        payload: { type: "PINNED_CORE_VERSION", version: pinnedVersion },
+        actor: "system",
+        priorState: undefined,
+        newState: "pinned",
+        reasoning: "Project Core version pinned on first touch",
+      });
+      return;
+    }
+    if (recorded !== pinnedVersion) {
+      throw new ChronoError({
+        code: ErrorCode.CONFIG_ERROR,
+        severity: Severity.BLOCKER,
+        message: `Project pins Core ${recorded}, launcher is ${pinnedVersion}: refusing to substitute cores`,
+        invariantRef: "INV §4.1",
+        affectedTarget: "CORE-VERSION",
+        suggestedAction: "Install the matching chrono release, or run an explicit PO-authorized upgrade before retrying",
+      });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1981,6 +2067,421 @@ export class ChronoCore {
       return { ok: true, value: undefined };
     } catch (e) {
       return this.handleError(e);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Slice 10: setup state, broker credentials, Gaspar entry [§§3, 5]
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Readable setup-state projection for init resume/doctor flows.
+   * Returns null when setup never started.
+   */
+  getSetupState(): CoreResult<{ step: string; updatedAt: string; detail: string } | null> {
+    try {
+      return { ok: true, value: this.db.setup().get() };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Advance the persisted setup state machine. Same-step re-entry (for
+   * idempotent retry) or exactly the next step; skip-ahead is denied so
+   * no step can be marked complete without performing it. The detail
+   * payload must be a JSON object free of secret-bearing keys (keys,
+   * tokens, secrets, and credentials never persist here).
+   */
+  advanceSetupState(step: SetupStep, detail: Record<string, unknown>): CoreResult<{ step: string }> {
+    try {
+      if (detail === null || typeof detail !== "object" || Array.isArray(detail)) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Setup detail must be a JSON object",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Record non-secret setup progress as key/value detail",
+        });
+      }
+      for (const key of Object.keys(detail)) {
+        if (/secret|token|private|password|credential|keychain/i.test(key)) {
+          throw new ChronoError({
+            code: ErrorCode.SECRET_DETECTED,
+            severity: Severity.ERROR,
+            message: `Setup detail key '${key}' looks secret-bearing: progress must persist non-secret state only`,
+            invariantRef: "INV §7.9",
+            suggestedAction: "Keep keys, tokens, and credentials in the OS keychain, never in setup state",
+          });
+        }
+      }
+      this.assertNoNestedSecrets(detail, "detail");
+      let serialized: string;
+      try {
+        serialized = JSON.stringify(detail);
+      } catch {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Setup detail is not JSON-serializable",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Record plain JSON values only",
+        });
+      }
+      const current = this.db.setup().get();
+      if (!isLegalSetupAdvance(current?.step ?? null, step)) {
+        throw new ChronoError({
+          code: ErrorCode.ILLEGAL_TRANSITION,
+          severity: Severity.ERROR,
+          message: `Setup cannot move from '${current?.step ?? "none"}' to '${step}': forward-only with same-step re-entry`,
+          invariantRef: "INV §3.2",
+          affectedTarget: "setup",
+          suggestedAction: "Resume from the recorded step instead of skipping ahead",
+        });
+      }
+      const updatedAt = this.now();
+      this.db.transaction(() => {
+        this.db.setup().set(step, updatedAt, serialized);
+        this.events.append({
+          eventType: "StateTransition",
+          entityId: "setup",
+          payload: { entityType: "SETUP", eventType: "SetupAdvanced", fromState: current?.step ?? null, toState: step },
+          actor: "system",
+          priorState: current?.step,
+          newState: step,
+          reasoning: "Init orchestration advanced",
+        });
+      });
+      return { ok: true, value: { step } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /** Recursively reject secret-bearing keys in nested setup detail. */
+  private assertNoNestedSecrets(value: unknown, path: string): void {
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        this.assertNoNestedSecrets(value[i], `${path}[${String(i)}]`);
+      }
+      return;
+    }
+    if (typeof value === "object" && value !== null) {
+      for (const [key, nested] of Object.entries(value)) {
+        if (/secret|token|private|password|credential|keychain/i.test(key)) {
+          throw new ChronoError({
+            code: ErrorCode.SECRET_DETECTED,
+            severity: Severity.ERROR,
+            message: `Setup detail key '${path}.${key}' looks secret-bearing: progress must persist non-secret state only`,
+            invariantRef: "INV §7.9",
+            suggestedAction: "Keep keys, tokens, and credentials in the OS keychain, never in setup state",
+          });
+        }
+        this.assertNoNestedSecrets(nested, `${path}.${key}`);
+      }
+    }
+  }
+
+  /**
+   * Issue a broker credential for automatic Gaspar entry [§5.2].
+   * Returns the secret exactly once: only its SHA-256 persists. The CLI
+   * must place the secret in the OS keychain; adapters present it over a
+   * local stdio pipe, never in prompts, env, argv, logs, or files.
+   */
+  issueBrokerCredential(auth: CallerAuth): CoreResult<{ id: string; secret: string }> {
+    try {
+      const caller = this.resolveCaller(auth, "issue broker credential");
+      this.requireCapability("broker.issue", caller);
+      const id = this.sequences.allocate("BRK");
+      const secret = randomBytes(32).toString("hex");
+      const secretHash = createHash("sha256").update(secret, "utf8").digest("hex");
+      const createdAt = this.now();
+      this.db.transaction(() => {
+        this.db.brokerCredentials().create({ id, secretHash, createdAt });
+        this.events.append({
+          eventType: "ArtifactCreated",
+          entityId: id,
+          payload: { type: "BROKER_CREDENTIAL" },
+          actor: caller.auditActor,
+          priorState: undefined,
+          newState: "active",
+          reasoning: "Broker credential issued for automatic Gaspar entry",
+        });
+      });
+      return { ok: true, value: { id, secret } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /** Revoke a broker credential (terminal; audited). */
+  revokeBrokerCredential(id: string, auth: CallerAuth): CoreResult<void> {
+    try {
+      const caller = this.resolveCaller(auth, "revoke broker credential");
+      this.requireCapability("broker.revoke", caller);
+      this.db.transaction(() => {
+        this.db.brokerCredentials().revoke(id);
+        this.events.append({
+          eventType: "StateTransition",
+          entityId: id,
+          payload: { entityType: "BROKER_CREDENTIAL", eventType: "BrokerRevoked" },
+          actor: caller.auditActor,
+          priorState: "active",
+          newState: "revoked",
+          reasoning: "Broker credential revoked",
+        });
+      });
+      return { ok: true, value: undefined };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * State-aware Gaspar entry projection [§5.3]. Deterministic data the
+   * adapter renders as Gaspar's opening: projected state, pending
+   * decisions, blockers, and the required next action. No prose, no
+   * conversation memory — the adapter combines this with the canonical
+   * Gaspar definition. Requires a live gaspar or PO session.
+   */
+  gasparEntryProjection(auth: CallerAuth): CoreResult<GasparEntryProjection> {
+    try {
+      const caller = this.resolveCaller(auth, "gaspar entry projection");
+      if (caller.role !== "gaspar" && caller.role !== "PO") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Entry projection requires a gaspar or PO session, not '${caller.role}': workers cannot derive Gaspar authority`,
+          invariantRef: "INV §5.1",
+          affectedTarget: caller.session.id,
+          suggestedAction: "Redeem a broker credential for a bounded Gaspar session first",
+        });
+      }
+      return { ok: true, value: this.buildGasparEntryProjection() };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /** Pure projection builder shared by redeem and refresh paths. */
+  private buildGasparEntryProjection(): GasparEntryProjection {
+    const status = this.status();
+    const state = status.ok ? status.value!.state : "BLOCKED";
+    let language = "en";
+    try {
+      language = this.projects.findById("default").language;
+    } catch {
+      // Fresh projects fall back to the default language.
+    }
+    const gasparAutonomy = status.ok ? status.value!.details.gasparAutonomy : "SEMI_AUTONOMOUS";
+    const runtime = status.ok ? status.value!.details.runtime : null;
+    const architectureState = status.ok ? status.value!.details.architectureState : null;
+    const specCount = status.ok ? status.value!.specCount : 0;
+    const moduleCount = status.ok ? status.value!.moduleCount : 0;
+    const blockers = status.ok
+      ? status.value!.activeBlockerList.map((b) => ({ id: b.id, type: b.type, reason: b.reason }))
+      : [];
+    const awaitingApprovalModules: string[] = [];
+    try {
+      for (const artifact of this.artifacts.listByType("MOD")) {
+        if (artifact.status === "AWAITING_APPROVAL") {
+          awaitingApprovalModules.push(artifact.id);
+        }
+      }
+    } catch {
+      // Projection stays fail-open on content: state + blockers suffice.
+    }
+    const architectureSecurityPending =
+      architectureState === "proposed" || architectureState === "under_review";
+    const requiredDecisions: string[] = [
+      ...awaitingApprovalModules.map((id) => `module-approval:${id}`),
+      ...blockers.map((b) => `resolve-blocker:${b.id}`),
+    ];
+    if (architectureSecurityPending) {
+      requiredDecisions.push("architecture-security:ARCH");
+    }
+    const nextAction = GASPAR_ENTRY_ACTIONS[state] ?? { key: "explain-blocker", summary: "Explain the blocking condition and the safe next action." };
+    return {
+      projectState: state,
+      language,
+      gasparAutonomy,
+      runtime,
+      specCount,
+      moduleCount,
+      activeBlockers: blockers.length,
+      blockers,
+      awaitingApprovalModules,
+      architectureSecurityPending,
+      requiredDecisions,
+      nextAction,
+    };
+  }
+
+  /**
+   * Redeem a broker credential for a bounded Gaspar session [§§5.1–5.2].
+   * The secret is the credential: no session is required to call this,
+   * so unknown ids, revoked credentials, and wrong secrets all deny
+   * without distinguishing the reason beyond revocation transparency.
+   * On success mints a short-lived project-wide gaspar session bound to
+   * the approved adapter and returns it with the entry projection. The
+   * token is returned once over the caller's local channel; the Core
+   * never places it in prompts, logs, or persisted artifacts.
+   */
+  redeemBrokerCredential(input: {
+    brokerId: string;
+    secret: string;
+    adapterId: string;
+    runtime: string;
+  }): CoreResult<{
+    session: { id: string; token: string; expiresAt: string };
+    projection: GasparEntryProjection;
+  }> {
+    try {
+      if (input.brokerId.length === 0 || input.brokerId.length > 64) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Broker redemption requires a broker credential id",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Present the broker id issued during setup",
+        });
+      }
+      let credential;
+      try {
+        credential = this.db.brokerCredentials().findById(input.brokerId);
+      } catch {
+        this.auditBrokerAttempt(input.brokerId, input.adapterId, "unknown-credential");
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: "Broker credential invalid: entry denied",
+          invariantRef: "INV §5.1",
+          affectedTarget: input.adapterId,
+          suggestedAction: "Issue a broker credential during setup and redeem it through the adapter",
+        });
+      }
+      if (credential.revoked) {
+        this.auditBrokerAttempt(input.brokerId, input.adapterId, "revoked-credential");
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: "Broker credential revoked: entry denied",
+          invariantRef: "INV §5.1",
+          affectedTarget: input.adapterId,
+          suggestedAction: "Issue a fresh broker credential during setup",
+        });
+      }
+      const presented = createHash("sha256").update(input.secret, "utf8").digest();
+      const expected = Buffer.from(credential.secretHash, "hex");
+      if (presented.length !== expected.length || !timingSafeEqual(presented, expected)) {
+        this.auditBrokerAttempt(input.brokerId, input.adapterId, "secret-mismatch");
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: "Broker credential invalid: entry denied",
+          invariantRef: "INV §5.1",
+          affectedTarget: input.adapterId,
+          suggestedAction: "Present the broker secret stored at setup time",
+        });
+      }
+      const adapter = this.getAdapterForDispatch(input.adapterId);
+      if (input.runtime.trim().length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Broker redemption requires the adapter runtime",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Identify the runtime redeeming entry",
+        });
+      }
+      const project = this.projects.findById("default");
+      if (project.runtime !== null && project.runtime !== input.runtime) {
+        throw new ChronoError({
+          code: ErrorCode.INCONSISTENT_REFERENCE,
+          severity: Severity.ERROR,
+          message: `Entry runtime '${input.runtime}' does not match project runtime '${project.runtime}'`,
+          invariantRef: "INV §10.2",
+          affectedTarget: input.adapterId,
+          suggestedAction: "Redeem entry from the project's configured runtime",
+        });
+      }
+      this.requireSetupAtLeast("ADAPTERS_REGISTERED_AND_APPROVED", input.adapterId);
+      this.requireCurrentRtk(
+        input.adapterId,
+        { id: "broker-entry", adapter: adapter.id, runtime: input.runtime },
+        adapter.id
+      );
+      this.requireCurrentSkill(input.adapterId);
+      const token = randomBytes(32).toString("hex");
+      const tokenHash = createHash("sha256").update(token, "utf8").digest("hex");
+      const id = this.sequences.allocate("SES");
+      const issuedAt = this.now();
+      const expiresAt = new Date(Date.parse(issuedAt) + BROKER_SESSION_TTL_SECONDS * 1000).toISOString();
+      this.db.transaction(() => {
+        this.db.sessions().create({
+          id,
+          tokenHash,
+          role: "gaspar",
+          adapter: adapter.id,
+          runtime: input.runtime,
+          projectId: "default",
+          scopeModule: null,
+          scopeWp: null,
+          parentId: null,
+          issuedAt,
+          expiresAt,
+        });
+        this.events.append({
+          eventType: "ArtifactCreated",
+          entityId: id,
+          payload: { type: "SESSION", role: "gaspar", adapter: adapter.id, authPath: "broker-redemption", brokerId: input.brokerId },
+          actor: "gaspar",
+          priorState: undefined,
+          newState: "active",
+          reasoning: "Bounded Gaspar session minted for automatic runtime entry",
+        });
+      });
+      return {
+        ok: true,
+        value: {
+          session: { id, token, expiresAt },
+          projection: this.buildGasparEntryProjection(),
+        },
+      };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /** Setup-readiness floor for Gaspar entry: adapters approved or later. */
+  private requireSetupAtLeast(step: SetupStep, target: string): void {
+    const current = this.db.setup().get();
+    if (current === null || setupStepIndex(current.step) < setupStepIndex(step)) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Gaspar entry requires setup at '${step}' (currently '${current?.step ?? "not started"}'): finish setup first`,
+        invariantRef: "INV §5.1",
+        affectedTarget: target,
+        suggestedAction: "Run chrono init to prepare Gaspar entry",
+      });
+    }
+  }
+
+  /** Audit a failed broker redemption without recording secret material. */
+  private auditBrokerAttempt(brokerId: string, adapterId: string, outcome: string): void {
+    try {
+      this.events.append({
+        eventType: "BlockerRaised",
+        entityId: brokerId,
+        payload: { type: "BROKER_ATTEMPT", adapterId, outcome },
+        actor: "unknown",
+        priorState: undefined,
+        newState: "denied",
+        reasoning: "Failed Gaspar entry redemption",
+      });
+    } catch {
+      // Audit failure must not mask the denial.
     }
   }
 
@@ -5946,6 +6447,29 @@ export class ChronoCore {
    */
   describeRtkAttestation(): RtkAttestationDetail | null {
     return this.db.rtkAttestations().latestFull();
+  }
+
+  /**
+   * Routing-proof status for one adapter/runtime scope (read-only).
+   * Lets init/doctor skip-or-prove without attempting dispatch:
+   * `present` with a future `validUntil` means dispatch would find an
+   * unexpired proof (binary/adapter bindings are re-validated at
+   * dispatch). Never throws for missing rows.
+   */
+  routingProofStatus(
+    adapterId: string,
+    runtime: string
+  ): { present: boolean; id: string | null; validUntil: string | null; expired: boolean } {
+    const proof = this.db.routingProofs().latestFor(adapterId, runtime, "default");
+    if (proof === null) {
+      return { present: false, id: null, validUntil: null, expired: false };
+    }
+    return {
+      present: true,
+      id: proof.id,
+      validUntil: proof.validUntil,
+      expired: Date.parse(proof.validUntil) <= Date.parse(this.now()),
+    };
   }
 
   /**

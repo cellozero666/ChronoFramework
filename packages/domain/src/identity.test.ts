@@ -29,6 +29,7 @@ describe("Artifact identity format [CORE §3.1]", () => {
     // the validator must recognize what the Core itself mints [CORE §3.1].
     expect(isValidArtifactId("RTE-0001")).toBe(true);
     expect(isValidArtifactId("SES-0001")).toBe(true);
+    expect(isValidArtifactId("BRK-0001")).toBe(true);
     expect(isValidArtifactId("GRANT-0001")).toBe(true);
     expect(parseArtifactId("RTE-0007")).toEqual({ family: "RTE", seq: 7 });
     expect(parseArtifactId("SES-0042")).toEqual({ family: "SES", seq: 42 });

@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -571,5 +571,28 @@ export const MIGRATIONS: Record<number, string> = {
       valid_until        TEXT NOT NULL
     );
     CREATE INDEX idx_routing_proof_scope ON routing_proof(adapter_id, runtime, project_id);
+  `,
+  12: `
+    -- Setup state machine for chrono init orchestration [SLICE-10 §3.3]:
+    -- one resumable row: the furthest step reached plus non-secret detail
+    -- JSON (consent scopes, per-step verification notes). Advance is
+    -- same-step (idempotent retry) or exactly-next-step; skip-ahead denied.
+    CREATE TABLE setup_state (
+      id         TEXT PRIMARY KEY CHECK (id = 'setup'),
+      step       TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      detail     TEXT NOT NULL DEFAULT '{}'
+    );
+    -- Broker credentials for automatic Gaspar entry [SLICE-10 §5.2]:
+    -- only the SHA-256 of the secret persists; the secret itself lives in
+    -- the OS keychain and travels to the adapter over a local stdio pipe,
+    -- never in prompts, env, argv, logs, or repository files. Revocation
+    -- is terminal.
+    CREATE TABLE broker_credential (
+      id          TEXT PRIMARY KEY,
+      secret_hash TEXT NOT NULL,
+      created_at  TEXT NOT NULL,
+      revoked     INTEGER NOT NULL DEFAULT 0
+    );
   `,
 };

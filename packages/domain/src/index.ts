@@ -155,6 +155,17 @@ export {
   type SkillRuntime,
 } from "./release.js";
 
+// Setup state machine for init orchestration [SLICE-10 §3.3]
+export {
+  BROKER_SESSION_TTL_SECONDS,
+  GASPAR_ENTRY_ACTIONS,
+  SETUP_STEPS,
+  isLegalSetupAdvance,
+  setupStepIndex,
+  type GasparEntryProjection,
+  type SetupStep,
+} from "./setup.js";
+
 // Revision hashing
 export {
   canonicalize,

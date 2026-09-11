@@ -67,6 +67,7 @@ RTK-<seq>        e.g., RTK-001
 SKILL-<seq>      e.g., SKILL-001
 RTE-<seq>        e.g., RTE-001 (operational: routing-proof evidence rows)
 SES-<seq>        e.g., SES-001 (operational: authenticated adapter sessions)
+BRK-<seq>        e.g., BRK-001 (operational: broker credentials for Gaspar entry)
 GRANT-<seq>      e.g., GRANT-001 (operational: dispatch grants)
 ```
 

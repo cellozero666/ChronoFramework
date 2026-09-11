@@ -151,6 +151,7 @@ export function runInit(projectPath: string, options: InitOptions = {}): CliOutp
   try {
     core = new ChronoCore({
       projectPath,
+      pinnedVersion: CHRONO_VERSION,
       ...(options.language !== undefined ? { language: options.language } : {}),
       ...(options.gasparAutonomy !== undefined ? { gasparAutonomy: options.gasparAutonomy } : {}),
       ...(options.runtime !== undefined ? { runtime: options.runtime } : {}),
@@ -208,6 +209,17 @@ export function runInit(projectPath: string, options: InitOptions = {}): CliOutp
  */
 function constructionFailure(e: unknown, asJson: boolean): CliOutput {
   const message = e instanceof Error ? e.message : String(e);
+  // Preserve a deterministic Core failure (e.g. pinned-version mismatch)
+  // instead of flattening every construction fault to CORE_INIT_FAILURE.
+  const coreFault =
+    typeof e === "object" &&
+    e !== null &&
+    "code" in e &&
+    typeof (e as { code?: unknown }).code === "string" &&
+    "severity" in e &&
+    typeof (e as { severity?: unknown }).severity === "string"
+      ? (e as { code: string; severity: string; invariantRef?: string; affectedTarget?: string; suggestedAction?: string })
+      : null;
   if (asJson) {
     return {
       exitCode: 2,
@@ -215,10 +227,14 @@ function constructionFailure(e: unknown, asJson: boolean): CliOutput {
         {
           ok: false,
           error: {
-            code: "CORE_INIT_FAILURE",
-            severity: "ERROR",
+            code: coreFault?.code ?? "CORE_INIT_FAILURE",
+            severity: coreFault?.severity ?? "ERROR",
             message,
-            suggestedAction: "Verify the project path is writable and .chrono/chrono.db is intact",
+            ...(coreFault?.invariantRef !== undefined ? { invariantRef: coreFault.invariantRef } : {}),
+            ...(coreFault?.affectedTarget !== undefined ? { affectedTarget: coreFault.affectedTarget } : {}),
+            suggestedAction:
+              coreFault?.suggestedAction ??
+              "Verify the project path is writable and .chrono/chrono.db is intact",
           },
         },
         null,
@@ -231,8 +247,8 @@ function constructionFailure(e: unknown, asJson: boolean): CliOutput {
     exitCode: 2,
     stdout: "",
     stderr: [
-      `Fatal [CORE_INIT_FAILURE] (ERROR): ${message}`,
-      "  suggested action: Verify the project path is writable and .chrono/chrono.db is intact",
+      `Fatal [${coreFault?.code ?? "CORE_INIT_FAILURE"}] (${coreFault?.severity ?? "ERROR"}): ${message}`,
+      `  suggested action: ${coreFault?.suggestedAction ?? "Verify the project path is writable and .chrono/chrono.db is intact"}`,
     ].join("\n"),
   };
 }
@@ -244,7 +260,7 @@ export function runStatus(projectPath: string, options: OutputOptions = {}): Cli
   const asJson = options.json === true;
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -295,7 +311,7 @@ export function runValidate(projectPath: string, options: OutputOptions = {}): C
   const asJson = options.json === true;
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -359,7 +375,7 @@ export function runApprove(
   }
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -418,7 +434,7 @@ export function runWaive(
   }
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -562,7 +578,7 @@ export function runEnroll(
   }
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -676,7 +692,7 @@ export function runKeysGenerate(
   }
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -945,7 +961,7 @@ export function runGate(projectPath: string, options: GateOptions): CliOutput {
       : { exitCode, stdout: exitCode === 0 ? human : "", stderr: exitCode === 0 ? "" : human };
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -1081,7 +1097,7 @@ export function runAttestationStatus(
   const asJson = options.json === true;
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -1111,7 +1127,7 @@ export function runRtkVerify(
   const asJson = options.json === true;
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -1256,7 +1272,7 @@ export function runRtkProve(
   }
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -1377,7 +1393,7 @@ export async function runSkillVerify(
   const caller = { actor: options.as, session: options.session };
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -1544,7 +1560,7 @@ export function runSessionOpen(
   const asJson = options.json === true;
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -1666,7 +1682,7 @@ export function runSessionRevoke(
   const asJson = options.json === true;
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -1762,7 +1778,7 @@ export function runDispatch(
   }
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -2021,7 +2037,7 @@ export function runAdapterRegister(
   }
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -2045,7 +2061,7 @@ export function runAdapterList(projectPath: string, options: OutputOptions = {})
   const asJson = options.json === true;
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -2077,7 +2093,7 @@ export function runAdapterActivate(
   }
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -2109,7 +2125,7 @@ export function runAdapterRevoke(
   }
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }
@@ -2241,7 +2257,7 @@ export function runSetup(
   }
   let core: ChronoCore;
   try {
-    core = new ChronoCore({ projectPath });
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
   } catch (e) {
     return constructionFailure(e, asJson);
   }

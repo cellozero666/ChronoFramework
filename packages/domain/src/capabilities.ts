@@ -20,7 +20,7 @@
 import type { AgentRole } from "./state.js";
 
 /** Version of this authority policy, persisted with authorization evidence. */
-export const AUTHORITY_POLICY_VERSION = "3";
+export const AUTHORITY_POLICY_VERSION = "4";
 
 /**
  * Version of the runtime tool-classification policy below. Bumped
@@ -51,7 +51,9 @@ export type CoreOperation =
   | "attestation.record"
   | "adapter.register"
   | "adapter.approve"
-  | "adapter.revoke";
+  | "adapter.revoke"
+  | "broker.issue"
+  | "broker.revoke";
 
 const ALL_WORKERS: readonly AgentRole[] = ["belthazar", "melchior", "prometheus"];
 
@@ -79,6 +81,8 @@ export const ROLE_CAPABILITIES: Record<CoreOperation, readonly CapabilityHolder[
   "adapter.register": ["PO"],
   "adapter.approve": ["PO"],
   "adapter.revoke": ["PO"],
+  "broker.issue": ["gaspar", "PO"],
+  "broker.revoke": ["gaspar", "PO"],
 };
 
 /**
