@@ -308,12 +308,14 @@ The project must survive:
 - agent replacement;
 - machine restarts where applicable.
 
-A possible initial project structure is:
+The approved persistence model is hybrid. Versioned Markdown/YAML files are the human-readable authoritative contracts; `.chrono/chrono.db` is SQLite storage for transactional events, locks, lifecycle transitions, approvals, attestations, evidence indexes, and migrations. The database MUST NOT replace the documents as contracts.
+
+An initial project structure is:
 
 ``` text
 .chrono/
 ├── config.yaml
-├── state.yaml
+├── chrono.db
 │
 ├── context/
 │   ├── PROJECT.md
@@ -336,12 +338,24 @@ A possible initial project structure is:
 └── reports/
 ```
 
-The exact physical layout is an implementation decision and may evolve.
+Non-semantic directory details may evolve, but the Markdown/YAML plus SQLite boundary is normative.
 
 The invariant is:
 
 > Project truth must be persisted outside temporary AI conversation
 > context.
+
+Lifecycle state is hierarchical and fixed for v1:
+
+```text
+Project:       UNINITIALIZED | ANALYZING | ARCHITECTING | SPECIFYING | PLANNING | EXECUTING | VERIFYING | COMPLETE | BLOCKED
+Specification: DRAFT | REVIEW | READY | SUPERSEDED
+Module:        DRAFT | AWAITING_APPROVAL | APPROVED | EXECUTING | VERIFYING | PASSED | FAILED | COMPLETE | BLOCKED
+WorkPackage:   PLANNED | AUTHORIZED | RUNNING | BLOCKED | IMPLEMENTED | VERIFYING | FAILED | COMPLETE
+Verification:  PENDING | RUNNING | FAILED | PASSED | WAIVED
+```
+
+Project state is a deterministic projection and MUST NOT conceal a blocked, failed, running, or awaiting-approval child. `WAIVED` remains distinct from `PASSED`.
 
 ------------------------------------------------------------------------
 
@@ -576,6 +590,23 @@ RTK installation requires applicable user/system permission. Lack of permission
 blocks setup with actionable instructions; CHRONO must never silently fall back
 to unfiltered command output. RTK remains external to domain ownership: it does
 not define CHRONO state, governance, gates, or lifecycle.
+
+The Karpathy Guidelines skill is a second mandatory adapter-level process
+dependency. Its canonical upstream is
+`https://github.com/multica-ai/andrej-karpathy-skills`. CHRONO must pin an
+immutable commit, verify integrity/provenance, preserve MIT attribution, and
+generate Claude Code, OpenCode, and Kiro packages from the single canonical
+`skills/karpathy-guidelines/SKILL.md` source. Upstream instructions that point
+to another repository must not redirect installation silently.
+
+Every CHRONO agent must apply: think before coding, simplicity first, surgical
+changes, and goal-driven verified execution. The precedence is Product Owner,
+CHRONO protocols/Core, approved artifacts/Harness, role rules, then the skill.
+The skill cannot simplify away security, traceability, evidence, gates, error
+handling, or approved scope. The Core must require a current SkillAttestation
+covering source revision/hash, generated hashes, runtime discovery, permissions,
+and activation. Missing, divergent, inactive, modified, untrusted, or bypassed
+state must produce `BLOCKED_PROCESS_SKILL` and deny dispatch.
 
 ------------------------------------------------------------------------
 
@@ -944,6 +975,8 @@ The Core should eventually own capabilities such as:
 - consistency checks;
 - execution authorization;
 - runtime dispatch.
+- RTK capability and routing attestation;
+- mandatory process-skill provenance, conversion and activation attestation.
 
 Conceptually, before an implementation agent starts:
 
@@ -1055,13 +1088,13 @@ stop()
 Runtime adapters implement this behavior using capabilities available in
 their environment.
 
-Initial adapters may target:
+Required v1 adapters are:
 
 - OpenCode;
 - Claude Code;
 - Kiro;
-- Codex;
-- Gemini.
+
+Codex and Gemini may be added later through the same contract.
 
 A runtime adapter may use:
 
@@ -1077,6 +1110,8 @@ A runtime adapter may use:
 Those mechanisms belong to the adapter layer.
 
 They must not redefine CHRONO governance or lifecycle rules.
+
+Integration is bidirectional. `chrono run` MUST obtain Core authorization before dispatching a runtime, and each required runtime MUST install a native pre-tool hook that calls `chrono gate` before protected actions. A direct OpenCode, Claude Code, or Kiro session therefore remains subject to CHRONO, RTK, process-skill, permission, approval, and security gates. Failure to prove either dispatch or hook enforcement denies agent execution.
 
 ------------------------------------------------------------------------
 
@@ -1116,6 +1151,7 @@ chrono/
 │   ├── adapters/
 │   │   ├── opencode/
 │   │   ├── claude/
+│   │   ├── kiro/
 │   │   ├── codex/
 │   │   └── gemini/
 │   │
@@ -1139,11 +1175,9 @@ structure.
 
 ## 24. CLI as Framework Entry Point
 
-A portable initial implementation can expose CHRONO through a CLI.
+A globally installed `chrono` command is the mandatory framework entry point and integration manager.
 
-Node.js/TypeScript is a reasonable initial implementation choice because
-CHRONO is primarily orchestration, file processing, state management and
-runtime integration rather than performance-sensitive computation.
+The v1 implementation MUST use a TypeScript monorepo on supported Node.js LTS releases. It MUST support macOS, Linux, and Windows and be distributed free under Apache License 2.0 (`Apache-2.0`) through npm and GitHub Releases with signatures, checksums, SBOM, provenance, and preserved third-party notices, without a paid service or server dependency.
 
 Conceptual commands may include:
 
@@ -1152,13 +1186,16 @@ chrono init
 chrono status
 chrono interview
 chrono validate
+chrono gate <operation>
 chrono specs
 chrono roadmap
 chrono approve <target>
 chrono run <target>
 ```
 
-The exact command vocabulary must be designed during implementation.
+Additional commands may be designed during implementation, but `chrono`, `chrono init`, `chrono setup`, `chrono status`, `chrono gate`, `chrono approve`, `chrono waive`, and `chrono run` are required.
+
+The global launcher MUST locate the current project, resolve its pinned local CHRONO version, and delegate to that local Core. It MUST fail closed if the local Core is absent, incompatible, or unverifiable and MUST NOT silently execute a different global Core.
 
 The CLI is the interface to the framework Core; it is not itself the
 architectural definition of CHRONO.
@@ -1178,10 +1215,13 @@ architectural definition of CHRONO.
 7.  configuring the selected runtime adapter;
 8.  detecting and health-checking the mandatory RTK installation;
 9.  configuring and verifying RTK interception for the selected runtime;
-10. configuring agent/model preferences;
-11. launching or preparing the initial Gaspar system-analysis session.
+10. installing, converting, and activation-testing the mandatory Karpathy Guidelines skill;
+11. recording Product Owner-selected agent/model configuration without embedding a provider or model default;
+12. launching or preparing the initial Gaspar system-analysis session.
 
 Initialization must not assume that the project is a web application.
+
+No provider, model name, or model version may be hardcoded in source, templates, generated agent definitions, tests, defaults, or adapters. Model selection belongs to the Product Owner's project/runtime configuration and does not change role authority or deterministic policy.
 
 ------------------------------------------------------------------------
 
@@ -1227,6 +1267,8 @@ Two distinct Product Owner decisions are mandatory for affected work:
 A module cannot become `READY` without the first decision and cannot become `COMPLETE` without the second. Material changes to threats, trust boundaries, dependencies, controls, infrastructure exposure, or implementation assumptions invalidate affected security approval and return work to analysis or correction.
 
 Gaspar coordinates and persists security decisions; Belthazar implements secure defaults and reports deviations; Prometheus enforces least privilege and hardened, recoverable operations; Lucca proves controls through negative and abuse-case testing; Glenn independently assesses and blocks material risks; Spekkio challenges the evidence and denies `PASS` when security obligations remain unresolved. Only the Product Owner may accept residual risk, explicitly and traceably. A waiver remains distinct from `PASS`.
+
+PO approval, waiver, and risk acceptance MUST occur through interactive human-only `chrono` commands and be cryptographically signed with a key outside the project and agent context, preferably in the operating-system keychain. The signature binds action, scope, artifact identity, exact revision/hash, signer, and timestamp. The Core persists the event append-only in SQLite; changed content invalidates it. Missing interactivity, identity, key access, or signature validity yields `APPROVAL_REQUIRED`, and no adapter or agent may impersonate the PO.
 
 The Core must return `EXECUTION_DENIED` or `COMPLETION_DENIED` when a required Security Profile, PO decision, current evidence, or blocker resolution is absent, stale, contradictory, or invalid.
 
@@ -1544,9 +1586,10 @@ Recommended implementation order:
 15. implement Spekkio verification and defect routing;
 16. implement correction loops;
 17. enforce mandatory RTK installation, interception, health, audit, and savings checks;
-18. add model recommendations/configuration;
-19. validate the entire workflow end-to-end;
-20. only then add additional runtime adapters.
+18. enforce pinned Karpathy Guidelines installation, conversion, activation, and equivalence checks;
+19. add model recommendations/configuration;
+20. validate the entire workflow end-to-end;
+21. only then add additional runtime adapters.
 
 ------------------------------------------------------------------------
 

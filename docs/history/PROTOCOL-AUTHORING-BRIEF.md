@@ -1,4 +1,6 @@
-# CHRONO — Formal Protocol Documentation Phase
+# CHRONO — Protocol-Authoring Brief (Historical)
+
+> Historical record only. Current navigation and authority are defined in the [documentation index](../README.md); paths below have been normalized to the current repository structure.
 
 You are working on the CHRONO Framework repository.
 
@@ -9,7 +11,7 @@ Your task is to transform the existing conceptual architecture into a set of **f
 All documents created in this phase MUST be written in English and saved under:
 
 ```text
-/DOCS
+docs/protocols
 ```
 
 Create the directory if it does not exist.
@@ -21,8 +23,8 @@ Create the directory if it does not exist.
 Before writing anything, read the existing CHRONO documentation available in the repository, especially:
 
 ```text
-INIT.md
-CHRONO-FRAMEWORK-ARCHITECTURE.md
+docs/reference/FRAMEWORK-DEFINITION.md
+docs/architecture/REFERENCE-ARCHITECTURE.md
 ```
 
 Treat these documents as the current architectural source of truth.
@@ -99,9 +101,9 @@ INITIAL.md                     COMPLETE
     ↓
 FRAMEWORK ARCHITECTURE         COMPLETE
     ↓
-FORMAL PROTOCOLS               ← CURRENT PHASE
+FORMAL PROTOCOLS               COMPLETE
     ↓
-DOMAIN MODEL
+DOMAIN MODEL                   ← NEXT PHASE
     ↓
 CORE SPECIFICATION
     ↓
@@ -123,7 +125,7 @@ CHRONO itself follows:
 The CHRONO framework should be developed according to the same principle.
 
 The ordered execution roadmap for the subsequent phases is maintained in
-`IMPLEMENTATION.md`. That roadmap does not authorize implementation before the
+[`docs/implementation/IMPLEMENTATION-PLAN.md`](../implementation/IMPLEMENTATION-PLAN.md). That roadmap does not authorize implementation before the
 formal protocols and their derived domain model pass their respective review
 gates.
 
@@ -131,10 +133,10 @@ gates.
 
 # 4. Documentation to Produce
 
-Create the following documents under `/DOCS`:
+Create the following documents under `docs/protocols`:
 
 ```text
-/DOCS
+docs/protocols
 ├── 01-SYSTEM-ANALYSIS-PROTOCOL.md
 ├── 02-AUTHORITY-DECISION-PROTOCOL.md
 ├── 03-ARTIFACT-MODEL.md
@@ -205,7 +207,7 @@ Do not accidentally turn implementation suggestions into protocol requirements.
 Create:
 
 ```text
-/DOCS/01-SYSTEM-ANALYSIS-PROTOCOL.md
+docs/protocols/01-SYSTEM-ANALYSIS-PROTOCOL.md
 ```
 
 This document formalizes Gaspar's behavior from CHRONO initialization until enough system understanding exists to proceed into architecture.
@@ -340,7 +342,7 @@ It means enough authoritative information exists to begin architecture without i
 Create:
 
 ```text
-/DOCS/02-AUTHORITY-DECISION-PROTOCOL.md
+docs/protocols/02-AUTHORITY-DECISION-PROTOCOL.md
 ```
 
 Formalize CHRONO's authority model.
@@ -423,7 +425,7 @@ Unresolved authority conflict escalates to the Product Owner.
 Create:
 
 ```text
-/DOCS/03-ARTIFACT-MODEL.md
+docs/protocols/03-ARTIFACT-MODEL.md
 ```
 
 This is extremely important.
@@ -457,6 +459,9 @@ SecurityReport
 Waiver
 ChangeRequest
 ProjectState
+RuntimeCapability
+RTKAttestation
+SkillAttestation
 ```
 
 Do NOT prematurely lock the implementation into TypeScript classes, YAML files, database tables, or JSON schemas.
@@ -509,7 +514,7 @@ The document should identify what the future deterministic Core must be capable 
 Create:
 
 ```text
-/DOCS/04-ARCHITECTURE-ADR-PROTOCOL.md
+docs/protocols/04-ARCHITECTURE-ADR-PROTOCOL.md
 ```
 
 Formalize the transition:
@@ -559,7 +564,7 @@ They do not silently redefine it.
 Create:
 
 ```text
-/DOCS/05-SPECIFICATION-PROTOCOL.md
+docs/protocols/05-SPECIFICATION-PROTOCOL.md
 ```
 
 Formalize Spec discovery and creation.
@@ -630,7 +635,7 @@ It MUST NOT become an uncontrolled design notebook.
 Create:
 
 ```text
-/DOCS/06-HARNESS-PROTOCOL.md
+docs/protocols/06-HARNESS-PROTOCOL.md
 ```
 
 Every executable Spec MUST have a corresponding Harness.
@@ -703,6 +708,10 @@ RTK is a REQUIRED operational dependency for every CHRONO CLI runtime adapter. T
 
 OpenCode and Claude adapters SHOULD use RTK's officially supported native integration. The Kiro adapter MUST implement and test explicit shell-command interception through Kiro's blocking `PreToolUse` hook or an equivalent wrapper because native RTK support MUST NOT be assumed. Every adapter MUST verify effective routing rather than treating configuration-file presence as proof.
 
+The Karpathy Guidelines skill is a REQUIRED process dependency for every CHRONO agent runtime. Its canonical upstream MUST be `https://github.com/multica-ai/andrej-karpathy-skills`, pinned to an immutable reviewed commit. All Claude Code, OpenCode, and Kiro artifacts MUST be deterministically generated from `skills/karpathy-guidelines/SKILL.md`, remain semantically equivalent, preserve the MIT license/attribution, and pass runtime discovery/activation tests. Upstream documentation that references another repository MUST NOT redirect CHRONO installation without an explicit reviewed source change.
+
+The skill MUST require think-before-coding, simplicity, surgical changes, and goal-driven verification throughout CHRONO work. Its authority is lower than Product Owner decisions, CHRONO protocols/Core, approved artifacts/Harnesses, and role rules. It MUST NOT justify removal or weakening of security, traceability, evidence, gates, error handling, or approved behavior. A missing, modified, untrusted, divergent, inactive, or bypassed skill MUST create `BLOCKED_PROCESS_SKILL` and deterministically deny agent dispatch. Applicable installation/configuration permission remains required.
+
 ---
 
 # 12. Document 07 — Consistency Validation Protocol
@@ -710,7 +719,7 @@ OpenCode and Claude adapters SHOULD use RTK's officially supported native integr
 Create:
 
 ```text
-/DOCS/07-CONSISTENCY-VALIDATION-PROTOCOL.md
+docs/protocols/07-CONSISTENCY-VALIDATION-PROTOCOL.md
 ```
 
 Formalize the two validation layers:
@@ -788,7 +797,7 @@ Security-related inconsistencies should involve Glenn.
 Create:
 
 ```text
-/DOCS/08-ROADMAP-EXECUTION-PROTOCOL.md
+docs/protocols/08-ROADMAP-EXECUTION-PROTOCOL.md
 ```
 
 Formalize:
@@ -877,6 +886,8 @@ Runtime adapters come later.
 
 The execution protocol must define fail-closed security authorization. Belthazar, Prometheus, Lucca, and Glenn MUST provide current security-relevant implementation, infrastructure, test, dependency, and review evidence. Material deviation from the approved threat model or controls MUST create a blocker/change request and invalidate affected authorization until Gaspar updates impacted artifacts and the Product Owner makes the required decision.
 
+It must also define mandatory process-skill authorization: every agent dispatch requires a current `SkillAttestation` for the pinned Karpathy Guidelines source and its runtime-specific generated artifact. The protocol MUST validate provenance, hashes, semantic equivalence, runtime discovery, permissions, and activation rather than merely checking that a file exists.
+
 ---
 
 # 14. Document 09 — Verification & Correction Protocol
@@ -884,7 +895,7 @@ The execution protocol must define fail-closed security authorization. Belthazar
 Create:
 
 ```text
-/DOCS/09-VERIFICATION-CORRECTION-PROTOCOL.md
+docs/protocols/09-VERIFICATION-CORRECTION-PROTOCOL.md
 ```
 
 Formalize the post-execution quality process.
@@ -1056,9 +1067,25 @@ COMPLETE
 
 ---
 
-# 16. Do Not Prematurely Implement
+# 16. Approved Post-Protocol Implementation Baseline
 
-During this task:
+The prohibition on implementation below governed the completed protocol-writing phase. The subsequent implementation is now authorized only against the following approved baseline:
+
+- TypeScript monorepo on supported Node.js LTS releases;
+- mandatory globally installed `chrono` launcher delegating to the version-pinned local Core;
+- free npm and GitHub Releases distribution for macOS, Linux, and Windows, with signatures, checksums, SBOM, and provenance, and no required paid/server dependency;
+- Apache License 2.0 (`Apache-2.0`) for CHRONO-authored software and documentation, with preservation of third-party licenses and attribution;
+- versioned Markdown/YAML contracts plus `.chrono/chrono.db` SQLite operational storage;
+- hierarchical Project, Specification, Module, WorkPackage, and Verification states defined in `docs/reference/FRAMEWORK-DEFINITION.md` and `docs/implementation/IMPLEMENTATION-PLAN.md`;
+- cryptographically signed, interactive, human-only PO approval/waiver/risk commands with signing keys outside agent/project reach;
+- required OpenCode, Claude Code, and Kiro adapters, each enforcing both authorized `chrono run` dispatch and native pre-tool calls to `chrono gate`;
+- RTK and Karpathy Guidelines attestations remain mandatory and fail closed.
+
+The Product Owner selects the implementation and agent models through external project/runtime configuration. No provider, model name, or model version may be hardcoded in framework source, defaults, templates, tests, generated agent definitions, or adapters. The selected model generates code but cannot define policy, grant approval, or alter gates.
+
+# 17. Historical Phase Boundary: Do Not Prematurely Implement
+
+During the completed protocol-authoring task:
 
 DO NOT create:
 
@@ -1086,36 +1113,13 @@ The purpose of these documents is to make the future implementation derivable fr
 
 ---
 
-# 17. Do Not Over-Specify Physical Storage Yet
+# 18. Approved Physical Storage
 
-We know CHRONO requires persistent state.
-
-We do NOT yet need to freeze whether every artifact becomes:
-
-```text
-YAML
-JSON
-Markdown
-SQLite
-combination of these
-```
-
-The protocol documents should define:
-
-```text
-WHAT must persist
-WHY it must persist
-WHO owns it
-HOW it relates to other artifacts
-WHEN it changes
-WHAT authority is required
-```
-
-The future implementation phase will define the physical representation.
+CHRONO uses a deliberate hybrid: versioned Markdown/YAML are human-readable authoritative contracts; `.chrono/chrono.db` (SQLite) contains transactional operational events, locks, states, approvals, attestations, evidence indexes, and migrations. SQLite does not replace the documents as contracts. Exact schemas and non-semantic paths are derived in the Core Specification within this boundary.
 
 ---
 
-# 18. Framework vs. Agent Responsibility
+# 19. Framework vs. Agent Responsibility
 
 Preserve this separation throughout all documents.
 
@@ -1160,7 +1164,7 @@ Do not assign deterministic gate enforcement solely to prompts.
 
 ---
 
-# 19. Important Design Constraint
+# 20. Important Design Constraint
 
 The future Core may expose commands conceptually similar to:
 
@@ -1196,9 +1200,9 @@ They do not define the framework lifecycle.
 
 ---
 
-# 20. Expected Result
+# 21. Expected Result
 
-At the end of this task, `/DOCS` should contain a coherent formal specification of CHRONO's internal engineering methodology.
+At the end of this task, `docs/protocols` should contain a coherent formal specification of CHRONO's internal engineering methodology.
 
 The documents should be detailed enough that the next phase can read them and derive:
 
@@ -1240,13 +1244,13 @@ Its own development must follow the same discipline.
 
 ---
 
-# 21. Final Review Before Completion
+# 22. Final Review Before Completion
 
 Before considering this documentation task complete:
 
 1. Read all nine generated documents again.
 2. Compare them against `INITIAL.md`.
-3. Compare them against `CHRONO-FRAMEWORK-ARCHITECTURE.md`.
+3. Compare them against `docs/architecture/REFERENCE-ARCHITECTURE.md`.
 4. Check terminology across all documents.
 5. Check authority boundaries.
 6. Check lifecycle consistency.
@@ -1263,6 +1267,7 @@ Before considering this documentation task complete:
 17. Check that architecture and implementation security decisions are separately persisted by the Product Owner.
 18. Check that missing or stale security evidence fails closed.
 19. Check that every named execution/verification role has explicit security duties and escalation rules.
+20. Check that the Karpathy Guidelines skill is mandatory, pinned, single-source, subordinate to CHRONO authority, and activation-tested in each runtime.
 
 If inconsistencies are found, correct the documentation before finishing.
 

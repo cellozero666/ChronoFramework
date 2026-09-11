@@ -1,4 +1,4 @@
-# INIT.md - CHRONO Framework
+# CHRONO Framework Definition
 
 ## 1. Purpose
 
@@ -588,49 +588,17 @@ CHRONO state must not depend exclusively on an LLM session or context window.
 
 The framework must maintain persistent and deterministic project state.
 
-Conceptual lifecycle:
+The normative lifecycle is hierarchical:
 
 ```text
-UNINITIALIZED
-      │
-      ▼
-SYSTEM_ANALYSIS
-      │
-      ▼
-REQUIREMENTS_REVIEW
-      │
-      ▼
-ARCHITECTURE
-      │
-      ▼
-ARCHITECTURE_REVIEW
-      │
-      ▼
-SPECIFICATION
-      │
-      ▼
-SPEC_REVIEW
-      │
-      ▼
-AWAITING_APPROVAL
-      │
-      ▼
-READY
-      │
-      ▼
-IMPLEMENTING
-      │
-      ▼
-VERIFYING
-   ┌──┴────┐
-   ▼       ▼
-FAILED   PASSED
-   │        │
-   ▼        ▼
-CORRECTION COMPLETE
+Project:       UNINITIALIZED | ANALYZING | ARCHITECTING | SPECIFYING | PLANNING | EXECUTING | VERIFYING | COMPLETE | BLOCKED
+Specification: DRAFT | REVIEW | READY | SUPERSEDED
+Module:        DRAFT | AWAITING_APPROVAL | APPROVED | EXECUTING | VERIFYING | PASSED | FAILED | COMPLETE | BLOCKED
+WorkPackage:   PLANNED | AUTHORIZED | RUNNING | BLOCKED | IMPLEMENTED | VERIFYING | FAILED | COMPLETE
+Verification:  PENDING | RUNNING | FAILED | PASSED | WAIVED
 ```
 
-The exact state names and granularity may evolve during implementation.
+Project state is a deterministic projection of aggregate state and MUST NOT hide a blocked, failed, running, or awaiting-approval child. Legal transitions and projection precedence are defined in the Domain/Core specification without changing these state sets except through an approved protocol revision.
 
 Mandatory principle:
 
@@ -700,7 +668,9 @@ module:
   approved_at: ...
 ```
 
-The physical persistence format is an implementation decision.
+Approvals are append-only SQLite events and are also represented in the applicable human-readable artifact metadata. Markdown/YAML remains the reviewable project contract; `.chrono/chrono.db` provides transactional integrity, state transitions, locks, approvals, attestations, evidence indexes, and migrations.
+
+`chrono approve`, `chrono waive`, and risk acceptance are interactive human-only commands. The PO signing key MUST remain outside the project and agent-accessible context, preferably in the operating-system keychain. A signature MUST bind action, scope, artifact identity, exact revision/hash, signer, and timestamp. Material change invalidates the affected signature. Without an interactive terminal, available key, verified identity, and valid signature, the Core MUST return `APPROVAL_REQUIRED`. Agents and adapters MUST NOT impersonate or automate PO approval.
 
 Mandatory rule:
 
@@ -1102,6 +1072,10 @@ Runtime-specific integrations exist through adapters or equivalent mechanisms.
 
 An adapter may use runtime-native capabilities, including skills or agent definitions, but it cannot alter CHRONO's fundamental governance and lifecycle rules.
 
+The `chrono` command is mandatory and globally installed. It registers supported runtime integrations, locates the current project, resolves the CHRONO version pinned by that project, and delegates to the local Core. It MUST fail closed when the local Core is absent, incompatible, or unverifiable; the global installation MUST NOT silently substitute its own Core.
+
+OpenCode, Claude Code, and Kiro are required v1 integrations. Each MUST implement both `chrono run` dispatch and native pre-tool enforcement that calls `chrono gate`. This bidirectional design applies CHRONO authorization even when a user starts the runtime directly. If either dispatch or hook enforcement cannot be proven, agent execution is denied.
+
 ---
 
 ## 22. Model Independence
@@ -1119,6 +1093,8 @@ configurable
 ```
 
 Each agent may use a different model.
+
+The Product Owner selects models through project/runtime configuration at execution time. No provider, model name, or model version may be hardcoded in framework source, defaults, templates, generated agent definitions, tests, or adapters. A missing required model selection is a configuration error, not permission for the framework to choose silently.
 
 CHRONO may recommend models according to role requirements, including reasoning quality, coding quality, context capacity, tool use, security reasoning, or independent verification ability.
 
@@ -1242,6 +1218,12 @@ This reduces hallucination, context pollution, and token consumption.
 Rust Token Killer (RTK) is a mandatory operational dependency for every CHRONO CLI runtime adapter. CHRONO must detect a genuine, compatible RTK installation, record its version and integration mode, and verify that command output is routed through RTK before starting agent execution. If RTK is absent, unhealthy, incompatible, or bypassed, execution must fail closed with `RTK_REQUIRED` or `RTK_BYPASS_DETECTED`.
 
 RTK remains an external output-optimization component rather than the owner of CHRONO domain state, gates, authority, or lifecycle. Installation requires the applicable user/system permission; when permission is unavailable, CHRONO must stop with actionable installation instructions instead of silently falling back to raw command output. Runtime adapters must use RTK's native integration when officially supported and a tested hook/wrapper when it is not. Version constraints, provenance, integrity verification, configuration, health checks, bypass events, and token-saving evidence must be persistent and auditable.
+
+The Karpathy Guidelines skill is also a mandatory process dependency for all CHRONO agent runtimes. Its only accepted upstream is `https://github.com/multica-ai/andrej-karpathy-skills`, and CHRONO must pin an immutable commit, verify provenance and integrity, preserve the MIT license/attribution, and derive every runtime package from the single canonical `skills/karpathy-guidelines/SKILL.md` source. References in upstream documentation to a different repository MUST NOT silently change CHRONO's selected source.
+
+The skill's four behaviors—think before coding, simplicity first, surgical changes, and goal-driven verified execution—MUST govern Gaspar and all specialized agents throughout analysis, planning, implementation, testing, security, and verification. They remain subordinate to the precedence `Product Owner → CHRONO protocols/Core → approved artifacts/Harness → role rules → Karpathy Guidelines`. “Simplicity” MUST NOT remove required security, traceability, evidence, gates, error handling, or approved scope.
+
+Adapters must install and activate a semantically identical runtime artifact for Claude Code, OpenCode, and Kiro. Installation alone is insufficient: the Core must require a current `SkillAttestation` proving pinned source revision/hash, generated artifact hashes, runtime discovery, agent permission, and activation smoke test. Missing, modified, untrusted, divergent, inactive, or bypassed skill state MUST create `BLOCKED_PROCESS_SKILL` and deny agent dispatch. Installation or global configuration changes require applicable user permission; no silent fallback is allowed.
 
 ---
 
@@ -1411,8 +1393,9 @@ The first version should prioritize:
 16. Independent verification through Spekkio
 17. Defect routing and correction loops
 18. Traceability
-19. Context budgeting and optional token-optimization integration
-20. Runtime and model independence
+19. Context budgeting and mandatory RTK installation, routing, and attestation
+20. Mandatory Karpathy Guidelines installation, conversion, activation, and attestation
+21. Runtime and model independence
 ```
 
 The first end-to-end milestone is:
@@ -1457,7 +1440,7 @@ PASS or correction loop
 Module COMPLETE
 ```
 
-A practical first implementation may use a portable CLI and a deterministic local Core. Node.js/TypeScript is a reasonable initial implementation option because the framework primarily requires orchestration, structured state, file processing, validation, dependency management, and runtime integration.
+The v1 implementation MUST use a TypeScript monorepo on supported Node.js LTS releases, with a portable global launcher and deterministic local Core. It MUST support macOS, Linux, and Windows and be distributed free under Apache License 2.0 (`Apache-2.0`) through npm and GitHub Releases with signed artifacts, checksums, SBOM, provenance, and preserved third-party notices. It MUST NOT require a paid service or server dependency.
 
 The first runtime adapter should prove the entire workflow in one environment before additional adapters are prioritized.
 
