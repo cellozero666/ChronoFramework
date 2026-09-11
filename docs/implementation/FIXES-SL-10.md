@@ -197,10 +197,35 @@ removed from all procedures.
 
 ## 5. Update roadmap (filled)
 
-Second verification pass (this turn) re-checked every §1 item against
-the final tree. Status legend: DONE (verified in tree + tests),
-OPEN (blocked on external authorization or runtime), FUTURE
-(enhancement, not a defect).
+Second verification pass re-checked every §1 item against the final
+tree: each fix below was located in code, its regression test executed,
+and its live behavior probed where applicable. Status legend: FIXED
+(verified in tree + tests, all green), OPEN (blocked on external
+authorization or runtime), FUTURE (enhancement, not a defect).
+
+### 5.1 Disposition of findings F1–F17
+
+| ID | Finding (§1) | Disposition | Evidence |
+|---|---|---|---|
+| F1 | Read-only open broke authorizing gates | FIXED | `runGate` opens read-write (comment documents why); pure reads use `openReadProject`; live probe: gates return Core verdicts (no `SQLITE_READONLY`), status leaves mtime stable |
+| F2 | Pinned-version check before repository assignment | FIXED | constructor assigns `events` first inside the guarded block; mismatch/malformed paths close the handle (`setup-entry.test.ts`: pin tests) |
+| F3 | Setup machine allowed skip-ahead | FIXED | `isLegalSetupAdvance` is same-or-next only; `setup.test.ts` denies `DETECTED → READY` with `ILLEGAL_TRANSITION` |
+| F4 | Stale test masked the F3 class | FIXED | pinned-version test performs `init()` before `status()` |
+| F5 | Verify/prove binary-path mismatch | FIXED | both commands resolve via injectable `resolveBinary` before executing/recording; gate-cli tests pin a fixture resolver |
+| F6 | Proof-submitter binding vs setup bootstrap | FIXED (reverted with rationale) | no submitter-label check remains in code or tests; boundary is session validity + dispatch-time re-validation + revocation cascade |
+| F7 | Proof target required a registered adapter | FIXED | record validates id shape only; dispatch re-validates everything; dedicated pending-adapter test denies `RTK_ROUTING_FAILURE` naming adapter + status |
+| F8 | Template-escaping slip in generated plugin | FIXED | `node --check` guard over all three JS assets in `setup-cli.test.ts` |
+| F9 | Session `touch()` broke read-only opens | FIXED | write skipped when `readOnly`; doctor-with-session test passes |
+| F10 | Duplicated skill fixture drifted | FIXED | single `test-skill-fixture.ts` + explicit hash-pinning test |
+| F11 | Claude-settings merge duplicates | FIXED | recursive command scan + nested-duplicate test; dead walk removed |
+| F12 | `RTE`/`SES`/`BRK` outside validated families | FIXED | families + pattern + identity tests + CORE §3.1 table |
+| F13 | Secret scanner blocked `keychain` metadata | FIXED | key-name allowlist adjusted + value-pattern scan at any depth; nested-secret test |
+| F14 | Shared adapter label/runtime in flow sessions | FIXED | per-adapter sessions; single-runtime pins `project.runtime`, multi keeps it null; multi-runtime init/entry test |
+| F15 | Broker account file lacked credential id | FIXED | two-line file (account + id); session script reads line 1, passes line 2 as `--broker`; covered by init/entry tests |
+| F16 | Single-row setup state overwrote step detail | FIXED | broker id persists in account file + `SetupAdvanced` audit payload (detail included, secret-scanned) |
+| F17 | Toolchain/hygiene + flattening `constructionFailure` | FIXED | lint/typecheck clean; `CONFIG_ERROR` preservation asserted by the version-mismatch test; no garbled shell procedures remain in evidence |
+
+### 5.2 Verification-pass and follow-up items
 
 | ID | Item | Status | Evidence / notes |
 |---|---|---|---|
