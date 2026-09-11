@@ -3064,7 +3064,7 @@ export function createProgram(cwd: string): Command {
       let stdinText = "";
       try {
         stdinText = readStdin(0, "utf8");
-      } catch (e) {
+      } catch {
         emitProgramResult(
           program,
           opts.json === true
