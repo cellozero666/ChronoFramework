@@ -82,6 +82,13 @@ for (const marker of [
     violations.push(`output contains crash marker '${marker}'`);
   }
 }
+/* Vitest prints an "Errors  N errors" section for unhandled errors that
+   escape individual test files (e.g. a crashed worker). Any nonzero count
+   fails the gate even if the per-file tallies look complete. */
+{
+  const m = output.match(/^\s*Errors\s+([1-9][0-9]*)\s+errors?\s*$/m);
+  if (m) violations.push(`output reports an Errors section with ${m[1]} error(s)`);
+}
 
 /* 4. Skipped / todo tests are forbidden for mandatory suites. */
 const skipped = output.match(/(\d+) skipped/);
