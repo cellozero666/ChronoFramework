@@ -1226,7 +1226,7 @@ export function runRtkProve(
       ? { exitCode, stdout: JSON.stringify({ ok: false, error: { code, message: reason } }, null, 2), stderr: "" }
       : { exitCode, stdout: "", stderr: `Error [${code}]: ${reason}` };
   if (options.adapter.length === 0) {
-    return fail(2, "VALIDATION_ERROR", "rtk prove requires --adapter <registered runtime id>");
+    return fail(2, "VALIDATION_ERROR", "rtk prove requires --adapter <runtime adapter id>");
   }
   if (options.as === undefined || options.as.length === 0) {
     return fail(2, "VALIDATION_ERROR", "rtk prove requires --as <actor> matching the caller session");

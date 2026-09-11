@@ -974,6 +974,55 @@ describe("Dispatch grants (session binding)", () => {
     }
   });
 
+  it("records proofs pre-registration but never authorizes dispatch with them", () => {
+    // Evidence precedes approval by design (setup proves routing before
+    // the PO approves adapters). Recording succeeds for a merely
+    // registered (pending) adapter; dispatch still denies until active.
+    const { core, sign, poPrivateKey, restoreTty: restorePendingTty } = clockedCore(T0);
+    try {
+      const { gaspar } = approvedModule(core, sign, poPrivateKey);
+      const poAuth = { actor: "PO", session: bootstrapPrivilegedSession(core, "PO", poPrivateKey) };
+      const entrypoint = join(tempDir, "fixture-runtime.sh");
+      writeFileSync(entrypoint, "#!/bin/sh\necho ok\n");
+      chmodSync(entrypoint, 0o755);
+      expect(
+        core.registerAdapter(
+          { id: "pending-ad", name: "Pending", entrypoint, conformanceProof: ["fixture --version"] },
+          poAuth
+        ).ok
+      ).toBe(true);
+      recordAttestations(core, gaspar, poPrivateKey, T0);
+      const rtkBin = join(tempDir, "fixture-rtk.sh");
+      const recorded = core.recordRoutingProof(gaspar, {
+        adapterId: "pending-ad",
+        binaryPath: rtkBin,
+        version: "1.0.0-test",
+        proofCommand: JSON.stringify([rtkBin, "gain"]),
+        commandHash: computeRevisionHash([rtkBin, "gain"]),
+        outputHash: computeRevisionHash("fixture gain ok"),
+        exitStatus: 0,
+        gainAvailable: true,
+        timestamp: T0,
+        ttlSeconds: 3600,
+      });
+      expect(recorded.ok).toBe(true);
+      const worker = openTestSession(core, "belthazar", "MOD-0001");
+      const denied = core.authorizeExecution("MOD-0001", {
+        actor: "gaspar",
+        role: "belthazar",
+        session: worker,
+        requesterSession: gaspar.session,
+        adapterId: "pending-ad",
+      });
+      expect(denied.ok).toBe(false);
+      expect(denied.error?.code).toBe("RTK_ROUTING_FAILURE");
+      expect(denied.error?.message ?? "").toContain("pending-ad");
+    } finally {
+      restorePendingTty();
+      core.close();
+    }
+  });
+
   it("rejects cross-scope grant reuse", () => {
     const { core, sign, poPrivateKey, restoreTty: restoreScopeTty } = clockedCore(T0);
     try {

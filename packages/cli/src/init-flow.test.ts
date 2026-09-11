@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChronoCore } from "@chrono/core";
 import { MemoryKeyStore } from "./keychain.js";
+import { hashSkillSource, SKILL_RELEASE } from "@chrono/domain";
 import {
   buildInitPlan,
   detectInit,
@@ -154,6 +155,9 @@ function autoConfirm(seen: string[]): (planText: string, challenge: string) => s
 }
 
 describe("Init detection (read-only)", () => {
+  it("pins the shared skill fixture to the release hash", () => {
+    expect(hashSkillSource(FIXTURE_SKILL_MD)).toBe(SKILL_RELEASE.sourceHash);
+  });
   let tempDir: string;
   let binDir: string;
 

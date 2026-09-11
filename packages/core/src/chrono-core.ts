@@ -4775,15 +4775,18 @@ export class ChronoCore {
    * executed effectively through the genuine RTK binary for one
    * adapter/runtime/project scope [SLICE-9 §9.3, P8.5, INV §8.4].
    *
-   * Any authenticated session may submit, but the proof's adapter must
-   * already be approved: unregistered or revoked adapters cannot collect
-   * proofs. The runtime, attestation, and binary bindings are derived by
-   * the Core — never trusted from caller input. The proof pins the
-   * current RTK
+   * Any authenticated session may submit for any well-formed adapter
+   * scope — registration is deliberately NOT required at record time so
+   * setup can prove routing before the PO's adapter-approval decision
+   * (evidence precedes approval). The runtime, attestation, and binary
+   * bindings are derived by the Core — never trusted from caller input.
+   * The proof pins the current RTK
    * attestation, the binary content hash, the command and output hashes,
    * and a bounded validity window. Only successful routings (exit 0)
-   * prove effectiveness. Dispatch re-validates every binding; binary
-   * replacement or adapter revocation invalidates.
+   * prove effectiveness. Dispatch re-validates every binding (registered,
+   * active adapter, current attestation, live binary); proofs for
+   * unknown, pending, or revoked adapters can never authorize execution,
+   * and binary replacement or adapter revocation invalidates.
    */
   recordRoutingProof(auth: CallerAuth, input: {
     adapterId: string;
@@ -5482,7 +5485,17 @@ export class ChronoCore {
     try {
       this.getAdapterForDispatch(proof.adapterId);
     } catch {
-      throw denied(`routing proof '${proof.id}' names an adapter that is no longer approved`);
+      let status: string | null = null;
+      try {
+        status = this.db.adapters().findById(proof.adapterId).status;
+      } catch {
+        status = null;
+      }
+      throw denied(
+        status === null
+          ? `routing proof '${proof.id}' names unregistered adapter '${proof.adapterId}'`
+          : `routing proof '${proof.id}' names adapter '${proof.adapterId}' with status '${status}'`
+      );
     }
     let currentBinaryHash: string;
     try {
