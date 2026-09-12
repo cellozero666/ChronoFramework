@@ -41,6 +41,7 @@ import {
   PO_KEY_SERVICE,
   PO_KEY_STAGING_ACCOUNT,
   isInteractiveTerminal,
+  verifyKeyCustody,
   type KeyStore,
 } from "./keychain.js";
 
@@ -606,7 +607,7 @@ export function runEnroll(
     } catch (e) {
       return keychainFailure(e, asJson);
     }
-    if (readPoKey(deps.store) !== pair.privateKeyPem) {
+    if (!verifyKeyCustody(readPoKey(deps.store), pair.publicKeyPem)) {
       restorePreviousKey(deps.store, previous);
       return keychainFailure(
         new Error("Primary key verification failed before enrollment; previous custody restored."),
@@ -763,7 +764,7 @@ export function runKeysGenerate(
         asJson
       );
     }
-    if (readPoKey(deps.store) !== pair.privateKeyPem) {
+    if (!verifyKeyCustody(readPoKey(deps.store), pair.publicKeyPem)) {
       return keychainFailure(
         new Error(
           `Primary key verification failed after the new public key was accepted. The new private key remains staged as '${PO_KEY_STAGING_ACCOUNT}'; restore it before approving.`

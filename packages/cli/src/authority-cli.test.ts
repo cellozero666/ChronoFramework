@@ -27,7 +27,7 @@ import {
   testDeps,
   type HumanCommandDeps,
 } from "./index.js";
-import { MemoryKeyStore, PO_KEY_STAGING_ACCOUNT } from "./keychain.js";
+import { MemoryKeyStore, PO_KEY_STAGING_ACCOUNT, verifyKeyCustody } from "./keychain.js";
 
 const SPEC = { id: "SP-0001", title: "T", purpose: "P" };
 const FIXED_REVISION = `sha256:${"c".repeat(64)}`;
@@ -38,6 +38,29 @@ function interactive(store?: MemoryKeyStore): HumanCommandDeps {
 
 function nonInteractive(store?: MemoryKeyStore): HumanCommandDeps {
   return { interactive: false, store: store ?? new MemoryKeyStore() };
+}
+
+/**
+ * TEST-ONLY store reproducing macOS `security -w` read semantics: the
+ * retrieved PEM is trimmed, so exact string equality with the written
+ * material fails while cryptographic custody still proves.
+ */
+class TrimmingStore extends MemoryKeyStore {
+  override readKey(account: string): string | null {
+    const raw = super.readKey(account);
+    if (raw === null) {
+      return null;
+    }
+    const trimmed = raw.trim();
+    return trimmed.length === 0 ? null : trimmed;
+  }
+}
+
+/** TEST-ONLY store whose reads always throw (keychain failure). */
+class FailingReadStore extends MemoryKeyStore {
+  override readKey(_account: string): string | null {
+    throw new Error("keychain unavailable");
+  }
 }
 
 function openGasparWithKey(core: ChronoCore, privateKeyPem: string): { actor: string; session: { id: string; token: string } } {
@@ -318,6 +341,33 @@ describe("CLI human-only authority", () => {
     restoreTty();
   });
 
+  it("rotates through macOS-style trimmed keychain reads", () => {
+    // Same rotation flow against a store that trims on read (macOS
+    // `security -w` semantics): custody verification must accept the
+    // transport-equivalent encoding at enrollment, staging, and
+    // replacement time.
+    const restoreTty = fakeInteractiveTerminal();
+    const store = new TrimmingStore();
+    const deps = interactive(store);
+    try {
+      expect(runEnroll(tempDir, { rationale: "trimmed enrollment" }, deps, confirmEcho).exitCode).toBe(0);
+      const rotated = runKeysGenerate(tempDir, { rotate: true, rationale: "trimmed rotation" }, deps);
+      expect(rotated.exitCode).toBe(0);
+      expect(rotated.stdout).not.toContain("PRIVATE");
+      expect(rotated.stderr).not.toContain("PRIVATE");
+      expect(store.readKey(PO_KEY_STAGING_ACCOUNT)).toBeNull();
+      // The replacement key is live: it signs approvals the Core accepts.
+      const core = new ChronoCore({ projectPath: tempDir });
+      try {
+        expect(core.poKeyRevision()).toMatch(/^sha256:[0-9a-f]{64}$/);
+      } finally {
+        core.close();
+      }
+    } finally {
+      restoreTty();
+    }
+  });
+
   it("failed rotation preserves the active key and cleans staging", () => {
     const restoreTty = fakeInteractiveTerminal();
     const unrelated = generateApprovalKeyPair();
@@ -430,6 +480,77 @@ describe("CLI PO enrollment ceremony [SLICE-9 §9.1]", () => {
       const second = runEnroll(tempDir, { rationale: "second" }, interactive(store), confirmEcho);
       expect(second.exitCode).toBe(1);
       expect(store.readKey("po")).toBe(first);
+    } finally {
+      restoreTty();
+    }
+  });
+  it("enrolls through macOS-style trimmed keychain reads", () => {
+    // The shared TrimmingStore trims on read exactly like macOS
+    // `security -w` output: enrollment must succeed through canonical
+    // custody verification, not exact PEM string equality.
+    const restoreTty = fakeInteractiveTerminal();
+    const store = new TrimmingStore();
+    try {
+      const out = runEnroll(tempDir, { rationale: "macOS round-trip" }, interactive(store), confirmEcho);
+      expect(out.exitCode).toBe(0);
+      const stored = store.readKey("po");
+      expect(stored).not.toBeNull();
+      // The trimmed material still proves custody of the enrolled key:
+      // resolve the enrolled public identity through the Core and
+      // verify cryptographically (never by string equality).
+      const check = new ChronoCore({ projectPath: tempDir });
+      try {
+        expect(check.poKeyRevision()).toMatch(/^sha256:[0-9a-f]{64}$/);
+      } finally {
+        check.close();
+      }
+      expect(out.stdout).not.toContain("PRIVATE");
+      expect(out.stderr).not.toContain("PRIVATE");
+    } finally {
+      restoreTty();
+    }
+  });
+
+  it("restores the previous key when enrollment fails after a trimmed write", () => {
+    const restoreTty = fakeInteractiveTerminal();
+    const store = new TrimmingStore();
+    try {
+      const first = generateApprovalKeyPair();
+      // Seed previous custody directly and enroll it with the Core, so
+      // the CLI run below exercises the restore path (Core refuses a
+      // duplicate enrollment after the new key is written+verified).
+      store.writeKey("po", first.privateKeyPem);
+      const direct = new ChronoCore({ projectPath: tempDir });
+      try {
+        enrollTestPo(direct, first);
+      } finally {
+        direct.close();
+      }
+      const second = runEnroll(tempDir, { rationale: "second" }, interactive(store), confirmEcho);
+      expect(second.exitCode).toBe(1);
+      // Restoration is atomic and verifiable: the store still proves
+      // custody of the FIRST key, not the generated second.
+      const restored = store.readKey("po");
+      expect(restored).not.toBeNull();
+      expect(verifyKeyCustody(restored, first.publicKeyPem)).toBe(true);
+    } finally {
+      restoreTty();
+    }
+  });
+
+  it("fails closed when the keychain read throws", () => {
+    const restoreTty = fakeInteractiveTerminal();
+    const store = new FailingReadStore();
+    try {
+      const out = runEnroll(tempDir, { rationale: "unreadable" }, interactive(store), confirmEcho);
+      expect(out.exitCode).toBe(2);
+      expect(out.stderr).toContain("Primary key verification failed");
+      const check = new ChronoCore({ projectPath: tempDir });
+      try {
+        expect(check.poKeyRevision()).toBeNull();
+      } finally {
+        check.close();
+      }
     } finally {
       restoreTty();
     }

@@ -9,7 +9,8 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey } from "node:crypto";
+import { fingerprintPublicKey } from "@chrono/domain";
 
 export const PO_KEY_SERVICE = "chrono-po-signing-key";
 export const PO_KEY_ACCOUNT = "po";
@@ -37,6 +38,67 @@ export class KeychainError extends Error {
 }
 
 /**
+ * Canonical key-custody verification: proves retrieved keychain
+ * material is the private key pairing with the expected public key.
+ *
+ * Transport-equivalent encodings are normalized ONLY at the
+ * boundaries — CRLF becomes LF everywhere (CR is meaningless in PEM
+ * armor and base64), and ASCII whitespace is trimmed at the very
+ * start/end. Interior bytes are never touched, and normalization
+ * alone never passes: acceptance additionally requires parsing the
+ * material as an Ed25519 private key, deriving its public key, and
+ * matching its fingerprint against the expected public key.
+ *
+ * macOS `security find-generic-password -w` hex-encodes passwords
+ * that contain newlines (observed: multiline secrets come back as
+ * lowercase hex plus a trailing newline, while single-line secrets
+ * come back plain). The hex form is therefore tried as a second
+ * transport encoding of the same material — still gated by the same
+ * fingerprint proof, never accepted on shape alone. This decoding
+ * lives here (PO-key custody only), never in generic `readKey`,
+ * because broker secrets are legitimately hex and must pass through
+ * byte-identical.
+ *
+ * Fail-closed results: null/empty/unreadable material, malformed or
+ * truncated PEM, a different valid private key, and non-Ed25519 keys
+ * all return false. Nothing secret is printed, logged, or persisted
+ * here; callers report stable codes only.
+ */
+export function verifyKeyCustody(retrieved: string | null, expectedPublicKeyPem: string): boolean {
+  if (retrieved === null || retrieved.length === 0) {
+    return false;
+  }
+  const candidates = [retrieved];
+  const trimmed = retrieved.trim();
+  if (/^[0-9a-f]+$/i.test(trimmed) && trimmed.length % 2 === 0 && trimmed.length >= 2) {
+    try {
+      candidates.push(Buffer.from(trimmed, "hex").toString("utf8"));
+    } catch {
+      // Not decodable hex: the raw form below still gets its chance.
+    }
+  }
+  for (const candidate of candidates) {
+    const normalized = candidate.replace(/\r\n/g, "\n").replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, "");
+    if (normalized.length === 0) {
+      continue;
+    }
+    try {
+      const privateKey = createPrivateKey(normalized);
+      if (privateKey.asymmetricKeyType !== "ed25519") {
+        continue;
+      }
+      const derivedPublicPem = createPublicKey(privateKey).export({ format: "pem", type: "spki" }).toString();
+      if (fingerprintPublicKey(derivedPublicPem) === fingerprintPublicKey(expectedPublicKeyPem)) {
+        return true;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
+
+/**
  * OS keychain backing store.
  * - macOS: `security` CLI (Keychain).
  * - Linux: `secret-tool` (libsecret / Secret Service).
@@ -58,7 +120,7 @@ export class OsKeychainStore implements KeyStore {
           return null;
         }
         throw new KeychainError(
-          "OS keychain read failed; refusing to continue without the PO key"
+          `OS keychain read failed (${execDetail(e)}); refusing to continue without the PO key`
         );
       }
     }
@@ -76,7 +138,7 @@ export class OsKeychainStore implements KeyStore {
           return null;
         }
         throw new KeychainError(
-          "OS keychain read failed; refusing to continue without the PO key"
+          `OS keychain read failed (${execDetail(e)}); refusing to continue without the PO key`
         );
       }
     }
@@ -96,7 +158,7 @@ export class OsKeychainStore implements KeyStore {
         return;
       } catch (e) {
         throw new KeychainError(
-          `OS keychain write failed: ${shortMessage(e)}. Approve the keychain prompt or check permissions.`
+          `OS keychain write failed (${execDetail(e)}). Approve the keychain prompt or check permissions.`
         );
       }
     }
@@ -114,7 +176,7 @@ export class OsKeychainStore implements KeyStore {
             "secret-tool is not installed; install libsecret (e.g. apt install libsecret-tools) so the PO key stays in the OS keychain"
           );
         }
-        throw new KeychainError(`OS keychain write failed: ${shortMessage(e)}`);
+        throw new KeychainError(`OS keychain write failed (${execDetail(e)})`);
       }
     }
     throw new KeychainError(
@@ -136,7 +198,7 @@ export class OsKeychainStore implements KeyStore {
           return;
         }
         throw new KeychainError(
-          `OS keychain delete failed: ${shortMessage(e)}. Approve the keychain prompt or check permissions.`
+          `OS keychain delete failed (${execDetail(e)}). Approve the keychain prompt or check permissions.`
         );
       }
     }
@@ -144,7 +206,7 @@ export class OsKeychainStore implements KeyStore {
       try {
         execFileSync(
           "secret-tool",
-          ["clear", "service", PO_KEY_SERVICE, "account", account],
+          ["clear", "service", service, "account", account],
           { stdio: ["ignore", "pipe", "pipe"] }
         );
         return;
@@ -154,7 +216,7 @@ export class OsKeychainStore implements KeyStore {
             "secret-tool is not installed; install libsecret (e.g. apt install libsecret-tools) so the PO key stays in the OS keychain"
           );
         }
-        throw new KeychainError(`OS keychain delete failed: ${shortMessage(e)}`);
+        throw new KeychainError(`OS keychain delete failed (${execDetail(e)})`);
       }
     }
     throw new KeychainError(
@@ -164,12 +226,12 @@ export class OsKeychainStore implements KeyStore {
 }
 
 function isNotFound(e: unknown): boolean {
-  const message = shortMessage(e).toLowerCase();
+  const text = `${execStderr(e)} ${(e as { message?: unknown }).message ?? ""}`.toLowerCase();
   return (
-    message.includes("could not be found") ||
-    message.includes("no such") ||
-    message.includes("not found") ||
-    message.includes("no matching")
+    text.includes("could not be found") ||
+    text.includes("no such") ||
+    text.includes("not found") ||
+    text.includes("no matching")
   );
 }
 
@@ -178,11 +240,37 @@ function isMissingBinary(e: unknown): boolean {
   return code === "ENOENT";
 }
 
-function shortMessage(e: unknown): string {
-  if (e instanceof Error) {
-    return e.message.split("\n")[0] ?? "unknown error";
+/**
+ * Secret-safe exec failure detail for user-facing messages. Uses the
+ * child STDERR only — never the command line, which may carry secrets
+ * as arguments (e.g. `security ... -w <private key>`). PEM-shaped
+ * content is scrubbed defensively and the text is length-capped.
+ */
+function execStderr(e: unknown): string {
+  if (typeof e === "object" && e !== null) {
+    const raw = (e as { stderr?: unknown }).stderr;
+    const text =
+      typeof raw === "string" ? raw : raw instanceof Uint8Array ? Buffer.from(raw).toString("utf8") : "";
+    return text.trim();
   }
-  return String(e).split("\n")[0] ?? "unknown error";
+  return "";
+}
+
+/**
+ * Scrub key material from tool output before it reaches user-facing
+ * messages. Exported for direct unit tests; production callers go
+ * through `execDetail`.
+ */
+export function sanitizeKeychainDetail(text: string): string {
+  const scrubbed = text
+    .replace(/-----BEGIN [^-]*-----[\s\S]*?-----END [^-]*-----/g, "[redacted-key-material]")
+    .split("\n")[0]
+    ?.trim();
+  return scrubbed !== undefined && scrubbed.length > 0 ? scrubbed.slice(0, 300) : "no tool output";
+}
+
+function execDetail(e: unknown): string {
+  return sanitizeKeychainDetail(execStderr(e));
 }
 
 /** Interactive-terminal probe: stdin AND stdout must be TTYs [ADR-003]. */

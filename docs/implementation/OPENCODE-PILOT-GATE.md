@@ -165,6 +165,67 @@ repository without `.chrono`):
 - the unrelated `/private/tmp/.chrono` was never modified, and was
   not deleted to make the test pass.
 
+## Finding OC-P4 — PO enrollment fails on the real macOS Keychain round-trip
+
+A real `chrono init --runtime opencode` failed at `PO_ENROLLED` with
+`CORE_INIT_FAILURE: "Primary key verification failed before
+enrollment; previous custody restored."` The project stayed safely
+resumable at `PROJECT_INITIALIZED`. Root causes, both confirmed live
+against the host Keychain:
+
+1. Fragile string equality: `runEnroll` compared the read-back PEM
+   with exact `!==` against the generated PEM, but macOS
+   `security find-generic-password -w` output is not byte-identical
+   (trailing-newline variance).
+2. Worse, `security -w` **hex-encodes passwords containing newlines**
+   (observed: 119-byte PEM → 239-byte lowercase hex + newline; single-line
+   secrets return plain). The retrieved "PEM" could never parse.
+3. Latent `isNotFound` defect: it inspected only the first line of
+   `execFileSync` errors (`Command failed: ...`), never stderr, so real
+   "could not be found" results threw `KeychainError` instead of
+   returning null — misdiagnosing absent keys and masking the absent
+   vs locked distinction.
+4. Latent secret exposure: those same error messages embed the full
+   argv including `-w <private key>`; failure paths surfaced them into
+   CLI output. (Also fixed: Linux `deleteKey` ignored its `service`
+   parameter.)
+
+### Required correction (shipped same session)
+
+Canonical `verifyKeyCustody` (`packages/cli/src/keychain.ts`), applied
+identically at enrollment, rotation (staging included), and every
+custody checkpoint: normalize transport-equivalent encodings only
+(CRLF→LF; ASCII whitespace trimmed at the boundaries; interior bytes
+untouched), accept the macOS hex transport form, then REQUIRE parsing
+as Ed25519, public-key derivation, and fingerprint equality with the
+expected public key. Null/empty/malformed/truncated/replaced/non-Ed25519
+material returns false; nothing secret is printed, logged, or
+persisted. Exec errors now surface sanitized stderr only (PEM-scrubbed,
+length-capped) — argv with key material never reaches output — and
+`isNotFound` inspects stderr, restoring the absent-vs-failure
+distinction. Previous-key atomic restore is unchanged and covered under
+trimming semantics.
+
+### Evidence
+
+Unit suites: `keychain.test.ts` (exact/trimmed/CRLF/whitespace
+acceptance gated on proof; malformed/different/truncated/empty/EC-key/
+garbage-identity/interior-corruption/hex-of-wrong-key rejections;
+sanitizer redaction + caps) plus a real-`security` integration test on
+a unique disposable service/account asserting write → provable custody
+→ delete → absent, deleting only that credential.
+`authority-cli.test.ts`: enrollment + rotation through a trimming
+store (macOS read semantics), read-failure fail-closed with no
+enrollment, previous-key restoration verified cryptographically.
+Live proof (2026-09-12, newly packed `@chrono/* 0.1.0`, isolated
+install, fresh disposable Git project — never the pilot project):
+`chrono enroll` under a real pty with the challenge typed back →
+exit 0, fingerprint recorded, no key material in output, Core
+`poKeyRevision` set, keychain-held 239-byte hex material proving
+custody; then exactly the enrolled credential deleted and the probe
+project removed (verified absent afterwards). No model, no provider,
+no OpenCode launch, no push/publish.
+
 ## OpenCode pilot entry criteria
 
 The real test may start only when:
