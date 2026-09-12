@@ -99,17 +99,19 @@ never from chat history:
  * Runtime-neutral entry bootstrap (POSIX sh, no secrets inside).
  * Resolves the project root, reads the broker account name, fetches the
  * secret from the OS keychain, redeems entry, prints the safe projection
- * to stdout, and writes the session token to a 0600 file named on
- * stderr only.
+ * as JSON to stdout, and writes the session token to a 0600 file whose
+ * path is NEVER printed, logged, or exposed (operators who need the
+ * token use direct `chrono` commands).
  *
- * Fail-loud, never ungoverned [FIXES-SL-10.1 C4]: any failure inside a
- * CHRONO project exits nonzero so the runtime surfaces the stderr
- * warning (Kiro: stderr sent to the agent on nonzero exit; PreToolUse
- * gates keep enforcing fail-closed regardless). The ONLY exit-0
- * non-success path is "no CHRONO project above cwd", where there is
- * nothing to govern. A missing broker account, an unavailable secret,
- * or a denied redemption exits 3 with an actionable remediation —
- * sessions MUST NOT proceed as ungoverned default agents.
+ * Fail-loud, never ungoverned [FIXES-SL-10.1 C4, OC-P1]: any failure
+ * inside a CHRONO project exits nonzero so the runtime surfaces the
+ * stderr warning (OpenCode: the plugin fails the request; Kiro: stderr
+ * sent to the agent; pre-tool gates keep enforcing fail-closed
+ * regardless). The ONLY exit-0 non-success path is "no CHRONO project
+ * above cwd", where there is nothing to govern. A missing broker
+ * account, an unavailable secret, or a denied redemption exits 3 with
+ * an actionable remediation — sessions MUST NOT proceed as ungoverned
+ * default agents.
  */
 export function buildEntrySessionScript(): string {
   return `#!/bin/sh
@@ -151,12 +153,12 @@ if [ -z "$SECRET" ]; then
   exit 3
 fi
 TOKEN_FILE="\${TMPDIR:-/tmp}/chrono-gaspar-$ADAPTER-$$.token"
-if ! printf '%s' "$SECRET" | "$CHRONO_BIN" entry --adapter "$ADAPTER" --broker "$BROKER" --secret-stdin --token-out "$TOKEN_FILE" --path "$ROOT"; then
+if ! printf '%s' "$SECRET" | "$CHRONO_BIN" entry --adapter "$ADAPTER" --broker "$BROKER" --secret-stdin --token-out "$TOKEN_FILE" --path "$ROOT" --json; then
   echo "[chrono] ENTRY BLOCKED: Gaspar entry denied: run chrono doctor for recovery (no ungoverned fallback)" >&2
   exit 3
 fi
 chmod 600 "$TOKEN_FILE" 2>/dev/null || true
-echo "[chrono] Gaspar session ready: $TOKEN_FILE" >&2
+echo "[chrono] Gaspar session ready (token confined to a 0600 file)" >&2
 `;
 }
 

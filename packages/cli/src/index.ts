@@ -2421,39 +2421,57 @@ export function runSetup(
     const claudeSettingsPath = join(projectPath, CLAUDE_SETTINGS_RELATIVE_PATH);
     const sessionScriptPath = join(projectPath, ENTRY_SESSION_SCRIPT_RELATIVE_PATH);
     const gasparDefinitionPath = join(projectPath, GASPAR_DEFINITION_RELATIVE_PATH);
+    // Runtime scoping [OPENCODE-PILOT-GATE.md]: only the selected
+    // runtime's integration assets are installed or modified, plus the
+    // shared entry-session script every runtime redeems through.
+    // Unknown adapter ids (no declared runtime) keep the legacy full
+    // baseline — never guessed into a runtime, never silently narrowed.
+    const runtimeId = options.runtime ?? null;
+    const scopedRuntime = runtimeId === "opencode" || runtimeId === "claude-code" || runtimeId === "kiro" ? runtimeId : null;
+    const writesOpencode = scopedRuntime === null || scopedRuntime === "opencode";
+    const writesClaude = scopedRuntime === null || scopedRuntime === "claude-code";
+    const writesKiro = scopedRuntime === null || scopedRuntime === "kiro";
+    const writeBytes = (full: string, content: string): void => {
+      mkdirSync(dirname(full), { recursive: true });
+      writeFileSync(full, content, "utf8");
+    };
     try {
-      mkdirSync(dirname(pluginPath), { recursive: true });
-      writeFileSync(pluginPath, buildOpencodePlugin(), "utf8");
-      mkdirSync(dirname(sessionScriptPath), { recursive: true });
-      writeFileSync(sessionScriptPath, buildEntrySessionScript(), "utf8");
-      mkdirSync(dirname(claudeHookPath), { recursive: true });
-      writeFileSync(claudeHookPath, buildClaudeHook(), "utf8");
-      mkdirSync(dirname(kiroHookPath), { recursive: true });
-      writeFileSync(kiroHookPath, buildKiroHook(), "utf8");
-      mkdirSync(dirname(kiroRegistrationPath), { recursive: true });
-      writeFileSync(kiroRegistrationPath, buildKiroHookRegistration(), "utf8");
-      // Claude settings are user-owned: merge the managed entry, backing
-      // up before any overwrite; malformed content fails with remediation.
+      writeBytes(sessionScriptPath, buildEntrySessionScript());
+      if (writesOpencode) {
+        writeBytes(pluginPath, buildOpencodePlugin());
+      }
+      if (writesClaude) {
+        writeBytes(claudeHookPath, buildClaudeHook());
+      }
+      if (writesKiro) {
+        writeBytes(kiroHookPath, buildKiroHook());
+        writeBytes(kiroRegistrationPath, buildKiroHookRegistration());
+      }
+      // Claude settings are user-owned: merge the managed entry only
+      // when the Claude runtime is in scope, backing up before any
+      // overwrite; malformed content fails with remediation.
       let existingSettings: string | null = null;
-      try {
-        existingSettings = readFileSync(claudeSettingsPath, "utf8");
-      } catch (e) {
-        if ((e as { code?: string }).code !== "ENOENT") {
-          throw e;
+      if (writesClaude) {
+        try {
+          existingSettings = readFileSync(claudeSettingsPath, "utf8");
+        } catch (e) {
+          if ((e as { code?: string }).code !== "ENOENT") {
+            throw e;
+          }
         }
-      }
-      let mergedSettings: { merged: string; changed: boolean };
-      try {
-        mergedSettings = mergeClaudeSettings(existingSettings);
-      } catch (e) {
-        return fail(2, "VALIDATION_ERROR", e instanceof Error ? e.message : "Claude settings merge refused");
-      }
-      if (mergedSettings.changed) {
-        mkdirSync(dirname(claudeSettingsPath), { recursive: true });
-        if (existingSettings !== null && !existsSync(`${claudeSettingsPath}.chrono-bak`)) {
-          writeFileSync(`${claudeSettingsPath}.chrono-bak`, existingSettings, "utf8");
+        let mergedSettings: { merged: string; changed: boolean };
+        try {
+          mergedSettings = mergeClaudeSettings(existingSettings);
+        } catch (e) {
+          return fail(2, "VALIDATION_ERROR", e instanceof Error ? e.message : "Claude settings merge refused");
         }
-        writeFileSync(claudeSettingsPath, mergedSettings.merged, "utf8");
+        if (mergedSettings.changed) {
+          mkdirSync(dirname(claudeSettingsPath), { recursive: true });
+          if (existingSettings !== null && !existsSync(`${claudeSettingsPath}.chrono-bak`)) {
+            writeFileSync(`${claudeSettingsPath}.chrono-bak`, existingSettings, "utf8");
+          }
+          writeFileSync(claudeSettingsPath, mergedSettings.merged, "utf8");
+        }
       }
       // Runtime-scoped entry assets, only when the adapter declares a
       // known runtime: Claude SessionStart bootstrap, Kiro SessionStart
@@ -2467,7 +2485,6 @@ export function runSetup(
         }
         writeFileSync(`${path}.chrono-bak`, original, "utf8");
       };
-      const runtimeId = options.runtime ?? null;
       if (runtimeId === "claude-code") {
         const beforeSessionStart = readFileSync(claudeSettingsPath, "utf8");
         const sessionStart = mergeClaudeHookGroup(beforeSessionStart, "SessionStart", {
@@ -2489,12 +2506,10 @@ export function runSetup(
       return keychainFailure(e, asJson);
     }
     const managedHooks = [
-      ".opencode/plugins/chrono-gate.js",
-      CLAUDE_HOOK_RELATIVE_PATH,
-      KIRO_HOOK_RELATIVE_PATH,
-      KIRO_HOOK_REGISTRATION_RELATIVE_PATH,
-      CLAUDE_SETTINGS_RELATIVE_PATH,
       ENTRY_SESSION_SCRIPT_RELATIVE_PATH,
+      ...(writesOpencode ? [".opencode/plugins/chrono-gate.js"] : []),
+      ...(writesClaude ? [CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH] : []),
+      ...(writesKiro ? [KIRO_HOOK_RELATIVE_PATH, KIRO_HOOK_REGISTRATION_RELATIVE_PATH] : []),
       ...(options.runtime === "claude-code" ? [GASPAR_DEFINITION_RELATIVE_PATH] : []),
       ...(options.runtime === "kiro" ? [kiroEntryRegistrationPath(options.adapter)] : []),
     ];
@@ -2508,22 +2523,22 @@ export function runSetup(
             routingProven,
             skill: "current",
             proofsRun: proofs.length,
-            plugin: ".opencode/plugins/chrono-gate.js",
+            plugin: writesOpencode ? ".opencode/plugins/chrono-gate.js" : null,
             hooks: managedHooks,
           },
           null,
           2
         )
       : [
-        `Adapter '${adapter.id}' setup complete.`,
-        `  entrypoint: ${adapter.entrypoint} (live)`,
-        `  rtk: ${rtkVersion.stdout.trim().split("\n")[0] ?? "unknown"} (gain ok, attestation current)`,
-        `  routing: ${routingProven ? "proven" : "unproven (adapter duty, see RUNTIME §6.3)"}`,
-        "  skill: current, artifacts intact",
-        `  proofs: ${String(proofs.length)} green`,
-        "  plugin: .opencode/plugins/chrono-gate.js",
-        `  hooks: ${managedHooks.join(", ")}`,
-      ].join("\n");
+          `Adapter '${adapter.id}' setup complete.`,
+          `  entrypoint: ${adapter.entrypoint} (live)`,
+          `  rtk: ${rtkVersion.stdout.trim().split("\n")[0] ?? "unknown"} (gain ok, attestation current)`,
+          `  routing: ${routingProven ? "proven" : "unproven (adapter duty, see RUNTIME §6.3)"}`,
+          "  skill: current, artifacts intact",
+          `  proofs: ${String(proofs.length)} green`,
+          ...(writesOpencode ? ["  plugin: .opencode/plugins/chrono-gate.js"] : []),
+          `  hooks: ${managedHooks.join(", ")}`,
+        ].join("\n");
     return { exitCode: 0, stdout: body, stderr: "" };
   } finally {
     core.close();

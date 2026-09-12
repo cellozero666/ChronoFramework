@@ -1718,6 +1718,84 @@ describe("Routing proof authority (candidate promotes to authoritative)", () => 
       h.core.close();
     }
   });
+
+  it("rolls back promotion when the audit event cannot persist (OC-P2)", () => {
+    // Promotion and its ProofPromoted audit event must commit
+    // atomically: an authoritative proof without its audit event is a
+    // silent authority mint. Sabotage the event store and require the
+    // row to stay a candidate.
+    const h = harness();
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      approveSecondAdapter(h.core, po, h.sign, "route-ad");
+      const id = recordCandidate(h.core, gaspar, "route-ad");
+      installManagedProofAssets(tempDir, "route-ad");
+      const raw = new Database(join(tempDir, ".chrono", "chrono.db"));
+      try {
+        raw.exec("DROP TABLE event_log");
+      } finally {
+        raw.close();
+      }
+      const promoted = h.core.promoteRoutingProof(id, po);
+      expect(promoted.ok).toBe(false);
+      const scopes = h.core.routingProofScopes("route-ad");
+      expect(scopes.find((proof) => proof.id === id)?.authority).toBe("candidate");
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+
+  it("emits exactly one audit event across repeated promotions (OC-P2)", () => {
+    const h = harness();
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      approveSecondAdapter(h.core, po, h.sign, "route-ad");
+      const id = recordCandidate(h.core, gaspar, "route-ad");
+      installManagedProofAssets(tempDir, "route-ad");
+      expect(h.core.promoteRoutingProof(id, po).ok).toBe(true);
+      expect(h.core.promoteRoutingProof(id, po).ok).toBe(true);
+      const promotions = h.core.listEvents().filter((e) => e.eventType === "ProofPromoted" && e.entityId === id);
+      expect(promotions).toHaveLength(1);
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+
+  it("resolves concurrent promotion on two connections to one event (OC-P2)", () => {
+    // better-sqlite3 serializes writers; whichever handle lands first
+    // applies the transition, the loser observes the authoritative row
+    // and emits nothing. Either order yields exactly one audit event.
+    const h = harness();
+    let second: ChronoCore | null = null;
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      approveSecondAdapter(h.core, po, h.sign, "route-ad");
+      const id = recordCandidate(h.core, gaspar, "route-ad");
+      installManagedProofAssets(tempDir, "route-ad");
+      second = new ChronoCore({ projectPath: tempDir, runtime: "test-runtime", clock: () => T0 });
+      expect(h.core.promoteRoutingProof(id, po).ok).toBe(true);
+      expect(second.promoteRoutingProof(id, po).ok).toBe(true);
+      const firstEvents = h.core.listEvents().filter((e) => e.eventType === "ProofPromoted" && e.entityId === id);
+      const secondEvents = second.listEvents().filter((e) => e.eventType === "ProofPromoted" && e.entityId === id);
+      expect(firstEvents).toHaveLength(1);
+      expect(secondEvents).toHaveLength(1);
+      expect(second.routingProofScopes("route-ad").find((proof) => proof.id === id)?.authority).toBe(
+        "authoritative"
+      );
+    } finally {
+      h.restoreTty();
+      h.core.close();
+      second?.close();
+    }
+  });
 });
 
 describe.each([11, 12])("Routing proof migration (v%i → current)", (baseline) => {
@@ -1858,7 +1936,7 @@ describe.each([11, 12])("Routing proof migration (v%i → current)", (baseline) 
 
   it("preserves vintage rows as non-authoritative candidates", () => {
     const { applied } = seedVintageDb();
-    expect(applied[applied.length - 1]).toBe(13);
+    expect(applied[applied.length - 1]).toBe(14);
     const db = new ChronoDatabase({ path: dbPath() });
     try {
       const row = db.routingProofs().findById("RTE-0001");

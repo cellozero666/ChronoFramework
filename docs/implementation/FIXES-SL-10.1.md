@@ -270,9 +270,25 @@ versions recorded into `VERIFIED_KIRO_VERSIONS`.
 - C4 exit additionally needs either genuine-Kiro pass or a PO-approved
   scope change removing Kiro from mandatory v1 support.
 
-**Recommendation: `BLOCKED`** — C1–C3 implemented, traced (RTK), and
-independently reviewed; C4 hermetic-complete with the real-runtime half
-open; Slices 9/10 stay `IMPLEMENTED — NOT COMPLETE`; no Phase 6.
+**Recommendation: `BLOCKED`** for global Slice 9/10 closure — C1–C2 are
+implemented and independently rechecked; C3 is implemented but its promotion
+transaction/persistence guard requires OC-P2 hardening; C4 is hermetic-complete
+with the real-runtime half open. Slices 9/10 stay `IMPLEMENTED — NOT COMPLETE`.
+The bounded OpenCode-only Phase 6A pilot may proceed separately after its own
+gate reaches `READY_FOR_OPENCODE_PILOT`.
+
+### Staged rollout decision
+
+The PO subsequently chose OpenCode as the first real-runtime product pilot.
+Claude Code and Kiro no longer block that OpenCode-only milestone, but they
+remain mandatory for the current final-v1 contract. OpenCode pilot preparation
+is governed by `OPENCODE-PILOT-GATE.md`; its OC-P1 adapter finding must be
+resolved before provider-backed testing begins. The same independent review
+also found OC-P2: promotion is not yet atomic with its audit event and lacks a
+persistence-level update guard. Therefore C3 remains implemented but requires
+this final hardening before the pilot relies on an authoritative proof. A
+successful OpenCode pilot is Phase 6A evidence, not global completion of this
+corrective gate.
 
 ## Exit criteria
 

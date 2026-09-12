@@ -43,6 +43,13 @@ ordinary users to execute them during a successful first-run journey.
 
 ## Task 3 — Phase 6 end-to-end MVP proof
 
+Execute this task incrementally by runtime: Phase 6A OpenCode, Phase 6B Claude
+Code, then Phase 6C Kiro. The current authorized preparation target is Phase
+6A only, governed by [`OPENCODE-PILOT-GATE.md`](OPENCODE-PILOT-GATE.md).
+Absence or failure of an unselected Claude/Kiro runtime must not block the
+OpenCode-only project path. An OpenCode pass is an incremental milestone, not
+completion of this all-runtime task or final-v1 conformance.
+
 Build disposable fixtures for:
 
 1. a small greenfield project;

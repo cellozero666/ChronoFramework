@@ -82,9 +82,12 @@ export {
 
 // Managed-asset inventory for routing drift binding [FIXES-SL-10.1 C2]
 export {
-  SHARED_MANAGED_ASSETS,
+  ENTRY_SESSION_SCRIPT_ASSET,
+  LEGACY_MANAGED_ASSETS,
+  RUNTIME_MANAGED_ASSETS,
+  claudeEntryAsset,
+  kiroEntryAsset,
   managedAssetInventory,
-  runtimeManagedAssets,
   type ManagedAssetKind,
   type ManagedAssetSpec,
 } from "./managed-assets.js";

@@ -21,6 +21,30 @@
  * Tool policy version: TOOL_POLICY_VERSION=1 (see @chrono/domain
  * OPENCODE_TOOL_POLICY). The lists below are generated from that policy;
  * the Core remains the authority — the plugin only shapes the intake.
+ *
+ * Automatic Gaspar entry is MANDATORY inside a CHRONO project
+ * [OC-P1, SLICE-10 §5]: on `session.created` the plugin prefetches entry,
+ * and `experimental.chat.system.transform` (verified present in the
+ * installed OpenCode 1.18.30 plugin API) establishes it authoritatively
+ * before the first response. Any entry failure — missing script, timeout,
+ * nonzero exit, malformed or oversized projection, unavailable injection —
+ * throws a stable secret-safe `ENTRY_BLOCKED` error, which fails the LLM
+ * request instead of producing an ordinary ungoverned first response.
+ * `tool.execute.before` additionally denies EVERY tool (including reads)
+ * while entry is unproven, so renaming or removing the transform upstream
+ * degrades to denial, never to silent agency. Outside a CHRONO project
+ * (no .chrono/chrono.db) the plugin stays silent and plain OpenCode use
+ * is unaffected.
+ *
+ * Session credentials: the entry script confines the broker-minted
+ * session token to a `0600` file whose path is never printed, logged, or
+ * exposed to the model by this plugin. This plugin consumes only the
+ * safe JSON projection on stdout; it never reads the token file, never
+ * holds the token in memory, and never places secrets in prompts, logs,
+ * or model-visible environments. Stale token files (older than twice the
+ * broker session TTL, CHRONO-namespaced names only) are swept
+ * best-effort on session create/delete and plugin dispose; failed entry
+ * creates no file at all.
  */
 
 const READ_TOOLS = ["glob", "grep", "lsp", "question", "read", "skill", "todowrite"];
@@ -41,32 +65,77 @@ export function buildOpencodePlugin(): string {
  * Enforcement contract (explicit environment, never invented identity):
  * - Outside a CHRONO project (no .chrono/chrono.db under the session
  *   directory): pass, plain OpenCode use is unaffected.
-  * - Inside a CHRONO project: read-only tools pass without dispatch
-  *   scope; every mutable tool requires CHRONO_GATE_MODULE (+ optional
-  *   CHRONO_GATE_WP), CHRONO_GATE_AS, CHRONO_GATE_ROLE, and
-  *   CHRONO_SESSION_TOKEN and a live \`chrono gate execution\` AUTHORIZED
-  *   verdict. Unknown tools are denied until classified (deny-by-default).
-  *   Anything missing or DENIED throws (fail-closed).
-  *
- * Automatic Gaspar entry: on \`session.created\` inside a CHRONO project
- * the plugin runs the managed entry script, which redeems a broker
- * session over a local channel and prints the safe Core projection. The
- * projection is injected once into the session system prompt; the
- * session token stays in plugin memory (never in model context). The
- * entry script fails loud (nonzero exit) when entry is unavailable, so
- * a missing projection is always visible; pre-tool gates keep
- * enforcing fail-closed regardless.
-  */
+ * - Inside a CHRONO project: Gaspar entry is MANDATORY. The first
+ *   system transform establishes entry (entry script redeem +
+ *   structured projection validated atomically, exactly-once injection).
+ *   ANY entry failure — missing script, timeout, nonzero exit,
+ *   malformed or oversized projection, unavailable injection — throws
+ *   ENTRY_BLOCKED and fails the request instead of answering ungoverned.
+ * - Read-only tools pass without dispatch scope once entry is proven;
+ *   every mutable tool requires CHRONO_GATE_MODULE (+ optional
+ *   CHRONO_GATE_WP), CHRONO_GATE_AS, CHRONO_GATE_ROLE, and
+ *   CHRONO_SESSION_TOKEN and a live \`chrono gate execution\` AUTHORIZED
+ *   verdict. Unknown tools are denied until classified (deny-by-default).
+ *   While entry is unproven, EVERY tool (including reads) is denied.
+ *   Anything missing or DENIED throws (fail-closed).
+ * - Session tokens: never held here, never logged, never modeled. The
+ *   entry script confines the token to a 0600 file; only the safe JSON
+ *   projection travels on stdout into this plugin.
+ */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 const READ_TOOLS = new Set(${JSON.stringify(READ_TOOLS)});
 const MUTATE_TOOLS = new Set(${JSON.stringify(MUTATE_TOOLS)});
 
+// Fail-closed entry bounds (documented, deterministic).
+// CHRONO_ENTRY_TIMEOUT_MS overrides the entry spawn timeout per
+// attempt (default 30000); non-numeric or non-positive values fall
+// back. Read per attempt so host configuration applies without reload.
+const ENTRY_TIMEOUT_DEFAULT_MS = 30000;
+const ENTRY_MAX_ATTEMPTS = 3;
+const ENTRY_PROJECTION_MAX_BYTES = 65536;
+const TOKEN_STALE_MS = 3600 * 1000;
+const TOKEN_FILE_PREFIX = "chrono-gaspar-";
+const TOKEN_FILE_SUFFIX = ".token";
+
 function readEnv(name) {
   const value = process.env[name];
   return value === undefined || value === "" ? null : value;
+}
+
+function tmpDir() {
+  return process.env["TMPDIR"] ?? process.env["TMP"] ?? process.env["TEMP"] ?? "/tmp";
+}
+
+function chronoProjectRoot(directory) {
+  const root = directory || process.cwd();
+  try {
+    if (existsSync(join(root, ".chrono", "chrono.db"))) {
+      return root;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function openCodeSessionId(value) {
+  const id =
+    (value && (value.sessionID || value.session_id)) ||
+    (value && value.properties && (value.properties.sessionID || value.properties.session_id)) ||
+    (value && value.event && value.event.properties && (value.event.properties.sessionID || value.event.properties.session_id)) ||
+    "default";
+  return String(id);
+}
+
+function redactTokenPaths(text) {
+  return String(text ?? "").replace(/chrono-gaspar-[^\\s"']*\\.token/g, "[token path redacted]");
+}
+
+function doctorHint(root) {
+  return "Run \`chrono doctor --path " + root + "\` for recovery.";
 }
 
 function gateFor(tool) {
@@ -80,76 +149,256 @@ function gateFor(tool) {
 }
 
 export const ChronoGatePlugin = async (ctx) => {
-  // Entry projections stashed per OpenCode session id (process memory
-  // only). Session tokens never enter this map or model context: the
-  // entry script confines the token to a 0600 file and only the safe
-  // projection travels on stdout.
-  const entryProjections = new Map();
-  const runEntryProjection = (root, sessionId) => {
-    if (entryProjections.has(sessionId)) {
-      return;
+  // Per-session entry state. "unknown" (absent) means entry was never
+  // attempted; "ok" carries the validated injection payload plus whether
+  // it was injected; "blocked" carries the stable failure with its
+  // attempt count. Bounded: oldest sessions evict past 100 entries, and
+  // session.deleted drops state immediately.
+  const entryStates = new Map();
+  const knownRoots = new Set();
+
+  function entryBlocked(code, reason, root, attempts) {
+    const attemptNote = attempts >= ENTRY_MAX_ATTEMPTS ? " Entry will not be retried for this session: restart OpenCode after recovery." : "";
+    return new Error(
+      "[chrono] ENTRY_BLOCKED[" + code + "]: " + reason + "." + attemptNote + " " + doctorHint(root)
+    );
+  }
+
+  function validateProjection(text) {
+    if (text.length > ENTRY_PROJECTION_MAX_BYTES) {
+      return { error: { code: "ENTRY_OVERSIZED", reason: "entry projection exceeds the " + ENTRY_PROJECTION_MAX_BYTES + " byte bound" } };
     }
+    let parsed;
     try {
-      const script = join(root, ".chrono", "hooks", "chrono-entry-session.sh");
-      if (!existsSync(script)) {
-        return;
-      }
-      const adapter = readEnv("CHRONO_ENTRY_ADAPTER") ?? "opencode";
-      const chronoBin = readEnv("CHRONO_BIN") ?? "chrono";
-      const ran = spawnSync("sh", [script, adapter], {
+      parsed = JSON.parse(text);
+    } catch {
+      return { error: { code: "ENTRY_MALFORMED", reason: "entry projection is not parseable JSON" } };
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { error: { code: "ENTRY_MALFORMED", reason: "entry projection is not a JSON object" } };
+    }
+    if (parsed.ok !== true) {
+      const detail =
+        parsed.error && typeof parsed.error.code === "string" ? " (" + parsed.error.code + ")" : "";
+      return { error: { code: "ENTRY_DENIED", reason: "entry redeem refused" + detail } };
+    }
+    if (typeof parsed.sessionId !== "string" || !/^SES-[0-9]+$/.test(parsed.sessionId)) {
+      return { error: { code: "ENTRY_MALFORMED", reason: "entry projection lacks a valid session id" } };
+    }
+    const projection = parsed.projection;
+    if (typeof projection !== "object" || projection === null || Array.isArray(projection)) {
+      return { error: { code: "ENTRY_MALFORMED", reason: "entry projection lacks a projection object" } };
+    }
+    if (typeof projection.projectState !== "string" || projection.projectState.length === 0) {
+      return { error: { code: "ENTRY_MALFORMED", reason: "entry projection lacks projectState" } };
+    }
+    const nextAction = projection.nextAction;
+    if (typeof nextAction !== "object" || nextAction === null || typeof nextAction.key !== "string" || nextAction.key.length === 0) {
+      return { error: { code: "ENTRY_MALFORMED", reason: "entry projection lacks nextAction.key" } };
+    }
+    if (projection.requiredDecisions !== undefined && !Array.isArray(projection.requiredDecisions)) {
+      return { error: { code: "ENTRY_MALFORMED", reason: "entry projection requiredDecisions is not an array" } };
+    }
+    // Atomic payload: canonical JSON of exactly the validated fields.
+    // Never truncated: oversized input is rejected above, not sliced.
+    const payload = JSON.stringify({
+      sessionId: parsed.sessionId,
+      projection: {
+        projectState: projection.projectState,
+        nextAction: { key: nextAction.key, summary: typeof nextAction.summary === "string" ? nextAction.summary : "" },
+        requiredDecisions: Array.isArray(projection.requiredDecisions) ? projection.requiredDecisions.filter((d) => typeof d === "string") : [],
+        blockers: Array.isArray(projection.blockers) ? projection.blockers : undefined,
+      },
+      skill: typeof parsed.skill === "object" && parsed.skill !== null ? parsed.skill : undefined,
+    });
+    return { payload };
+  }
+
+  function runEntryOnce(root) {
+    const script = join(root, ".chrono", "hooks", "chrono-entry-session.sh");
+    let scriptPresent = false;
+    try {
+      scriptPresent = existsSync(script);
+    } catch {
+      scriptPresent = false;
+    }
+    if (!scriptPresent) {
+      return { error: { code: "ENTRY_SCRIPT_MISSING", reason: "managed entry script is missing" } };
+    }
+    const adapter = readEnv("CHRONO_ENTRY_ADAPTER") ?? "opencode";
+    const chronoBin = readEnv("CHRONO_BIN") ?? "chrono";
+    const timeoutOverride = Number(readEnv("CHRONO_ENTRY_TIMEOUT_MS"));
+    const timeoutMs =
+      Number.isFinite(timeoutOverride) && timeoutOverride > 0 ? Math.floor(timeoutOverride) : ENTRY_TIMEOUT_DEFAULT_MS;
+    let ran;
+    try {
+      ran = spawnSync("sh", [script, adapter], {
         encoding: "utf8",
-        timeout: 30000,
+        timeout: timeoutMs,
         env: { ...process.env, CHRONO_BIN: chronoBin },
       });
-      const out = typeof ran.stdout === "string" ? ran.stdout.trim() : "";
-      if (ran.status === 0 && out.length > 0) {
-        entryProjections.set(sessionId, out.slice(0, 8000));
-      }
-    } catch {
-      // Entry failures are loud at the script level (nonzero exit);
-      // without a projection there is nothing to inject, and pre-tool
-      // gates keep enforcing fail-closed.
+    } catch (e) {
+      return { error: { code: "ENTRY_SPAWN_FAILED", reason: "entry execution threw: " + (e instanceof Error ? e.message : String(e)) } };
     }
-  };
-  return {
-    event: async ({ event }) => {
-      if (!event || event.type !== "session.created") {
-        return;
+    if (ran.error !== undefined && ran.error !== null) {
+      const timedOut = ran.signal === "SIGTERM" || (ran.error && ran.error.code === "ETIMEDOUT");
+      return {
+        error: timedOut
+          ? { code: "ENTRY_TIMEOUT", reason: "entry execution timed out after " + timeoutMs + "ms" }
+          : { code: "ENTRY_SPAWN_FAILED", reason: "entry execution failed to spawn" },
+      };
+    }
+    if (ran.status !== 0) {
+      const note = redactTokenPaths(typeof ran.stderr === "string" ? ran.stderr.trim().split("\\n")[0] ?? "" : "").slice(0, 300);
+      return {
+        error: {
+          code: "ENTRY_DENIED",
+          reason: "entry script exited " + String(ran.status) + (note.length > 0 ? ": " + note : ""),
+        },
+      };
+    }
+    const out = typeof ran.stdout === "string" ? ran.stdout.trim() : "";
+    if (out.length === 0) {
+      return { error: { code: "ENTRY_MALFORMED", reason: "entry script produced no output" } };
+    }
+    return validateProjection(out);
+  }
+
+  function sweepStaleTokenFiles() {
+    // Best-effort stale-token recovery: files older than twice the
+    // broker session TTL are dead credentials (0600, path never
+    // exposed). CHRONO-namespaced names only; failures never throw.
+    let entries;
+    try {
+      entries = readdirSync(tmpDir());
+    } catch {
+      return;
+    }
+    const cutoff = Date.now() - TOKEN_STALE_MS;
+    for (const entry of entries) {
+      if (!entry.startsWith(TOKEN_FILE_PREFIX) || !entry.endsWith(TOKEN_FILE_SUFFIX)) {
+        continue;
       }
-      const root = (ctx && ctx.directory) || process.cwd();
-      if (!existsSync(join(root, ".chrono", "chrono.db"))) {
-        return;
-      }
-      const sessionId =
-        (event.properties && (event.properties.sessionID || event.properties.session_id)) ||
-        event.sessionID ||
-        event.session_id ||
-        "default";
-      runEntryProjection(root, String(sessionId));
-    },
-    "experimental.chat.system.transform": async (input, output) => {
+      const full = join(tmpDir(), entry);
       try {
-        const sessionId =
-          (input && (input.sessionID || input.session_id)) || "default";
-        const projection = entryProjections.get(String(sessionId));
-        if (projection !== undefined && output && Array.isArray(output.system)) {
-          output.system.push(
-            "<chrono-entry>Gaspar entry projection from the project-pinned Core. " +
-              "Derive your opening strictly from it, never from chat history:\\n" +
-              projection +
-              "</chrono-entry>"
-          );
-          entryProjections.delete(String(sessionId));
+        if (statSync(full).mtimeMs < cutoff) {
+          unlinkSync(full);
         }
       } catch {
-        // Context injection is best effort; enforcement never depends on it.
+        continue;
       }
+    }
+  }
+
+  function dropSessionState(sessionId) {
+    entryStates.delete(sessionId);
+    if (entryStates.size > 100) {
+      const oldest = entryStates.keys().next();
+      if (!oldest.done) {
+        entryStates.delete(oldest.value);
+      }
+    }
+  }
+
+  async function ensureEntry(root, sessionId) {
+    const known = entryStates.get(sessionId);
+    if (known !== undefined && known.status === "ok") {
+      return known;
+    }
+    if (known !== undefined && known.status === "blocked" && known.attempts >= ENTRY_MAX_ATTEMPTS) {
+      throw entryBlocked(known.code, known.reason, root, known.attempts);
+    }
+    const attempts = (known !== undefined && known.status === "blocked" ? known.attempts : 0) + 1;
+    const result = runEntryOnce(root);
+    if (result.payload !== undefined) {
+      const fresh = { status: "ok", payload: result.payload, injected: false };
+      entryStates.set(sessionId, fresh);
+      return fresh;
+    }
+    const blocked = { status: "blocked", code: result.error.code, reason: result.error.reason, attempts };
+    entryStates.set(sessionId, blocked);
+    throw entryBlocked(result.error.code, result.error.reason, root, attempts);
+  }
+
+  return {
+    event: async ({ event }) => {
+      // Notification-only path (a throw here cannot abort anything):
+      // prefetch entry and sweep stale token files. The transform hook
+      // remains the authoritative gate and retries within budget.
+      try {
+        if (!event || (event.type !== "session.created" && event.type !== "session.deleted")) {
+          return;
+        }
+        const root = (ctx && ctx.directory) || process.cwd();
+        if (chronoProjectRoot(root) === null) {
+          return;
+        }
+        knownRoots.add(root);
+        sweepStaleTokenFiles();
+        if (event.type !== "session.created") {
+          dropSessionState(openCodeSessionId(event));
+          return;
+        }
+        const sessionId = openCodeSessionId(event);
+        if (!entryStates.has(sessionId)) {
+          try {
+            await ensureEntry(root, sessionId);
+          } catch {
+            // Recorded as blocked; the transform hook enforces loudly.
+          }
+        }
+      } catch {
+        // Event delivery never fails a session; enforcement lives in the
+        // transform and tool hooks below.
+      }
+    },
+    "experimental.chat.system.transform": async (input, output) => {
+      const root = (ctx && ctx.directory) || process.cwd();
+      if (chronoProjectRoot(root) === null) {
+        return;
+      }
+      const sessionId = openCodeSessionId(input);
+      // Authoritative gate: throws ENTRY_BLOCKED on ANY failure, which
+      // fails the LLM request instead of answering ungoverned.
+      const state = await ensureEntry(root, sessionId);
+      if (state.injected) {
+        return;
+      }
+      if (output === null || output === undefined || !Array.isArray(output.system)) {
+        entryStates.set(sessionId, {
+          status: "blocked",
+          code: "ENTRY_INJECTION_UNAVAILABLE",
+          reason: "system-context injection surface is unavailable",
+          attempts: ENTRY_MAX_ATTEMPTS,
+        });
+        throw entryBlocked("ENTRY_INJECTION_UNAVAILABLE", "system-context injection surface is unavailable", root, ENTRY_MAX_ATTEMPTS);
+      }
+      output.system.push(
+        "<chrono-entry>Gaspar entry projection from the project-pinned Core. " +
+          "Derive your opening strictly from it, never from chat history:\\n" +
+          state.payload +
+          "</chrono-entry>"
+      );
+      state.injected = true;
     },
     "tool.execute.before": async (input) => {
       const tool = input && typeof input.tool === "string" ? input.tool : "";
       const root = (ctx && ctx.directory) || process.cwd();
-      if (!existsSync(join(root, ".chrono", "chrono.db"))) {
+      if (chronoProjectRoot(root) === null) {
         return;
+      }
+      // Backstop: entry must be proven before ANY tool — including reads.
+      // If the transform path was bypassed or renamed upstream, tools
+      // still cannot act. Unknown state attempts entry once (bounded);
+      // blocked state denies immediately.
+      const sessionId = openCodeSessionId(input);
+      const known = entryStates.get(sessionId);
+      if (known === undefined || known.status !== "ok") {
+        try {
+          await ensureEntry(root, sessionId);
+        } catch (e) {
+          throw e instanceof Error ? e : new Error("[chrono] ENTRY_BLOCKED: entry unproven");
+        }
       }
       const kind = gateFor(tool);
       if (kind === "read") {
@@ -222,6 +471,15 @@ export const ChronoGatePlugin = async (ctx) => {
       const code = verdict && typeof verdict.code === "string" ? verdict.code : "DENIED";
       const reason = verdict && typeof verdict.reason === "string" ? verdict.reason : "denied";
       throw new Error(\`[chrono] \${code}: \${reason}\`);
+    },
+    dispose: async () => {
+      // Best-effort stale-token sweep on unload (runtime close/restart).
+      // Never throws into the host.
+      try {
+        sweepStaleTokenFiles();
+      } catch {
+        // Cleanup is advisory; enforcement never depends on it.
+      }
     },
   };
 };

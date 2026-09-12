@@ -10,9 +10,18 @@ are cleared. Slices 9 and 10 are implemented and pass the hermetic verification
 baseline, but neither is complete. Effective RTK interception/routing proof,
 fail-closed Gaspar entry projection, contract alignment for proof authority,
 and real-runtime acceptance remain in
-[`FIXES-SL-10.1.md`](FIXES-SL-10.1.md). Phase 6 must not start until fresh
-independent dispositions close both slices. Neither the Phase 6 MVP gate nor
-final v1 has been claimed.
+[`FIXES-SL-10.1.md`](FIXES-SL-10.1.md). The complete, all-runtime Phase 6 gate
+must not close until fresh independent dispositions close both slices. The
+bounded OpenCode-only Phase 6A pilot may start when
+`OPENCODE-PILOT-GATE.md` reaches `READY_FOR_OPENCODE_PILOT`. Neither the full
+Phase 6 MVP gate nor final v1 has been claimed.
+
+**Rollout decision:** real-runtime qualification is staged. OpenCode is the
+first product pilot (Phase 6A), followed by Claude Code (Phase 6B) and Kiro
+(Phase 6C). See [`OPENCODE-PILOT-GATE.md`](OPENCODE-PILOT-GATE.md). Kiro does
+not block the OpenCode-only pilot, but all three runtime gates remain mandatory
+for final-v1 conformance unless a later explicit PO scope decision changes the
+release contract.
 
 No provider, model name, or model version may be hardcoded in source, templates, adapters, tests, generated agent files, or defaults. Model selection is external configuration owned by the Product Owner. Changing the selected model MUST NOT change authority, state, gates, evidence requirements, or behavior.
 

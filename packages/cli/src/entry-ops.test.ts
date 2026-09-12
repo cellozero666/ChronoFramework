@@ -410,19 +410,19 @@ describe("Uninstall scopes", () => {
     rmSync(binDir, { recursive: true, force: true });
   });
 
-  it("removes hooks and restores settings without touching user content", async () => {
+  it("removes hooks without touching user content or unselected runtimes", async () => {
     const project = await readyProject(tempDir, binDir);
     void project;
-    const settingsPath = join(tempDir, ".claude", "settings.json");
-    const before = readFileSync(settingsPath, "utf8");
-    expect(before).toContain("chrono-claude-gate.js");
+    // OpenCode-only setup never creates Claude/Kiro integration assets
+    // (skill artifacts stay: one attested unit for all runtimes).
+    expect(existsSync(join(tempDir, ".claude", "settings.json"))).toBe(false);
+    expect(existsSync(join(tempDir, ".claude", "agents"))).toBe(false);
+    expect(existsSync(join(tempDir, ".kiro", "hooks"))).toBe(false);
     const out = runUninstall(tempDir, { scope: "hooks", json: true });
     expect(out.exitCode).toBe(0);
     expect(existsSync(join(tempDir, ".opencode", "plugins", "chrono-gate.js"))).toBe(false);
+    expect(existsSync(join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"))).toBe(false);
     expect(existsSync(join(tempDir, ".chrono", "broker-account"))).toBe(false);
-    // Backup consumed: settings no longer reference managed hooks.
-    const after = readFileSync(settingsPath, "utf8");
-    expect(after).not.toContain(".chrono/hooks/");
     // Doctor now reports drift instead of passing.
     const doctor = runDoctor(tempDir, { json: true });
     expect(doctor.exitCode).toBe(1);

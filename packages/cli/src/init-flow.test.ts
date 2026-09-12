@@ -28,6 +28,7 @@ import {
   detectInit,
   detectionHash,
   readInitPlanFile,
+  runDoctor,
   runInitFlow,
   validatePlanReplay,
   writeInitPlanFile,
@@ -316,9 +317,15 @@ describe("Init happy path and resume", () => {
     } finally {
       core.close();
     }
-    // Managed assets installed; broker secret in keychain only.
+    // Managed assets installed for the selected runtime only;
+    // unselected runtimes' integration assets are untouched (skill
+    // artifacts stay: one attested unit for all runtimes); broker
+    // secret in keychain only.
     expect(existsSync(join(tempDir, ".opencode", "plugins", "chrono-gate.js"))).toBe(true);
-    expect(existsSync(join(tempDir, ".kiro", "hooks", "chrono-gate.json"))).toBe(true);
+    expect(existsSync(join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"))).toBe(true);
+    expect(existsSync(join(tempDir, ".claude", "settings.json"))).toBe(false);
+    expect(existsSync(join(tempDir, ".claude", "agents"))).toBe(false);
+    expect(existsSync(join(tempDir, ".kiro", "hooks"))).toBe(false);
     expect(existsSync(join(tempDir, ".chrono", "broker-account"))).toBe(true);
     const [account, recordedBroker] = readFileSync(join(tempDir, ".chrono", "broker-account"), "utf8").trim().split("\n");
     expect(account).toMatch(/^gaspar-entry-[0-9a-f]{16}$/);
@@ -345,6 +352,27 @@ describe("Init happy path and resume", () => {
     } finally {
       core2.close();
     }
+  });
+  it("opencode-only selection ignores absent Claude/Kiro runtimes", async () => {
+    // No claude/kiro binaries exist in this fixture. Explicit opencode
+    // selection must initialize cleanly, install no Claude/Kiro
+    // integration assets, and keep doctor free of Claude/Kiro reasons.
+    const bins = makeBins(binDir);
+    const store = new MemoryKeyStore();
+    const out = await runInitFlow(
+      tempDir,
+      { json: true, yes: true, runtimeIds: ["opencode"] },
+      depsOf(store),
+      flowProbes(bins),
+      autoConfirm([])
+    );
+    expect(out.exitCode).toBe(0);
+    expect(JSON.parse(out.stdout) as object).toMatchObject({ ok: true, ready: true, runtimes: ["opencode"] });
+    expect(existsSync(join(tempDir, ".claude", "settings.json"))).toBe(false);
+    expect(existsSync(join(tempDir, ".kiro", "hooks"))).toBe(false);
+    const doctor = runDoctor(tempDir, { json: true });
+    const reasons = (JSON.parse(doctor.stdout) as { doctor: { entry: { reasons: string[] } } }).doctor.entry.reasons;
+    expect(reasons.some((r) => /claude|kiro/i.test(r))).toBe(false);
   });
 
   it("re-running on READY is a health path, not a duplicate identity", async () => {

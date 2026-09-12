@@ -386,6 +386,8 @@ Slice 10 was implemented before Slice 9 received its independent `COMPLETE`
 disposition. The code may remain, but both gates remain open. Resolve
 [`FIXES-SL-10.1.md`](FIXES-SL-10.1.md), complete the required real-runtime
 matrix, and obtain fresh independent dispositions for Slices 9 and 10 before
-continuing with Phase 6 and the remaining release-candidate tasks in
-`IMPLEMENTER-TASKS.md`. Do not publish, tag, push, or declare final v1 solely
-because the one-command journey passes.
+closing the all-runtime Phase 6 gate and remaining release-candidate tasks in
+`IMPLEMENTER-TASKS.md`. The bounded OpenCode-only Phase 6A pilot is separately
+governed by `OPENCODE-PILOT-GATE.md` and does not close this slice. Do not
+publish, tag, push, or declare final v1 solely because the one-command journey
+passes.

@@ -6,7 +6,7 @@
  * [RUNTIME §5, PL Phase 5]
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -232,6 +232,15 @@ describe("OpenCode pre-tool enforcement", () => {
       join(tempDir, "gate-deny.sh"),
       "echo '{\"result\":\"DENIED\",\"code\":\"EXECUTION_DENIED\",\"reason\":\"nope\"}'; exit 1"
     );
+    // Proven-entry fixture: gate tests exercise dispatch policy, not
+    // entry, so entry is established before each gate call.
+    mkdirSync(join(tempDir, ".chrono", "hooks"), { recursive: true });
+    writeFileSync(
+      join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"),
+      "#!/bin/sh\necho '{\"ok\":true,\"sessionId\":\"SES-0001\",\"projection\":{\"projectState\":\"ANALYZING\",\"nextAction\":{\"key\":\"k\",\"summary\":\"s\"},\"requiredDecisions\":[]}}'\n",
+      "utf8"
+    );
+    chmodSync(join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"), 0o755);
     savedEnv = { ...process.env };
   });
 
@@ -254,9 +263,15 @@ describe("OpenCode pre-tool enforcement", () => {
     before: (input: unknown) => Promise<unknown>;
   }> {
     const module = (await import(pathToFileURL(pluginPath).href)) as {
-      ChronoGatePlugin: (ctx: unknown) => Promise<{ "tool.execute.before": (input: unknown) => Promise<unknown> }>;
+      ChronoGatePlugin: (ctx: unknown) => Promise<{
+        "tool.execute.before": (input: unknown) => Promise<unknown>;
+        "experimental.chat.system.transform": (input: unknown, output: { system: unknown[] }) => Promise<unknown>;
+      }>;
     };
     const hooks = await module.ChronoGatePlugin({ directory });
+    // Prove entry first: these tests exercise dispatch policy, and the
+    // plugin denies every tool while entry is unproven (OC-P1).
+    await hooks["experimental.chat.system.transform"]({ sessionID: "gate-tests" }, { system: [] });
     return { before: hooks["tool.execute.before"] };
   }
 
@@ -326,10 +341,29 @@ describe("OpenCode pre-tool enforcement", () => {
   });
 });
 
-describe("OpenCode automatic Gaspar entry", () => {
+describe("OpenCode automatic Gaspar entry (fail-closed, OC-P1)", () => {
   let tempDir: string;
   let pluginPath: string;
   let savedEnv: Record<string, string | undefined>;
+
+  /** Canned entry payload matching `chrono entry --json` (never a token). */
+  function writeEntryScript(body: string): void {
+    writeFileSync(join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"), `#!/bin/sh\n${body}\n`, "utf8");
+    chmodSync(join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"), 0o755);
+  }
+
+  function validPayload(): string {
+    return JSON.stringify({
+      ok: true,
+      sessionId: "SES-0001",
+      projection: {
+        projectState: "ANALYZING",
+        nextAction: { key: "resume-discovery", summary: "Resume discovery" },
+        requiredDecisions: [],
+      },
+      skill: { installed: true },
+    });
+  }
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "chrono-entry-test-"));
@@ -337,20 +371,16 @@ describe("OpenCode automatic Gaspar entry", () => {
     writeFileSync(join(tempDir, ".chrono", "chrono.db"), "", "utf8");
     pluginPath = join(tempDir, "chrono-gate.js");
     writeFileSync(pluginPath, buildOpencodePlugin(), "utf8");
-    // Fixture entry script: prints a canned projection, never a token.
-    writeFileSync(
-      join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"),
-      "#!/bin/sh\necho '{\"ok\":true,\"projection\":{\"projectState\":\"ANALYZING\"}}'\n",
-      "utf8"
-    );
-    chmodSync(join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"), 0o755);
+    writeEntryScript(`echo '${validPayload()}'`);
     savedEnv = { ...process.env };
     delete process.env["CHRONO_BIN"];
     delete process.env["CHRONO_ENTRY_ADAPTER"];
+    delete process.env["CHRONO_ENTRY_TIMEOUT_MS"];
+    delete process.env["TMPDIR"];
   });
 
   afterEach(() => {
-    for (const key of ["CHRONO_BIN", "CHRONO_ENTRY_ADAPTER"]) {
+    for (const key of ["CHRONO_BIN", "CHRONO_ENTRY_ADAPTER", "CHRONO_ENTRY_TIMEOUT_MS", "TMPDIR"]) {
       if (savedEnv[key] === undefined) {
         delete process.env[key];
       } else {
@@ -363,55 +393,186 @@ describe("OpenCode automatic Gaspar entry", () => {
   async function fullHooks(directory: string): Promise<{
     event: (event: unknown) => Promise<unknown>;
     transform: (input: unknown, output: { system: unknown[] }) => Promise<unknown>;
+    before: (input: unknown) => Promise<unknown>;
+    dispose: () => Promise<unknown>;
   }> {
     const module = (await import(pathToFileURL(pluginPath).href)) as {
       ChronoGatePlugin: (ctx: unknown) => Promise<{
         event: (event: unknown) => Promise<unknown>;
         "experimental.chat.system.transform": (input: unknown, output: { system: unknown[] }) => Promise<unknown>;
+        "tool.execute.before": (input: unknown) => Promise<unknown>;
+        dispose: () => Promise<unknown>;
       }>;
     };
     const hooks = await module.ChronoGatePlugin({ directory });
-    return { event: hooks.event, transform: hooks["experimental.chat.system.transform"] };
+    return {
+      event: hooks.event,
+      transform: hooks["experimental.chat.system.transform"],
+      before: hooks["tool.execute.before"],
+      dispose: hooks.dispose,
+    };
   }
 
-  it("injects the entry projection once on session.created", async () => {
+  it("injects the validated entry projection exactly once per session", async () => {
     const { event, transform } = await fullHooks(tempDir);
     await event({ event: { type: "session.created", properties: { sessionID: "s1" } } });
     const output = { system: [] as unknown[] };
     await transform({ sessionID: "s1" }, output);
     expect(output.system).toHaveLength(1);
-    expect(String(output.system[0])).toContain("chrono-entry");
-    expect(String(output.system[0])).toContain("ANALYZING");
+    const injected = String(output.system[0]);
+    expect(injected).toContain("chrono-entry");
+    expect(injected).toContain("SES-0001");
+    expect(injected).toContain("resume-discovery");
+    // Atomic payload: extract the injected JSON and check completeness.
+    const start = injected.indexOf("{");
+    const parsed = JSON.parse(injected.slice(start, injected.lastIndexOf("}") + 1)) as {
+      sessionId: string;
+      projection: { projectState: string };
+    };
+    expect(parsed.sessionId).toBe("SES-0001");
+    expect(parsed.projection.projectState).toBe("ANALYZING");
     // Second transform does not re-inject.
     await transform({ sessionID: "s1" }, output);
     expect(output.system).toHaveLength(1);
   });
 
-  it("degrades silently outside projects and without the entry script", async () => {
+  it("establishes entry lazily without a prior session.created event", async () => {
+    const { transform } = await fullHooks(tempDir);
+    const output = { system: [] as unknown[] };
+    await transform({ sessionID: "s-lazy" }, output);
+    expect(output.system).toHaveLength(1);
+  });
+
+  it("stays silent outside CHRONO projects (tools included)", async () => {
     const plain = mkdtempSync(join(tmpdir(), "chrono-plain-"));
     try {
-      const { event, transform } = await fullHooks(plain);
+      const { event, transform, before } = await fullHooks(plain);
       await event({ event: { type: "session.created", properties: { sessionID: "s1" } } });
       const output = { system: [] as unknown[] };
       await transform({ sessionID: "s1" }, output);
       expect(output.system).toHaveLength(0);
+      await expect(before({ tool: "bash" })).resolves.toBeUndefined();
     } finally {
       rmSync(plain, { recursive: true, force: true });
     }
+  });
+
+  it("denies entry when the script is missing (transform and every tool)", async () => {
     rmSync(join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"));
-    const { event, transform } = await fullHooks(tempDir);
+    const { event, transform, before } = await fullHooks(tempDir);
     await event({ event: { type: "session.created", properties: { sessionID: "s2" } } });
     const output = { system: [] as unknown[] };
-    await transform({ sessionID: "s2" }, output);
+    await expect(transform({ sessionID: "s2" }, output)).rejects.toThrow(/ENTRY_BLOCKED\[ENTRY_SCRIPT_MISSING\]/);
+    expect(output.system).toHaveLength(0);
+    // Backstop: reads, mutations, and unknown tools all deny while unproven.
+    await expect(before({ tool: "read" })).rejects.toThrow(/ENTRY_BLOCKED/);
+    await expect(before({ tool: "bash" })).rejects.toThrow(/ENTRY_BLOCKED/);
+    await expect(before({ tool: "mcp__x" })).rejects.toThrow(/ENTRY_BLOCKED/);
+  });
+
+  it("denies nonzero exits, timeouts, and malformed projections", async () => {
+    // Nonzero exit with a stderr note.
+    writeEntryScript("echo '[chrono] ENTRY BLOCKED: denied' >&2; exit 3");
+    const denied = await fullHooks(tempDir);
+    await expect(denied.transform({ sessionID: "s3" }, { system: [] })).rejects.toThrow(
+      /ENTRY_BLOCKED\[ENTRY_DENIED\]/
+    );
+    // Timeout (bounded by the documented env override for tests).
+    process.env["CHRONO_ENTRY_TIMEOUT_MS"] = "200";
+    writeEntryScript("sleep 5; echo 'too late'");
+    const timedOut = await fullHooks(tempDir);
+    await expect(timedOut.transform({ sessionID: "s4" }, { system: [] })).rejects.toThrow(
+      /ENTRY_BLOCKED\[ENTRY_TIMEOUT\]/
+    );
+    delete process.env["CHRONO_ENTRY_TIMEOUT_MS"];
+    // Malformed variants.
+    const malformed: Array<[string, RegExp]> = [
+      ["echo 'not json{{{'", /ENTRY_MALFORMED/],
+      ["echo '{\"ok\":false,\"error\":{\"code\":\"X\"}}'", /ENTRY_DENIED/],
+      ["echo '{\"ok\":true}'", /ENTRY_MALFORMED/],
+      ["echo '{\"ok\":true,\"sessionId\":\"nope\",\"projection\":{\"projectState\":\"ANALYZING\",\"nextAction\":{\"key\":\"k\"}}}'", /ENTRY_MALFORMED/],
+      ["echo '{\"ok\":true,\"sessionId\":\"SES-1\",\"projection\":{}}'", /ENTRY_MALFORMED/],
+    ];
+    for (const [body, pattern] of malformed) {
+      writeEntryScript(body);
+      const hooks = await fullHooks(tempDir);
+      await expect(hooks.transform({ sessionID: `s-m-${body.length}` }, { system: [] })).rejects.toThrow(pattern);
+    }
+  });
+
+  it("rejects oversized projections atomically instead of truncating", async () => {
+    const big = `{"ok":true,"sessionId":"SES-1","projection":{"projectState":"ANALYZING","nextAction":{"key":"k"},"pad":"${"x".repeat(70000)}"}}`;
+    writeEntryScript(`echo '${big}'`);
+    const { transform } = await fullHooks(tempDir);
+    const output = { system: [] as unknown[] };
+    await expect(transform({ sessionID: "s-big" }, output)).rejects.toThrow(/ENTRY_BLOCKED\[ENTRY_OVERSIZED\]/);
     expect(output.system).toHaveLength(0);
   });
 
-  it("ignores non-session events", async () => {
+  it("fails when the injection surface is unavailable", async () => {
+    const { transform } = await fullHooks(tempDir);
+    await expect(transform({ sessionID: "s-nosys" }, {} as { system: unknown[] })).rejects.toThrow(
+      /ENTRY_BLOCKED\[ENTRY_INJECTION_UNAVAILABLE\]/
+    );
+    await expect(
+      transform({ sessionID: "s-nosys2" }, { system: "not-an-array" } as unknown as { system: unknown[] })
+    ).rejects.toThrow(/ENTRY_BLOCKED\[ENTRY_INJECTION_UNAVAILABLE\]/);
+  });
+
+  it("retries within budget, then fails terminally and deterministically", async () => {
+    writeEntryScript("exit 3");
+    const { transform } = await fullHooks(tempDir);
+    const output = { system: [] as unknown[] };
+    await expect(transform({ sessionID: "s-r" }, output)).rejects.toThrow(/ENTRY_BLOCKED\[ENTRY_DENIED\]/);
+    await expect(transform({ sessionID: "s-r" }, output)).rejects.toThrow(/ENTRY_BLOCKED\[ENTRY_DENIED\]/);
+    await expect(transform({ sessionID: "s-r" }, output)).rejects.toThrow(/ENTRY_BLOCKED\[ENTRY_DENIED\]/);
+    await expect(transform({ sessionID: "s-r" }, output)).rejects.toThrow(/will not be retried/);
+    expect(output.system).toHaveLength(0);
+  });
+
+  it("redacts token paths from failure diagnostics", async () => {
+    writeEntryScript("echo 'denied for chrono-gaspar-opencode-123.token' >&2; exit 3");
+    const { transform } = await fullHooks(tempDir);
+    await expect(transform({ sessionID: "s-red" }, { system: [] })).rejects.toThrow(/\[token path redacted\]/);
+    try {
+      await transform({ sessionID: "s-red" }, { system: [] });
+      expect.unreachable();
+    } catch (e) {
+      expect(String((e as Error).message)).not.toContain("chrono-gaspar-opencode-123.token");
+    }
+  });
+
+  it("sweeps stale token files and drops state on session end", async () => {
+    const fakeTmp = mkdtempSync(join(tmpdir(), "chrono-tmp-"));
+    process.env["TMPDIR"] = fakeTmp;
+    try {
+      const stale = join(fakeTmp, "chrono-gaspar-opencode-1.token");
+      const fresh = join(fakeTmp, "chrono-gaspar-opencode-2.token");
+      const other = join(fakeTmp, "unrelated.txt");
+      writeFileSync(stale, "x", "utf8");
+      writeFileSync(fresh, "x", "utf8");
+      writeFileSync(other, "x", "utf8");
+      const old = Date.now() - 7200 * 1000;
+      const { utimesSync } = await import("node:fs");
+      utimesSync(stale, old / 1000, old / 1000);
+      const { event, dispose } = await fullHooks(tempDir);
+      await event({ event: { type: "session.created", properties: { sessionID: "s-sweep" } } });
+      expect(existsSync(stale)).toBe(false);
+      expect(existsSync(fresh)).toBe(true);
+      expect(existsSync(other)).toBe(true);
+      await event({ event: { type: "session.deleted", properties: { sessionID: "s-sweep" } } });
+      await expect(dispose()).resolves.toBeUndefined();
+    } finally {
+      rmSync(fakeTmp, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores non-session events for prefetch but still gates the transform", async () => {
     const { event, transform } = await fullHooks(tempDir);
     await event({ event: { type: "message.updated" } });
     const output = { system: [] as unknown[] };
     await transform({ sessionID: "s9" }, output);
-    expect(output.system).toHaveLength(0);
+    expect(output.system).toHaveLength(1);
   });
 });
 

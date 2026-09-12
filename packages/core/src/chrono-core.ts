@@ -5161,15 +5161,26 @@ export class ChronoCore {
           suggestedAction: "Install managed hook assets with chrono setup, then promote the proof",
         });
       }
-      const promoted = this.db.routingProofs().promote(proof.id, adapterHash, manifest.hash);
-      this.events.append({
-        eventType: "ProofPromoted",
-        entityId: promoted.id,
-        payload: { adapterId: proof.adapterId, runtime: proof.runtime, adapterHash, assetHash: manifest.hash },
-        actor: caller.auditActor,
-        priorState: "candidate",
-        newState: "authoritative",
-        reasoning: "Routing proof promoted after signed adapter approval with re-validated bindings",
+      // Atomic promotion [OC-P2]: the row update and its ProofPromoted
+      // audit event commit in one database transaction. If the event
+      // cannot persist, the row stays a candidate — an authoritative
+      // proof without its audit event can never exist. A concurrent
+      // promotion that lands first reports applied:false, so no
+      // duplicate event is ever emitted.
+      const promoted = this.db.transaction(() => {
+        const step = this.db.routingProofs().promote(proof.id, adapterHash, manifest.hash);
+        if (step.applied) {
+          this.events.append({
+            eventType: "ProofPromoted",
+            entityId: step.record.id,
+            payload: { adapterId: proof.adapterId, runtime: proof.runtime, adapterHash, assetHash: manifest.hash },
+            actor: caller.auditActor,
+            priorState: "candidate",
+            newState: "authoritative",
+            reasoning: "Routing proof promoted after signed adapter approval with re-validated bindings",
+          });
+        }
+        return step.record;
       });
       return { ok: true, value: { id: promoted.id } };
     } catch (e) {

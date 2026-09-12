@@ -138,5 +138,6 @@ disposition. That implementation may remain, but it does not waive this gate.
 Resolve the code and contract findings in
 [`FIXES-SL-10.1.md`](FIXES-SL-10.1.md), obtain the missing real-runtime
 evidence, and then perform a fresh independent disposition of both slices
-before continuing to Phase 6. Stop only at a genuinely required PO decision or
-external-action authorization.
+before closing the all-runtime Phase 6 gate. The bounded OpenCode-only Phase 6A
+pilot is separately governed by `OPENCODE-PILOT-GATE.md`. Stop only at a
+genuinely required PO decision or external-action authorization.

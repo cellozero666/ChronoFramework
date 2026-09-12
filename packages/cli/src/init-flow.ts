@@ -337,17 +337,27 @@ export function detectInit(
   for (const r of selected) {
     routing[r.id] = "unproven";
   }
+  // Planned files follow the same per-runtime scoping as setup: only
+  // the selected runtimes' integration assets are listed, plus the
+  // shared entry script and broker account. An OpenCode-only plan never
+  // promises Claude/Kiro files.
+  const selectedIds = selected.map((r) => r.id);
   const filesToCreate = [
     ".chrono/chrono.db",
-    ".opencode/plugins/chrono-gate.js",
-    ".chrono/hooks/chrono-claude-gate.js",
-    ".chrono/hooks/chrono-kiro-gate.js",
-    ".kiro/hooks/chrono-gate.json",
-    ".claude/agents/gaspar.md",
+    ".chrono/hooks/chrono-entry-session.sh",
     ".chrono/broker-account",
+    ...(selectedIds.includes("opencode") ? [".opencode/plugins/chrono-gate.js"] : []),
+    ...(selectedIds.includes("claude-code")
+      ? [".chrono/hooks/chrono-claude-gate.js", ".claude/agents/gaspar.md"]
+      : []),
+    ...(selectedIds.includes("kiro")
+      ? [".chrono/hooks/chrono-kiro-gate.js", ".kiro/hooks/chrono-gate.json"]
+      : []),
   ];
-  const filesToModify = [".claude/settings.json"];
-  const backups = [".claude/settings.json.chrono-bak (only when an existing file changes)"];
+  const filesToModify = selectedIds.includes("claude-code") ? [".claude/settings.json"] : [];
+  const backups = selectedIds.includes("claude-code")
+    ? [".claude/settings.json.chrono-bak (only when an existing file changes)"]
+    : [];
   const needsNetwork: string[] = [];
   if (!skillInstalled) {
     needsNetwork.push("fetch the pinned Karpathy Guidelines skill release");
@@ -1310,8 +1320,18 @@ export async function runInitFlow(
           return prefixStepFailure("NATIVE_HOOKS_INSTALLED", promoted, asJson);
         }
       }
+      const installedHooks = [".chrono/hooks/chrono-entry-session.sh"];
+      for (const runtimeId of plan.runtimeIds) {
+        if (runtimeId === "opencode") {
+          installedHooks.push(".opencode/plugins/chrono-gate.js");
+        } else if (runtimeId === "claude-code") {
+          installedHooks.push(".chrono/hooks/chrono-claude-gate.js");
+        } else if (runtimeId === "kiro") {
+          installedHooks.push(".chrono/hooks/chrono-kiro-gate.js", ".kiro/hooks/chrono-gate.json");
+        }
+      }
       const failed = mark("NATIVE_HOOKS_INSTALLED", {
-        hooks: [".opencode/plugins/chrono-gate.js", ".chrono/hooks/chrono-claude-gate.js", ".chrono/hooks/chrono-kiro-gate.js"],
+        hooks: installedHooks,
       });
       if (failed !== null) {
         lock.release();
@@ -1721,33 +1741,37 @@ export function checkManagedHooks(
     }
   };
   const checks: Record<string, boolean> = {
-    // Shared assets: every setup installs these.
-    ".opencode/plugins/chrono-gate.js": checkBytes(".opencode/plugins/chrono-gate.js", buildOpencodePlugin()),
-    ".chrono/hooks/chrono-claude-gate.js": checkBytes(".chrono/hooks/chrono-claude-gate.js", buildClaudeHook()),
-    ".chrono/hooks/chrono-kiro-gate.js": checkBytes(".chrono/hooks/chrono-kiro-gate.js", buildKiroHook()),
+    // Shared mandatory asset: every setup installs the entry script.
     ".chrono/hooks/chrono-entry-session.sh": checkBytes(
       ".chrono/hooks/chrono-entry-session.sh",
       buildEntrySessionScript()
     ),
-    ".kiro/hooks/chrono-gate.json": checkBytes(".kiro/hooks/chrono-gate.json", buildKiroHookRegistration()),
     ".chrono/broker-account": checkPresent(".chrono/broker-account"),
-    // The PreToolUse merge runs on every setup (shared enforcement
-    // baseline); SessionStart and the agent definition are
-    // Claude-scoped below.
-    ".claude/settings.json:PreToolUse": checkContains(".claude/settings.json", "chrono-claude-gate.js"),
   };
-  // Runtime-scoped assets apply only to active adapters carrying a known
-  // runtime id (init registers adapters under runtime ids). Custom adapter
-  // ids keep the shared assets; nothing is guessed for them.
+  // Runtime-scoped assets are verified only for the runtimes that own
+  // them; unknown adapter ids keep the legacy full baseline (never
+  // guessed). An OpenCode-only project therefore never reports missing
+  // Claude/Kiro assets, and vice versa.
   const runtimes = activeAdapterIds.filter((id): id is KnownRuntimeId => isKnownRuntimeId(id));
-  if (runtimes.includes("claude-code")) {
+  const unknownAdapters = activeAdapterIds.filter((id) => !isKnownRuntimeId(id));
+  if (runtimes.includes("opencode") || unknownAdapters.length > 0) {
+    checks[".opencode/plugins/chrono-gate.js"] = checkBytes(".opencode/plugins/chrono-gate.js", buildOpencodePlugin());
+  }
+  if (runtimes.includes("claude-code") || unknownAdapters.length > 0) {
+    checks[".chrono/hooks/chrono-claude-gate.js"] = checkBytes(".chrono/hooks/chrono-claude-gate.js", buildClaudeHook());
+    // The PreToolUse merge runs on every Claude-scoped setup (shared
+    // enforcement baseline for that runtime); SessionStart and the agent
+    // definition are Claude-scoped below.
+    checks[".claude/settings.json:PreToolUse"] = checkContains(".claude/settings.json", "chrono-claude-gate.js");
     checks[".claude/agents/gaspar.md"] = checkBytes(".claude/agents/gaspar.md", buildGasparDefinition());
     checks[".claude/settings.json:SessionStart"] = checkContains(
       ".claude/settings.json",
       entrySessionCommand("claude-code")
     );
   }
-  if (runtimes.includes("kiro")) {
+  if (runtimes.includes("kiro") || unknownAdapters.length > 0) {
+    checks[".chrono/hooks/chrono-kiro-gate.js"] = checkBytes(".chrono/hooks/chrono-kiro-gate.js", buildKiroHook());
+    checks[".kiro/hooks/chrono-gate.json"] = checkBytes(".kiro/hooks/chrono-gate.json", buildKiroHookRegistration());
     checks[".kiro/hooks/chrono-entry-kiro.json"] = checkBytes(
       kiroEntryRegistrationPath("kiro"),
       buildKiroEntryRegistration("kiro")

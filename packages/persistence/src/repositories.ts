@@ -2303,11 +2303,17 @@ export class RoutingProofRepository {
    * mutation of a proof row: candidate → authoritative only, with the
    * adapter registration hash and asset manifest hash snapshotted at
    * promotion time. Anything else throws without touching the row.
+   *
+   * Returns whether this call applied the transition. A concurrent
+   * promotion that lands first resolves deterministically: the loser
+   * observes the authoritative row and reports `applied: false` so the
+   * caller emits no duplicate audit event [OC-P2]. Callers MUST persist
+   * the audit event in the same database transaction as this update.
    */
-  promote(id: string, adapterHash: string, assetHash: string): RoutingProofRecord {
+  promote(id: string, adapterHash: string, assetHash: string): { record: RoutingProofRecord; applied: boolean } {
     const current = this.findById(id);
     if (current.authority === "authoritative") {
-      return current;
+      return { record: current, applied: false };
     }
     if (current.authority !== "candidate") {
       throw new ChronoError({
@@ -2319,10 +2325,24 @@ export class RoutingProofRepository {
         suggestedAction: "Re-record the proof with chrono rtk prove",
       });
     }
-    this.db
+    const updated = this.db
       .prepare("UPDATE routing_proof SET authority = 'authoritative', adapter_hash = ?, asset_hash = ? WHERE id = ? AND authority = 'candidate'")
       .run(adapterHash, assetHash, id);
-    return this.findById(id);
+    if (updated.changes === 0) {
+      const raced = this.findById(id);
+      if (raced.authority === "authoritative") {
+        return { record: raced, applied: false };
+      }
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: `Routing proof '${id}' changed during promotion: refusing to mint authority on a moving row`,
+        invariantRef: "INV §14.4",
+        affectedTarget: id,
+        suggestedAction: "Re-read the proof and promote the current candidate",
+      });
+    }
+    return { record: this.findById(id), applied: true };
   }
 
   findById(id: string): RoutingProofRecord {

@@ -876,6 +876,7 @@ Event types:
 - `BlockerRaised`, `BlockerResolved`
 - `DefectRaised`, `DefectResolved`
 - `EvidenceRecorded`, `RtKAttested`, `SkillAttested`
+- `RoutingProofRecorded`, `ProofPromoted`
 - `ModuleCompleted`, `ProjectInitialized`
 - `DENIED` (gate failure audit)
 

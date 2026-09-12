@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -609,5 +609,46 @@ export const MIGRATIONS: Record<number, string> = {
     ALTER TABLE routing_proof ADD COLUMN adapter_hash TEXT;
     ALTER TABLE routing_proof ADD COLUMN pre_routing_command TEXT NOT NULL DEFAULT '';
     ALTER TABLE routing_proof ADD COLUMN asset_hash TEXT;
+  `,
+  14: `
+    -- Routing-proof promotion guard [OC-P2]: the persistence layer permits
+    -- exactly one mutation of a proof row — candidate → authoritative with
+    -- non-null adapter and managed-asset hashes — and forbids every other
+    -- UPDATE and every DELETE. Core-level validation stays primary; these
+    -- triggers are the backstop against bypass via direct SQL, so an
+    -- authoritative proof without a legal promotion can never exist, and
+    -- authoritative rows can never be modified or removed afterward.
+    CREATE TRIGGER routing_proof_permit_promotion_only
+    BEFORE UPDATE ON routing_proof
+    FOR EACH ROW
+    WHEN NOT (
+      OLD.authority = 'candidate' AND NEW.authority = 'authoritative'
+      AND NEW.adapter_hash IS NOT NULL AND NEW.asset_hash IS NOT NULL
+      AND NEW.id = OLD.id
+      AND NEW.adapter_id = OLD.adapter_id
+      AND NEW.runtime = OLD.runtime
+      AND NEW.session_id = OLD.session_id
+      AND NEW.project_id = OLD.project_id
+      AND NEW.rtk_attestation_id = OLD.rtk_attestation_id
+      AND NEW.binary_path = OLD.binary_path
+      AND NEW.binary_hash = OLD.binary_hash
+      AND NEW.version = OLD.version
+      AND NEW.proof_command = OLD.proof_command
+      AND NEW.pre_routing_command = OLD.pre_routing_command
+      AND NEW.command_hash = OLD.command_hash
+      AND NEW.output_hash = OLD.output_hash
+      AND NEW.exit_status = OLD.exit_status
+      AND NEW.gain_available = OLD.gain_available
+      AND NEW.timestamp = OLD.timestamp
+      AND NEW.valid_until = OLD.valid_until
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'routing_proof: only candidate → authoritative promotion with non-null hashes is permitted');
+    END;
+    CREATE TRIGGER routing_proof_no_delete
+    BEFORE DELETE ON routing_proof
+    BEGIN
+      SELECT RAISE(ABORT, 'routing_proof: proof rows are append-only and cannot be deleted');
+    END;
   `,
 };
