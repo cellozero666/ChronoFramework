@@ -36,7 +36,7 @@ import {
   type InitDetection,
 } from "./init-flow.js";
 import { runAdapterList } from "./index.js";
-import { FIXTURE_SKILL_MD } from "./test-skill-fixture.js";
+import { FIXTURE_SKILL_MD } from "../test/test-skill-fixture.js";
 
 
 function fakeInteractiveTerminal(): () => void {

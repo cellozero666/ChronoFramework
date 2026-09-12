@@ -40,7 +40,7 @@ import {
   runUninstall,
   type FlowProbes,
 } from "./init-flow.js";
-import { FIXTURE_SKILL_MD } from "./test-skill-fixture.js";
+import { FIXTURE_SKILL_MD } from "../test/test-skill-fixture.js";
 
 function fakeInteractiveTerminal(): () => void {
   const stdinDesc = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
