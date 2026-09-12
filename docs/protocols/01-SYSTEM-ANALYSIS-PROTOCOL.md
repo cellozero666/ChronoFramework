@@ -34,7 +34,7 @@ Gaspar MUST determine whether the project is greenfield, existing, or already CH
 
 Initialization MUST run through the globally installed `chrono` launcher, pin and verify the project-local Core, and register both dispatch and blocking `chrono gate` hooks for OpenCode, Claude Code, and Kiro. A missing/incompatible local Core or unproven hook MUST block agent execution. The Product Owner's runtime/model selection MUST be recorded as configuration; no provider, model, or version may be supplied by a hardcoded default.
 
-Initialization MUST detect the selected runtime and a genuine, compatible RTK installation from `https://github.com/rtk-ai/rtk`. `rtk gain` and an adapter routing self-test MUST succeed. Missing, stale, incompatible, or bypassed RTK MUST create `BLOCKED_RTK`; no agent-driven CLI execution MAY begin.
+Initialization MUST detect the selected runtime and a genuine, compatible RTK installation from `https://github.com/rtk-ai/rtk`. `rtk gain` MUST succeed (binary identity) and an effective routing proof MUST be recorded per adapter (`chrono rtk prove`; CANDIDATE until `chrono rtk promote` after adapter approval). Missing, stale, incompatible, or bypassed RTK MUST create `BLOCKED_RTK`; no agent-driven CLI execution MAY begin. `[ADR-006, INV §8]`.
 
 Initialization MUST also install or verify the mandatory Karpathy Guidelines skill from the CHRONO-pinned immutable revision of `https://github.com/multica-ai/andrej-karpathy-skills`. The adapter MUST prove provenance, source/generated hashes, license attribution, runtime discovery, agent permission, and activation. Missing, divergent, modified, untrusted, inactive, or bypassed skill state MUST create `BLOCKED_PROCESS_SKILL` and prevent Gaspar or specialist dispatch.
 

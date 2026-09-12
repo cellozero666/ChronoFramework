@@ -32,6 +32,7 @@
   },
   "devDependencies": {
     "@chrono/persistence": "^0.1.0",
+    "better-sqlite3": "^13.0.3",
     "typescript": "^5.6.0"
   }
 }

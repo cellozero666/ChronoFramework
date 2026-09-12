@@ -50,6 +50,7 @@ export {
   type ProjectRecord,
   type QaReportRecord,
   type RtkAttestationDetail,
+  type RoutingProofAuthority,
   type RoutingProofRecord,
   type SecurityProfileRecord,
   type SessionAuthorizationRecord,

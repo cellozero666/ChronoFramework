@@ -22,6 +22,7 @@ import {
   fingerprintPublicKey,
   generateApprovalKeyPair,
   hashSkillSource,
+  managedAssetInventory,
   signApprovalPayload,
   skillGeneratedHashes,
   skillVendorPath,
@@ -489,20 +490,30 @@ function setupGateProject(tempDir: string): GateFixture {
     const adapterApprovalId = adapterApprovals[adapterApprovals.length - 1]!.entityId;
     expect(core.approveAdapter("test-adapter", adapterApprovalId, po).ok).toBe(true);
     const proofCommand = JSON.stringify([rtkBin, "gain"]);
-    expect(
-      core.recordRoutingProof(gaspar, {
-        adapterId: "test-adapter",
-        binaryPath: rtkBin,
-        version: "1.0.0-test",
-        proofCommand,
-        commandHash: computeRevisionHash([rtkBin, "gain"]),
-        outputHash: computeRevisionHash("fixture gain ok"),
-        exitStatus: 0,
-        gainAvailable: true,
-        timestamp: new Date().toISOString(),
-        ttlSeconds: 86400,
-      }).ok
-    ).toBe(true);
+    const recordedProof = core.recordRoutingProof(gaspar, {
+      adapterId: "test-adapter",
+      binaryPath: rtkBin,
+      version: "1.0.0-test",
+      proofCommand,
+      preRoutingCommand: JSON.stringify(["ls", tempDir]),
+      commandHash: computeRevisionHash([rtkBin, "gain"]),
+      outputHash: computeRevisionHash("fixture gain ok"),
+      exitStatus: 0,
+      gainAvailable: true,
+      timestamp: new Date().toISOString(),
+      ttlSeconds: 86400,
+    });
+    expect(recordedProof.ok).toBe(true);
+    for (const spec of managedAssetInventory("test-adapter")) {
+      const target = join(tempDir, spec.path);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(
+        target,
+        spec.kind === "marker" ? `fixture-managed ${spec.marker ?? spec.path}\n` : `fixture-managed ${spec.path}\n`,
+        "utf8"
+      );
+    }
+    expect(core.promoteRoutingProof(recordedProof.value!.id, po).ok).toBe(true);
     const openWorker = (role: string) => {
       const res = core.openSession(
         { role, adapter: "test-adapter", runtime: "test-runtime", scopeModule: "MOD-0001", ttlSeconds: 3600 },

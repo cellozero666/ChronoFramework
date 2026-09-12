@@ -100,8 +100,16 @@ never from chat history:
  * Resolves the project root, reads the broker account name, fetches the
  * secret from the OS keychain, redeems entry, prints the safe projection
  * to stdout, and writes the session token to a 0600 file named on
- * stderr only. Any failure degrades to ungoverned assistance with an
- * operator-visible note; pre-tool gates keep enforcing fail-closed.
+ * stderr only.
+ *
+ * Fail-loud, never ungoverned [FIXES-SL-10.1 C4]: any failure inside a
+ * CHRONO project exits nonzero so the runtime surfaces the stderr
+ * warning (Kiro: stderr sent to the agent on nonzero exit; PreToolUse
+ * gates keep enforcing fail-closed regardless). The ONLY exit-0
+ * non-success path is "no CHRONO project above cwd", where there is
+ * nothing to govern. A missing broker account, an unavailable secret,
+ * or a denied redemption exits 3 with an actionable remediation —
+ * sessions MUST NOT proceed as ungoverned default agents.
  */
 export function buildEntrySessionScript(): string {
   return `#!/bin/sh
@@ -122,14 +130,14 @@ if [ -z "$ROOT" ]; then
 fi
 ACCOUNT_FILE="$ROOT/.chrono/broker-account"
 if [ ! -f "$ACCOUNT_FILE" ]; then
-  echo "[chrono] Gaspar entry not prepared: run chrono init" >&2
-  exit 0
+  echo "[chrono] ENTRY BLOCKED: Gaspar entry not prepared in this project: run chrono init (no ungoverned fallback)" >&2
+  exit 3
 fi
 ACCOUNT="$(sed -n '1p' "$ACCOUNT_FILE")"
 BROKER="$(sed -n '2p' "$ACCOUNT_FILE")"
 if [ -z "$ACCOUNT" ] || [ -z "$BROKER" ]; then
-  echo "[chrono] Gaspar entry not prepared: run chrono init" >&2
-  exit 0
+  echo "[chrono] ENTRY BLOCKED: Gaspar entry not prepared in this project: run chrono init (no ungoverned fallback)" >&2
+  exit 3
 fi
 SECRET=""
 if command -v security >/dev/null 2>&1; then
@@ -139,13 +147,13 @@ if [ -z "$SECRET" ] && command -v secret-tool >/dev/null 2>&1; then
   SECRET="$(secret-tool lookup service chrono-gaspar-entry account "$ACCOUNT" 2>/dev/null || true)"
 fi
 if [ -z "$SECRET" ]; then
-  echo "[chrono] broker secret unavailable in OS keychain: entry degraded, pre-tool gates still enforce" >&2
-  exit 0
+  echo "[chrono] ENTRY BLOCKED: broker secret unavailable in OS keychain: unlock the keychain or re-run chrono init (pre-tool gates still enforce)" >&2
+  exit 3
 fi
 TOKEN_FILE="\${TMPDIR:-/tmp}/chrono-gaspar-$ADAPTER-$$.token"
 if ! printf '%s' "$SECRET" | "$CHRONO_BIN" entry --adapter "$ADAPTER" --broker "$BROKER" --secret-stdin --token-out "$TOKEN_FILE" --path "$ROOT"; then
-  echo "[chrono] Gaspar entry denied: run chrono doctor for recovery" >&2
-  exit 0
+  echo "[chrono] ENTRY BLOCKED: Gaspar entry denied: run chrono doctor for recovery (no ungoverned fallback)" >&2
+  exit 3
 fi
 chmod 600 "$TOKEN_FILE" 2>/dev/null || true
 echo "[chrono] Gaspar session ready: $TOKEN_FILE" >&2
@@ -160,7 +168,24 @@ export function buildKiroEntryRegistration(adapterId: string): string {
       hooks: [
         {
           name: `chrono-gaspar-entry-${adapterId}`,
+          // IDE surface: Session Start fires when a new chat session
+          // begins (https://kiro.dev/docs/hooks/types/#session-start-ide-only).
           trigger: "SessionStart",
+          action: { type: "command", command: entrySessionCommand(adapterId) },
+        },
+        {
+          name: `chrono-gaspar-entry-${adapterId}-cli`,
+          // CLI surface: Agent Spawn fires when the agent is first
+          // activated; Session Start is IDE-only and never fires on CLI
+          // (https://kiro.dev/docs/hooks/types/#agent-spawn-cli-only).
+          // Both hooks run the same entry script: exit 0 prints the safe
+          // projection to stdout (added to agent context per
+          // https://kiro.dev/docs/hooks/actions/#shell-command-action);
+          // nonzero sends the stderr warning to the agent (fail-loud).
+          // Whether a surface ignores the other trigger is unverified
+          // without a real Kiro runtime and is an explicit acceptance
+          // check [FIXES-SL-10.1 C4].
+          trigger: "AgentSpawn",
           action: { type: "command", command: entrySessionCommand(adapterId) },
         },
       ],

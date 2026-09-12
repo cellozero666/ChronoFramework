@@ -355,18 +355,23 @@ The Core MUST treat time-bound and change-bound state as "current" or "stale/inv
 
 | Condition | State |
 |---|---|
-| Recorded with successful `rtk gain` + routing self-test, within TTL | `current` |
+| Recorded with successful `rtk gain` (binary identity), within TTL | `current` |
 | TTL elapsed (default: project-configured window) | `stale` |
 | Binary changed, version mismatch, collision detected, bypass event | `invalid` |
 | Re-tested and healthy | → `current` |
 
+Attestation currency alone never authorizes dispatch: dispatch additionally
+requires a current AUTHORITATIVE routing proof for the (adapter, runtime,
+project) scope (`chrono rtk prove` records a CANDIDATE; `chrono rtk promote`
+authorizes it after signed adapter approval) `[ADR-006, INV §8.7]`.
+
 **Invalidation triggers:**
 - RTK binary path or version changes `[REF.§123]`
 - `rtk gain` fails (proves it is not Rust Token Killer) `[REF.§123]`
-- Routing self-test fails `[P8.7]`
+- No current AUTHORITATIVE routing proof, or any proof binding drifted (binary, registration, managed assets, attestation) `[ADR-006]`
 - Bypass event detected `[P7.3, P8.7]`
 
-**Effect:** `stale` or `invalid` → `BLOCKED_RTK` → dispatch denied `[P6.5, P7.3, P8.7]`.
+**Effect:** `stale` or `invalid` → `BLOCKED_RTK` → dispatch denied `[P6.5, P7.3, P8.7]`; missing/drifted proof → `RTK_ROUTING_FAILURE` → dispatch denied.
 
 ### 4.2 SkillAttestation freshness `[P6.6, REF.§1189-1190]`
 

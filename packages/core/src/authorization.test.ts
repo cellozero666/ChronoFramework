@@ -4,10 +4,11 @@
  * [CORE §7.4/§7.6, DOM §6.4/§6.6, Remediation §5]
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
+import Database from "better-sqlite3";
 import {
   SKILL_RELEASE,
   SKILL_RUNTIME_PATHS,
@@ -20,6 +21,7 @@ import {
   fingerprintPublicKey,
   generateApprovalKeyPair,
   hashSkillSource,
+  managedAssetInventory,
   signApprovalPayload,
   skillGeneratedHashes,
   skillVendorPath,
@@ -27,6 +29,7 @@ import {
   SKILL_UPSTREAM,
 } from "@chrono/domain";
 import { ChronoCore, type CallerAuth } from "./chrono-core.js";
+import { ChronoDatabase } from "@chrono/persistence";
 
 const FIXED_TIME = "2026-06-01T00:00:00.000Z";
 const SPEC = {
@@ -266,6 +269,22 @@ function recordAttestations(
 }
 
 /**
+ * Install the managed-asset inventory for a fixture adapter so a
+ * candidate proof can be promoted (promotion snapshots the manifest
+ * hash; dispatch re-validates it). `exact` entries carry fixture bytes,
+ * `marker` entries carry their marker string.
+ */
+function installManagedProofAssets(projectPath: string, adapterId: string): void {
+  for (const spec of managedAssetInventory(adapterId)) {
+    const target = join(projectPath, spec.path);
+    mkdirSync(dirname(target), { recursive: true });
+    const content =
+      spec.kind === "marker" ? `fixture-managed ${spec.marker ?? spec.path}\n` : `fixture-managed ${spec.path}\n`;
+    writeFileSync(target, content, "utf8");
+  }
+}
+
+/**
  * Provision an approved fixture adapter plus a current routing proof so
  * dispatch-authorized paths stay green. Idempotent per project: repeat
  * registration resolves to the existing row, approved adapters skip the
@@ -321,6 +340,7 @@ function provisionRoutingProof(
     binaryPath: rtkBin,
     version: "1.0.0-test",
     proofCommand,
+    preRoutingCommand: JSON.stringify(["ls", root]),
     commandHash: computeRevisionHash([rtkBin, "gain"]),
     outputHash: computeRevisionHash("fixture gain ok"),
     exitStatus: 0,
@@ -329,6 +349,11 @@ function provisionRoutingProof(
     ttlSeconds: 3600,
   });
   expect(proof.ok).toBe(true);
+  // Recorded proofs are non-authoritative candidates: promotion after
+  // the signed approval above is what authorizes dispatch [ADR-006].
+  installManagedProofAssets(root, "test-adapter");
+  const promoted = core.promoteRoutingProof(proof.value!.id, po);
+  expect(promoted.ok).toBe(true);
   return proof.value!.id;
 }
 
@@ -854,20 +879,22 @@ describe("Dispatch grants (session binding)", () => {
       recordAttestations(core, gaspar, poPrivateKey, T0);
       const rtkBin = join(tempDir, "fixture-rtk.sh");
       const fixtureProofCommand = JSON.stringify([rtkBin, "gain"]);
-      expect(
-        core.recordRoutingProof(gaspar, {
-          adapterId: "fixture",
-          binaryPath: rtkBin,
-          version: "1.0.0-test",
-          proofCommand: fixtureProofCommand,
-          commandHash: computeRevisionHash([rtkBin, "gain"]),
-          outputHash: computeRevisionHash("fixture gain ok"),
-          exitStatus: 0,
-          gainAvailable: true,
-          timestamp: T0,
-          ttlSeconds: 3600,
-        }).ok
-      ).toBe(true);
+      const recordedProof = core.recordRoutingProof(gaspar, {
+        adapterId: "fixture",
+        binaryPath: rtkBin,
+        version: "1.0.0-test",
+        proofCommand: fixtureProofCommand,
+        preRoutingCommand: JSON.stringify(["ls", tempDir]),
+        commandHash: computeRevisionHash([rtkBin, "gain"]),
+        outputHash: computeRevisionHash("fixture gain ok"),
+        exitStatus: 0,
+        gainAvailable: true,
+        timestamp: T0,
+        ttlSeconds: 3600,
+      });
+      expect(recordedProof.ok).toBe(true);
+      installManagedProofAssets(tempDir, "fixture");
+      expect(core.promoteRoutingProof(recordedProof.value!.id, poAuth).ok).toBe(true);
       const worker = openTestSession(core, "belthazar", "MOD-0001");
       const authz = core.authorizeExecution("MOD-0001", {
         actor: "gaspar",
@@ -940,6 +967,7 @@ describe("Dispatch grants (session binding)", () => {
         binaryPath: rtkBin,
         version: "1.0.0-test",
         proofCommand: JSON.stringify([rtkBin, "gain"]),
+        preRoutingCommand: JSON.stringify(["ls", tempDir]),
         commandHash: computeRevisionHash([rtkBin, "gain"]),
         outputHash: computeRevisionHash("fixture gain ok"),
         exitStatus: 0,
@@ -998,6 +1026,7 @@ describe("Dispatch grants (session binding)", () => {
         binaryPath: rtkBin,
         version: "1.0.0-test",
         proofCommand: JSON.stringify([rtkBin, "gain"]),
+        preRoutingCommand: JSON.stringify(["ls", tempDir]),
         commandHash: computeRevisionHash([rtkBin, "gain"]),
         outputHash: computeRevisionHash("fixture gain ok"),
         exitStatus: 0,
@@ -1284,5 +1313,615 @@ describe("Completion authorization", () => {
     });
     expect(waived.ok).toBe(true);
     expect(core.authorizeCompletion("MOD-0001", fx.gaspar).ok).toBe(true);
+  });
+});
+
+describe("Routing proof authority (candidate promotes to authoritative)", () => {
+  // Adversarial coverage for FIXES-SL-10.1 C2/C3 [ADR-006]: recorded
+  // proofs are non-authoritative candidates; only promotion after signed
+  // adapter approval authorizes dispatch, and every binding (attestation,
+  // binary, registration, assets, TTL, scope) re-validates per use.
+  let tempDir: string;
+  const T0 = "2026-09-11T00:00:00.000Z";
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-proof-auth-test-"));
+  });
+
+  afterEach(() => {
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  function harness(projectRuntime: string | null = "test-runtime"): {
+    core: ChronoCore;
+    clockRef: { now: string };
+    sign: SignFn;
+    privateKeyPem: string;
+    restoreTty: () => void;
+  } {
+    const clockRef = { now: T0 };
+    const restoreTty = fakeInteractiveTerminal();
+    const core = new ChronoCore({ projectPath: tempDir, runtime: projectRuntime, clock: () => clockRef.now });
+    expect(core.init().ok).toBe(true);
+    const pair = generateApprovalKeyPair();
+    enrollTestPo(core, pair, T0);
+    const sign: SignFn = (fields) => ({
+      timestamp: FIXED_TIME,
+      signature: signApprovalPayload(
+        buildApprovalPayload({ ...fields, timestamp: FIXED_TIME }),
+        pair.privateKeyPem
+      ),
+    });
+    return { core, clockRef, sign, privateKeyPem: pair.privateKeyPem, restoreTty };
+  }
+
+  function approveSecondAdapter(
+    core: ChronoCore,
+    po: CallerAuth,
+    sign: SignFn,
+    id: string
+  ): void {
+    const entrypoint = join(tempDir, `${id}.sh`);
+    writeFileSync(entrypoint, "#!/bin/sh\necho ok\n");
+    chmodSync(entrypoint, 0o755);
+    expect(
+      core.registerAdapter(
+        { id, name: id, entrypoint, conformanceProof: [`${id} --version`] },
+        po
+      ).ok
+    ).toBe(true);
+    approve(core, sign, "adapter-registration", id, core.adapterRegistrationHash(id));
+    const approvals = core.listEvents().filter((e) => e.eventType === "ApprovalGranted");
+    expect(
+      core.approveAdapter(id, approvals[approvals.length - 1]!.entityId, po).ok
+    ).toBe(true);
+  }
+
+  function recordCandidate(core: ChronoCore, submitter: CallerAuth, adapterId: string, ttlSeconds = 3600, timestamp = T0): string {
+    const rtkBin = join(tempDir, "fixture-rtk.sh");
+    const pre = ["ls", tempDir];
+    const routed = [rtkBin, "ls", tempDir];
+    const res = core.recordRoutingProof(submitter, {
+      adapterId,
+      binaryPath: rtkBin,
+      version: "1.0.0-test",
+      proofCommand: JSON.stringify(routed),
+      preRoutingCommand: JSON.stringify(pre),
+      commandHash: computeRevisionHash({ pre, routed }),
+      outputHash: computeRevisionHash("fixture routed ok"),
+      exitStatus: 0,
+      gainAvailable: true,
+      timestamp,
+      ttlSeconds,
+    });
+    expect(res.ok).toBe(true);
+    return res.value!.id;
+  }
+
+  function openWorker(core: ChronoCore, adapterId: string, runtime: string): { id: string; token: string } {
+    const res = core.openSession(
+      { role: "belthazar", adapter: adapterId, runtime, scopeModule: "MOD-0001", ttlSeconds: 3600 },
+      { interactive: true }
+    );
+    expect(res.ok).toBe(true);
+    return { id: res.value!.id, token: res.value!.token };
+  }
+
+  function dispatch(
+    core: ChronoCore,
+    gaspar: CallerAuth,
+    adapterId: string,
+    runtime = "test-runtime"
+  ): { ok: boolean; code?: string | undefined; message?: string | undefined } {
+    const worker = openWorker(core, adapterId, runtime);
+    const res = core.authorizeExecution("MOD-0001", {
+      actor: "gaspar",
+      role: "belthazar",
+      session: worker,
+      requesterSession: gaspar.session,
+      adapterId,
+    });
+    if (res.ok) {
+      return { ok: true };
+    }
+    return { ok: false, code: res.error?.code, message: res.error?.message ?? "" };
+  }
+
+  it("candidate proofs deny dispatch until promoted, then authorize", () => {
+    const h = harness();
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      approveSecondAdapter(h.core, po, h.sign, "route-ad");
+      const id = recordCandidate(h.core, gaspar, "route-ad");
+      const denied = dispatch(h.core, gaspar, "route-ad");
+      expect(denied.ok).toBe(false);
+      expect(denied.code).toBe("RTK_ROUTING_FAILURE");
+      expect(denied.message ?? "").toContain("non-authoritative candidate");
+      expect(denied.message ?? "").toContain("route-ad");
+      installManagedProofAssets(tempDir, "route-ad");
+      expect(h.core.promoteRoutingProof(id, po).ok).toBe(true);
+      expect(dispatch(h.core, gaspar, "route-ad").ok).toBe(true);
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+
+  it("promotion requires signed adapter approval", () => {
+    const h = harness();
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      const entrypoint = join(tempDir, "pending-ad.sh");
+      writeFileSync(entrypoint, "#!/bin/sh\necho ok\n");
+      chmodSync(entrypoint, 0o755);
+      expect(
+        h.core.registerAdapter(
+          { id: "pending-ad", name: "Pending", entrypoint, conformanceProof: ["pending-ad --version"] },
+          po
+        ).ok
+      ).toBe(true);
+      const id = recordCandidate(h.core, gaspar, "pending-ad");
+      const promoted = h.core.promoteRoutingProof(id, po);
+      expect(promoted.ok).toBe(false);
+      expect(promoted.error?.code).toBe("EXECUTION_DENIED");
+      expect(promoted.error?.message ?? "").toContain("pending");
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+
+  it("promotion is PO-only and idempotent", () => {
+    const h = harness();
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      approveSecondAdapter(h.core, po, h.sign, "route-ad");
+      const id = recordCandidate(h.core, gaspar, "route-ad");
+      const gasparPromote = h.core.promoteRoutingProof(id, gaspar);
+      expect(gasparPromote.ok).toBe(false);
+      expect(gasparPromote.error?.code).toBe("EXECUTION_DENIED");
+      installManagedProofAssets(tempDir, "route-ad");
+      const first = h.core.promoteRoutingProof(id, po);
+      expect(first.ok).toBe(true);
+      const second = h.core.promoteRoutingProof(id, po);
+      expect(second.ok).toBe(true);
+      expect(second.value?.id).toBe(first.value?.id);
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+
+  it("promotion denies a superseded attestation", () => {
+    const h = harness();
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      approveSecondAdapter(h.core, po, h.sign, "route-ad");
+      const id = recordCandidate(h.core, gaspar, "route-ad");
+      const rtkBin = join(tempDir, "fixture-rtk.sh");
+      expect(
+        h.core.recordRtkAttestation(gaspar, {
+          binaryPath: rtkBin,
+          binaryIdentity: "rtk-test",
+          version: "1.0.0-test",
+          provenance: RTK_UPSTREAM,
+          integrationMode: "test",
+          routingTestPassed: true,
+          routingTestLog: "fixture",
+          gained: true,
+          savingsEvidence: null,
+          ttlSeconds: 3600,
+        }).ok
+      ).toBe(true);
+      installManagedProofAssets(tempDir, "route-ad");
+      const promoted = h.core.promoteRoutingProof(id, po);
+      expect(promoted.ok).toBe(false);
+      expect(promoted.error?.code).toBe("RTK_ROUTING_FAILURE");
+      expect(promoted.error?.message ?? "").toContain("attestation");
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+
+  it("promotion denies a binary replaced since the proof", () => {
+    const h = harness();
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      approveSecondAdapter(h.core, po, h.sign, "route-ad");
+      const id = recordCandidate(h.core, gaspar, "route-ad");
+      const rtkBin = join(tempDir, "fixture-rtk.sh");
+      writeFileSync(rtkBin, "#!/bin/sh\necho fixture-rtk REPLACED\n", "utf8");
+      installManagedProofAssets(tempDir, "route-ad");
+      const promoted = h.core.promoteRoutingProof(id, po);
+      expect(promoted.ok).toBe(false);
+      expect(promoted.error?.code).toBe("RTK_ROUTING_FAILURE");
+      expect(promoted.error?.message ?? "").toContain("changed since the proof");
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+
+  it("dispatch denies an expired proof", () => {
+    const h = harness();
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      approveSecondAdapter(h.core, po, h.sign, "route-ad");
+      const id = recordCandidate(h.core, gaspar, "route-ad", 1);
+      installManagedProofAssets(tempDir, "route-ad");
+      expect(h.core.promoteRoutingProof(id, po).ok).toBe(true);
+      h.clockRef.now = new Date(Date.parse(T0) + 2000).toISOString();
+      const denied = dispatch(h.core, gaspar, "route-ad");
+      expect(denied.ok).toBe(false);
+      expect(denied.code).toBe("RTK_ROUTING_FAILURE");
+      expect(denied.message ?? "").toContain("expired");
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+
+  it("dispatch denies a binary replaced after promotion", () => {
+    const h = harness();
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      approveSecondAdapter(h.core, po, h.sign, "route-ad");
+      const id = recordCandidate(h.core, gaspar, "route-ad");
+      installManagedProofAssets(tempDir, "route-ad");
+      expect(h.core.promoteRoutingProof(id, po).ok).toBe(true);
+      expect(dispatch(h.core, gaspar, "route-ad").ok).toBe(true);
+      writeFileSync(join(tempDir, "fixture-rtk.sh"), "#!/bin/sh\necho fixture-rtk REPLACED\n", "utf8");
+      const denied = dispatch(h.core, gaspar, "route-ad");
+      expect(denied.ok).toBe(false);
+      expect(denied.code).toBe("RTK_ROUTING_FAILURE");
+      expect(denied.message ?? "").toContain("changed since the proof");
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+
+  it("dispatch denies managed-asset drift after promotion", () => {
+    const h = harness();
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      approveSecondAdapter(h.core, po, h.sign, "route-ad");
+      const id = recordCandidate(h.core, gaspar, "route-ad");
+      installManagedProofAssets(tempDir, "route-ad");
+      expect(h.core.promoteRoutingProof(id, po).ok).toBe(true);
+      expect(dispatch(h.core, gaspar, "route-ad").ok).toBe(true);
+      writeFileSync(join(tempDir, ".opencode", "plugins", "chrono-gate.js"), "tampered-by-test\n", "utf8");
+      const denied = dispatch(h.core, gaspar, "route-ad");
+      expect(denied.ok).toBe(false);
+      expect(denied.code).toBe("RTK_ROUTING_FAILURE");
+      expect(denied.message ?? "").toContain("managed-asset drift");
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+
+  it("dispatch denies adapter re-registration after promotion", () => {
+    const h = harness();
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      approveSecondAdapter(h.core, po, h.sign, "route-ad");
+      const id = recordCandidate(h.core, gaspar, "route-ad");
+      installManagedProofAssets(tempDir, "route-ad");
+      expect(h.core.promoteRoutingProof(id, po).ok).toBe(true);
+      expect(dispatch(h.core, gaspar, "route-ad").ok).toBe(true);
+      // Simulate re-registration drift: the entrypoint moves to another
+      // live executable, so dispatch stays executable but the
+      // registration hash no longer matches the promotion snapshot.
+      const moved = join(tempDir, "route-ad-moved.sh");
+      writeFileSync(moved, "#!/bin/sh\necho moved\n", "utf8");
+      chmodSync(moved, 0o755);
+      const raw = new Database(join(tempDir, ".chrono", "chrono.db"));
+      try {
+        raw.prepare("UPDATE adapter SET entrypoint = ? WHERE id = ?").run(moved, "route-ad");
+      } finally {
+        raw.close();
+      }
+      const denied = dispatch(h.core, gaspar, "route-ad");
+      expect(denied.ok).toBe(false);
+      expect(denied.code).toBe("RTK_ROUTING_FAILURE");
+      expect(denied.message ?? "").toContain("current adapter registration");
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+
+  it("dispatch denies cross-runtime and cross-adapter proof reuse", () => {
+    const h = harness();
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      // recordAttestations provisions + promotes a proof for
+      // test-adapter under test-runtime only.
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      expect(dispatch(h.core, gaspar, "test-adapter", "test-runtime").ok).toBe(true);
+      // Cross-runtime: the project pin bars foreign-runtime sessions at
+      // open, so no foreign session can even present the proof scope.
+      const foreign = h.core.openSession(
+        { role: "belthazar", adapter: "test-adapter", runtime: "other-runtime", scopeModule: "MOD-0001", ttlSeconds: 3600 },
+        { interactive: true }
+      );
+      expect(foreign.ok).toBe(false);
+      expect(foreign.error?.code).toBe("INCONSISTENT_REFERENCE");
+      // Cross-adapter: a live session on the approved second adapter has
+      // no proof in its own scope, so lookup denies.
+      approveSecondAdapter(h.core, po, h.sign, "route-ad");
+      const otherAdapter = dispatch(h.core, gaspar, "route-ad", "test-runtime");
+      expect(otherAdapter.ok).toBe(false);
+      expect(otherAdapter.code).toBe("RTK_ROUTING_FAILURE");
+      expect(otherAdapter.message ?? "").toContain("no current RTK routing proof");
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+
+  it("identity-only and already-routed inputs never reach the Core as proofs", () => {
+    // The CLI rejects these before recording (covered in rtk-cli
+    // tests); the Core additionally binds the pre-routing input so a
+    // smuggled identity-only routed command is auditable as evidence,
+    // not authority: a candidate alone never dispatches.
+    const h = harness();
+    try {
+      const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
+      const po = { actor: "PO", session: bootstrapPrivilegedSession(h.core, "PO", h.privateKeyPem) };
+      recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
+      approveSecondAdapter(h.core, po, h.sign, "route-ad");
+      const rtkBin = join(tempDir, "fixture-rtk.sh");
+      const res = h.core.recordRoutingProof(gaspar, {
+        adapterId: "route-ad",
+        binaryPath: rtkBin,
+        version: "1.0.0-test",
+        proofCommand: JSON.stringify([rtkBin, "gain"]),
+        preRoutingCommand: JSON.stringify(["gain"]),
+        commandHash: computeRevisionHash({ pre: ["gain"], routed: [rtkBin, "gain"] }),
+        outputHash: computeRevisionHash("fixture gain ok"),
+        exitStatus: 0,
+        gainAvailable: true,
+        timestamp: T0,
+        ttlSeconds: 3600,
+      });
+      // Recording is evidence, not authority: it succeeds, but the
+      // candidate authorizes nothing and promotion still requires the
+      // full approval + manifest bindings.
+      expect(res.ok).toBe(true);
+      expect(dispatch(h.core, gaspar, "route-ad").ok).toBe(false);
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+});
+
+describe.each([11, 12])("Routing proof migration (v%i → current)", (baseline) => {
+  // FIXES-SL-10.1 C3 review evidence: routing_proof rows written under
+  // schema v11/v12 (no authority columns) migrate with evidence intact,
+  // default to non-authoritative CANDIDATE (never accidentally
+  // AUTHORITATIVE), and remain promotable after signed approval with
+  // current bindings — so dispatch denies before promotion and
+  // authorizes after.
+  let tempDir: string;
+  const T0 = "2026-09-11T00:00:00.000Z";
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-proof-mig-test-"));
+  });
+
+  afterEach(() => {
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  function dbPath(): string {
+    return join(tempDir, ".chrono", "chrono.db");
+  }
+
+  function seedVintageDb(): { applied: number[] } {
+    mkdirSync(join(tempDir, ".chrono"), { recursive: true });
+    const rtkBin = join(tempDir, "fixture-rtk.sh");
+    writeFileSync(rtkBin, "#!/bin/sh\necho fixture-rtk 1.0.0-test\n", "utf8");
+    chmodSync(rtkBin, 0o755);
+    const binaryHash = createHash("sha256").update(readFileSync(rtkBin)).digest("hex");
+    const migrator = new ChronoDatabase({ path: dbPath() });
+    try {
+      migrator.migrate(baseline);
+    } finally {
+      migrator.close();
+    }
+    const raw = new Database(dbPath());
+    try {
+      raw
+        .prepare(
+          "INSERT INTO rtk_attestation (id, binary_path, binary_identity, version, provenance, integration_mode, routing_test_passed, routing_test_log, gained, savings_evidence, bypass_events, valid_until, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .run(
+          "RTK-0001", rtkBin, "rtk-test", "1.0.0-test", RTK_UPSTREAM, "test", 1, "fixture", 1, null, "[]",
+          "2026-09-12T00:00:00.000Z", "current"
+        );
+      raw
+        .prepare(
+          "INSERT INTO routing_proof (id, adapter_id, runtime, session_id, project_id, rtk_attestation_id, binary_path, binary_hash, version, proof_command, command_hash, output_hash, exit_status, gain_available, timestamp, valid_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .run(
+          "RTE-0001", "test-adapter", "test-runtime", "SES-0001", "default", "RTK-0001", rtkBin, binaryHash,
+          "1.0.0-test", JSON.stringify([rtkBin, "gain"]), `sha256:${"a".repeat(64)}`, `sha256:${"b".repeat(64)}`,
+          0, 1, T0, "2026-09-12T00:00:00.000Z"
+        );
+      const skillContent = "fixture-skill for migration evidence";
+      const vendorTarget = join(tempDir, skillVendorPath("test-pin"));
+      mkdirSync(dirname(vendorTarget), { recursive: true });
+      writeFileSync(vendorTarget, skillContent, "utf8");
+      for (const runtime of ["claude", "opencode", "kiro"] as const) {
+        const target = join(tempDir, SKILL_RUNTIME_PATHS[runtime]);
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, skillContent, "utf8");
+      }
+      raw
+        .prepare(
+          "INSERT INTO skill_attestation (id, upstream, pinned_commit, source_hash, generated_hashes, converter_version, license_status, attribution, runtime_identity, agent_identity, discovery_result, permission_result, activation_test_passed, bypass_events, valid_until, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .run(
+          "SKL-0001", SKILL_UPSTREAM, "test-pin", hashSkillSource(skillContent),
+          skillGeneratedHashes(convertSkillSource(skillContent)), SKILL_RELEASE.converterVersion,
+          "MIT", "test", "test", "test", "found", "granted", 1, "[]", "2026-09-12T00:00:00.000Z", "current"
+        );
+    } finally {
+      raw.close();
+    }
+    const finisher = new ChronoDatabase({ path: dbPath() });
+    try {
+      return { applied: finisher.migrate().map((m) => m.version) };
+    } finally {
+      finisher.close();
+    }
+  }
+
+  function migratedHarness(): {
+    core: ChronoCore;
+    privateKeyPem: string;
+    gaspar: CallerAuth;
+    po: CallerAuth;
+    restoreTty: () => void;
+  } {
+    const restoreTty = fakeInteractiveTerminal();
+    const core = new ChronoCore({ projectPath: tempDir, runtime: "test-runtime", clock: () => T0 });
+    expect(core.init().ok).toBe(true);
+    const pair = generateApprovalKeyPair();
+    enrollTestPo(core, pair, T0);
+    const sign: SignFn = (fields) => ({
+      timestamp: FIXED_TIME,
+      signature: signApprovalPayload(
+        buildApprovalPayload({ ...fields, timestamp: FIXED_TIME }),
+        pair.privateKeyPem
+      ),
+    });
+    const { gaspar } = approvedModule(core, sign, pair.privateKeyPem);
+    const po = { actor: "PO", session: bootstrapPrivilegedSession(core, "PO", pair.privateKeyPem) };
+    const entrypoint = join(tempDir, "fixture-runtime.sh");
+    writeFileSync(entrypoint, "#!/bin/sh\necho fixture-ok\n", "utf8");
+    chmodSync(entrypoint, 0o755);
+    expect(
+      core.registerAdapter(
+        { id: "test-adapter", name: "Test adapter", entrypoint, conformanceProof: ["test-adapter --version"] },
+        po
+      ).ok
+    ).toBe(true);
+    const revision = core.adapterRegistrationHash("test-adapter");
+    const approval = core.recordApproval({
+      action: "adapter-registration",
+      scopeArtifactId: "test-adapter",
+      scopeRevision: revision,
+      authority: "PO",
+      rationale: "migration test",
+      timestamp: FIXED_TIME,
+      signature: sign({
+        action: "adapter-registration",
+        scopeArtifactId: "test-adapter",
+        scopeRevision: revision,
+        authority: "PO",
+        rationale: "migration test",
+      }).signature,
+    });
+    expect(approval.ok).toBe(true);
+    expect(core.approveAdapter("test-adapter", approval.value!.id, po).ok).toBe(true);
+    installManagedProofAssets(tempDir, "test-adapter");
+    return { core, privateKeyPem: pair.privateKeyPem, gaspar, po, restoreTty };
+  }
+
+  it("preserves vintage rows as non-authoritative candidates", () => {
+    const { applied } = seedVintageDb();
+    expect(applied[applied.length - 1]).toBe(13);
+    const db = new ChronoDatabase({ path: dbPath() });
+    try {
+      const row = db.routingProofs().findById("RTE-0001");
+      // Evidence intact.
+      expect(row.adapterId).toBe("test-adapter");
+      expect(row.binaryPath).toBe(join(tempDir, "fixture-rtk.sh"));
+      expect(row.rtkAttestationId).toBe("RTK-0001");
+      expect(row.commandHash).toBe(`sha256:${"a".repeat(64)}`);
+      expect(row.outputHash).toBe(`sha256:${"b".repeat(64)}`);
+      // Fail-closed defaults: candidate, no snapshots, empty pre-routing.
+      expect(row.authority).toBe("candidate");
+      expect(row.adapterHash).toBe(null);
+      expect(row.assetHash).toBe(null);
+      expect(row.preRoutingCommand).toBe("");
+      // No authoritative proof exists for the scope.
+      expect(db.routingProofs().latestAuthoritative("test-adapter", "test-runtime", "default")).toBe(null);
+      expect(db.routingProofs().latestFor("test-adapter", "test-runtime", "default")?.id).toBe("RTE-0001");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("denies dispatch for the vintage candidate before promotion", () => {
+    seedVintageDb();
+    const h = migratedHarness();
+    try {
+      const worker = openTestSession(h.core, "belthazar", "MOD-0001");
+      const denied = h.core.authorizeExecution("MOD-0001", {
+        actor: "gaspar",
+        role: "belthazar",
+        session: worker,
+        requesterSession: h.gaspar.session,
+        adapterId: "test-adapter",
+      });
+      expect(denied.ok).toBe(false);
+      expect(denied.error?.code).toBe("RTK_ROUTING_FAILURE");
+      expect(denied.error?.message ?? "").toContain("RTE-0001");
+      expect(denied.error?.message ?? "").toContain("non-authoritative candidate");
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
+  });
+
+  it("promotes the vintage proof and authorizes dispatch after", () => {
+    seedVintageDb();
+    const h = migratedHarness();
+    try {
+      const promoted = h.core.promoteRoutingProof("RTE-0001", h.po);
+      expect(promoted.ok).toBe(true);
+      expect(promoted.value?.id).toBe("RTE-0001");
+      const worker = openTestSession(h.core, "belthazar", "MOD-0001");
+      const authz = h.core.authorizeExecution("MOD-0001", {
+        actor: "gaspar",
+        role: "belthazar",
+        session: worker,
+        requesterSession: h.gaspar.session,
+        adapterId: "test-adapter",
+      });
+      expect(authz.ok).toBe(true);
+    } finally {
+      h.restoreTty();
+      h.core.close();
+    }
   });
 });

@@ -48,14 +48,14 @@ export function buildOpencodePlugin(): string {
   *   verdict. Unknown tools are denied until classified (deny-by-default).
   *   Anything missing or DENIED throws (fail-closed).
   *
-  * Automatic Gaspar entry (best effort, never a bypass): on
-  * \`session.created\` inside a CHRONO project the plugin runs the
-  * managed entry script, which redeems a broker session over a local
-  * channel and prints the safe Core projection. The projection is
-  * injected once into the session system prompt; the session token
-  * stays in plugin memory (never in model context). When entry is
-  * unavailable the session proceeds ungoverned and pre-tool gates keep
-  * enforcing fail-closed.
+ * Automatic Gaspar entry: on \`session.created\` inside a CHRONO project
+ * the plugin runs the managed entry script, which redeems a broker
+ * session over a local channel and prints the safe Core projection. The
+ * projection is injected once into the session system prompt; the
+ * session token stays in plugin memory (never in model context). The
+ * entry script fails loud (nonzero exit) when entry is unavailable, so
+ * a missing projection is always visible; pre-tool gates keep
+ * enforcing fail-closed regardless.
   */
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -106,8 +106,9 @@ export const ChronoGatePlugin = async (ctx) => {
         entryProjections.set(sessionId, out.slice(0, 8000));
       }
     } catch {
-      // Entry is best effort: degraded sessions proceed ungoverned and
-      // pre-tool gates keep enforcing fail-closed.
+      // Entry failures are loud at the script level (nonzero exit);
+      // without a projection there is nothing to inject, and pre-tool
+      // gates keep enforcing fail-closed.
     }
   };
   return {

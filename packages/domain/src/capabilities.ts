@@ -185,6 +185,21 @@ export function classifyOpencodeTool(tool: string): ToolClassification | undefin
 }
 
 /**
+ * Canonical required runtime identifiers [SLICE-9 §9.5]. These are stable
+ * integration targets named normatively by the framework — not providers,
+ * models, or versions. Adapter ids registered under these names receive
+ * runtime-scoped managed assets and entry wiring; all other adapter ids
+ * keep the shared baseline and are never guessed into a runtime.
+ */
+export const KNOWN_RUNTIME_IDS = ["opencode", "claude-code", "kiro"] as const;
+export type KnownRuntimeId = (typeof KNOWN_RUNTIME_IDS)[number];
+
+/** True when the adapter id carries a known runtime identity. */
+export function isKnownRuntimeId(id: string): id is KnownRuntimeId {
+  return (KNOWN_RUNTIME_IDS as readonly string[]).includes(id);
+}
+
+/**
  * Check a session-resolved role against a transition event row.
  * BlockerRaised/Resolved are linkage-governed (the blocker record carries
  * the authority); every other event requires its listed role.

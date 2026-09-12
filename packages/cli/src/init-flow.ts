@@ -35,6 +35,7 @@ import { tmpdir, homedir as osHomedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { ChronoCore } from "@chrono/core";
 import {
+  SKILL_RELEASE,
   buildSessionAuthorizationPayload,
   computeRevisionHash,
   setupStepIndex,
@@ -48,6 +49,7 @@ import {
   runApprove,
   runEnroll,
   runGate,
+  runRtkPromote,
   runRtkProve,
   runRtkVerify,
   runSetup,
@@ -60,6 +62,7 @@ import {
 } from "./index.js";
 import { buildClaudeHook } from "./claude-hook.js";
 import { buildKiroHook, buildKiroHookRegistration } from "./kiro-hook.js";
+import { evaluateKiroSupport } from "./kiro-capability.js";
 import {
   buildEntrySessionScript,
   buildGasparDefinition,
@@ -73,8 +76,9 @@ import { openReadProject } from "./project.js";
 import type { KeyStore } from "./keychain.js";
 
 /** Canonical runtime identifiers (never providers or models) [FW §22]. */
-export const RUNTIME_IDS = ["opencode", "claude-code", "kiro"] as const;
-export type RuntimeId = (typeof RUNTIME_IDS)[number];
+export { KNOWN_RUNTIME_IDS as RUNTIME_IDS };
+export type RuntimeId = KnownRuntimeId;
+import { KNOWN_RUNTIME_IDS, isKnownRuntimeId, type KnownRuntimeId } from "@chrono/domain";
 
 /** Candidate executable names per runtime, probed on PATH. */
 const RUNTIME_BINARIES: Record<RuntimeId, string[]> = {
@@ -266,10 +270,10 @@ export function detectInit(
   }
   // Runtimes: presence probe only, never execution beyond --version.
   const requested = options.runtimeIds;
-  const runtimes: RuntimeDetection[] = (RUNTIME_IDS as readonly string[]).map((id) => {
+  const runtimes: RuntimeDetection[] = KNOWN_RUNTIME_IDS.map((id) => {
     let binary: string | null = null;
     let version: string | null = null;
-    for (const candidate of RUNTIME_BINARIES[id as RuntimeId]) {
+    for (const candidate of RUNTIME_BINARIES[id]) {
       const probed = probes.execFile([candidate, "--version"], 15000);
       if (probed.exitCode === 0) {
         binary = candidate;
@@ -279,23 +283,23 @@ export function detectInit(
     }
     if (requested !== undefined) {
       if (!requested.includes(id)) {
-        return { id: id as RuntimeId, binary, version, selected: false, reason: "not requested" };
+        return { id, binary, version, selected: false, reason: "not requested" };
       }
       if (binary === null) {
-        return { id: id as RuntimeId, binary, version, selected: true, reason: "requested but binary absent: setup will stop with remediation" };
+        return { id, binary, version, selected: true, reason: "requested but binary absent: setup will stop with remediation" };
       }
-      return { id: id as RuntimeId, binary, version, selected: true, reason: "requested and installed" };
+      return { id, binary, version, selected: true, reason: "requested and installed" };
     }
     if (binary === null) {
-      return { id: id as RuntimeId, binary, version, selected: false, reason: "binary absent" };
+      return { id, binary, version, selected: false, reason: "binary absent" };
     }
-    return { id: id as RuntimeId, binary, version, selected: true, reason: "detected on PATH" };
+    return { id, binary, version, selected: true, reason: "detected on PATH" };
   });
   const conflicts: string[] = [];
   if (requested !== undefined) {
     for (const id of requested) {
-      if (!(RUNTIME_IDS as readonly string[]).includes(id)) {
-        conflicts.push(`Unknown runtime '${id}': expected one of ${RUNTIME_IDS.join(", ")}`);
+      if (!isKnownRuntimeId(id)) {
+        conflicts.push(`Unknown runtime '${id}': expected one of ${KNOWN_RUNTIME_IDS.join(", ")}`);
       }
     }
   }
@@ -303,6 +307,17 @@ export function detectInit(
   for (const r of selected) {
     if (r.binary === null) {
       conflicts.push(`Runtime '${r.id}' selected but its binary is absent: install it, then re-run chrono init`);
+      continue;
+    }
+    // Kiro capability gate [FIXES-SL-10.1 C4]: version floor plus
+    // real-runtime evidence, reported as an environment blocker rather
+    // than readiness. Without this, init would declare an adapter ready
+    // whose automatic entry was never observed.
+    if (r.id === "kiro") {
+      const support = evaluateKiroSupport({ binary: r.binary, versionOutput: r.version });
+      for (const reason of support.reasons) {
+        conflicts.push(reason);
+      }
     }
   }
   // RTK identity probe (version query only; attestation state from above).
@@ -383,7 +398,7 @@ export function buildInitPlan(detection: InitDetection, createdAt?: string): Ini
     { step: "RTK_VERIFIED_AND_ROUTED", title: "Verify genuine RTK and prove routing per runtime", actions: ["chrono rtk verify", "chrono rtk prove"], effects: { files: false, keychain: false, network: false, global: false } },
     { step: "SKILL_VERIFIED_AND_EMITTED", title: "Verify pinned skill and emit runtime artifacts", actions: ["chrono skill verify"], effects: { files: true, keychain: false, network: !detection.skill.installed, global: false } },
     { step: "ADAPTERS_REGISTERED_AND_APPROVED", title: "Register, approve, and activate runtime adapters", actions: ["chrono adapter register/approve"], effects: { files: false, keychain: false, network: false, global: false } },
-    { step: "NATIVE_HOOKS_INSTALLED", title: "Install native fail-closed hooks and role definitions", actions: ["chrono setup"], effects: { files: true, keychain: false, network: false, global: false } },
+    { step: "NATIVE_HOOKS_INSTALLED", title: "Install native fail-closed hooks and role definitions, then promote routing proofs to authoritative", actions: ["chrono setup", "chrono rtk promote"], effects: { files: true, keychain: false, network: false, global: false } },
     { step: "RUNTIME_CONFORMANCE_PASSED", title: "Run black-box conformance per runtime", actions: ["conformance proofs", "live gate smoke"], effects: { files: false, keychain: false, network: false, global: false } },
     { step: "GASPAR_ENTRY_PREPARED", title: "Issue broker credential and prove entry loop", actions: ["chrono broker issue", "entry self-test"], effects: { files: true, keychain: true, network: false, global: false } },
     { step: "READY", title: "Persist readiness projection and next action", actions: ["readiness report"], effects: { files: false, keychain: false, network: false, global: false } },
@@ -1127,7 +1142,10 @@ export async function runInitFlow(
             resolveBinary: (b) => probes.which(b),
             ttlSeconds: 86400,
             json: true,
-            command: [detection.rtk.binary ?? "rtk", "gain"],
+            // Raw pre-routing input: the flow maps it through
+            // `rtk rewrite` itself (identity-only and already-routed
+            // inputs can never prove routing) [FIXES-SL-10.1 C2].
+            command: ["ls", root],
           },
           defaultRtkSpawn(probes)
         );
@@ -1257,6 +1275,39 @@ export async function runInitFlow(
         if (installed.exitCode !== 0) {
           lock.release();
           return prefixStepFailure("NATIVE_HOOKS_INSTALLED", installed, asJson);
+        }
+      }
+      // Promote each runtime's candidate proof to authoritative (ADR-006,
+      // C3): adapters are approved above and managed hooks are installed,
+      // so the promotion bindings (registration hash, asset manifest)
+      // can snapshot. Idempotent: already-authoritative scopes skip.
+      for (const runtimeId of plan.runtimeIds) {
+        const scopes = core.routingProofScopes(runtimeId);
+        const candidate = scopes.find(
+          (proof) => proof.runtime === runtimeId && proof.authority === "candidate" && !proof.expired
+        );
+        if (candidate === undefined) {
+          const authoritative = scopes.find(
+            (proof) => proof.runtime === runtimeId && proof.authority === "authoritative" && !proof.expired
+          );
+          if (authoritative === undefined) {
+            lock.release();
+            return stepFailure(
+              "NATIVE_HOOKS_INSTALLED",
+              "RTK_ROUTING_FAILURE",
+              `No current routing proof to promote for '${runtimeId}': re-run chrono init to re-prove routing`,
+              asJson
+            );
+          }
+          continue;
+        }
+        const promoted = runRtkPromote(
+          root,
+          { proof: candidate.id, as: "PO", session: poSession.session, json: true }
+        );
+        if (promoted.exitCode !== 0) {
+          lock.release();
+          return prefixStepFailure("NATIVE_HOOKS_INSTALLED", promoted, asJson);
         }
       }
       const failed = mark("NATIVE_HOOKS_INSTALLED", {
@@ -1556,10 +1607,31 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
       }
       const scopes = core.routingProofScopes(adapter.id);
       const live = scopes.filter((proof) => !proof.expired);
-      routing[adapter.id] = live.length > 0 ? "proven" : "unproven";
+      const authoritative = live.filter((proof) => proof.authority === "authoritative");
+      if (authoritative.length > 0) {
+        routing[adapter.id] = "proven";
+        continue;
+      }
+      if (live.length > 0) {
+        routing[adapter.id] = "candidate";
+        reasons.push(`routing proof for '${adapter.id}' is a non-authoritative candidate: run chrono rtk promote after adapter approval`);
+        continue;
+      }
+      routing[adapter.id] = "unproven";
       if (live.length === 0) {
         reasons.push(`no current routing proof for '${adapter.id}'`);
       }
+    }
+    // Kiro capability blocker [FIXES-SL-10.1 C4]: automatic Gaspar
+    // entry on a real Kiro surface is unverified (no verified CLI
+    // version on record; IDE version undetectable), so any Kiro
+    // adapter — active or not — keeps entry unready. This is loud by
+    // design: Kiro readiness requires genuine Kiro execution, and the
+    // doctor must never report it on hermetic evidence alone.
+    if (adapters.some((adapter) => adapter.id === "kiro")) {
+      reasons.push(
+        "Kiro adapter present but automatic Gaspar entry unverified (C4): real Kiro execution required before entry or dispatch; see FIXES-SL-10.1"
+      );
     }
     const skill = core.describeSkillInstallation();
     if (!skill.installed) {
@@ -1667,7 +1739,7 @@ export function checkManagedHooks(
   // Runtime-scoped assets apply only to active adapters carrying a known
   // runtime id (init registers adapters under runtime ids). Custom adapter
   // ids keep the shared assets; nothing is guessed for them.
-  const runtimes = activeAdapterIds.filter((id): id is RuntimeId => (RUNTIME_IDS as readonly string[]).includes(id));
+  const runtimes = activeAdapterIds.filter((id): id is KnownRuntimeId => isKnownRuntimeId(id));
   if (runtimes.includes("claude-code")) {
     checks[".claude/agents/gaspar.md"] = checkBytes(".claude/agents/gaspar.md", buildGasparDefinition());
     checks[".claude/settings.json:SessionStart"] = checkContains(
@@ -1915,12 +1987,26 @@ export function runEntry(projectPath: string, options: EntryOptions, stdinText: 
       return fail(1, "EXECUTION_DENIED", `Entry session token file write failed: ${e instanceof Error ? e.message : String(e)}`);
     }
     const projection = redeemed.value!.projection;
+    // Skill activation payload [FIXES-SL-10.1 C4]: the entry carries
+    // everything the runtime needs to activate the pinned process
+    // skill (pin, hashes, installed state). Whether the runtime honors
+    // it is observed in real-runtime acceptance — the entry never
+    // claims activation, only delivers the evidence for it.
+    const skillInstallation = core.describeSkillInstallation();
+    const skill = {
+      installed: skillInstallation.installed,
+      state: skillInstallation.installed ? "current" : skillInstallation.code,
+      pinnedCommit: SKILL_RELEASE.pinnedCommit,
+      sourceHash: SKILL_RELEASE.sourceHash,
+      license: SKILL_RELEASE.license,
+    };
     const body = asJson
-      ? JSON.stringify({ ok: true, sessionId: redeemed.value!.session.id, projection }, null, 2)
+      ? JSON.stringify({ ok: true, sessionId: redeemed.value!.session.id, projection, skill }, null, 2)
       : [
           `Gaspar entry: session '${redeemed.value!.session.id}' (expires ${redeemed.value!.session.expiresAt}).`,
           `state: ${projection.projectState}  next: ${projection.nextAction.key} — ${projection.nextAction.summary}`,
           ...projection.requiredDecisions.map((d) => `decision required: ${d}`),
+          `skill: ${skill.installed ? `active (${skill.pinnedCommit.slice(0, 12)})` : `MISSING (${skill.state})`}`,
         ].join("\n");
     return { exitCode: 0, stdout: body, stderr: "" };
   } finally {

@@ -6,10 +6,11 @@
  * identical bytes.
  *
  * Native contract: the Kiro adapter registers this script as a blocking
- * `PreToolUse` interceptor (or equivalent wrapper until official native
- * support is verified). It receives a JSON payload on stdin
- * (`{ tool_name, ... }`). Exit 0 allows the tool; exit 2 blocks it with
- * the stderr reason. Any other failure blocks (fail-closed).
+ * `PreToolUse` interceptor. It receives a JSON payload on stdin
+ * (`{ tool_name, ... }`). Exit 0 allows the tool; any nonzero exit
+ * blocks it with the stderr reason sent to the agent (this script uses
+ * exit 2 for denials). Any other failure blocks (fail-closed).
+ * Shell-command action semantics: https://kiro.dev/docs/hooks/actions/#shell-command-action.
  *
  * Slice 9 §9.5: every Kiro tool capable of filesystem, process, network,
  * package, Git, credential, deployment, destructive, or
@@ -24,27 +25,54 @@ export const KIRO_HOOK_RELATIVE_PATH = ".chrono/hooks/chrono-kiro-gate.js";
 export const KIRO_HOOK_REGISTRATION_RELATIVE_PATH = ".kiro/hooks/chrono-gate.json";
 
 /**
- * Kiro canonical PreToolUse tool names (lowercased for matching).
- * Sources: https://kiro.dev/docs/cli/hooks/ and
- * https://kiro.dev/docs/cli/v3/hooks (matcher examples `write|read`,
- * 2.x `Write|Edit`), plus the alias table (`fs_write`/`write`,
- * `execute_bash`/`shell`) in the KiroCrew hooks reference. Any tool not
- * listed here — future built-ins, `mcp_*`, custom tools — is denied
- * until classified in a reviewed Core policy release.
+ * Kiro canonical CLI tool names, grounded in the vendor reference
+ * (https://kiro.dev/docs/reference/built-in-tools/, fetched 2026-09-11;
+ * trigger/action semantics at https://kiro.dev/docs/hooks/,
+ * https://kiro.dev/docs/hooks/types/, https://kiro.dev/docs/hooks/actions/).
+ * Matching is case-insensitive (the script lowercases before lookup).
+ * Anything not listed here — future built-ins, `mcp_*`, custom tools,
+ * undocumented names — is denied until classified in a reviewed Core
+ * policy release (deny-by-default). In particular `ls`, `todowrite`,
+ * `task`, `edit`, `deploy`, and `package` are NOT documented Kiro CLI
+ * tools and MUST NOT be allow-listed as read-only; `webfetch` and
+ * `websearch` are NOT real tool names (the documented names are
+ * `web_fetch` / `web_search`) and are denied as unknown.
  */
-const KIRO_READ_TOOLS = ["glob", "grep", "ls", "read", "todowrite"];
+const KIRO_READ_TOOLS = [
+  "glob",
+  "grep",
+  "read",
+  "fs_read",
+  "fsread",
+  "code",
+  "introspect",
+  "tool_search",
+];
 const KIRO_MUTATE_TOOLS = [
+  "write",
+  "fs_write",
+  "fswrite",
+  "shell",
+  "execute_bash",
+  "execute_cmd",
+  "aws",
+  "use_aws",
+  "web_search",
+  "web_fetch",
+  "delegate",
+  "subagent",
+  "use_subagent",
+  "goal",
+  "knowledge",
+  "session",
+  "report",
+  "todo",
+  "todo-list",
   "deploy",
   "edit",
-  "execute_bash",
-  "fs_write",
   "multiedit",
   "package",
-  "shell",
   "task",
-  "webfetch",
-  "websearch",
-  "write",
 ];
 
 /**

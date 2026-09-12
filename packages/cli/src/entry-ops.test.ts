@@ -17,11 +17,18 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
+import Database from "better-sqlite3";
 import { ChronoCore } from "@chrono/core";
 import {
+  buildApprovalPayload,
   buildSessionAuthorizationPayload,
   signApprovalPayload,
 } from "@chrono/domain";
+import { runSetup } from "./index.js";
+import {
+  buildKiroEntryRegistration,
+  kiroEntryRegistrationPath,
+} from "./gaspar-entry.js";
 import { MemoryKeyStore } from "./keychain.js";
 import {
   runInitFlow,
@@ -79,6 +86,15 @@ function flowProbes(bins: { rtk: string; runtime: string }): FlowProbes {
       if (binary === bins.rtk || name === "rtk") {
         if (args[0] === "--version") {
           return { exitCode: 0, stdout: "rtk 0.44.0-test\n", stderr: "" };
+        }
+        if (args[0] === "rewrite") {
+          // Fixture mapping: raw pre-routing words are routed through
+          // the genuine (fixture) binary (see init-flow.test.ts).
+          const mapped = args
+            .slice(1)
+            .map((word) => `'${word.replace(/'/g, `'"'"'`)}'`)
+            .join(" ");
+          return { exitCode: 0, stdout: `rtk ${mapped}\n`, stderr: "" };
         }
         return { exitCode: 0, stdout: "Token Killer savings dashboard\n", stderr: "" };
       }
@@ -334,6 +350,47 @@ describe("Broker and entry", () => {
     expect(noStdin.exitCode).toBe(2);
     expect(existsSync(join(binDir, "t.token"))).toBe(false);
   });
+
+  it("identifies projection failure in human and JSON output without leaking secrets", async () => {
+    // C1 evidence: an unreadable module registry denies redemption with
+    // the stable PROJECTION_FAILED code on both surfaces, mints no
+    // session file, and never echoes the broker secret or any token.
+    const project = await readyProject(tempDir, binDir);
+    const listed = runBrokerList(tempDir, { json: true, as: "gaspar", session: project.gaspar });
+    const brokerId = (JSON.parse(listed.stdout) as { credentials: { id: string }[] }).credentials[0]!.id;
+    const account = readFileSync(join(tempDir, ".chrono", "broker-account"), "utf8").split("\n")[0] ?? "";
+    const secret = project.store.readKey(account) ?? "";
+    expect(secret.length).toBeGreaterThan(0);
+    const raw = new Database(join(tempDir, ".chrono", "chrono.db"));
+    try {
+      raw.exec("DROP TABLE artifact");
+    } finally {
+      raw.close();
+    }
+    const tokenOut = join(binDir, "denied.token");
+    const jsonOut = runEntry(
+      tempDir,
+      { adapter: "opencode", broker: brokerId, runtime: "opencode", tokenOut, json: true },
+      secret
+    );
+    expect(jsonOut.exitCode).toBe(1);
+    const parsed = JSON.parse(jsonOut.stdout) as { ok: boolean; error: { code: string; message: string } };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error.code).toBe("PROJECTION_FAILED");
+    expect(parsed.error.message.length).toBeGreaterThan(0);
+    expect(jsonOut.stdout).not.toContain(secret);
+    expect(jsonOut.stderr).not.toContain(secret);
+    const humanOut = runEntry(
+      tempDir,
+      { adapter: "opencode", broker: brokerId, runtime: "opencode", tokenOut },
+      secret
+    );
+    expect(humanOut.exitCode).toBe(1);
+    expect(humanOut.stdout).toBe("");
+    expect(humanOut.stderr).toContain("PROJECTION_FAILED");
+    expect(humanOut.stderr).not.toContain(secret);
+    expect(existsSync(tokenOut)).toBe(false);
+  });
 });
 
 describe("Uninstall scopes", () => {
@@ -416,8 +473,7 @@ describe("Uninstall scopes", () => {
   });
 });
 
-describe("Publish safety", () => {
-  it("declares no install/uninstall lifecycle hooks", async () => {
+describe("Publish safety", () => {  it("declares no install/uninstall lifecycle hooks", async () => {
     const { fileURLToPath } = await import("node:url");
     const rootPkg = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..", "..", "package.json");
     const pkg = JSON.parse(readFileSync(rootPkg, "utf8")) as {
@@ -426,5 +482,163 @@ describe("Publish safety", () => {
     for (const key of ["preinstall", "install", "postinstall", "preuninstall", "uninstall", "prepublishOnly"]) {
       expect(pkg.scripts?.[key]).toBe(undefined);
     }
+  });
+});
+
+describe("Kiro entry (hermetic contract, real runtime open)", () => {
+  // C4 evidence at hermetic grade: setup emits the dual-surface entry
+  // registration, the doctor reports Kiro as an environment blocker
+  // (never ready), drift is named, and entry without routing proof is
+  // denied. None of this claims real Kiro conformance: no Kiro binary
+  // exists on this host and VERIFIED_KIRO_VERSIONS is empty.
+  let tempDir: string;
+  let binDir: string;
+  let restoreTty: () => void;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-kiro-entry-"));
+    binDir = mkdtempSync(join(tmpdir(), "chrono-kiro-entry-bins-"));
+    restoreTty = fakeInteractiveTerminal();
+  });
+
+  afterEach(() => {
+    restoreTty();
+    rmSync(tempDir, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  });
+
+  function kiroEntrypoint(): string {
+    const entrypoint = join(tempDir, "fixture-kiro.sh");
+    writeFileSync(entrypoint, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'fixture-kiro 1.0'; else echo fixture-kiro-ok; fi\n", "utf8");
+    chmodSync(entrypoint, 0o755);
+    return entrypoint;
+  }
+
+  function approveKiroAdapter(store: MemoryKeyStore, entrypoint: string): void {
+    const core = new ChronoCore({ projectPath: tempDir });
+    try {
+      const privateKey = store.readKey("po");
+      if (privateKey === null) {
+        throw new Error("PO key missing from test store");
+      }
+      const po = bootstrapSession(tempDir, store, "PO", "opencode", "opencode");
+      const poAuth = { actor: "PO", session: po };
+      expect(
+        core.registerAdapter(
+          { id: "kiro", name: "Kiro", entrypoint, conformanceProof: [`${entrypoint} --version`] },
+          poAuth
+        ).ok
+      ).toBe(true);
+      const revision = core.adapterRegistrationHash("kiro");
+      const timestamp = new Date().toISOString();
+      const signature = signApprovalPayload(
+        buildApprovalPayload({
+          action: "adapter-registration",
+          scopeArtifactId: "kiro",
+          scopeRevision: revision,
+          authority: "PO",
+          rationale: "test",
+          timestamp,
+        }),
+        privateKey
+      );
+      const recorded = core.recordApproval({
+        action: "adapter-registration",
+        scopeArtifactId: "kiro",
+        scopeRevision: revision,
+        authority: "PO",
+        rationale: "test",
+        timestamp,
+        signature,
+      });
+      expect(recorded.ok).toBe(true);
+      expect(core.approveAdapter("kiro", recorded.value!.id, poAuth).ok).toBe(true);
+    } finally {
+      core.close();
+    }
+  }
+
+  function stubExec(entrypoint: string, rtkBin: string): (cmd: string[]) => { exitCode: number; stdout: string; stderr: string } {
+    return (cmd: string[]) => {
+      const [bin, ...args] = cmd as [string, ...string[]];
+      if (bin === entrypoint && args[0] === "--version") {
+        return { exitCode: 0, stdout: "fixture-kiro 1.0\n", stderr: "" };
+      }
+      if (bin === rtkBin) {
+        if (args[0] === "--version") {
+          return { exitCode: 0, stdout: "rtk 0.44.0-test\n", stderr: "" };
+        }
+        if (args[0] === "gain") {
+          return { exitCode: 0, stdout: "Token Killer savings dashboard\n", stderr: "" };
+        }
+      }
+      return { exitCode: 1, stdout: "", stderr: `unknown fixture command: ${bin}` };
+    };
+  }
+
+  it("setup emits the dual-surface Kiro entry registration", async () => {
+    const project = await readyProject(tempDir, binDir);
+    const entrypoint = kiroEntrypoint();
+    approveKiroAdapter(project.store, entrypoint);
+    const out = runSetup(
+      tempDir,
+      { adapter: "kiro", runtime: "kiro", rtkBinary: join(binDir, "rtk"), json: true },
+      stubExec(entrypoint, join(binDir, "rtk"))
+    );
+    expect(out.exitCode).toBe(0);
+    const written = readFileSync(join(tempDir, kiroEntryRegistrationPath("kiro")), "utf8");
+    expect(written).toBe(buildKiroEntryRegistration("kiro"));
+    const triggers = (
+      JSON.parse(written) as { hooks: { trigger: string }[] }
+    ).hooks.map((h) => h.trigger).sort();
+    expect(triggers).toEqual(["AgentSpawn", "SessionStart"]);
+  });
+
+  it("doctor reports Kiro as an environment blocker and names entry drift", async () => {
+    const project = await readyProject(tempDir, binDir);
+    const entrypoint = kiroEntrypoint();
+    approveKiroAdapter(project.store, entrypoint);
+    const setupOut = runSetup(
+      tempDir,
+      { adapter: "kiro", runtime: "kiro", rtkBinary: join(binDir, "rtk"), json: true },
+      stubExec(entrypoint, join(binDir, "rtk"))
+    );
+    expect(setupOut.exitCode).toBe(0);
+    const blocked = runDoctor(tempDir, { json: true, as: "gaspar", session: project.gaspar });
+    expect(blocked.exitCode).toBe(1);
+    const reasons = (JSON.parse(blocked.stdout) as { doctor: { entry: { reasons: string[] } } }).doctor.entry.reasons;
+    expect(reasons.some((r) => r.includes("Kiro adapter present") && r.includes("C4"))).toBe(true);
+    writeFileSync(join(tempDir, kiroEntryRegistrationPath("kiro")), '{"tampered":true}', "utf8");
+    const drifted = runDoctor(tempDir, { json: true, as: "gaspar", session: project.gaspar });
+    expect(drifted.exitCode).toBe(1);
+    const driftReasons = (JSON.parse(drifted.stdout) as { doctor: { entry: { reasons: string[] } } }).doctor.entry.reasons;
+    expect(driftReasons.some((r) => r.includes("chrono-entry-kiro.json"))).toBe(true);
+  });
+
+  it("denies Kiro entry without routing proof or registration", async () => {
+    const project = await readyProject(tempDir, binDir);
+    const listed = runBrokerList(tempDir, { json: true, as: "gaspar", session: project.gaspar });
+    const brokerId = (JSON.parse(listed.stdout) as { credentials: { id: string }[] }).credentials[0]!.id;
+    const account = readFileSync(join(tempDir, ".chrono", "broker-account"), "utf8").split("\n")[0] ?? "";
+    const secret = project.store.readKey(account) ?? "";
+    // Unregistered Kiro adapter: no entry.
+    const ghost = runEntry(
+      tempDir,
+      { adapter: "kiro", broker: brokerId, runtime: "opencode", tokenOut: join(binDir, "k.token"), json: true },
+      secret
+    );
+    expect(ghost.exitCode).toBe(1);
+    // Approved-but-unproven Kiro adapter: entry reaches the routing gate
+    // and denies there.
+    const entrypoint = kiroEntrypoint();
+    approveKiroAdapter(project.store, entrypoint);
+    const unproven = runEntry(
+      tempDir,
+      { adapter: "kiro", broker: brokerId, runtime: "opencode", tokenOut: join(binDir, "k2.token"), json: true },
+      secret
+    );
+    expect(unproven.exitCode).toBe(1);
+    expect((JSON.parse(unproven.stdout) as { error: { code: string } }).error.code).toBe("RTK_ROUTING_FAILURE");
+    expect(existsSync(join(binDir, "k2.token"))).toBe(false);
   });
 });

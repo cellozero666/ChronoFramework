@@ -479,6 +479,7 @@ FUNCTION gate_execution(module_id, wp_id, spec_revision):
     ASSERT runtime_capabilities_valid
     ASSERT least_privilege_permissions_verified
     ASSERT rtk_attestation EXISTS AND status == current
+    ASSERT authoritative routing proof EXISTS for the (adapter, runtime, project) scope AND all bindings re-validate [§10.2]
     ASSERT skill_attestation EXISTS AND status == current
     ASSERT no_active blocker targeting module OR work_package
     ASSERT no_relevant_artifact_changed_after_approval
@@ -618,6 +619,8 @@ FUNCTION record_evidence(producer, tool, target_revision, check_name, result, di
 
 ### 10.1 Attestation recording
 
+Attestation proves binary identity only — never routing:
+
 ```
 FUNCTION verify_and_record_rtk():
     # Must be the genuine Rust Token Killer binary
@@ -625,15 +628,12 @@ FUNCTION verify_and_record_rtk():
     IF NOT binary_from("https://github.com/rtk-ai/rtk"):
         RAISE RTK_NAME_COLLISION
 
-    # rtk gain must succeed
+    # rtk gain must succeed: dashboard verification, proving the
+    # binary is genuinely Rust Token Killer (NOT proof that any
+    # runtime command was routed)
     gain_result = execute_rtk_gain(binary)
     IF gain_result != 0:
         RAISE RTK_NAME_COLLISION
-
-    # Routing self-test
-    routing_result = execute_routing_self_test(binary)
-    IF routing_result != SUCCESS:
-        RAISE RTK_ROUTING_FAILURE
 
     # Check TTL
     IF rtk_recorded_at < now - ttl_from_config:
@@ -643,29 +643,77 @@ FUNCTION verify_and_record_rtk():
 
     INSERT INTO rtk_attestation (
         binary_path, binary_identity, version, provenance="https://github.com/rtk-ai/rtk",
-        integration_mode, routing_test_passed=TRUE, gained=TRUE, ...,
+        integration_mode, routing_test_passed=FALSE, gained=TRUE, ...,
         valid_until=now + ttl, status
     )
     INSERT INTO event_log (event_type="RtKAttested", ...)
 ```
 
-Reference: `[DOM §3.27]`, `[INV §8]`, `[P6.5]`, `[REF §13]`.
+Reference: `[DOM §3.27]`, `[INV §8]`, `[P6.5]`, `[REF §13]`, `[ADR-006]`.
 
 ### 10.2 Dispatch-time RTK check
 
 Before any agent-driven CLI dispatch:
+
 ```
-FUNCTION check_rtk_before_dispatch():
+FUNCTION check_rtk_before_dispatch(target, adapter_id, session):
     rtk = SELECT latest FROM rtk_attestation WHERE status == current
     IF rtk IS NULL:
         RAISE BLOCKED_RTK
     IF rtk.bypass_events IS NOT EMPTY:
         rtk.status = invalid
         RAISE BLOCKED_RTK
-    RETURN rtk
+    proof = SELECT latest_authoritative FROM routing_proof
+            WHERE adapter_id AND runtime == session.runtime AND project_id
+    IF proof IS NULL:
+        # A non-authoritative candidate names the missing step;
+        # no proof at all means routing is unproven.
+        RAISE RTK_ROUTING_FAILURE
+    IF proof.expired OR proof.rtk_attestation_id != rtk.id:
+        RAISE RTK_ROUTING_FAILURE
+    IF NOT adapter_active(proof.adapter_id):
+        RAISE RTK_ROUTING_FAILURE
+    IF proof.adapter_hash != current_registration_hash(proof.adapter_id):
+        RAISE RTK_ROUTING_FAILURE
+    IF sha256(proof.binary_path) != proof.binary_hash:
+        RAISE RTK_ROUTING_FAILURE
+    IF proof.asset_hash != current_managed_asset_manifest(proof.adapter_id):
+        RAISE RTK_ROUTING_FAILURE
+    RETURN (rtk, proof)
 ```
 
 Configuration-file presence alone is NOT proof `[P8.7, INV §8.4]`.
+Attestation currency alone NEVER authorizes dispatch `[INV §8.5, ADR-006]`.
+
+### 10.3 Routing proofs (candidate → authoritative)
+
+Effective routing is proven per adapter through `chrono rtk prove`
+`[FIXES-SL-10.1 C2, ADR-006]`:
+
+```
+FUNCTION prove_routing(adapter_id, raw_command):
+    REJECT IF raw_command is empty, already rtk-prefixed, or identity-only
+        (gain, --version, config, init, help: binary/dashboard surface only)
+    binary = resolve_genuine_rtk()  # --version + gain, else BLOCKED_RTK
+    mapped = execute(binary, ["rewrite", ...raw_command])
+    REJECT IF rewrite refuses, the mapping escapes the genuine binary,
+        execution fails, or output exceeds the provability cap
+    INSERT INTO routing_proof (..., authority='candidate', ...)  # authorizes nothing
+    INSERT INTO event_log (event_type="RoutingProofRecorded", ...)
+
+FUNCTION promote_routing_proof(proof_id):  # PO session, adapter.approve
+    proof = SELECT FROM routing_proof WHERE id
+    RETURN proof IF already authoritative (idempotent)
+    REJECT unless adapter approved (promotion executes approval, never substitutes)
+    REJECT unless proof binds the current attestation and the live binary
+    manifest = read_managed_asset_inventory(proof.adapter_id)
+    REJECT IF any managed asset missing
+    UPDATE routing_proof SET authority='authoritative',
+        adapter_hash=current_registration_hash, asset_hash=manifest.hash
+    INSERT INTO event_log (event_type="ProofPromoted", ...)
+```
+
+Reference: `[INV §8.4, INV §8.7, INV §14.4]`.
 
 ---
 

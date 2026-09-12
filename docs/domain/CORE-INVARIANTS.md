@@ -216,12 +216,16 @@ CHRONO MUST NOT silently fall back to raw/unfiltered command output when RTK is 
 - `[REF.§1192, P1.37, REF.§1220]`
 
 ### 8.4 Routing verification required
-Configuration-file presence is NOT proof of operation. Each adapter MUST prove effective command routing through a routing self-test.
-- `[P6.5, REF.§1189, P8.7]`
+Configuration-file presence is NOT proof of operation. Each adapter MUST prove effective command routing: the raw pre-routing command mapped through `rtk rewrite` and executed through the genuine binary with bound evidence. `rtk gain` proves binary/dashboard identity only, never routing.
+- `[P6.5, REF.§1189, P8.7, ADR-006]`
 
 ### 8.5 RTK attestation freshness
-A current RTKAttestation is required before dispatch. Stale or invalid attestation → `BLOCKED_RTK` → dispatch denied.
-- `[P6.5, P6.7, P7.3, P8.5, P8.7]`
+A current RTKAttestation is required before dispatch. Stale or invalid attestation → `BLOCKED_RTK` → dispatch denied. Attestation currency alone never authorizes dispatch: a current AUTHORITATIVE routing proof for the (adapter, runtime, project) scope is additionally required.
+- `[P6.5, P6.7, P7.3, P8.5, P8.7, ADR-006]`
+
+### 8.7 Routing-proof authority
+Recorded routing proofs are non-authoritative CANDIDATE rows. Only explicit promotion after signed adapter approval (`chrono rtk promote`, PO session) makes a proof AUTHORITATIVE, snapshotting the adapter registration hash and the managed-asset manifest hash. Dispatch re-validates every binding per use; binary replacement, re-registration, asset drift, revocation, expiry, or a superseded attestation invalidates.
+- `[FIXES-SL-10.1 C2, C3, ADR-006]`
 
 ### 8.6 RTK outside domain ownership
 RTK does NOT own CHRONO state, governance, gates, or lifecycle. Token savings evidence MUST NOT be conflated with billing savings validation.
@@ -359,6 +363,7 @@ The Core uses this taxonomy to classify and report invariant violations. Errors 
 | `ILLEGAL_TRANSITION` | Transition violates legal transition table | I-02.2 |
 | `STALE_REVISION` | Reference to non-current artifact revision | I-09.3 |
 | `HIDDEN_CHILD_STATE` | Project projection would hide blocking child | I-02.3 |
+| `PROJECTION_FAILED` | Mandatory entry/state context cannot be projected; no partial projection is returned | I-02.3 |
 
 ### 14.3 Reference integrity failures
 | Code | Meaning | Invariant |
@@ -389,7 +394,7 @@ The Core uses this taxonomy to classify and report invariant violations. Errors 
 | Code | Meaning | Invariant |
 |---|---|---|
 | `BLOCKED_RTK` | RTK attestation missing/stale/invalid/bypassed | I-08.5 |
-| `RTK_ROUTING_FAILURE` | Command not routed through RTK | I-08.4 |
+| `RTK_ROUTING_FAILURE` | No current AUTHORITATIVE routing proof for the scope (unproven, candidate-only, expired, superseded, drifted, or cross-scope) | I-08.4 |
 | `RTK_NAME_COLLISION` | Installed `rtk` is not Rust Token Killer | I-08.2 |
 | `BLOCKED_PROCESS_SKILL` | Skill attestation missing/stale/invalid/bypassed | I-09.7 |
 | `SKILL_PROVENANCE_FAILURE` | Upstream divergence, hash mismatch, or license issue | I-09.2, I-09.3 |

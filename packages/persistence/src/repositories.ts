@@ -2205,6 +2205,8 @@ export class SkillRepository {
 }
 
 /** RTK routing proof record [SLICE-9 §9.3, P8.5, INV §8.4]. */
+export type RoutingProofAuthority = "candidate" | "authoritative";
+
 export interface RoutingProofRecord {
   id: string;
   adapterId: string;
@@ -2216,12 +2218,16 @@ export interface RoutingProofRecord {
   binaryHash: string;
   version: string;
   proofCommand: string;
+  preRoutingCommand: string;
   commandHash: string;
   outputHash: string;
   exitStatus: number;
   gainAvailable: boolean;
   timestamp: string;
   validUntil: string;
+  authority: RoutingProofAuthority;
+  adapterHash: string | null;
+  assetHash: string | null;
 }
 
 interface RoutingProofRow {
@@ -2235,19 +2241,25 @@ interface RoutingProofRow {
   binary_hash: unknown;
   version: unknown;
   proof_command: unknown;
+  pre_routing_command: unknown;
   command_hash: unknown;
   output_hash: unknown;
   exit_status: unknown;
   gain_available: unknown;
   timestamp: unknown;
   valid_until: unknown;
+  authority: unknown;
+  adapter_hash: unknown;
+  asset_hash: unknown;
 }
 
 /**
- * Repository for RTK routing proofs. Rows are append-only: proofs are
- * never updated or deleted, so a recorded proof cannot be weakened after
- * the fact. Consumers re-validate liveness (adapter, binary, attestation)
- * at every use.
+ * Repository for RTK routing proofs. Rows are append-only with one
+ * narrowly guarded exception: a `candidate` proof may transition to
+ * `authoritative` through explicit promotion (Core-owned, audited).
+ * Nothing else about a proof row may change after recording, and rows
+ * are never deleted. Consumers re-validate liveness (adapter, binary,
+ * attestation, registration hash, asset manifest) at every use.
  */
 export class RoutingProofRepository {
   constructor(private readonly db: Database) {}
@@ -2263,6 +2275,7 @@ export class RoutingProofRepository {
     binaryHash: string;
     version: string;
     proofCommand: string;
+    preRoutingCommand: string;
     commandHash: string;
     outputHash: string;
     exitStatus: number;
@@ -2273,15 +2286,43 @@ export class RoutingProofRepository {
     this.db.prepare(
       `INSERT INTO routing_proof (id, adapter_id, runtime, session_id, project_id,
          rtk_attestation_id, binary_path, binary_hash, version, proof_command,
-         command_hash, output_hash, exit_status, gain_available, timestamp, valid_until)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         pre_routing_command, command_hash, output_hash, exit_status, gain_available,
+         timestamp, valid_until, authority, adapter_hash, asset_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'candidate', NULL, NULL)`
     ).run(
       proof.id, proof.adapterId, proof.runtime, proof.sessionId, proof.projectId,
       proof.rtkAttestationId, proof.binaryPath, proof.binaryHash, proof.version,
-      proof.proofCommand, proof.commandHash, proof.outputHash, proof.exitStatus,
+      proof.proofCommand, proof.preRoutingCommand, proof.commandHash, proof.outputHash, proof.exitStatus,
       proof.gainAvailable ? 1 : 0, proof.timestamp, proof.validUntil
     );
     return this.findById(proof.id);
+  }
+
+  /**
+   * Promote a candidate proof to authoritative. The single permitted
+   * mutation of a proof row: candidate → authoritative only, with the
+   * adapter registration hash and asset manifest hash snapshotted at
+   * promotion time. Anything else throws without touching the row.
+   */
+  promote(id: string, adapterHash: string, assetHash: string): RoutingProofRecord {
+    const current = this.findById(id);
+    if (current.authority === "authoritative") {
+      return current;
+    }
+    if (current.authority !== "candidate") {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: `Routing proof '${id}' has unknown authority '${current.authority}': cannot promote`,
+        invariantRef: "INV §14.4",
+        affectedTarget: id,
+        suggestedAction: "Re-record the proof with chrono rtk prove",
+      });
+    }
+    this.db
+      .prepare("UPDATE routing_proof SET authority = 'authoritative', adapter_hash = ?, asset_hash = ? WHERE id = ? AND authority = 'candidate'")
+      .run(adapterHash, assetHash, id);
+    return this.findById(id);
   }
 
   findById(id: string): RoutingProofRecord {
@@ -2306,6 +2347,18 @@ export class RoutingProofRepository {
       .prepare(
         `SELECT * FROM routing_proof
          WHERE adapter_id = ? AND runtime = ? AND project_id = ?
+         ORDER BY valid_until DESC, rowid DESC LIMIT 1`
+      )
+      .get(adapterId, runtime, projectId) as RoutingProofRow | undefined;
+    return row === undefined ? null : this.mapRow(row);
+  }
+
+  /** Latest AUTHORITATIVE proof for one adapter/runtime/project scope (may be expired). */
+  latestAuthoritative(adapterId: string, runtime: string, projectId: string): RoutingProofRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM routing_proof
+         WHERE adapter_id = ? AND runtime = ? AND project_id = ? AND authority = 'authoritative'
          ORDER BY valid_until DESC, rowid DESC LIMIT 1`
       )
       .get(adapterId, runtime, projectId) as RoutingProofRow | undefined;
@@ -2342,12 +2395,16 @@ export class RoutingProofRepository {
       binaryHash: row.binary_hash as string,
       version: row.version as string,
       proofCommand: row.proof_command as string,
+      preRoutingCommand: (row.pre_routing_command as string | null) ?? "",
       commandHash: row.command_hash as string,
       outputHash: row.output_hash as string,
       exitStatus: row.exit_status as number,
       gainAvailable: Boolean(row.gain_available),
       timestamp: row.timestamp as string,
       validUntil: row.valid_until as string,
+      authority: row.authority === "authoritative" ? "authoritative" : "candidate",
+      adapterHash: (row.adapter_hash as string | null) ?? null,
+      assetHash: (row.asset_hash as string | null) ?? null,
     };
   }
 }

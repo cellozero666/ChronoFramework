@@ -24,6 +24,7 @@ import {
   fingerprintPublicKey,
   generateApprovalKeyPair,
   hashSkillSource,
+  managedAssetInventory,
   signApprovalPayload,
   skillGeneratedHashes,
   skillVendorPath,
@@ -345,20 +346,30 @@ function enrollTestPo(
       const adapterApprovalId = approve(core, privateKeyPem, "adapter-registration", "fixture", registrationHash);
       expect(core.approveAdapter("fixture", adapterApprovalId, po).ok).toBe(true);
       const fixtureProofCommand = JSON.stringify([rtkBin, "gain"]);
-      expect(
-        core.recordRoutingProof(gaspar, {
-          adapterId: "fixture",
-          binaryPath: rtkBin,
-          version: "1.0.0-test",
-          proofCommand: fixtureProofCommand,
-          commandHash: computeRevisionHash([rtkBin, "gain"]),
-          outputHash: computeRevisionHash("fixture gain ok"),
-          exitStatus: 0,
-          gainAvailable: true,
-          timestamp: new Date().toISOString(),
-          ttlSeconds: 86400,
-        }).ok
-      ).toBe(true);
+      const recordedProof = core.recordRoutingProof(gaspar, {
+        adapterId: "fixture",
+        binaryPath: rtkBin,
+        version: "1.0.0-test",
+        proofCommand: fixtureProofCommand,
+        preRoutingCommand: JSON.stringify(["ls", tempDir]),
+        commandHash: computeRevisionHash([rtkBin, "gain"]),
+        outputHash: computeRevisionHash("fixture gain ok"),
+        exitStatus: 0,
+        gainAvailable: true,
+        timestamp: new Date().toISOString(),
+        ttlSeconds: 86400,
+      });
+      expect(recordedProof.ok).toBe(true);
+      for (const spec of managedAssetInventory("fixture")) {
+        const target = join(tempDir, spec.path);
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(
+          target,
+          spec.kind === "marker" ? `fixture-managed ${spec.marker ?? spec.path}\n` : `fixture-managed ${spec.path}\n`,
+          "utf8"
+        );
+      }
+      expect(core.promoteRoutingProof(recordedProof.value!.id, po).ok).toBe(true);
       worker = { actor: "belthazar", session: signedSession(core, "belthazar", privateKeyPem, "MOD-0001") };
     } finally {
       core.close();

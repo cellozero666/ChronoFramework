@@ -173,7 +173,7 @@ FUNCTION verify_hooks_registered():
     RETURN TRUE
 ```
 
-This is proven via a routing self-test `[P8.7]`, not by configuration-file presence.
+This is proven by effective routing evidence (`chrono rtk prove` + `chrono rtk promote`, `[CORE §10.3]`), not by configuration-file presence.
 
 ---
 
@@ -198,12 +198,26 @@ If RTK is absent, incompatible, or bypassed, the adapter MUST stop and provide a
 
 ### 6.3 RTK routing requirement
 
-Every command that the agent dispatches MUST be routed through RTK:
+Every command that the agent dispatches MUST be covered by a current
+AUTHORITATIVE routing proof for the (adapter, runtime, project) scope
+`[CORE §10.2, INV §8.7, ADR-006]`:
+
 ```
-rtk exec adapter <command> <args>
+chrono rtk prove --adapter <id> -- <raw command>   # records a CANDIDATE (authorizes nothing)
+chrono rtk promote --proof <id>                    # PO-only, after signed adapter approval
 ```
 
-The adapter proves routing via the routing self-test `[P8.7]`. Configuration-file presence (`rtk.yaml`) is NOT proof of routing `[P8.7]`.
+`prove` maps the raw pre-routing command through `rtk rewrite` (the
+documented source of truth for hook interception), executes the mapped
+command only through the genuine attested binary, and binds the
+pre-routing input, routed command, output hash, and TTL as evidence.
+Identity-only commands (`rtk gain`, `rtk --version`) prove binary and
+dashboard identity for attestation — never routing. `promote`
+re-validates attestation, binary, approval, and managed-asset bindings
+and snapshots the registration and asset hashes; dispatch re-validates
+all of them per use, so drift invalidates without further ceremony.
+
+Configuration-file presence (`rtk.yaml`) is NOT proof of routing `[P8.7]`.
 
 ---
 
@@ -338,8 +352,8 @@ The Core MUST scan evidence for secret patterns and raise `SECRET_DETECTED` if f
 Each runtime adapter MUST demonstrate:
 
 1. **Dispatch authorization**: `chrono gate execution` is called before dispatch and is enforced. `[FW §1077]`.
-2. **In-runtime hook**: Native pre-tool hooks call `chrono gate` before protected actions, proven by a routing self-test. `[REF §1214]`.
-3. **RTK routing**: All commands route through `rtk exec adapter ...`, proven by `rtk gain` success. `[P8.7]`.
+2. **In-runtime hook**: Native pre-tool hooks call `chrono gate` before protected actions, proven by effective routing evidence (`[CORE §10.3]`). `[REF §1214]`.
+3. **RTK routing**: Every dispatched command is covered by a current AUTHORITATIVE routing proof (recorded with `chrono rtk prove`, promoted with `chrono rtk promote` after signed adapter approval). `rtk gain` proves binary/dashboard identity for attestation only — never routing. `[CORE §10, INV §8, ADR-006]`.
 4. **Skill activation**: Karpathy Guidelines skill is active (not just discoverable) in the runtime. `[P6.6]`.
 5. **No hardcoded model**: No provider/model/version string in adapter source or defaults. `[INV §11.2]`.
 

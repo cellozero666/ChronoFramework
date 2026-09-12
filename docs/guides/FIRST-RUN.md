@@ -85,10 +85,16 @@ persisted lifecycle state. No copied prompts, no manual agent
 selection, no exported tokens, no repeated questions.
 
 > Status: SessionStart assets ship for all three runtimes and pass
-> hermetic enforcement tests. Final live acceptance (paid model
-> execution, provider login) awaits explicit PO authorization and is
-> reported as open, not passed. Kiro conformance additionally awaits a
-> Kiro runtime on the verification host.
+> hermetic enforcement tests. Kiro entry uses the documented hook
+> contract (`.kiro/hooks/*.json` v1; `SessionStart` on IDE,
+> `AgentSpawn` on CLI, `PreToolUse` blocking; stdout-to-context on
+> exit 0, stderr warning on nonzero) and requires Kiro CLI 3.0+.
+> Automatic Gaspar entry on a real Kiro surface is UNVERIFIED: `chrono
+> init --runtime kiro` stops as an environment blocker (C4) and
+> `doctor` reports Kiro adapters accordingly until genuine Kiro
+> execution evidences the exact version. Final live acceptance (paid
+> model execution, provider login) awaits explicit PO authorization
+> and is reported as open, not passed.
 
 ## 4. Re-run, repair, and diagnose
 
@@ -99,8 +105,26 @@ chrono doctor --as gaspar --session-token <id/token>  # includes broker visibili
 ```
 
 `doctor` reports project/Core compatibility, setup state, adapter
-approval, RTK routing per adapter, skill activation, hook drift,
-broker health, and Gaspar entry readiness with actionable reasons.
+approval, RTK routing per adapter (`proven`, `candidate`, or
+`unproven`), skill activation, hook drift, broker health, and Gaspar
+entry readiness with actionable reasons.
+
+## 4.1 Proving routing (when `doctor` says `candidate` or `unproven`)
+
+```sh
+chrono rtk verify --session-token <id/token>
+chrono rtk prove --adapter <id> --as gaspar --session-token <id/token> -- ls <dir>
+chrono rtk promote --proof <id> --as PO --session-token <po-id/token>
+```
+
+Pass the RAW command without any `rtk` prefix: the flow maps it through
+`rtk rewrite` itself and refuses identity-only commands (`gain`,
+`--version`), unmapped input, and oversized output. `prove` records a
+non-authoritative CANDIDATE that authorizes nothing; `promote` (PO
+session, after signed adapter approval) makes it AUTHORITATIVE. Binary
+replacement, adapter re-registration, or managed-asset drift
+invalidates proofs automatically — `doctor` tells you which binding
+broke. `chrono init` runs this whole sequence for you on new projects.
 
 ## 5. Removal
 
@@ -122,7 +146,8 @@ install/uninstall lifecycle hooks — asserted by test).
 | Symptom | Cause | Recovery |
 |---|---|---|
 | `RTK_NAME_COLLISION` | installed `rtk` is not Rust Token Killer | install from `https://github.com/rtk-ai/rtk`, verify `rtk gain` |
-| `BLOCKED_RTK` | attestation missing/stale or routing unproven | `chrono rtk verify`, then `chrono rtk prove --adapter <id> -- <cmd>` |
+| `BLOCKED_RTK` | attestation missing/stale or routing unproven | `chrono rtk verify`, then prove routing and promote (below) |
+| `RTK_ROUTING_FAILURE` | no current AUTHORITATIVE proof, or drift since promotion | `chrono doctor` names the cause; re-prove/promote or reinstall hooks |
 | `BLOCKED_PROCESS_SKILL` | skill missing/divergent/inactive | `chrono skill verify` |
 | `CONSENT_REQUIRED` | automation without a scope | add the named `--yes-*` flag or run interactively |
 | `APPROVAL_REQUIRED` | PO-only step without terminal/key | run in a live terminal with the enrolled key |

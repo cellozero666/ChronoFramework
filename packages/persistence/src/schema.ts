@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -594,5 +594,20 @@ export const MIGRATIONS: Record<number, string> = {
       created_at  TEXT NOT NULL,
       revoked     INTEGER NOT NULL DEFAULT 0
     );
+  `,
+  13: `
+    -- Routing-proof authority [FIXES-SL-10.1 C3]: proofs are recorded as
+    -- non-authoritative CANDIDATE and become AUTHORITATIVE only through
+    -- explicit promotion after signed adapter approval. Promotion
+    -- snapshots the adapter registration hash and the managed-asset
+    -- manifest hash; dispatch re-validates both, so adapter
+    -- re-registration or managed-asset drift invalidates old proofs.
+    -- Pre-routing input is bound so the effective routed command is
+    -- traceable to what the operator asked to route. Existing rows keep
+    -- their evidence and become CANDIDATE (fail-closed default).
+    ALTER TABLE routing_proof ADD COLUMN authority TEXT NOT NULL DEFAULT 'candidate';
+    ALTER TABLE routing_proof ADD COLUMN adapter_hash TEXT;
+    ALTER TABLE routing_proof ADD COLUMN pre_routing_command TEXT NOT NULL DEFAULT '';
+    ALTER TABLE routing_proof ADD COLUMN asset_hash TEXT;
   `,
 };

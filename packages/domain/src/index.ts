@@ -80,15 +80,27 @@ export {
   type ProjectProjectionInput,
 } from "./validator.js";
 
+// Managed-asset inventory for routing drift binding [FIXES-SL-10.1 C2]
+export {
+  SHARED_MANAGED_ASSETS,
+  managedAssetInventory,
+  runtimeManagedAssets,
+  type ManagedAssetKind,
+  type ManagedAssetSpec,
+} from "./managed-assets.js";
+
 // Authority/capability matrix [DOM §2.2, Remediation §3A]
 export {
   AUTHORITY_POLICY_VERSION,
   EVENT_ROLE_ALLOWLIST,
+  KNOWN_RUNTIME_IDS,
   ROLE_CAPABILITIES,
   isCapable,
+  isKnownRuntimeId,
   mayEnactEvent,
   type CapabilityHolder,
   type CoreOperation,
+  type KnownRuntimeId,
 } from "./capabilities.js";
 
 // Registration rules (entry states, required fields)

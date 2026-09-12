@@ -129,6 +129,7 @@ interface CommandOpts {
   readonly file?: unknown;
   readonly approval?: unknown;
   readonly id?: unknown;
+  readonly proof?: unknown;
   readonly rtkBinary?: unknown;
   readonly yes?: unknown;
   readonly yesFiles?: unknown;
@@ -1205,15 +1206,52 @@ export function resolveExecutable(binary: string): string | null {
 }
 
 /**
- * RTK routing proof: `chrono rtk prove` (Slice 9 §9.3, [P8.5, INV §8.4]).
+ * Maximum routed-command output hashed into a routing proof (8 MiB).
+ * Larger outputs cannot be proven: hashing unbounded agent-visible
+ * output into SQLite risks disk/memory exhaustion and the output is
+ * never printed or persisted anyway [FIXES-SL-10.1 C2].
+ */
+export const RTK_PROOF_OUTPUT_CAP_BYTES = 8 * 1024 * 1024;
+
+/**
+ * RTK identity/operational command heads that can never demonstrate
+ * effective interception [FIXES-SL-10.1 C2]. `gain`/`--version` prove
+ * the genuine binary and its dashboard (verified by `rtk verify`), but
+ * no runtime command passes through the hook path for them; the
+ * operational heads (`config`, `init`, `help`) likewise route nothing.
+ * Matching is exact and case-sensitive: anything else flows to
+ * `rtk rewrite`, which refuses what it cannot map.
+ */
+const IDENTITY_ONLY_RTK_COMMANDS = new Set([
+  "gain",
+  "version",
+  "--version",
+  "-V",
+  "config",
+  "init",
+  "help",
+  "-h",
+  "--help",
+]);
+
+export function isIdentityOnlyRtkCommand(head: string): boolean {
+  return IDENTITY_ONLY_RTK_COMMANDS.has(head);
+}
+
+/**
+ * RTK routing proof: `chrono rtk prove` (Slice 9 §9.3, [P8.5, INV §8.4],
+ * ADR-006). Proves EFFECTIVE interception through the genuine RTK binary:
+ * the raw pre-routing command is mapped with `rtk rewrite` (the documented
+ * single source of truth for hooks), the mapped command is executed, and
+ * exit status plus output hash are bound with adapter, runtime, session,
+ * project, RTK identity, timestamp, and TTL.
  *
- * Executes a command through the genuine RTK binary (argv[0] must be that
- * binary: grants cannot smuggle another binary, same bar as `run`) and
- * records an append-only proof binding adapter, runtime, session scope,
- * attestation, binary content hash, command/output hashes, and exit
- * status. Only exit-0 routings prove effectiveness. Dispatch consumes
- * these proofs; the `routingTestPassed` attestation flag alone never
- * authorizes anything.
+ * Recorded proofs are non-authoritative CANDIDATE rows: they authorize
+ * nothing until `chrono rtk promote` (PO session) promotes them after
+ * signed adapter approval. Identity-only commands (`gain`, `--version`,
+ * `config`, `init`, `help`) and already-routed `rtk ...` inputs can never
+ * prove routing and are denied. Raw output is hashed, capped, and never
+ * printed or persisted.
  */
 export function runRtkProve(
   projectPath: string,
@@ -1246,9 +1284,15 @@ export function runRtkProve(
     return fail(2, "VALIDATION_ERROR", "rtk prove --timeout must be within 1 second and 1 hour");
   }
   const binary = options.binary ?? "rtk";
-  const [commandBinary, ...commandArgs] = options.command as [string, ...string[]];
-  if (commandBinary !== binary) {
-    return fail(2, "VALIDATION_ERROR", `rtk prove command must start with the RTK binary '${binary}': proofs cannot smuggle another binary`);
+  const raw = options.command;
+  if (raw.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "rtk prove requires a raw pre-routing command after -- (for example: ls <dir>)");
+  }
+  if (raw[0] === binary || (raw[0] !== undefined && raw[0].endsWith(`/${binary}`))) {
+    return fail(2, "VALIDATION_ERROR", `rtk prove takes the raw pre-routing command without the RTK prefix (for example: ls <dir>, not rtk ls <dir>): the flow maps it through '${binary} rewrite' itself`);
+  }
+  if (isIdentityOnlyRtkCommand(raw[0] ?? "")) {
+    return fail(1, "RTK_ROUTING_FAILURE", `identity-only command '${raw[0] ?? ""}' cannot prove routing: use a command RTK actually routes (for example: ls <dir>)`);
   }
   const resolved = (options.resolveBinary ?? resolveExecutable)(binary);
   if (resolved === null) {
@@ -1270,22 +1314,47 @@ export function runRtkProve(
     if (gainResult.status !== 0) {
       return fail(1, "RTK_NAME_COLLISION", "rtk gain failed: the binary is not proven Rust Token Killer");
     }
-    const ran = spawn(resolved, commandArgs, Math.floor(timeoutSeconds * 1000), {});
+    const rewritten = spawn(resolved, ["rewrite", ...raw], 60000, {});
+    // Deliberately exit-agnostic: `rtk rewrite --help` claims 0-with-map
+    // / 1-empty, but genuine RTK 0.44.0 exits 3 with a mapping and 1
+    // empty without one (production-path trace, FIXES-SL-10.1 gate
+    // item 5). Stdout presence is the contract: a mapping must parse
+    // and resolve to the genuine binary, otherwise no routing is proven.
+    const mappedText = rewritten.stdout.trim();
+    const mapped = mappedText.length === 0 ? null : splitCommandLine(mappedText);
+    if (mapped === null || mapped.length === 0) {
+      return fail(1, "RTK_ROUTING_FAILURE", "RTK refused to map the command: no interception route exists for this input");
+    }
+    const mappedHead = mapped[0] as string;
+    const mappedResolved = (options.resolveBinary ?? resolveExecutable)(mappedHead);
+    if (mappedResolved === null || mappedResolved !== resolved) {
+      return fail(1, "RTK_ROUTING_FAILURE", "RTK mapping escapes the genuine RTK binary: no routing proven");
+    }
+    if (mapped.length < 2) {
+      // A bare binary with no routed subcommand proves nothing was
+      // intercepted: refuse even if executing it would exit 0.
+      return fail(1, "RTK_ROUTING_FAILURE", "RTK mapping contains no routed command: no routing proven");
+    }
+    const routed = [resolved, ...mapped.slice(1)];
+    const ran = spawn(resolved, mapped.slice(1), Math.floor(timeoutSeconds * 1000), {});
     if (ran.timedOut) {
-      return fail(1, "RTK_ROUTING_FAILURE", `proof command timed out after ${timeoutSeconds}s: no routing proven`);
+      return fail(1, "RTK_ROUTING_FAILURE", `routed command timed out after ${timeoutSeconds}s: no routing proven`);
     }
     if (ran.status !== 0) {
-      return fail(1, "RTK_ROUTING_FAILURE", `proof command failed with exit ${String(ran.status)}: only successful routings prove effectiveness`);
+      return fail(1, "RTK_ROUTING_FAILURE", `routed command failed with exit ${String(ran.status)}: only successful routings prove effectiveness`);
     }
-    const argv = [resolved, ...commandArgs];
+    if (ran.stdout.length > RTK_PROOF_OUTPUT_CAP_BYTES) {
+      return fail(1, "RTK_ROUTING_FAILURE", `routed output exceeds the ${String(RTK_PROOF_OUTPUT_CAP_BYTES)} byte provability cap: refusing to record`);
+    }
     const recorded = core.recordRoutingProof(
       { actor: options.as, session: options.session },
       {
         adapterId: options.adapter,
         binaryPath: resolved,
         version,
-        proofCommand: JSON.stringify(argv),
-        commandHash: computeRevisionHash(argv),
+        proofCommand: JSON.stringify(routed),
+        preRoutingCommand: JSON.stringify(raw),
+        commandHash: computeRevisionHash({ pre: raw, routed }),
         outputHash: computeRevisionHash(ran.stdout),
         exitStatus: 0,
         gainAvailable: true,
@@ -1297,8 +1366,60 @@ export function runRtkProve(
       return coreError(recorded.error, asJson);
     }
     const body = asJson
-      ? JSON.stringify({ ok: true, id: recorded.value?.id, adapter: options.adapter, version }, null, 2)
-      : `Routing proven through '${binary}' (${version}) for adapter '${options.adapter}': proof '${recorded.value?.id ?? ""}'.`;
+      ? JSON.stringify({ ok: true, id: recorded.value?.id, adapter: options.adapter, version, authority: "candidate" }, null, 2)
+      : `Routing candidate recorded through '${binary}' (${version}) for adapter '${options.adapter}': proof '${recorded.value?.id ?? ""}' is non-authoritative until 'chrono rtk promote --proof ${recorded.value?.id ?? "<id>"}' runs after signed adapter approval.`;
+    return { exitCode: 0, stdout: body, stderr: "" };
+  } finally {
+    core.close();
+  }
+}
+
+/**
+ * RTK routing-proof promotion: `chrono rtk promote` (ADR-006,
+ * [FIXES-SL-10.1 C3]). Promotes a recorded CANDIDATE proof to
+ * AUTHORITATIVE after the PO's signed adapter approval. PO session
+ * required (`adapter.approve` capability): promotion executes a prior
+ * approval, never substitutes for it. The Core re-validates attestation
+ * currency, binary identity, adapter approval, and the managed-asset
+ * manifest, then snapshots the registration and asset hashes; dispatch
+ * re-validates both, so later drift invalidates. Already-authoritative
+ * proofs return unchanged (idempotent, safe for resume).
+ */
+export interface RtkPromoteOptions extends OutputOptions {
+  readonly proof: string;
+  readonly as?: string | undefined;
+  readonly session?: { id: string; token: string } | undefined;
+}
+
+export function runRtkPromote(projectPath: string, options: RtkPromoteOptions): CliOutput {
+  const asJson = options.json === true;
+  const fail = (exitCode: number, code: string, reason: string): CliOutput =>
+    asJson
+      ? { exitCode, stdout: JSON.stringify({ ok: false, error: { code, message: reason } }, null, 2), stderr: "" }
+      : { exitCode, stdout: "", stderr: `Error [${code}]: ${reason}` };
+  if (options.proof.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "rtk promote requires --proof <routing proof id>");
+  }
+  if (options.as === undefined || options.as.length === 0) {
+    return fail(2, "VALIDATION_ERROR", "rtk promote requires --as <actor> matching the caller session");
+  }
+  if (options.session === undefined) {
+    return fail(2, "VALIDATION_ERROR", "rtk promote requires --session-token");
+  }
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    const promoted = core.promoteRoutingProof(options.proof, { actor: options.as, session: options.session });
+    if (!promoted.ok) {
+      return coreError(promoted.error, asJson);
+    }
+    const body = asJson
+      ? JSON.stringify({ ok: true, id: promoted.value?.id, authority: "authoritative" }, null, 2)
+      : `Routing proof '${promoted.value?.id ?? ""}' promoted to authoritative: dispatch may now consume it while its bindings stay current.`;
     return { exitCode: 0, stdout: body, stderr: "" };
   } finally {
     core.close();
@@ -2649,13 +2770,14 @@ export function createProgram(cwd: string): Command {
         runRtkVerify(projectPath, {
           ...(typeof opts.binary === "string" ? { binaryPath: opts.binary } : {}),
           ...(token === null ? {} : { session: token }),
+          json: opts.json === true,
         })
       );
     });
 
   rtk
     .command("prove")
-    .description("Execute a command through the RTK binary and record a routing proof (fail-closed)")
+    .description("Prove effective RTK routing for an adapter and record a non-authoritative candidate proof (promote it after adapter approval)")
     .requiredOption("--adapter <id>", "registered runtime adapter id")
     .requiredOption("--as <actor>", "requesting identity (canonical role, matching the caller session)")
     .option("--binary <path>", "rtk binary (default: rtk from PATH)")
@@ -2664,7 +2786,7 @@ export function createProgram(cwd: string): Command {
     .option("--timeout <seconds>", "command timeout in seconds (default 120)")
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
-    .argument("<command...>", "command routed through the RTK binary (must start with it)")
+    .argument("<command...>", "raw pre-routing command (without the rtk prefix: mapped through 'rtk rewrite' by the flow)")
     .action((command: string[], opts: CommandOpts) => {
       const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
@@ -2680,6 +2802,28 @@ export function createProgram(cwd: string): Command {
           ...(ttl !== undefined && Number.isFinite(ttl) ? { ttlSeconds: ttl } : {}),
           ...(timeout !== undefined && Number.isFinite(timeout) ? { timeoutSeconds: timeout } : {}),
           command,
+          json: opts.json === true,
+        })
+      );
+    });
+
+  rtk
+    .command("promote")
+    .description("Promote a candidate routing proof to authoritative after signed adapter approval (PO session required)")
+    .requiredOption("--proof <id>", "candidate routing proof id from 'rtk prove'")
+    .requiredOption("--as <actor>", "requesting identity (PO, matching the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
+      emitProgramResult(
+        program,
+        runRtkPromote(projectPath, {
+          proof: String(opts.proof ?? ""),
+          ...(typeof opts.as === "string" ? { as: opts.as } : {}),
+          ...(token === null ? {} : { session: token }),
           json: opts.json === true,
         })
       );

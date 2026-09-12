@@ -45,6 +45,7 @@ import {
   fingerprintPublicKey,
   hashSkillSource,
   isLegalSetupAdvance,
+  managedAssetInventory,
   setupStepIndex,
   BROKER_SESSION_TTL_SECONDS,
   GASPAR_ENTRY_ACTIONS,
@@ -2317,31 +2318,155 @@ export class ChronoCore {
 
   /** Pure projection builder shared by redeem and refresh paths. */
   private buildGasparEntryProjection(): GasparEntryProjection {
+    const projectionFailed = (message: string, affectedTarget?: string): ChronoError =>
+      new ChronoError({
+        code: ErrorCode.PROJECTION_FAILED,
+        severity: Severity.BLOCKER,
+        message: `Gaspar entry context unavailable: ${message}`,
+        invariantRef: "INV §14.2",
+        ...(affectedTarget !== undefined ? { affectedTarget } : {}),
+        suggestedAction: "Run chrono doctor to diagnose the store, repair it, and retry entry",
+      });
     const status = this.status();
-    const state = status.ok ? status.value!.state : "BLOCKED";
+    if (!status.ok) {
+      throw new ChronoError({
+        code: ErrorCode.PROJECTION_FAILED,
+        severity: Severity.BLOCKER,
+        message: `Gaspar entry context unavailable: project state cannot be projected (${status.error?.code ?? "unknown"})`,
+        invariantRef: "INV §14.2",
+        suggestedAction: "Run chrono doctor to diagnose project state, repair the store, and retry entry",
+      });
+    }
     let language = "en";
     try {
       language = this.projects.findById("default").language;
     } catch {
       // Fresh projects fall back to the default language.
     }
-    const gasparAutonomy = status.ok ? status.value!.details.gasparAutonomy : "SEMI_AUTONOMOUS";
-    const runtime = status.ok ? status.value!.details.runtime : null;
-    const architectureState = status.ok ? status.value!.details.architectureState : null;
-    const specCount = status.ok ? status.value!.specCount : 0;
-    const moduleCount = status.ok ? status.value!.moduleCount : 0;
-    const blockers = status.ok
-      ? status.value!.activeBlockerList.map((b) => ({ id: b.id, type: b.type, reason: b.reason }))
-      : [];
-    const awaitingApprovalModules: string[] = [];
-    try {
-      for (const artifact of this.artifacts.listByType("MOD")) {
-        if (artifact.status === "AWAITING_APPROVAL") {
-          awaitingApprovalModules.push(artifact.id);
-        }
+    const gasparAutonomy = status.value!.details.gasparAutonomy;
+    const runtime = status.value!.details.runtime;
+    const architectureState = status.value!.details.architectureState;
+    const specCount = status.value!.specCount;
+    const moduleCount = status.value!.moduleCount;
+    if (
+      architectureState !== null &&
+      architectureState !== "proposed" &&
+      architectureState !== "under_review" &&
+      architectureState !== "approved" &&
+      architectureState !== "superseded"
+    ) {
+      throw projectionFailed(
+        `stored architecture state '${architectureState}' is not a legal lifecycle value: entry cannot be projected`
+      );
+    }
+    const blockers = status.value!.activeBlockerList.map((b) => ({ id: b.id, type: b.type, reason: b.reason }));
+    for (const blocker of blockers) {
+      if (typeof blocker.id !== "string" || blocker.id.length === 0) {
+        throw projectionFailed("malformed blocker data would produce an incomplete next action");
       }
-    } catch {
-      // Projection stays fail-open on content: state + blockers suffice.
+      try {
+        assertBlockerType(blocker.type);
+      } catch {
+        throw projectionFailed(
+          `blocker '${blocker.id}' carries unknown type '${blocker.type}': entry cannot be projected`,
+          blocker.id
+        );
+      }
+    }
+    // Module approvals are mandatory PO decisions: a module row that is
+    // missing, malformed, or in an illegal state must deny entry rather
+    // than present an incomplete next action. Reads here fail closed;
+    // nothing is caught and defaulted.
+    let modules: { id: string; status: string; revision: string }[];
+    try {
+      modules = this.artifacts
+        .listByType("MOD")
+        .map((artifact) => ({ id: artifact.id, status: artifact.status, revision: artifact.revision }));
+    } catch (e) {
+      throw new ChronoError({
+        code: ErrorCode.PROJECTION_FAILED,
+        severity: Severity.BLOCKER,
+        message: `Gaspar entry context unavailable: module registry unreadable (${e instanceof Error ? e.message : String(e)})`,
+        invariantRef: "INV §14.2",
+        suggestedAction: "Run chrono doctor to diagnose the store, repair it, and retry entry",
+      });
+    }
+    // Lifecycle inputs beyond modules must also be well-formed: the
+    // projector tolerates unknown states by fall-through, so malformed
+    // work-package, spec, or architecture rows would silently skew the
+    // projected state. Read failures already fail closed via status().
+    for (const workPackage of this.artifacts.listByType("WP")) {
+      if (!isValidState("WP", workPackage.status)) {
+        throw projectionFailed(
+          `work package '${workPackage.id}' carries illegal state '${workPackage.status}': entry cannot be projected`,
+          workPackage.id
+        );
+      }
+    }
+    for (const spec of this.artifacts.listByType("SP")) {
+      if (!isValidState("SP", spec.status)) {
+        throw projectionFailed(
+          `spec '${spec.id}' carries illegal state '${spec.status}': entry cannot be projected`,
+          spec.id
+        );
+      }
+    }
+    const awaitingApprovalModules: string[] = [];
+    for (const artifact of modules) {
+      if (typeof artifact.id !== "string" || artifact.id.length === 0 || !isValidState("MOD", artifact.status)) {
+        throw new ChronoError({
+          code: ErrorCode.PROJECTION_FAILED,
+          severity: Severity.BLOCKER,
+          message: "Gaspar entry context unavailable: malformed module data would produce an incomplete next action",
+          invariantRef: "INV §14.2",
+          affectedTarget: typeof artifact.id === "string" && artifact.id.length > 0 ? artifact.id : undefined,
+          suggestedAction: "Run chrono doctor to diagnose the store, repair it, and retry entry",
+        });
+      }
+      if (artifact.status === "AWAITING_APPROVAL") {
+        awaitingApprovalModules.push(artifact.id);
+      }
+    }
+    // Approval-gated module states (anything the ModuleApproved transition
+    // could have produced) must still bind a current module-approval for
+    // the exact revision: without it the next action would present
+    // approval context as ready that dispatch would deny. BLOCKED is
+    // reachable pre-approval, so it is excluded. Repository failures and
+    // absent bindings both deny with the stable projection code.
+    for (const artifact of modules) {
+      if (
+        artifact.status !== "APPROVED" &&
+        artifact.status !== "EXECUTING" &&
+        artifact.status !== "VERIFYING" &&
+        artifact.status !== "PASSED" &&
+        artifact.status !== "FAILED" &&
+        artifact.status !== "COMPLETE"
+      ) {
+        continue;
+      }
+      let bound: boolean;
+      try {
+        bound = this.hasValidApproval(artifact.id, artifact.revision, "module-approval");
+      } catch (e) {
+        throw projectionFailed(
+          `approval registry unreadable for module '${artifact.id}': entry cannot be projected (${e instanceof Error ? e.message : String(e)})`,
+          artifact.id
+        );
+      }
+      if (!bound) {
+        throw projectionFailed(
+          `module '${artifact.id}' at state '${artifact.status}' lacks a current module-approval for revision '${artifact.revision}': presenting its next action would be partial approval context`,
+          artifact.id
+        );
+      }
+    }
+    // Lifecycle divergence: every mutation syncs the stored project state
+    // with the computed projection, so a mismatch proves external
+    // tampering. Presenting either side as ready would be fail-open.
+    if (status.value!.details.projectState !== status.value!.state) {
+      throw projectionFailed(
+        `stored project state '${status.value!.details.projectState}' disagrees with the computed projection '${status.value!.state}': entry cannot be projected`
+      );
     }
     const architectureSecurityPending =
       architectureState === "proposed" || architectureState === "under_review";
@@ -2352,9 +2477,9 @@ export class ChronoCore {
     if (architectureSecurityPending) {
       requiredDecisions.push("architecture-security:ARCH");
     }
-    const nextAction = GASPAR_ENTRY_ACTIONS[state] ?? { key: "explain-blocker", summary: "Explain the blocking condition and the safe next action." };
+    const nextAction = GASPAR_ENTRY_ACTIONS[status.value!.state] ?? { key: "explain-blocker", summary: "Explain the blocking condition and the safe next action." };
     return {
-      projectState: state,
+      projectState: status.value!.state,
       language,
       gasparAutonomy,
       runtime,
@@ -2469,6 +2594,9 @@ export class ChronoCore {
       const id = this.sequences.allocate("SES");
       const issuedAt = this.now();
       const expiresAt = new Date(Date.parse(issuedAt) + BROKER_SESSION_TTL_SECONDS * 1000).toISOString();
+      // Project the entry context BEFORE minting: a projection failure
+      // denies redemption without leaving a live session behind.
+      const projection = this.buildGasparEntryProjection();
       this.db.transaction(() => {
         this.db.sessions().create({
           id,
@@ -2497,7 +2625,7 @@ export class ChronoCore {
         ok: true,
         value: {
           session: { id, token, expiresAt },
-          projection: this.buildGasparEntryProjection(),
+          projection,
         },
       };
     } catch (e) {
@@ -4778,21 +4906,25 @@ export class ChronoCore {
    * Any authenticated session may submit for any well-formed adapter
    * scope — registration is deliberately NOT required at record time so
    * setup can prove routing before the PO's adapter-approval decision
-   * (evidence precedes approval). The runtime, attestation, and binary
-   * bindings are derived by the Core — never trusted from caller input.
-   * The proof pins the current RTK
-   * attestation, the binary content hash, the command and output hashes,
+   * (evidence precedes approval). Recorded proofs are non-authoritative
+   * CANDIDATE rows: they authorize nothing until explicit promotion after
+   * signed adapter approval [ADR-006]. The runtime, attestation, and
+   * binary bindings are derived by the Core — never trusted from caller
+   * input. The proof pins the current RTK attestation, the binary content
+   * hash, the pre-routing input, the routed command and output hashes,
    * and a bounded validity window. Only successful routings (exit 0)
    * prove effectiveness. Dispatch re-validates every binding (registered,
-   * active adapter, current attestation, live binary); proofs for
-   * unknown, pending, or revoked adapters can never authorize execution,
-   * and binary replacement or adapter revocation invalidates.
+   * active adapter, current attestation, live binary, registration hash,
+   * asset manifest); proofs for unknown, pending, or revoked adapters can
+   * never authorize execution, and binary replacement, re-registration,
+   * asset drift, or adapter revocation invalidates.
    */
   recordRoutingProof(auth: CallerAuth, input: {
     adapterId: string;
     binaryPath: string;
     version: string;
     proofCommand: string;
+    preRoutingCommand: string;
     commandHash: string;
     outputHash: string;
     exitStatus: number;
@@ -4888,6 +5020,16 @@ export class ChronoCore {
           suggestedAction: "Record the exact command that was routed",
         });
       }
+      if (input.preRoutingCommand.trim().length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Routing proof requires the pre-routing input text",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Record the raw command as given before RTK routing",
+        });
+      }
+      this.assertNoSecrets("routing proof command", `${input.preRoutingCommand} ${input.proofCommand}`, "routing proof");
       this.assertFreshTimestamp(input.timestamp, adapterId);
       const ageMs = Date.parse(this.now()) - Date.parse(input.timestamp);
       if (ageMs > ROUTING_PROOF_FRESHNESS_MS) {
@@ -4922,6 +5064,7 @@ export class ChronoCore {
         binaryHash,
         version: input.version,
         proofCommand: input.proofCommand,
+        preRoutingCommand: input.preRoutingCommand,
         commandHash: input.commandHash,
         outputHash: input.outputHash,
         exitStatus: 0,
@@ -4932,16 +5075,143 @@ export class ChronoCore {
       this.events.append({
         eventType: "RoutingProofRecorded",
         entityId: record.id,
-        payload: { adapterId, runtime: session.runtime, commandHash: input.commandHash },
+        payload: { adapterId, runtime: session.runtime, commandHash: input.commandHash, authority: "candidate" },
         actor: caller.auditActor,
         priorState: undefined,
-        newState: "current",
-        reasoning: "RTK routing proof recorded",
+        newState: "candidate",
+        reasoning: "RTK routing proof recorded as non-authoritative candidate",
       });
       return { ok: true, value: { id: record.id } };
     } catch (e) {
       return this.handleError(e);
     }
+  }
+
+  /**
+   * Promote a candidate routing proof to authoritative [ADR-006]. PO-only
+   * (adapter.approve capability): promotion executes a prior signed
+   * adapter approval, never substitutes for it. Re-validates attestation
+   * currency, binary identity, adapter approval, and the managed-asset
+   * manifest, then snapshots the adapter registration hash and asset
+   * hash. Already-authoritative proofs return unchanged (idempotent).
+   */
+  promoteRoutingProof(proofId: string, auth: CallerAuth): CoreResult<{ id: string }> {
+    try {
+      const caller = this.resolveCaller(auth, "promote routing proof");
+      this.requireCapability("adapter.approve", caller);
+      const proof = this.db.routingProofs().findById(proofId);
+      if (proof.authority === "authoritative") {
+        return { ok: true, value: { id: proof.id } };
+      }
+      if (proof.authority !== "candidate") {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Routing proof '${proofId}' has unknown authority '${proof.authority}': cannot promote`,
+          invariantRef: "INV §14.4",
+          affectedTarget: proofId,
+          suggestedAction: "Re-record the proof with chrono rtk prove",
+        });
+      }
+      this.getAdapterForDispatch(proof.adapterId);
+      const attestation = this.db.rtkAttestations().latest();
+      const attestationState = this.attestationState(attestation, Date.parse(this.now()));
+      if (attestation === null || attestationState !== "current" || attestation.id !== proof.rtkAttestationId) {
+        throw new ChronoError({
+          code: ErrorCode.RTK_ROUTING_FAILURE,
+          severity: Severity.BLOCKER,
+          message: `Routing proof '${proofId}' no longer binds a current attestation: re-prove before promoting`,
+          invariantRef: "INV §8.4",
+          affectedTarget: proof.adapterId,
+          suggestedAction: "Record a fresh routing proof with chrono rtk prove, then promote it",
+        });
+      }
+      let currentBinaryHash: string;
+      try {
+        currentBinaryHash = createHash("sha256").update(readFileSync(proof.binaryPath)).digest("hex");
+      } catch {
+        throw new ChronoError({
+          code: ErrorCode.RTK_ROUTING_FAILURE,
+          severity: Severity.BLOCKER,
+          message: `RTK binary '${proof.binaryPath}' is unreadable since the proof: re-prove before promoting`,
+          invariantRef: "INV §8.4",
+          affectedTarget: proof.adapterId,
+          suggestedAction: "Record a fresh routing proof with chrono rtk prove, then promote it",
+        });
+      }
+      if (currentBinaryHash !== proof.binaryHash) {
+        throw new ChronoError({
+          code: ErrorCode.RTK_ROUTING_FAILURE,
+          severity: Severity.BLOCKER,
+          message: `RTK binary '${proof.binaryPath}' changed since the proof: re-prove before promoting`,
+          invariantRef: "INV §8.4",
+          affectedTarget: proof.adapterId,
+          suggestedAction: "Record a fresh routing proof with chrono rtk prove, then promote it",
+        });
+      }
+      const adapterHash = this.adapterRegistrationHash(proof.adapterId);
+      const manifest = this.readManagedAssetManifest(proof.adapterId);
+      if (manifest.missing.length > 0) {
+        throw new ChronoError({
+          code: ErrorCode.MISSING_REQUIRED_ARTIFACT,
+          severity: Severity.BLOCKER,
+          message: `Managed assets missing for '${proof.adapterId}' (${manifest.missing.join(", ")}): run chrono setup first`,
+          invariantRef: "INV §14.4",
+          affectedTarget: proof.adapterId,
+          suggestedAction: "Install managed hook assets with chrono setup, then promote the proof",
+        });
+      }
+      const promoted = this.db.routingProofs().promote(proof.id, adapterHash, manifest.hash);
+      this.events.append({
+        eventType: "ProofPromoted",
+        entityId: promoted.id,
+        payload: { adapterId: proof.adapterId, runtime: proof.runtime, adapterHash, assetHash: manifest.hash },
+        actor: caller.auditActor,
+        priorState: "candidate",
+        newState: "authoritative",
+        reasoning: "Routing proof promoted after signed adapter approval with re-validated bindings",
+      });
+      return { ok: true, value: { id: promoted.id } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Canonical managed-asset manifest for a proof scope, read from disk.
+   * Returns the deterministic manifest hash plus any missing entries.
+   * Callers decide whether absence denies (promote: yes) or only
+   * degrades reporting. Paths are project-relative and secrets never
+   * enter the hash inputs beyond file bytes of managed assets.
+   */
+  readManagedAssetManifest(adapterId: string): { hash: string; missing: string[] } {
+    const parts: string[] = [];
+    const missing: string[] = [];
+    for (const spec of managedAssetInventory(adapterId)) {
+      const full = joinPath(this.config.projectPath, spec.path);
+      let content: string | null = null;
+      try {
+        content = readFileSync(full, "utf8");
+      } catch {
+        content = null;
+      }
+      if (content === null) {
+        missing.push(spec.path);
+        parts.push(`${spec.path}\0${spec.kind}\0absent`);
+        continue;
+      }
+      if (spec.kind === "marker") {
+        const found = spec.marker !== undefined && content.includes(spec.marker);
+        if (!found) {
+          missing.push(spec.path);
+        }
+        parts.push(`${spec.path}\0marker\0${found ? "present" : "absent"}:${spec.marker ?? ""}`);
+        continue;
+      }
+      parts.push(`${spec.path}\0exact\0${createHash("sha256").update(content, "utf8").digest("hex")}`);
+    }
+    parts.sort();
+    return { hash: computeRevisionHash(parts), missing };
   }
 
   /**
@@ -5452,10 +5722,12 @@ export class ChronoCore {
 
   /**
    * Effective routing proof for one adapter/runtime/project scope.
-   * Re-validates every binding at dispatch: proof present and unexpired,
-   * bound to the still-current attestation, adapter still approved, and
-   * the RTK binary content unchanged since the proof. Anything else
-   * denies with RTK_ROUTING_FAILURE; nothing is burned or mutated.
+   * Re-validates every binding at dispatch: an AUTHORITATIVE proof must
+   * be present and unexpired, bound to the still-current attestation and
+   * to the current adapter registration hash, with the RTK binary
+   * content and the managed-asset manifest unchanged since promotion.
+   * Anything else denies with RTK_ROUTING_FAILURE; nothing is burned or
+   * mutated. [ADR-006]
    */
   private requireCurrentRoutingProof(
     target: string,
@@ -5472,9 +5744,14 @@ export class ChronoCore {
         affectedTarget: target,
         suggestedAction: "Record a routing proof with chrono rtk prove",
       });
-    const proof = this.db.routingProofs().latestFor(adapterId, runtime, "default");
+    const proof = this.db.routingProofs().latestAuthoritative(adapterId, runtime, "default");
     if (proof === null) {
-      throw denied("no current RTK routing proof for this adapter/runtime: routing is unproven");
+      const candidate = this.db.routingProofs().latestFor(adapterId, runtime, "default");
+      throw denied(
+        candidate === null
+          ? "no current RTK routing proof for this adapter/runtime: routing is unproven"
+          : `routing proof '${candidate.id}' for adapter '${adapterId}' is a non-authoritative candidate: promote it after signed adapter approval before dispatch`
+      );
     }
     if (Date.parse(proof.validUntil) <= Date.parse(this.now())) {
       throw denied(`routing proof '${proof.id}' expired at ${proof.validUntil}`);
@@ -5497,6 +5774,11 @@ export class ChronoCore {
           : `routing proof '${proof.id}' names adapter '${proof.adapterId}' with status '${status}'`
       );
     }
+    if (proof.adapterHash === null || proof.adapterHash !== this.adapterRegistrationHash(proof.adapterId)) {
+      throw denied(
+        `routing proof '${proof.id}' predates the current adapter registration: re-prove and promote after the configuration change`
+      );
+    }
     let currentBinaryHash: string;
     try {
       currentBinaryHash = createHash("sha256").update(readFileSync(proof.binaryPath)).digest("hex");
@@ -5505,6 +5787,11 @@ export class ChronoCore {
     }
     if (currentBinaryHash !== proof.binaryHash) {
       throw denied(`RTK binary '${proof.binaryPath}' changed since the proof`);
+    }
+    if (proof.assetHash === null || proof.assetHash !== this.readManagedAssetManifest(proof.adapterId).hash) {
+      throw denied(
+        `routing proof '${proof.id}' predates managed-asset drift: reinstall hooks with chrono setup, re-prove, and promote`
+      );
     }
   }
 
@@ -6519,16 +6806,17 @@ export class ChronoCore {
   routingProofStatus(
     adapterId: string,
     runtime: string
-  ): { present: boolean; id: string | null; validUntil: string | null; expired: boolean } {
-    const proof = this.db.routingProofs().latestFor(adapterId, runtime, "default");
+  ): { present: boolean; id: string | null; validUntil: string | null; expired: boolean; authority: string | null } {
+    const proof = this.db.routingProofs().latestAuthoritative(adapterId, runtime, "default");
     if (proof === null) {
-      return { present: false, id: null, validUntil: null, expired: false };
+      return { present: false, id: null, validUntil: null, expired: false, authority: null };
     }
     return {
       present: true,
       id: proof.id,
       validUntil: proof.validUntil,
       expired: Date.parse(proof.validUntil) <= Date.parse(this.now()),
+      authority: proof.authority,
     };
   }
 
@@ -6538,7 +6826,7 @@ export class ChronoCore {
    */
   routingProofScopes(
     adapterId: string
-  ): ReadonlyArray<{ runtime: string; id: string; validUntil: string; expired: boolean }> {
+  ): ReadonlyArray<{ runtime: string; id: string; validUntil: string; expired: boolean; authority: string }> {
     return this.db
       .routingProofs()
       .scopesFor(adapterId, "default")
@@ -6547,6 +6835,7 @@ export class ChronoCore {
         id: proof.id,
         validUntil: proof.validUntil,
         expired: Date.parse(proof.validUntil) <= Date.parse(this.now()),
+        authority: proof.authority,
       }));
   }
 

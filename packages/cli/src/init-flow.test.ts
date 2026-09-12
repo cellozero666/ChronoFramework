@@ -104,6 +104,16 @@ function flowProbes(bins: FixtureBins, opts: { failGainOnce?: boolean } = {}): F
           }
           return { exitCode: 0, stdout: "Token Killer savings dashboard\n", stderr: "" };
         }
+        if (args[0] === "rewrite") {
+          // Fixture mapping: the raw pre-routing words are routed
+          // through the genuine (fixture) binary. Single-quote each
+          // word so the CLI's splitCommandLine recovers the argv.
+          const mapped = args
+            .slice(1)
+            .map((word) => `'${word.replace(/'/g, `'"'"'`)}'`)
+            .join(" ");
+          return { exitCode: 0, stdout: `rtk ${mapped}\n`, stderr: "" };
+        }
         return { exitCode: 0, stdout: "rtk ok\n", stderr: "" };
       }
       if (binary === bins.runtime || name === "opencode") {

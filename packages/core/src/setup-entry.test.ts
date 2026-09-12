@@ -2,6 +2,7 @@
  * Slice 10 Core tests — setup state machine, pinned Core version, broker
  * credentials, and Gaspar entry projection [SLICE-10 §§2, 3, 5].
  */
+import Database from "better-sqlite3";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,6 +24,7 @@ import {
   fingerprintPublicKey,
   generateApprovalKeyPair,
   hashSkillSource,
+  managedAssetInventory,
   signApprovalPayload,
   skillGeneratedHashes,
   skillVendorPath,
@@ -249,22 +251,34 @@ function recordRtkAndSkill(core: ChronoCore, gaspar: CallerAuth, projectPath: st
   }
 }
 
-function recordProof(core: ChronoCore, submitter: CallerAuth, projectPath: string, adapterId: string): void {
+function recordProof(core: ChronoCore, submitter: CallerAuth, projectPath: string, adapterId: string, po: CallerAuth): void {
   const rtkBin = join(projectPath, "fixture-rtk.sh");
-  expect(
-    core.recordRoutingProof(submitter, {
-      adapterId,
-      binaryPath: rtkBin,
-      version: "1.0.0-test",
-      proofCommand: JSON.stringify([rtkBin, "gain"]),
-      commandHash: computeRevisionHash([rtkBin, "gain"]),
-      outputHash: computeRevisionHash("fixture gain ok"),
-      exitStatus: 0,
-      gainAvailable: true,
-      timestamp: T0,
-      ttlSeconds: 86400,
-    }).ok
-  ).toBe(true);
+  const recorded = core.recordRoutingProof(submitter, {
+    adapterId,
+    binaryPath: rtkBin,
+    version: "1.0.0-test",
+    proofCommand: JSON.stringify([rtkBin, "gain"]),
+    preRoutingCommand: JSON.stringify(["ls", projectPath]),
+    commandHash: computeRevisionHash([rtkBin, "gain"]),
+    outputHash: computeRevisionHash("fixture gain ok"),
+    exitStatus: 0,
+    gainAvailable: true,
+    timestamp: T0,
+    ttlSeconds: 86400,
+  });
+  expect(recorded.ok).toBe(true);
+  // Entry redemption requires proven routing: install the managed
+  // inventory and promote the candidate after approval [ADR-006].
+  for (const spec of managedAssetInventory(adapterId)) {
+    const target = join(projectPath, spec.path);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(
+      target,
+      spec.kind === "marker" ? `fixture-managed ${spec.marker ?? spec.path}\n` : `fixture-managed ${spec.path}\n`,
+      "utf8"
+    );
+  }
+  expect(core.promoteRoutingProof(recorded.value!.id, po).ok).toBe(true);
 }
 
 function advanceTo(core: ChronoCore, step: "ADAPTERS_REGISTERED_AND_APPROVED"): void {
@@ -426,7 +440,7 @@ describe("Broker credentials and Gaspar entry", () => {
     approveAdapter(core, "opencode", entrypoint, po, pair.privateKeyPem);
     recordRtkAndSkill(core, gaspar, tempDir);
     advanceTo(core, "ADAPTERS_REGISTERED_AND_APPROVED");
-    recordProof(core, gaspar, tempDir, "opencode");
+    recordProof(core, gaspar, tempDir, "opencode", po);
   });
 
   afterEach(() => {
@@ -547,7 +561,7 @@ describe("Broker credentials and Gaspar entry", () => {
         const freshPo = { actor: "PO", session: bootstrapSession(fresh, "PO", pair.privateKeyPem) };
         approveAdapter(fresh, "opencode", entrypoint, freshPo, pair.privateKeyPem);
         recordRtkAndSkill(fresh, freshGaspar, freshDir);
-        recordProof(fresh, freshGaspar, freshDir, "opencode");
+        recordProof(fresh, freshGaspar, freshDir, "opencode", freshPo);
         const freshBroker = fresh.issueBrokerCredential(freshGaspar);
         expect(freshBroker.ok).toBe(true);
         // No setup state advanced: readiness floor denies.
@@ -610,6 +624,172 @@ describe("Broker credentials and Gaspar entry", () => {
   });
 });
 
+describe("Fail-closed Gaspar entry projection", () => {
+  let tempDir: string;
+  let core: ChronoCore;
+  let restoreTty: () => void;
+  let gaspar: CallerAuth;
+  let brokerId: string;
+  let brokerSecret: string;
+
+  function sessionCount(): number {
+    const raw = new Database(join(tempDir, ".chrono", "chrono.db"), { readonly: true });
+    try {
+      const row = raw.prepare("SELECT COUNT(*) AS n FROM agent_session").get() as { n: number };
+      return row.n;
+    } finally {
+      raw.close();
+    }
+  }
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-projection-test-"));
+    core = new ChronoCore({ projectPath: tempDir, runtime: "test-runtime", clock: () => T0 });
+    expect(core.init().ok).toBe(true);
+    const pair = generateApprovalKeyPair();
+    restoreTty = fakeInteractiveTerminal();
+    enrollTestPo(core, pair);
+    gaspar = { actor: "gaspar", session: bootstrapSession(core, "gaspar", pair.privateKeyPem) };
+    const po = { actor: "PO", session: bootstrapSession(core, "PO", pair.privateKeyPem) };
+    const entrypoint = join(tempDir, "fixture-runtime.sh");
+    writeFileSync(entrypoint, "#!/bin/sh\necho fixture-ok\n", "utf8");
+    chmodSync(entrypoint, 0o755);
+    approveAdapter(core, "opencode", entrypoint, po, pair.privateKeyPem);
+    recordRtkAndSkill(core, gaspar, tempDir);
+    advanceTo(core, "ADAPTERS_REGISTERED_AND_APPROVED");
+    recordProof(core, gaspar, tempDir, "opencode", po);
+    const issued = core.issueBrokerCredential(gaspar);
+    expect(issued.ok).toBe(true);
+    brokerId = issued.value!.id;
+    brokerSecret = issued.value!.secret;
+  });
+
+  afterEach(() => {
+    if (typeof restoreTty !== "undefined") {
+      restoreTty();
+    }
+    if (typeof core !== "undefined") {
+      core.close();
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("denies projection when the module registry is unreadable, with no partial result", () => {
+    const raw = new Database(join(tempDir, ".chrono", "chrono.db"));
+    try {
+      raw.exec("DROP TABLE artifact");
+    } finally {
+      raw.close();
+    }
+    const projection = core.gasparEntryProjection(gaspar);
+    expect(projection.ok).toBe(false);
+    expect(projection.error?.code).toBe("PROJECTION_FAILED");
+    expect(projection.value).toBe(undefined);
+  });
+
+  it("denies redemption without minting a session when context cannot be projected", () => {
+    const before = sessionCount();
+    const raw = new Database(join(tempDir, ".chrono", "chrono.db"));
+    try {
+      raw.exec("DROP TABLE artifact");
+    } finally {
+      raw.close();
+    }
+    const redeemed = core.redeemBrokerCredential({
+      brokerId,
+      secret: brokerSecret,
+      adapterId: "opencode",
+      runtime: "test-runtime",
+    });
+    expect(redeemed.ok).toBe(false);
+    expect(redeemed.error?.code).toBe("PROJECTION_FAILED");
+    expect(sessionCount()).toBe(before);
+  });
+
+  it("denies projection on malformed module data instead of skipping it", () => {
+    const raw = new Database(join(tempDir, ".chrono", "chrono.db"));
+    try {
+      raw
+        .prepare(
+          "INSERT INTO artifact (id, type, revision, status, created_at, updated_at, deleted, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .run("MOD-9999", "MOD", `sha256:${"c".repeat(64)}`, "BOGUS", T0, T0, 0, `sha256:${"d".repeat(64)}`);
+    } finally {
+      raw.close();
+    }
+    const projection = core.gasparEntryProjection(gaspar);
+    expect(projection.ok).toBe(false);
+    expect(projection.error?.code).toBe("PROJECTION_FAILED");
+    expect(projection.value).toBe(undefined);
+  });
+
+  it("recovers after repair: removing the malformed row restores entry", () => {
+    const raw = new Database(join(tempDir, ".chrono", "chrono.db"));
+    try {
+      raw
+        .prepare(
+          "INSERT INTO artifact (id, type, revision, status, created_at, updated_at, deleted, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .run("MOD-9999", "MOD", `sha256:${"c".repeat(64)}`, "BOGUS", T0, T0, 0, `sha256:${"d".repeat(64)}`);
+    } finally {
+      raw.close();
+    }
+    expect(core.gasparEntryProjection(gaspar).ok).toBe(false);
+    const repair = new Database(join(tempDir, ".chrono", "chrono.db"));
+    try {
+      repair.prepare("DELETE FROM artifact WHERE id = ?").run("MOD-9999");
+    } finally {
+      repair.close();
+    }
+    const recovered = core.gasparEntryProjection(gaspar);
+    expect(recovered.ok).toBe(true);
+    expect(recovered.value?.projectState).toBe("ANALYZING");
+  });
+
+  it("denies projection when project state is unavailable, recovers after repair", () => {
+    const raw = new Database(join(tempDir, ".chrono", "chrono.db"));
+    const saved = raw.prepare("SELECT * FROM project WHERE id = ?").get("default") as Record<string, unknown>;
+    try {
+      raw.prepare("DELETE FROM project WHERE id = ?").run("default");
+    } finally {
+      raw.close();
+    }
+    const denied = core.gasparEntryProjection(gaspar);
+    expect(denied.ok).toBe(false);
+    expect(denied.error?.code).toBe("PROJECTION_FAILED");
+    expect(denied.value).toBe(undefined);
+    const repair = new Database(join(tempDir, ".chrono", "chrono.db"));
+    try {
+      repair
+        .prepare(
+          "INSERT INTO project (id, language, gaspar_autonomy, runtime, created_at, updated_at, state, system_analysis_complete, architecture_id, architecture_revision, architecture_state, spec_count, module_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .run(
+          saved["id"],
+          saved["language"],
+          saved["gaspar_autonomy"],
+          saved["runtime"],
+          saved["created_at"],
+          saved["updated_at"],
+          saved["state"],
+          saved["system_analysis_complete"],
+          saved["architecture_id"],
+          saved["architecture_revision"],
+          saved["architecture_state"],
+          saved["spec_count"],
+          saved["module_count"]
+        );
+    } finally {
+      repair.close();
+    }
+    const recovered = core.gasparEntryProjection(gaspar);
+    expect(recovered.ok).toBe(true);
+    expect(typeof recovered.value?.projectState).toBe("string");
+  });
+});
+
 describe("Gaspar entry action table", () => {
   it("covers every persisted project state exactly once", () => {
     for (const state of [
@@ -628,5 +808,340 @@ describe("Gaspar entry action table", () => {
       expect(GASPAR_ENTRY_ACTIONS[state]!.summary.length).toBeGreaterThan(0);
     }
     expect(Object.keys(GASPAR_ENTRY_ACTIONS)).toHaveLength(9);
+  });
+});
+
+describe("Fail-closed entry context (approvals, lifecycle, malformed rows)", () => {
+  // Focused C1 evidence [FIXES-SL-10.1 C1]: entry context fails closed
+  // with the stable PROJECTION_FAILED code when mandatory approval,
+  // blocker, work-package, spec, architecture, or lifecycle inputs are
+  // unreadable, malformed, unsubstantiated, or tampered — and recovers
+  // after repair. Outputs identify the failure without leaking secrets.
+  let tempDir: string;
+  let core: ChronoCore;
+  let restoreTty: () => void;
+  let gaspar: CallerAuth;
+  let po: CallerAuth;
+  let gasparToken: string;
+  let privateKeyPem: string;
+  let brokerId: string;
+  let brokerSecret: string;
+
+  function sessionCount(): number {
+    const raw = new Database(join(tempDir, ".chrono", "chrono.db"), { readonly: true });
+    try {
+      const row = raw.prepare("SELECT COUNT(*) AS n FROM agent_session").get() as { n: number };
+      return row.n;
+    } finally {
+      raw.close();
+    }
+  }
+
+  function rawDb(): ReturnType<typeof Database> {
+    return new Database(join(tempDir, ".chrono", "chrono.db"));
+  }
+
+  function approveModule(): string {
+    expect(
+      core.registerModule("MOD-0001", "DRAFT", { id: "MOD-0001", name: "M", purpose: "P", specs: [] }, gaspar).ok
+    ).toBe(true);
+    expect(core.transitionState("MOD-0001", "ModulePlanned", { ...gaspar }).ok).toBe(true);
+    const revision = core.getArtifact("MOD-0001").revision;
+    const signature = signApprovalPayload(
+      buildApprovalPayload({
+        action: "module-approval",
+        scopeArtifactId: "MOD-0001",
+        scopeRevision: revision,
+        authority: "PO",
+        rationale: "test approval",
+        timestamp: T0,
+      }),
+      privateKeyPem
+    );
+    expect(
+      core.recordApproval({
+        action: "module-approval",
+        scopeArtifactId: "MOD-0001",
+        scopeRevision: revision,
+        authority: "PO",
+        rationale: "test approval",
+        timestamp: T0,
+        signature,
+      }).ok
+    ).toBe(true);
+    expect(core.transitionState("MOD-0001", "ModuleApproved", { ...gaspar }).ok).toBe(true);
+    return revision;
+  }
+
+  function redeem(): { ok: boolean; code?: string | undefined; message?: string | undefined } {
+    const res = core.redeemBrokerCredential({ brokerId, secret: brokerSecret, adapterId: "opencode", runtime: "test-runtime" });
+    if (res.ok) {
+      return { ok: true };
+    }
+    return { ok: false, code: res.error?.code, message: res.error?.message ?? "" };
+  }
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-projection-c1-test-"));
+    core = new ChronoCore({ projectPath: tempDir, runtime: "test-runtime", clock: () => T0 });
+    expect(core.init().ok).toBe(true);
+    const pair = generateApprovalKeyPair();
+    privateKeyPem = pair.privateKeyPem;
+    restoreTty = fakeInteractiveTerminal();
+    enrollTestPo(core, pair);
+    const gasparSession = bootstrapSession(core, "gaspar", pair.privateKeyPem);
+    gaspar = { actor: "gaspar", session: gasparSession };
+    gasparToken = gasparSession.token;
+    po = { actor: "PO", session: bootstrapSession(core, "PO", pair.privateKeyPem) };
+    const entrypoint = join(tempDir, "fixture-runtime.sh");
+    writeFileSync(entrypoint, "#!/bin/sh\necho fixture-ok\n", "utf8");
+    chmodSync(entrypoint, 0o755);
+    approveAdapter(core, "opencode", entrypoint, po, pair.privateKeyPem);
+    recordRtkAndSkill(core, gaspar, tempDir);
+    advanceTo(core, "ADAPTERS_REGISTERED_AND_APPROVED");
+    recordProof(core, gaspar, tempDir, "opencode", po);
+    const issued = core.issueBrokerCredential(gaspar);
+    expect(issued.ok).toBe(true);
+    brokerId = issued.value!.id;
+    brokerSecret = issued.value!.secret;
+  });
+
+  afterEach(() => {
+    if (typeof restoreTty !== "undefined") {
+      restoreTty();
+    }
+    if (typeof core !== "undefined") {
+      core.close();
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("denies entry when the approval registry is unreadable, minting no session", () => {
+    approveModule();
+    expect(redeem().ok).toBe(true);
+    const before = sessionCount();
+    const raw = rawDb();
+    try {
+      raw.exec("DROP TABLE approval");
+    } finally {
+      raw.close();
+    }
+    const projection = core.gasparEntryProjection(gaspar);
+    expect(projection.ok).toBe(false);
+    expect(projection.error?.code).toBe("PROJECTION_FAILED");
+    expect(projection.value).toBe(undefined);
+    const denied = redeem();
+    expect(denied.ok).toBe(false);
+    expect(denied.code).toBe("PROJECTION_FAILED");
+    expect(sessionCount()).toBe(before);
+  });
+
+  it("denies an approved module whose approval binding is revoked, recovers on unrevoke", () => {
+    approveModule();
+    expect(redeem().ok).toBe(true);
+    // The schema forbids deleting approval rows (revoke instead), so
+    // revocation is the adversarial path to an unsubstantiated state.
+    const revoke = rawDb();
+    try {
+      revoke.prepare("UPDATE approval SET revoked = 1 WHERE action = ?").run("module-approval");
+    } finally {
+      revoke.close();
+    }
+    const denied = core.gasparEntryProjection(gaspar);
+    expect(denied.ok).toBe(false);
+    expect(denied.error?.code).toBe("PROJECTION_FAILED");
+    expect(denied.error?.message ?? "").toContain("MOD-0001");
+    expect(denied.value).toBe(undefined);
+    expect(redeem().ok).toBe(false);
+    // Repair: revocation is terminal and holds the unique approval slot,
+    // so recovery means a material revision plus a fresh PO approval —
+    // the same path production follows after a revoked approval.
+    const revised = `sha256:${"f".repeat(64)}`;
+    const bump = rawDb();
+    try {
+      bump.prepare("UPDATE artifact SET revision = ? WHERE id = ?").run(revised, "MOD-0001");
+    } finally {
+      bump.close();
+    }
+    const signature = signApprovalPayload(
+      buildApprovalPayload({
+        action: "module-approval",
+        scopeArtifactId: "MOD-0001",
+        scopeRevision: revised,
+        authority: "PO",
+        rationale: "test re-approval after revocation",
+        timestamp: T0,
+      }),
+      privateKeyPem
+    );
+    expect(
+      core.recordApproval({
+        action: "module-approval",
+        scopeArtifactId: "MOD-0001",
+        scopeRevision: revised,
+        authority: "PO",
+        rationale: "test re-approval after revocation",
+        timestamp: T0,
+        signature,
+      }).ok
+    ).toBe(true);
+    expect(core.gasparEntryProjection(gaspar).ok).toBe(true);
+    expect(redeem().ok).toBe(true);
+  });
+
+  it("denies a module revision that outruns its approval, recovers on revert", () => {
+    approveModule();
+    expect(redeem().ok).toBe(true);
+    const raw = rawDb();
+    let original: string;
+    try {
+      original = (raw.prepare("SELECT revision AS r FROM artifact WHERE id = ?").get("MOD-0001") as { r: string }).r;
+      raw.prepare("UPDATE artifact SET revision = ? WHERE id = ?").run(`sha256:${"e".repeat(64)}`, "MOD-0001");
+    } finally {
+      raw.close();
+    }
+    const denied = core.gasparEntryProjection(gaspar);
+    expect(denied.ok).toBe(false);
+    expect(denied.error?.code).toBe("PROJECTION_FAILED");
+    expect(redeem().ok).toBe(false);
+    const repair = rawDb();
+    try {
+      repair.prepare("UPDATE artifact SET revision = ? WHERE id = ?").run(original, "MOD-0001");
+    } finally {
+      repair.close();
+    }
+    expect(core.gasparEntryProjection(gaspar).ok).toBe(true);
+    expect(redeem().ok).toBe(true);
+  });
+
+  it("denies malformed blocker rows, recovers after repair", () => {
+    const raw = rawDb();
+    try {
+      raw
+        .prepare(
+          "INSERT INTO blocker (id, type, issuer, target_ids, reason, evidence_refs, created_at, resolved) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .run("BLK-0001", "BOGUS", "PO", '["MOD-0001"]', "tampered", "[]", T0, 0);
+    } finally {
+      raw.close();
+    }
+    const denied = core.gasparEntryProjection(gaspar);
+    expect(denied.ok).toBe(false);
+    expect(denied.error?.code).toBe("PROJECTION_FAILED");
+    expect(denied.error?.message ?? "").toContain("BLK-0001");
+    expect(denied.value).toBe(undefined);
+    const repair = rawDb();
+    try {
+      repair.prepare("DELETE FROM blocker WHERE id = ?").run("BLK-0001");
+    } finally {
+      repair.close();
+    }
+    expect(core.gasparEntryProjection(gaspar).ok).toBe(true);
+  });
+
+  it("denies an unreadable blocker registry", () => {
+    const raw = rawDb();
+    try {
+      raw.exec("DROP TABLE blocker");
+    } finally {
+      raw.close();
+    }
+    expect(core.gasparEntryProjection(gaspar).ok).toBe(false);
+    expect(core.gasparEntryProjection(gaspar).error?.code).toBe("PROJECTION_FAILED");
+  });
+
+  it("denies malformed work-package and spec rows, recovers after repair", () => {
+    const insert = rawDb();
+    try {
+      insert
+        .prepare(
+          "INSERT INTO artifact (id, type, revision, status, created_at, updated_at, deleted, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .run("WP-0001", "WP", `sha256:${"a".repeat(64)}`, "BOGUS", T0, T0, 0, `sha256:${"b".repeat(64)}`);
+      insert
+        .prepare(
+          "INSERT INTO artifact (id, type, revision, status, created_at, updated_at, deleted, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .run("SP-0001", "SP", `sha256:${"a".repeat(64)}`, "BOGUS", T0, T0, 0, `sha256:${"b".repeat(64)}`);
+    } finally {
+      insert.close();
+    }
+    const wpDenied = core.gasparEntryProjection(gaspar);
+    expect(wpDenied.ok).toBe(false);
+    expect(wpDenied.error?.code).toBe("PROJECTION_FAILED");
+    expect(wpDenied.error?.message ?? "").toContain("WP-0001");
+    const repair = rawDb();
+    try {
+      repair.prepare("DELETE FROM artifact WHERE id IN (?, ?)").run("WP-0001", "SP-0001");
+    } finally {
+      repair.close();
+    }
+    expect(core.gasparEntryProjection(gaspar).ok).toBe(true);
+  });
+
+  it("denies stored-vs-computed lifecycle divergence, recovers on repair", () => {
+    expect(core.gasparEntryProjection(gaspar).ok).toBe(true);
+    const raw = rawDb();
+    let stored: string;
+    try {
+      stored = (raw.prepare("SELECT state AS s FROM project WHERE id = ?").get("default") as { s: string }).s;
+      raw.prepare("UPDATE project SET state = ? WHERE id = ?").run("COMPLETE", "default");
+    } finally {
+      raw.close();
+    }
+    expect(stored).not.toBe("COMPLETE");
+    const denied = core.gasparEntryProjection(gaspar);
+    expect(denied.ok).toBe(false);
+    expect(denied.error?.code).toBe("PROJECTION_FAILED");
+    expect(redeem().ok).toBe(false);
+    const repair = rawDb();
+    try {
+      repair.prepare("UPDATE project SET state = ? WHERE id = ?").run(stored, "default");
+    } finally {
+      repair.close();
+    }
+    expect(core.gasparEntryProjection(gaspar).ok).toBe(true);
+    expect(redeem().ok).toBe(true);
+  });
+
+  it("denies a tampered architecture lifecycle value, recovers on repair", () => {
+    const raw = rawDb();
+    try {
+      raw.prepare("UPDATE project SET architecture_state = ? WHERE id = ?").run("BOGUS", "default");
+    } finally {
+      raw.close();
+    }
+    const denied = core.gasparEntryProjection(gaspar);
+    expect(denied.ok).toBe(false);
+    expect(denied.error?.code).toBe("PROJECTION_FAILED");
+    const repair = rawDb();
+    try {
+      repair.prepare("UPDATE project SET architecture_state = ? WHERE id = ?").run(null, "default");
+    } finally {
+      repair.close();
+    }
+    expect(core.gasparEntryProjection(gaspar).ok).toBe(true);
+  });
+
+  it("identifies projection failure without leaking secret material", () => {
+    const raw = rawDb();
+    try {
+      raw.exec("DROP TABLE artifact");
+    } finally {
+      raw.close();
+    }
+    const denied = core.gasparEntryProjection(gaspar);
+    expect(denied.ok).toBe(false);
+    expect(denied.error?.code).toBe("PROJECTION_FAILED");
+    const message = denied.error?.message ?? "";
+    expect(message.length).toBeGreaterThan(0);
+    expect(message).not.toContain(brokerSecret);
+    expect(message).not.toContain(gasparToken);
+    expect(JSON.stringify(denied)).not.toContain(brokerSecret);
+    expect(JSON.stringify(denied)).not.toContain(gasparToken);
+    const human = `Error [${denied.error?.code ?? "unknown"}]: ${message}`;
+    expect(human).toContain("PROJECTION_FAILED");
   });
 });

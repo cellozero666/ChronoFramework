@@ -42,7 +42,7 @@ Role views MAY emphasize implementation, UI/UX, infrastructure, testing, securit
 
 ## 5. RTK requirement
 
-All agent-driven CLI reading/searching/testing/building/version-control operations MUST be routed through a verified RTK integration when supported by RTK. The only accepted upstream is `https://github.com/rtk-ai/rtk`. A current routing self-test and RTKAttestation are REQUIRED before dispatch. Raw-output fallback is forbidden.
+All agent-driven CLI reading/searching/testing/building/version-control operations MUST be routed through a verified RTK integration when supported by RTK. The only accepted upstream is `https://github.com/rtk-ai/rtk`. A current RTKAttestation (binary identity via `rtk gain`) and a current AUTHORITATIVE routing proof (`chrono rtk prove` records a CANDIDATE, `chrono rtk promote` authorizes it after signed adapter approval) are REQUIRED before dispatch. Raw-output fallback is forbidden. `[ADR-006, INV §8]`.
 
 RTK reduces command output; it MUST NOT filter away required evidence irrecoverably. Full raw output MAY be retained outside LLM context when needed for audit/debugging, subject to secrets/privacy policy, while agents receive the curated output.
 
