@@ -109,6 +109,24 @@ approval, RTK routing per adapter (`proven`, `candidate`, or
 `unproven`), skill activation, hook drift, broker health, and Gaspar
 entry readiness with actionable reasons.
 
+### Project resolution (which directory is the project?)
+
+Every command resolves the project the same way, after canonicalizing
+symlinks (`/tmp` vs `/private/tmp` always agree):
+
+- explicit `--path` wins, canonicalized;
+- otherwise the nearest `.chrono` at or below the innermost containing
+  Git root (a `.chrono` above the Git root is never adopted);
+- outside Git, shared temporary directories are never adopted from or
+  traversed, so an unrelated `/tmp/.chrono` cannot capture siblings;
+- a fresh Git repository without `.chrono` resolves to the Git root;
+- an adopted store whose recorded identity disagrees is rejected
+  instead of inherited; legacy stores without a recorded identity stay
+  adoptable.
+
+If commands disagree about the project, `chrono doctor --path <dir>`
+names the cause; never copy a `.chrono` directory between projects.
+
 ## 4.1 Proving routing (when `doctor` says `candidate` or `unproven`)
 
 ```sh

@@ -5,7 +5,7 @@
  * secret bindings. Revocation is terminal; dispatch resolves fail-closed.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -216,7 +216,7 @@ describe("Adapter registry", () => {
     const approvalId = approveRegistration("fixture");
     expect(core.approveAdapter("fixture", approvalId, po).ok).toBe(true);
     expect(core.listAdapters().map((a) => `${a.id}:${a.status}`)).toEqual(["fixture:active"]);
-    expect(core.getAdapterForDispatch("fixture").entrypoint).toBe(entrypoint);
+    expect(core.getAdapterForDispatch("fixture").entrypoint).toBe(realpathSync(entrypoint));
     // Re-activation with the same approval is an audited no-op.
     expect(core.approveAdapter("fixture", approvalId, po).ok).toBe(true);
   });

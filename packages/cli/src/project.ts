@@ -10,43 +10,162 @@
  * before read-only use resumes.
  */
 
+import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve, sep } from "node:path";
 import { ChronoCore } from "@chrono/core";
+import { ChronoDatabase } from "@chrono/persistence";
 import { CHRONO_VERSION } from "./version.js";
 import type { CliOutput } from "./index.js";
 
-/** Walk up from `startDir` to the nearest directory holding `.chrono/chrono.db`. */
-export function findProjectRoot(startDir: string): string | null {
-  let current: string;
+/**
+ * Canonical project-root resolution [OPENCODE-PILOT-GATE.md project
+ * isolation finding]. One algorithm, used by every command:
+ *
+ * 1. Canonicalize the start directory (`realpathSync`): `/tmp` vs
+ *    `/private/tmp`, symlinked checkouts, and `..` segments all collapse
+ *    to one identity before any comparison.
+ * 2. The innermost containing Git repository root (`git rev-parse
+ *    --show-toplevel`, canonicalized) is the maximum upward boundary.
+ *    A `.chrono` above that root is never adopted.
+ * 3. Walk upward for the nearest `.chrono/chrono.db` at or below the
+ *    boundary. Outside Git, shared temporary directories (`os.tmpdir()`,
+ *    `/tmp`, `/var/tmp`) are never adopted from and never traversed:
+ *    an unrelated `/tmp/.chrono` must not capture `/tmp` siblings.
+ * 4. An adopted candidate whose stored project identity
+ *    (`runtime_config.project.root`, recorded at init) disagrees with
+ *    its directory is rejected (fail closed). Rows without a recorded
+ *    identity (legacy databases) stay adoptable.
+ * 5. With no adoption, the root is the Git root (new repository) or the
+ *    canonical start directory.
+ */
+export interface ProjectResolution {
+  /** Effective root: adopted `.chrono` dir, Git root, or canonical cwd. */
+  readonly root: string;
+  /** Innermost containing Git root (canonical), or null outside Git. */
+  readonly gitRoot: string | null;
+  /** Adopted `.chrono` directory (canonical), or null. */
+  readonly chronoRoot: string | null;
+}
+
+function canonicalDir(path: string): string | null {
   try {
-    current = realpathSync(resolve(startDir));
+    return realpathSync(resolve(path));
   } catch {
     return null;
   }
-  for (let depth = 0; depth < 64; depth++) {
+}
+
+function gitToplevel(canonicalStart: string): string | null {
+  try {
+    const raw = execFileSync("git", ["-C", canonicalStart, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      timeout: 15000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const root = realpathSync(String(raw).trim());
+    // Defensive: the reported root must actually contain the start dir.
+    return isWithinOrEqual(canonicalStart, root) ? root : null;
+  } catch {
+    // No git binary, not a repository, or unreadable: no git boundary.
+    return null;
+  }
+}
+
+function tempBoundaryDirs(): string[] {
+  const candidates = [tmpdir(), "/tmp", "/var/tmp"];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
     try {
-      if (existsSync(join(current, ".chrono", "chrono.db"))) {
-        return current;
-      }
+      seen.add(realpathSync(candidate));
     } catch {
-      return null;
+      // Absent temp dir: nothing to guard.
+    }
+  }
+  return [...seen];
+}
+
+function hasChronoDb(dir: string): boolean {
+  try {
+    return existsSync(join(dir, ".chrono", "chrono.db"));
+  } catch {
+    return false;
+  }
+}
+
+/** Stored project identity, or null when legacy/absent/unreadable. */
+function storedProjectRoot(candidateDir: string): string | null {
+  let db: ChronoDatabase | null = null;
+  try {
+    db = new ChronoDatabase({ path: join(candidateDir, ".chrono", "chrono.db"), readonly: true });
+    return db.runtimeConfig().get("project.root");
+  } catch {
+    return null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // Read-only probe failure is not fatal to resolution.
+    }
+  }
+}
+
+function isWithinOrEqual(dir: string, boundary: string): boolean {
+  return dir === boundary || dir.startsWith(boundary + sep);
+}
+
+export interface ResolveOptions {
+  /** Override shared-temp boundaries (tests only; production probes the host). */
+  readonly tempBoundaries?: readonly string[] | undefined;
+}
+
+export function resolveProject(startDir: string, options: ResolveOptions = {}): ProjectResolution {
+  const canonicalStart = canonicalDir(startDir);
+  if (canonicalStart === null) {
+    return { root: startDir, gitRoot: null, chronoRoot: null };
+  }
+  const gitRoot = gitToplevel(canonicalStart);
+  const tempBoundaries = gitRoot === null ? (options.tempBoundaries ?? tempBoundaryDirs()) : [];
+  let current = canonicalStart;
+  for (let depth = 0; depth < 64; depth++) {
+    if (gitRoot !== null && !isWithinOrEqual(current, gitRoot)) {
+      break;
+    }
+    if (gitRoot === null && current !== canonicalStart && tempBoundaries.includes(current)) {
+      break;
+    }
+    if (hasChronoDb(current)) {
+      const stored = storedProjectRoot(current);
+      if (stored !== null && stored !== current) {
+        // Foreign or relocated store: fail closed, adopt nothing.
+        return { root: gitRoot ?? canonicalStart, gitRoot, chronoRoot: null };
+      }
+      return { root: current, gitRoot, chronoRoot: current };
+    }
+    if (gitRoot !== null && current === gitRoot) {
+      break;
     }
     const parent = dirname(current);
     if (parent === current) {
-      return null;
+      break;
     }
     current = parent;
   }
-  return null;
+  return { root: gitRoot ?? canonicalStart, gitRoot, chronoRoot: null };
+}
+
+/** Walk up from `startDir` to the nearest adopted `.chrono` directory. */
+export function findProjectRoot(startDir: string, options: ResolveOptions = {}): string | null {
+  return resolveProject(startDir, options).chronoRoot;
 }
 
 /** Result of resolving the effective project directory for a command. */
 export function resolveProjectDir(cwd: string, explicitPath?: string): string {
   if (explicitPath !== undefined && explicitPath.length > 0) {
-    return explicitPath;
+    return canonicalDir(explicitPath) ?? explicitPath;
   }
-  return findProjectRoot(cwd) ?? cwd;
+  return resolveProject(cwd).root;
 }
 
 function notAProject(projectPath: string, asJson: boolean): CliOutput {

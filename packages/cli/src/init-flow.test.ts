@@ -16,6 +16,7 @@ import {
   writeFileSync,
   chmodSync,
   mkdirSync,
+  realpathSync,
   statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -442,8 +443,10 @@ describe("Init happy path and resume", () => {
 
   it("configures two runtimes with per-adapter sessions, proofs, and entry", async () => {
     const bins = makeBins(binDir);
-    const claudeBin = join(binDir, "claude");
-    writeFileSync(claudeBin, "#!/bin/sh\necho 'claude 9.9.9-test'\n", "utf8");
+    writeFileSync(join(binDir, "claude"), "#!/bin/sh\necho 'claude 9.9.9-test'\n", "utf8");
+    // Canonical spelling: setup executes (and compares) the registered
+    // canonical entrypoint.
+    const claudeBin = realpathSync(join(binDir, "claude"));
     chmodSync(claudeBin, 0o755);
     const probes = flowProbes(bins);
     const multi: FlowProbes = {

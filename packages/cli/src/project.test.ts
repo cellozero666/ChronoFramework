@@ -5,13 +5,25 @@
  * audited upgrade touch before read-only use resumes.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { ChronoCore } from "@chrono/core";
 import { ChronoDatabase } from "@chrono/persistence";
 import { runInit } from "./index.js";
-import { findProjectRoot, resolveProjectDir, openReadProject } from "./project.js";
+import { findProjectRoot, resolveProject, resolveProjectDir, openReadProject } from "./project.js";
+
+function gitInit(dir: string): void {
+  const ran = spawnSync("git", ["init", "-q"], { cwd: dir, encoding: "utf8" });
+  expect(ran.status).toBe(0);
+}
+
+function writeEmptyDb(dir: string): void {
+  mkdirSync(join(dir, ".chrono"), { recursive: true });
+  writeFileSync(join(dir, ".chrono", "chrono.db"), "", "utf8");
+}
 
 describe("Project root discovery", () => {
   let tempDir: string;
@@ -36,8 +48,8 @@ describe("Project root discovery", () => {
 
   it("returns null outside projects and honors explicit paths", () => {
     expect(findProjectRoot(tempDir)).toBe(null);
-    expect(resolveProjectDir(tempDir)).toBe(tempDir);
-    expect(resolveProjectDir(join(tempDir, "sub"), tempDir)).toBe(tempDir);
+    expect(resolveProjectDir(tempDir)).toBe(realpathSync(tempDir));
+    expect(resolveProjectDir(join(tempDir, "sub"), tempDir)).toBe(realpathSync(tempDir));
   });
 
   it("does not mistake sibling projects for parents", () => {
@@ -128,5 +140,162 @@ describe("Read-only project opening", () => {
       second.core.close();
     }
     expect(readFileSync(join(tempDir, "notes.txt"), "utf8")).toBe("keep me");
+  });
+});
+
+describe("Project isolation (git boundary, canonicalization)", () => {
+  // Adversarial coverage for the packed-CLI dry-run finding: an
+  // unrelated `.chrono` above (or beside, via /tmp) a fresh Git
+  // repository must never be adopted. Git root is the maximum upward
+  // boundary; canonical paths decide everything.
+  let outer: string;
+  const created: string[] = [];
+
+  beforeEach(() => {
+    outer = mkdtempSync(join(tmpdir(), "chrono-iso-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(outer, { recursive: true, force: true });
+    while (created.length > 0) {
+      rmSync(created.pop() as string, { recursive: true, force: true });
+    }
+  });
+
+  function track(path: string): string {
+    created.push(path);
+    return path;
+  }
+
+  it("never adopts .chrono above the git root", () => {
+    writeEmptyDb(outer);
+    const repo = join(outer, "fresh-repo");
+    mkdirSync(repo, { recursive: true });
+    gitInit(repo);
+    const nested = join(repo, "sub", "dir");
+    mkdirSync(nested, { recursive: true });
+    const canonicalRepo = realpathSync(repo);
+    expect(findProjectRoot(repo)).toBe(null);
+    expect(findProjectRoot(nested)).toBe(null);
+    expect(resolveProjectDir(repo)).toBe(canonicalRepo);
+    expect(resolveProjectDir(nested)).toBe(canonicalRepo);
+  });
+
+  it("preserves nested adoption inside non-git trees", () => {
+    expect(runInit(outer).exitCode).toBe(0);
+    const canonicalOuter = realpathSync(outer);
+    const nested = join(outer, "sub", "dir");
+    mkdirSync(nested, { recursive: true });
+    expect(findProjectRoot(nested)).toBe(canonicalOuter);
+    expect(resolveProjectDir(nested)).toBe(canonicalOuter);
+  });
+
+  it("adopts an existing .chrono at the git root from nested dirs", () => {
+    const repo = join(outer, "repo");
+    mkdirSync(repo, { recursive: true });
+    gitInit(repo);
+    expect(runInit(repo).exitCode).toBe(0);
+    const canonicalRepo = realpathSync(repo);
+    const nested = join(repo, "a", "b");
+    mkdirSync(nested, { recursive: true });
+    expect(findProjectRoot(nested)).toBe(canonicalRepo);
+    expect(resolveProjectDir(nested)).toBe(canonicalRepo);
+  });
+
+  it("keeps nested independent git repositories separate", () => {
+    expect(runInit(outer).exitCode).toBe(0);
+    gitInit(outer);
+    const inner = join(outer, "inner");
+    mkdirSync(inner, { recursive: true });
+    gitInit(inner);
+    const canonicalInner = realpathSync(inner);
+    expect(findProjectRoot(inner)).toBe(null);
+    expect(resolveProjectDir(inner)).toBe(canonicalInner);
+  });
+
+  it("canonicalizes symlinked project paths consistently", () => {
+    expect(runInit(outer).exitCode).toBe(0);
+    const canonicalOuter = realpathSync(outer);
+    const link = track(join(tmpdir(), `chrono-iso-link-${process.pid}`));
+    symlinkSync(outer, link);
+    const nested = join(link, "sub");
+    mkdirSync(nested, { recursive: true });
+    // Through the symlink, above it, and at the target: one identity.
+    expect(findProjectRoot(link)).toBe(canonicalOuter);
+    expect(findProjectRoot(nested)).toBe(canonicalOuter);
+    expect(resolveProjectDir(nested)).toBe(canonicalOuter);
+  });
+
+  it("never adopts temp-ancestor state in non-git trees", () => {
+    // Deterministic mechanism test: the sandbox root carries an
+    // unrelated `.chrono` and is declared a shared-temp boundary, so
+    // the child project must not inherit it.
+    writeEmptyDb(outer);
+    const child = join(outer, "child");
+    mkdirSync(child, { recursive: true });
+    const boundaries = [realpathSync(outer)] as const;
+    expect(findProjectRoot(child, { tempBoundaries: boundaries })).toBe(null);
+    expect(resolveProject(child, { tempBoundaries: boundaries }).root).toBe(realpathSync(child));
+    // Without the boundary declaration the nested project adopts
+    // normally (non-git nested invocation keeps working).
+    expect(findProjectRoot(child)).toBe(realpathSync(outer));
+  });
+
+  it("modifies no files outside the selected repository", () => {
+    // Resolution is pure: parent stores keep byte-identical content
+    // and mtimes across repeated resolution from nested probes.
+    writeEmptyDb(outer);
+    const repo = join(outer, "repo");
+    mkdirSync(repo, { recursive: true });
+    gitInit(repo);
+    const nested = join(repo, "sub");
+    mkdirSync(nested, { recursive: true });
+    const dbPath = join(outer, ".chrono", "chrono.db");
+    const before = readFileSync(dbPath);
+    const mtimeBefore = statSync(dbPath).mtimeMs;
+    for (let i = 0; i < 3; i++) {
+      expect(findProjectRoot(nested)).toBe(null);
+      expect(resolveProjectDir(nested)).toBe(realpathSync(repo));
+    }
+    expect(readFileSync(dbPath)).toEqual(before);
+    expect(statSync(dbPath).mtimeMs).toBe(mtimeBefore);
+  });
+
+  it("reproduces the packed-CLI dry-run finding under the shared temp root", () => {
+    // Best-effort host repro of the reported bug: a fresh Git
+    // repository directly under /tmp must never adopt an unrelated
+    // /private/tmp/.chrono, whether or not one exists on the host.
+    // Never creates or modifies /tmp/.chrono itself.
+    const probe = track(mkdtempSync("/tmp/chrono-dryrun-repro-"));
+    gitInit(probe);
+    const canonicalProbe = realpathSync(probe);
+    expect(canonicalProbe.startsWith(realpathSync("/tmp"))).toBe(true);
+    expect(findProjectRoot(probe)).toBe(null);
+    expect(resolveProjectDir(probe)).toBe(canonicalProbe);
+  });
+
+  it("rejects adoption on stored-identity mismatch, allows legacy rows", () => {
+    expect(runInit(outer).exitCode).toBe(0);
+    const canonicalOuter = realpathSync(outer);
+    const nested = join(outer, "sub");
+    mkdirSync(nested, { recursive: true });
+    expect(findProjectRoot(nested)).toBe(canonicalOuter);
+    // Tamper the stored identity: adoption must fail closed.
+    const raw = new ChronoDatabase({ path: join(outer, ".chrono", "chrono.db") });
+    try {
+      raw.migrate();
+      raw.runtimeConfig().set("project.root", join(outer, "elsewhere"));
+    } finally {
+      raw.close();
+    }
+    expect(findProjectRoot(nested)).toBe(null);
+    // Legacy rows without a recorded identity stay adoptable.
+    const direct = new Database(join(outer, ".chrono", "chrono.db"));
+    try {
+      direct.prepare("DELETE FROM runtime_config WHERE key = ?").run("project.root");
+    } finally {
+      direct.close();
+    }
+    expect(findProjectRoot(nested)).toBe(canonicalOuter);
   });
 });

@@ -9,7 +9,7 @@
 import { Command } from "commander";
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, accessSync, constants, openSync, readSync, writeSync, closeSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync, accessSync, constants, openSync, readSync, writeSync, closeSync, existsSync } from "node:fs";
 import { get } from "node:https";
 import { dirname, join, delimiter as pathDelimiter } from "node:path";
 import { ChronoCore } from "@chrono/core";
@@ -32,7 +32,8 @@ import { constructionFailure, openReadProject, resolveProjectDir } from "./proje
 export { buildOpencodePlugin };
 export { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook, mergeClaudeHookGroup, mergeClaudeSettings };
 export { KIRO_HOOK_REGISTRATION_RELATIVE_PATH, KIRO_HOOK_RELATIVE_PATH, buildKiroHook, buildKiroHookRegistration };
-export { findProjectRoot, resolveProjectDir, openReadProject, constructionFailure } from "./project.js";
+export { findProjectRoot, resolveProject, resolveProjectDir, openReadProject, constructionFailure } from "./project.js";
+export type { ProjectResolution } from "./project.js";
 import {
   MemoryKeyStore,
   OsKeychainStore,
@@ -1899,7 +1900,13 @@ export function runDispatch(
       const message = e instanceof Error ? e.message : "Adapter rejected for dispatch";
       return coreError({ code, severity: "BLOCKER", message }, asJson);
     }
-    if (options.command[0] !== adapter.entrypoint) {
+    let commandHead: string;
+    try {
+      commandHead = realpathSync(options.command[0] as string);
+    } catch {
+      commandHead = options.command[0] as string;
+    }
+    if (commandHead !== adapter.entrypoint) {
       return fail(2, "VALIDATION_ERROR", `run command must start with the registered entrypoint '${adapter.entrypoint}': grants cannot smuggle another binary`);
     }
     const target = options.wp ?? options.module;

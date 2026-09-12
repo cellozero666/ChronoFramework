@@ -113,6 +113,58 @@ transition.
 This is shared Core hardening and must close before the OpenCode pilot because
 the pilot relies on the authoritative RTK proof to permit mutations.
 
+## Finding OC-P3 — Project root escapes the Git repository
+
+A real packed-CLI dry run found a blocking project-isolation bug:
+with cwd `/tmp/chrono-opencode-project.bF0FCv` (a fresh Git repository
+without `.chrono`) and an unrelated `/private/tmp/.chrono` present,
+`chrono init --runtime opencode --dry-run` reported project
+`/private/tmp`. Root cause: `findProjectRoot` walked to the filesystem
+root with no repository boundary, and `/tmp` vs `/private/tmp`
+spellings were never canonicalized before comparison.
+
+### Required correction (shipped same session)
+
+One canonical resolver used by every command, with Git root as the
+maximum upward boundary, nearest-`.chrono` adoption only at or below
+it, shared-temp ancestors never adopted from or traversed, full
+`realpath` canonicalization (explicit `--path` included), stored
+project identity (`runtime_config.project.root`, recorded at init)
+verified on adoption with fail-closed rejection on mismatch (legacy
+rows without it stay adoptable), and the same boundary rules ported to
+the POSIX entry script and all three generated gate scripts (stored
+identity needs SQLite and stays CLI/Core-side, documented). Canonical
+binary/entrypoint identity was hardened alongside (attestation, proof,
+and registration compare canonical spellings; `chrono run` accepts the
+same binary under any equivalent spelling).
+
+### Evidence
+
+Adversarial suites: `project.test.ts` isolation describe (git
+boundary, nested/non-git adoption preserved, nested independent repos,
+symlinks, temp-ancestor skip, stored mismatch vs legacy, no-modification
+purity, exact host repro under `/tmp`); `runtime-hooks.test.ts`
+isolation describe (both gate scripts, same four cases);
+`setup-cli.test.ts` OpenCode root parity; `kiro-capability.test.ts`
+entry-script behavioral cases (skip/boundary/adopt/temp/missing
+broker); canonical-spelling fixes covered by existing suites with no
+test-logic changes. Live proof below: the exact disposable-project dry
+run with the newly packed CLI while `/private/tmp/.chrono` still
+exists, selecting `/private/tmp/chrono-opencode-project.<suffix>`.
+
+Live repro proof (2026-09-12, newly packed `@chrono/* 0.1.0`
+tarballs, isolated install, `/private/tmp/.chrono` present and
+untouched, cwd `/tmp/chrono-opencode-project.bF0FCv` — a bare Git
+repository without `.chrono`):
+
+- `chrono init --runtime opencode --dry-run` → exit 0, reports
+  `project: /private/tmp/chrono-opencode-project.bF0FCv (new
+  repository)` (previously: `/private/tmp`);
+- `--json` form reports the same canonical project with zero conflicts;
+- probe directory afterwards contains only `.git/` (zero writes);
+- the unrelated `/private/tmp/.chrono` was never modified, and was
+  not deleted to make the test pass.
+
 ## OpenCode pilot entry criteria
 
 The real test may start only when:

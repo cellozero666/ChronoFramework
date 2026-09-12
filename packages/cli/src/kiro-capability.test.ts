@@ -341,3 +341,104 @@ describe("Kiro init gating and doctor", () => {
     expect(parsed.error.message).toContain("3.0+");
   });
 });
+
+describe("Entry script project resolution (behavioral)", () => {
+  // Executes the generated POSIX script for real with stub-free
+  // environment behavior: git is real, keychain tools yield nothing,
+  // and `chrono` is never reached (no secret is ever available).
+  // Asserts the same boundary contract as the CLI resolver.
+  let tempDir: string;
+  let scriptPath: string;
+  const created: string[] = [];
+
+  function gitInit(dir: string): void {
+    const ran = spawnSync("git", ["init", "-q"], { cwd: dir, encoding: "utf8" });
+    expect(ran.status).toBe(0);
+  }
+
+  function writeDb(dir: string): void {
+    mkdirSync(join(dir, ".chrono"), { recursive: true });
+    writeFileSync(join(dir, ".chrono", "chrono.db"), "", "utf8");
+  }
+
+  function runScript(cwd: string): { status: number | null; stderr: string } {
+    const ran = spawnSync("sh", [scriptPath, "opencode"], { cwd, encoding: "utf8" });
+    return { status: ran.status, stderr: String(ran.stderr ?? "") };
+  }
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-entry-sh-test-"));
+    scriptPath = join(tempDir, "chrono-entry-session.sh");
+    writeFileSync(scriptPath, buildEntrySessionScript(), "utf8");
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+    while (created.length > 0) {
+      rmSync(created.pop() as string, { recursive: true, force: true });
+    }
+  });
+
+  it("skips silently with nothing to govern", () => {
+    const plain = mkdtempSync(join(tmpdir(), "chrono-entry-plain-"));
+    created.push(plain);
+    const out = runScript(plain);
+    expect(out.status).toBe(0);
+    expect(out.stderr).toContain("entry skipped");
+  });
+
+  it("stops at the git boundary above an unrelated project", () => {
+    const parent = mkdtempSync(join(tmpdir(), "chrono-entry-parent-"));
+    created.push(parent);
+    writeDb(parent);
+    const repo = join(parent, "repo");
+    mkdirSync(repo, { recursive: true });
+    gitInit(repo);
+    const out = runScript(repo);
+    expect(out.status).toBe(0);
+    expect(out.stderr).toContain("entry skipped");
+  });
+
+  it("adopts the git-root project from nested directories", () => {
+    const repo = mkdtempSync(join(tmpdir(), "chrono-entry-repo-"));
+    created.push(repo);
+    gitInit(repo);
+    writeDb(repo);
+    writeFileSync(join(repo, ".chrono", "broker-account"), "acct\nBRK-0001\n", "utf8");
+    const nested = join(repo, "sub", "dir");
+    mkdirSync(nested, { recursive: true });
+    const out = runScript(nested);
+    // Adopted (past root resolution into the broker step), then
+    // fail-loud on the unavailable keychain secret — never silent.
+    expect(out.status).toBe(3);
+    expect(out.stderr).toContain("secret unavailable");
+  });
+
+  it("adopts nested non-git projects and skips shared temp ancestors", () => {
+    const proj = mkdtempSync(join(tmpdir(), "chrono-entry-proj-"));
+    created.push(proj);
+    writeDb(proj);
+    writeFileSync(join(proj, ".chrono", "broker-account"), "acct\nBRK-0001\n", "utf8");
+    const nested = join(proj, "sub");
+    mkdirSync(nested, { recursive: true });
+    const nestedOut = runScript(nested);
+    expect(nestedOut.status).toBe(3);
+    expect(nestedOut.stderr).toContain("secret unavailable");
+    const probe = mkdtempSync("/tmp/chrono-entry-tmp-");
+    created.push(probe);
+    const probeOut = runScript(probe);
+    expect(probeOut.status).toBe(0);
+    expect(probeOut.stderr).toContain("entry skipped");
+  });
+
+  it("fails closed on a missing broker account", () => {
+    const repo = mkdtempSync(join(tmpdir(), "chrono-entry-nobroker-"));
+    created.push(repo);
+    gitInit(repo);
+    writeDb(repo);
+    const out = runScript(repo);
+    expect(out.status).toBe(3);
+    expect(out.stderr).toContain("ENTRY BLOCKED");
+    expect(out.stderr).toContain("not prepared");
+  });
+});

@@ -135,3 +135,91 @@ describe.each([
     expect(out.stderr).toContain("unreachable");
   });
 });
+
+describe.each([
+  { runtime: "claude", build: buildClaudeHook, filename: "chrono-claude-gate.js" },
+  { runtime: "kiro", build: buildKiroHook, filename: "chrono-kiro-gate.js" },
+])("$runtime hook project isolation (same root as CLI)", ({ build, filename }) => {
+  // The generated gate scripts resolve the project with the same
+  // bounded rules as the CLI: Git root is the maximum upward boundary,
+  // shared temp ancestors are never adopted. Unknown tools deny only
+  // inside an adopted project; outside, hooks pass through silently.
+  let outer: string;
+  const created: string[] = [];
+
+  function gitInit(dir: string): void {
+    const ran = spawnSync("git", ["init", "-q"], { cwd: dir, encoding: "utf8" });
+    expect(ran.status).toBe(0);
+  }
+
+  function writeHook(dir: string): string {
+    const hookPath = join(dir, filename);
+    writeFileSync(hookPath, build(), "utf8");
+    return hookPath;
+  }
+
+  function writeEmptyDb(dir: string): void {
+    mkdirSync(join(dir, ".chrono"), { recursive: true });
+    writeFileSync(join(dir, ".chrono", "chrono.db"), "", "utf8");
+  }
+
+  beforeEach(() => {
+    outer = mkdtempSync(join(tmpdir(), "chrono-hookiso-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(outer, { recursive: true, force: true });
+    while (created.length > 0) {
+      rmSync(created.pop() as string, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores .chrono above the git root", () => {
+    writeEmptyDb(outer);
+    const repo = join(outer, "repo");
+    mkdirSync(repo, { recursive: true });
+    gitInit(repo);
+    const hookPath = writeHook(repo);
+    const out = runHook(hookPath, repo, "mcp__future_tool", {});
+    expect(out.status).toBe(0);
+    expect(out.stderr).not.toContain("TOOL_DENIED");
+  });
+
+  it("enforces inside the adopted git-root project", () => {
+    const repo = join(outer, "repo");
+    mkdirSync(repo, { recursive: true });
+    gitInit(repo);
+    writeEmptyDb(repo);
+    const hookPath = writeHook(repo);
+    const nested = join(repo, "sub");
+    mkdirSync(nested, { recursive: true });
+    const out = runHook(hookPath, nested, "mcp__future_tool", {});
+    expect(out.status).toBe(2);
+    expect(out.stderr).toContain("TOOL_DENIED");
+  });
+
+  it("keeps nested independent git repositories separate", () => {
+    writeEmptyDb(outer);
+    gitInit(outer);
+    const inner = join(outer, "inner");
+    mkdirSync(inner, { recursive: true });
+    gitInit(inner);
+    const hookPath = writeHook(inner);
+    const out = runHook(hookPath, inner, "mcp__future_tool", {});
+    expect(out.status).toBe(0);
+    expect(out.stderr).not.toContain("TOOL_DENIED");
+  });
+
+  it("never adopts temp-ancestor state", () => {
+    // A bare directory directly under the shared temp root must not
+    // inherit an unrelated temp-root `.chrono` (read-only against the
+    // host: nothing is created or modified above the probe dir).
+    // A `.chrono` in a proper parent project still nests normally.
+    const probe = mkdtempSync("/tmp/chrono-hookiso-tmp-");
+    created.push(probe);
+    const hookPath = writeHook(probe);
+    const out = runHook(hookPath, probe, "mcp__future_tool", {});
+    expect(out.status).toBe(0);
+    expect(out.stderr).not.toContain("TOOL_DENIED");
+  });
+});

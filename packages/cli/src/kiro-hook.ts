@@ -118,11 +118,103 @@ export function buildKiroHook(): string {
  *   \`chrono gate execution\` AUTHORIZED verdict; unknown tools deny.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { dirname, join, sep } from "node:path";
 
 const READ_TOOLS = new Set(${JSON.stringify(KIRO_READ_TOOLS)});
 const MUTATE_TOOLS = new Set(${JSON.stringify(KIRO_MUTATE_TOOLS)});
+
+// Canonical project resolution (same contract as the CLI resolver in
+// packages/cli/src/project.ts): canonicalize once; the innermost Git
+// root is the maximum upward boundary; outside Git, shared temporary
+// directories are never adopted from and never traversed. Cached per
+// process (bounded) because this script runs per tool call.
+// Stored-identity verification needs SQLite and lives in the CLI/Core;
+// this script enforces the boundary rules. Deliberately uncached: a
+// project initialized after load must be enforced immediately.
+function canonicalDir(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return null;
+  }
+}
+function tempBoundaryDirs() {
+  const out = [];
+  const seen = new Set();
+  const candidates = [
+    process.env["TMPDIR"] ?? null,
+    process.env["TMP"] ?? null,
+    process.env["TEMP"] ?? null,
+    "/tmp",
+    "/private/tmp",
+    "/var/tmp",
+  ];
+  for (const candidate of candidates) {
+    if (candidate === null || candidate.length === 0) {
+      continue;
+    }
+    try {
+      const canonical = realpathSync(candidate);
+      if (!seen.has(canonical)) {
+        seen.add(canonical);
+        out.push(canonical);
+      }
+    } catch {
+      // Absent temp dir: nothing to guard.
+    }
+  }
+  return out;
+}
+function gitRootOf(canonicalStart) {
+  try {
+    const raw = execFileSync("git", ["-C", canonicalStart, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      timeout: 15000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return realpathSync(String(raw).trim());
+  } catch {
+    return null;
+  }
+}
+function findChronoRootUncached(canonicalStart) {
+  const gitRoot = gitRootOf(canonicalStart);
+  const withinOrEqual = (dir, boundary) => dir === boundary || dir.startsWith(boundary + sep);
+  const tempBoundaries = gitRoot === null ? tempBoundaryDirs() : [];
+  let current = canonicalStart;
+  for (let depth = 0; depth < 64; depth++) {
+    if (gitRoot !== null && !withinOrEqual(current, gitRoot)) {
+      return null;
+    }
+    if (gitRoot === null && current !== canonicalStart && tempBoundaries.includes(current)) {
+      return null;
+    }
+    try {
+      if (existsSync(join(current, ".chrono", "chrono.db"))) {
+        return current;
+      }
+    } catch {
+      return null;
+    }
+    if (gitRoot !== null && current === gitRoot) {
+      return null;
+    }
+    const parent = dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+  return null;
+}
+function resolveChronoRoot(startDir) {
+  const canonicalStart = canonicalDir(startDir || process.cwd());
+  if (canonicalStart === null) {
+    return null;
+  }
+  return findChronoRootUncached(canonicalStart);
+}
 function readEnv(name) {
   const value = process.env[name];
   return value === undefined || value === "" ? null : value;
@@ -148,8 +240,8 @@ function readStdin() {
 }
 
 async function main() {
-  const root = process.cwd();
-  if (!existsSync(join(root, ".chrono", "chrono.db"))) {
+  const root = resolveChronoRoot(process.cwd());
+  if (root === null) {
     process.exit(0);
   }
   const raw = await readStdin();

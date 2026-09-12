@@ -83,8 +83,8 @@ export function buildOpencodePlugin(): string {
  *   projection travels on stdout into this plugin.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, readdirSync, statSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
+import { dirname, join, sep } from "node:path";
 
 const READ_TOOLS = new Set(${JSON.stringify(READ_TOOLS)});
 const MUTATE_TOOLS = new Set(${JSON.stringify(MUTATE_TOOLS)});
@@ -110,15 +110,76 @@ function tmpDir() {
 }
 
 function chronoProjectRoot(directory) {
-  const root = directory || process.cwd();
-  try {
-    if (existsSync(join(root, ".chrono", "chrono.db"))) {
-      return root;
+  // Canonical project resolution (same contract as the CLI resolver in
+  // packages/cli/src/project.ts): canonicalize once; the innermost Git
+  // root is the maximum upward boundary; outside Git, shared temporary
+  // directories are never adopted from and never traversed.
+  // Deliberately uncached: a project initialized after plugin load must
+  // be enforced immediately, never served a stale pass-through.
+  const canonical = (path) => {
+    try {
+      return realpathSync(path);
+    } catch {
+      return null;
     }
-  } catch {
+  };
+  const canonicalStart = canonical(directory || process.cwd());
+  if (canonicalStart === null) {
     return null;
   }
-  return null;
+  let gitRoot = null;
+  try {
+    const raw = execFileSync("git", ["-C", canonicalStart, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      timeout: 15000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    gitRoot = realpathSync(String(raw).trim());
+  } catch {
+    gitRoot = null;
+  }
+  const withinOrEqual = (dir, boundary) => dir === boundary || dir.startsWith(boundary + sep);
+  const tempCandidates = [tmpDir(), "/tmp", "/private/tmp", "/var/tmp"];
+  const tempBoundaries = [];
+  if (gitRoot === null) {
+    const seen = new Set();
+    for (const candidate of tempCandidates) {
+      const resolved = canonical(candidate);
+      if (resolved !== null && !seen.has(resolved)) {
+        seen.add(resolved);
+        tempBoundaries.push(resolved);
+      }
+    }
+  }
+  let resolved = null;
+  let current = canonicalStart;
+  for (let depth = 0; depth < 64; depth++) {
+    if (gitRoot !== null && !withinOrEqual(current, gitRoot)) {
+      break;
+    }
+    if (gitRoot === null && current !== canonicalStart && tempBoundaries.includes(current)) {
+      break;
+    }
+    let hasDb = false;
+    try {
+      hasDb = existsSync(join(current, ".chrono", "chrono.db"));
+    } catch {
+      break;
+    }
+    if (hasDb) {
+      resolved = current;
+      break;
+    }
+    if (gitRoot !== null && current === gitRoot) {
+      break;
+    }
+    const parent = dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  return resolved;
 }
 
 function openCodeSessionId(value) {

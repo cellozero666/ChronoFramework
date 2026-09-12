@@ -120,10 +120,59 @@ export function buildEntrySessionScript(): string {
 set -eu
 ADAPTER="\${1:?adapter id required}"
 CHRONO_BIN="\${CHRONO_BIN:-chrono}"
+# Canonical project resolution (same contract as the CLI resolver in
+# packages/cli/src/project.ts, adapted to POSIX sh):
+#  1. canonicalize with physical pwd (-P): /tmp vs /private/tmp,
+#     symlinks, and \`..\` collapse to one identity;
+#  2. the innermost containing Git root is the maximum upward boundary
+#     (a .chrono above it is never adopted);
+#  3. outside Git, shared temporary directories are never adopted from
+#     and never traversed (an unrelated /tmp/.chrono must not capture
+#     /tmp siblings); the start directory itself is always eligible.
+# Stored-identity verification needs SQLite and lives in the CLI/Core;
+# this script enforces the boundary rules, \`chrono entry\` enforces the
+# rest. Any failure exits nonzero (fail-loud, never ungoverned).
+canon_dir() {
+  if D="$1"; then :; else return 1; fi
+  if [ -d "$D" ] && C="$(cd "$D" 2>/dev/null && pwd -P 2>/dev/null)"; then
+    printf '%s' "$C"
+    return 0
+  fi
+  return 1
+}
+CWD="$(canon_dir "$(pwd)")" || CWD="$(pwd)"
+GITROOT=""
+if command -v git >/dev/null 2>&1; then
+  if G="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)"; then
+    GITROOT="$(canon_dir "$G" 2>/dev/null || true)"
+    case "$CWD" in
+      "$GITROOT"|"$GITROOT"/*) : ;;
+      *) GITROOT="" ;;
+    esac
+  fi
+fi
+TMP1="$(canon_dir "\${TMPDIR:-/tmp}" 2>/dev/null || true)"
+is_temp_boundary() {
+  [ -n "$1" ] && { [ "$1" = "$TMP1" ] || [ "$1" = "/tmp" ] || [ "$1" = "/private/tmp" ] || [ "$1" = "/var/tmp" ]; }
+}
 ROOT=""
-D="$(pwd)"
-while [ "$D" != "/" ]; do
+D="$CWD"
+while [ -n "$D" ] && [ "$D" != "/" ]; do
+  # Boundaries first (ancestors only; the start directory itself is
+  # always eligible): never above the Git root, never into or past a
+  # shared temporary directory outside Git.
+  if [ "$D" != "$CWD" ]; then
+    if [ -n "$GITROOT" ]; then
+      case "$D" in
+        "$GITROOT"|"$GITROOT"/*) : ;;
+        *) break ;;
+      esac
+    elif is_temp_boundary "$D"; then
+      break
+    fi
+  fi
   if [ -f "$D/.chrono/chrono.db" ]; then ROOT="$D"; break; fi
+  if [ -n "$GITROOT" ] && [ "$D" = "$GITROOT" ]; then break; fi
   D="$(dirname "$D")"
 done
 if [ -z "$ROOT" ]; then

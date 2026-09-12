@@ -5,7 +5,7 @@
  */
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { accessSync, constants as fsConstants, readFileSync } from "node:fs";
+import { accessSync, constants as fsConstants, readFileSync, realpathSync } from "node:fs";
 import { join as joinPath } from "node:path";
 import {
   ChronoDatabase,
@@ -240,9 +240,19 @@ export class ChronoCore {
   private readonly config: CoreConfig;
 
   constructor(config: CoreConfig) {
-    this.config = config;
+    // Canonicalize once: symlinked checkouts (/tmp vs /private/tmp),
+    // `..` segments, and relative paths collapse to one identity so
+    // every command, hook, and stored record agrees on the project.
+    // Nonexistent paths (init targets) are kept as given.
+    let projectPath = config.projectPath;
+    try {
+      projectPath = realpathSync(projectPath);
+    } catch {
+      // Not yet on disk: resolution and init handle creation.
+    }
+    this.config = { ...config, projectPath };
     this.db = new ChronoDatabase({
-      path: `${config.projectPath}/.chrono/chrono.db`,
+      path: `${projectPath}/.chrono/chrono.db`,
       ...(config.readOnly === true ? { readonly: true } : {}),
     });
     if (config.readOnly !== true) {
@@ -277,6 +287,21 @@ export class ChronoCore {
   /** Current timestamp from the configured clock (wall-clock unless tests inject one). */
   private now(): string {
     return this.config.clock?.() ?? new Date().toISOString();
+  }
+
+  /**
+   * Canonical filesystem identity for stored-compared paths (contract 5:
+   * macOS `/tmp` vs `/private/tmp`, symlinked checkouts, `..`
+   * segments). Falls back to the given spelling when the path does not
+   * exist yet. All persisted binary/entrypoint paths use this form so
+   * equivalent spellings compare equal.
+   */
+  private canonicalPath(path: string): string {
+    try {
+      return realpathSync(path);
+    } catch {
+      return path;
+    }
   }
 
   /**
@@ -366,6 +391,11 @@ export class ChronoCore {
 
       const projectId = "default";
       this.projects.create(projectId, language, gasparAutonomy, this.config.runtime ?? null);
+
+      // Record the canonical project identity resolvers verify on
+      // adoption: a relocated or foreign store is rejected instead of
+      // silently inherited [OPENCODE-PILOT-GATE.md project isolation].
+      this.db.runtimeConfig().set("project.root", this.config.projectPath);
 
       this.events.append({
         eventType: "ProjectInitialized",
@@ -2738,7 +2768,7 @@ export class ChronoCore {
       const created = this.db.adapters().create({
         id: input.id,
         name: input.name,
-        entrypoint: input.entrypoint,
+        entrypoint: this.canonicalPath(input.entrypoint),
         gateHook: input.gateHook ?? null,
         dispatchProof: input.dispatchProof ?? null,
         rtkRouting: input.rtkRouting ?? null,
@@ -4872,7 +4902,7 @@ export class ChronoCore {
       const validUntil = new Date(Date.parse(this.now()) + input.ttlSeconds * 1000).toISOString();
       this.db.rtkAttestations().create({
         id,
-        binaryPath: input.binaryPath,
+        binaryPath: this.canonicalPath(input.binaryPath),
         binaryIdentity: input.binaryIdentity,
         version: input.version,
         provenance: input.provenance,
@@ -4969,7 +4999,7 @@ export class ChronoCore {
         });
       }
       const detail = this.db.rtkAttestations().latestFull();
-      if (detail === null || input.version !== detail.version || input.binaryPath !== detail.binaryPath) {
+      if (detail === null || input.version !== detail.version || this.canonicalPath(input.binaryPath) !== detail.binaryPath) {
         throw new ChronoError({
           code: ErrorCode.RTK_ROUTING_FAILURE,
           severity: Severity.BLOCKER,
@@ -5060,7 +5090,7 @@ export class ChronoCore {
         sessionId: session.id,
         projectId: "default",
         rtkAttestationId: attestation.id,
-        binaryPath: input.binaryPath,
+        binaryPath: this.canonicalPath(input.binaryPath),
         binaryHash,
         version: input.version,
         proofCommand: input.proofCommand,

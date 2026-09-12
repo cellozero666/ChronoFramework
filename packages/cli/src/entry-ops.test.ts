@@ -9,6 +9,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -511,7 +512,9 @@ describe("Kiro entry (hermetic contract, real runtime open)", () => {
     const entrypoint = join(tempDir, "fixture-kiro.sh");
     writeFileSync(entrypoint, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'fixture-kiro 1.0'; else echo fixture-kiro-ok; fi\n", "utf8");
     chmodSync(entrypoint, 0o755);
-    return entrypoint;
+    // Canonical spelling: setup executes (and compares) the registered
+    // canonical entrypoint.
+    return realpathSync(entrypoint);
   }
 
   function approveKiroAdapter(store: MemoryKeyStore, entrypoint: string): void {

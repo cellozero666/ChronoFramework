@@ -574,6 +574,32 @@ describe("OpenCode automatic Gaspar entry (fail-closed, OC-P1)", () => {
     await transform({ sessionID: "s9" }, output);
     expect(output.system).toHaveLength(1);
   });
+
+  it("resolves the same project root as the CLI (git boundary)", async () => {
+    const git = (dir: string): void => {
+      const ran = spawnSync("git", ["init", "-q"], { cwd: dir, encoding: "utf8" });
+      expect(ran.status).toBe(0);
+    };
+    const parent = mkdtempSync(join(tmpdir(), "chrono-oc-iso-"));
+    try {
+      // Unrelated .chrono above a fresh git repo: no adoption, tools
+      // pass through silently.
+      mkdirSync(join(parent, ".chrono"), { recursive: true });
+      writeFileSync(join(parent, ".chrono", "chrono.db"), "", "utf8");
+      const repo = join(parent, "repo");
+      mkdirSync(repo, { recursive: true });
+      git(repo);
+      const { before } = await fullHooks(repo);
+      await expect(before({ tool: "read" })).resolves.toBeUndefined();
+      // Own .chrono at the git root: adopted, entry mandatory.
+      mkdirSync(join(repo, ".chrono"), { recursive: true });
+      writeFileSync(join(repo, ".chrono", "chrono.db"), "", "utf8");
+      const adopted = await fullHooks(repo);
+      await expect(adopted.before({ tool: "read" })).rejects.toThrow(/ENTRY_BLOCKED/);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("CLI setup", () => {
