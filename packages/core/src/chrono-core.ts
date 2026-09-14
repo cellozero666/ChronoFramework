@@ -8219,7 +8219,7 @@ export class ChronoCore {
       ceremony: { key: string; sessionId: string; requestId: string };
     },
     auth: CallerAuth
-  ): CoreResult<{ approvalId: string; duplicate: boolean; aliased: boolean }> {
+  ): CoreResult<{ approvalId: string; duplicate: boolean; aliased: boolean; superseded: string | null }> {
     try {
       const caller = this.requireCapability("approval.finalize", this.resolveCaller(auth, "finalize approval ticket"));
       void caller;
@@ -8269,7 +8269,7 @@ export class ChronoCore {
       // recorded, so this path can never authorize anything new.
       const prior = this.db.ceremonyClaims().findByKey(ceremony.key);
       if (prior !== null && prior.approvalId !== null) {
-        return { ok: true, value: { approvalId: prior.approvalId, duplicate: true, aliased: false } };
+        return { ok: true, value: { approvalId: prior.approvalId, duplicate: true, aliased: false, superseded: null } };
       }
       if (ticket.consumed) {
         throw new ChronoError({
@@ -8340,18 +8340,25 @@ export class ChronoCore {
           suggestedAction: "Finalize only from the bound native ceremony for this exact ticket",
         });
       }
-      // Atomic exactly-once finalize: claim, consume, record, and
-      // audit commit together, or none of them does. A losing
-      // concurrent duplicate collides on the claim inside this same
-      // transaction and returns the winner without touching the
-      // ticket. Invalid provenance (bad signature) never reaches
-      // here: verification above throws before any state change, so
-      // the ticket stays live and retryable.
+      // Atomic exactly-once finalize: supersede-or-alias, claim,
+      // consume, record, validation, and audit commit together, or
+      // none of them does. A losing concurrent duplicate collides on
+      // the claim inside this same transaction and returns the winner
+      // without touching the ticket. Invalid provenance (bad
+      // signature) never reaches here: verification above throws
+      // before any state change, so the ticket stays live and
+      // retryable.
       const outcome = this.db.transaction(() => {
         const existing = this.approvals.findByScope(ticket.scopeArtifactId, ticket.scopeRevision, ticket.action);
         let approvalId: string;
         let aliased: boolean;
-        if (existing !== null && !existing.revoked) {
+        let superseded: string | null;
+        if (existing !== null && !existing.revoked && this.approvalCeremonyAuthoritative(existing.id)) {
+          // Alias ONLY an already-authoritative row (TICKET-0025
+          // repair): reuse is permitted solely when that exact
+          // approval is authoritative under the current policy and
+          // ceremony marker. Classic marker-less grants are
+          // authoritative by provenance and alias here unchanged.
           // Fan-out guard (TICKET-0024 repair): the same native
           // observation must never authorize two tickets against one
           // row. One question naming several tickets (old
@@ -8391,12 +8398,40 @@ export class ChronoCore {
             }
           }
           // Genuinely separate ceremony aliasing one pre-existing
-          // row (the schema keeps one row per scope/revision/
-          // action): no second row, no reused-pointer ambiguity —
-          // the per-ticket grant event below keeps the audit exact.
+          // AUTHORITATIVE row: no second row, no reused-pointer
+          // ambiguity — the per-ticket grant event below keeps the
+          // audit exact.
           approvalId = existing.id;
           aliased = true;
+          superseded = null;
         } else {
+          // Supersede path (TICKET-0025 repair): the active row is
+          // missing, revoked, or NON-AUTHORITATIVE (vulnerable,
+          // fan-out-derived, obsolete provenance). A new valid v2
+          // ceremony must never return that historical approval, so
+          // the old row is revoked append-only (history preserved)
+          // and a fresh monotonic id is allocated. The v17 partial
+          // unique index (active rows only) makes this possible;
+          // without it the old UNIQUE forced the invalid alias.
+          if (existing !== null && !existing.revoked) {
+            superseded = existing.id;
+            this.approvals.revoke(existing.id);
+            this.events.append({
+              eventType: "ApprovalRevoked",
+              entityId: existing.id,
+              payload: {
+                reason: "superseded by a new valid v2 ceremony: the historical approval is non-authoritative and must never be returned for a new ticket",
+                supersededByTicket: ticket.id,
+                ceremonyKey: ceremony.key,
+              },
+              actor: "PO",
+              priorState: "granted",
+              newState: "revoked",
+              reasoning: "Exactly-once repair: new ceremonies mint new approvals instead of aliasing invalid history",
+            });
+          } else {
+            superseded = null;
+          }
           approvalId = this.sequences.allocate("APR");
           aliased = false;
           try {
@@ -8447,6 +8482,8 @@ export class ChronoCore {
             // grants stay in history but every gate rejects them.
             ceremony: CEREMONY_MARKER_CURRENT,
             ceremonyKey: ceremony.key,
+            ceremonySession: ceremony.sessionId,
+            ceremonyRequest: ceremony.requestId,
             nativeObservation: input.observation,
             policyVersion: AUTHORITY_POLICY_VERSION,
           },
@@ -8455,14 +8492,43 @@ export class ChronoCore {
           newState: "granted",
           reasoning: "PO approval recorded through the native explicit-answer ceremony",
         });
-        return { duplicate: false as const, approvalId, aliased };
+        // In-transaction validation (TICKET-0025 repair): ticket
+        // consumption and proof that the resulting approval is
+        // current AND authoritative commit together. If the result
+        // is not authoritative, everything rolls back and the ticket
+        // stays live and retryable — a consumed ticket without a
+        // current authoritative approval is never persisted.
+        if (!this.approvalCeremonyAuthoritative(approvalId)) {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Finalize validation failed: the resulting approval '${approvalId}' for ticket '${ticket.id}' is not authoritative; refusing without consuming`,
+            invariantRef: "INV §14.4",
+            affectedTarget: ticket.id,
+            suggestedAction: "Re-request a ticket and confirm through a fresh ceremony",
+          });
+        }
+        if (!this.hasValidApproval(ticket.scopeArtifactId, ticket.scopeRevision, ticket.action)) {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Finalize validation failed: no current authoritative approval stands for '${ticket.scopeArtifactId}' after ticket '${ticket.id}'; refusing without consuming`,
+            invariantRef: "INV §4.4",
+            affectedTarget: ticket.scopeArtifactId,
+            suggestedAction: "Re-request a ticket for the current revision and confirm again",
+          });
+        }
+        return { duplicate: false as const, approvalId, aliased, superseded };
       });
       this.syncProjectState();
-      return { ok: true, value: { approvalId: outcome.approvalId, duplicate: false, aliased: outcome.aliased } };
+      return {
+        ok: true,
+        value: { approvalId: outcome.approvalId, duplicate: false, aliased: outcome.aliased, superseded: outcome.superseded },
+      };
     } catch (e) {
       if (e instanceof DuplicateCeremonyDelivery) {
         if (e.approvalId !== null) {
-          return { ok: true, value: { approvalId: e.approvalId, duplicate: true, aliased: false } };
+          return { ok: true, value: { approvalId: e.approvalId, duplicate: true, aliased: false, superseded: null } };
         }
         return this.handleError(
           new ChronoError({

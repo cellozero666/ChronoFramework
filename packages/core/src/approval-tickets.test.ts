@@ -547,6 +547,74 @@ describe("OC-P11 approval tickets (ADR-007)", () => {
     expect(core.hasValidApproval("REQ-0001", draftRev, "planning-approval")).toBe(false);
   });
 
+  it("a new valid v2 ceremony supersedes a non-authoritative historical approval (TICKET-0025 repair)", () => {
+    // Pilot replay: APR-0001 is an ACTIVE but non-authoritative
+    // historical row for this exact triple (vulnerable provenance:
+    // ticket marker, no explicit-answer marker, stale policy). A new
+    // valid v2 ceremony must mint a fresh approval and revoke the
+    // old row append-only — never alias it, never consume the ticket
+    // without a current authoritative result.
+    const { ticketId } = requestTicket();
+    const raw = new Database(join(tempDir, ".chrono", "chrono.db"));
+    try {
+      raw
+        .prepare(
+          `INSERT INTO approval (id, action, scope_artifact_id, scope_revision, authority, signer, signature, rationale, timestamp, revoked)
+           VALUES ('APR-0001', 'planning-approval', 'REQ-0001', ?, 'PO', 'PO', 'sig', 'r', ?, 0)`
+        )
+        .run(draftRev, FIXED_TIME);
+      raw
+        .prepare(
+          `INSERT INTO event_log (event_type, entity_id, payload, actor, timestamp, prior_state, new_state, reasoning)
+           VALUES ('ApprovalGranted', 'APR-0001', ?, 'PO', ?, 'granted', 'granted', 'legacy vulnerable grant')`
+        )
+        .run(
+          JSON.stringify({ action: "planning-approval", scopeArtifactId: "REQ-0001", scopeRevision: draftRev, ticketId: "TICKET-0000", policyVersion: "7" }),
+          FIXED_TIME
+        );
+      raw.prepare("INSERT INTO id_sequence (family, next) VALUES ('APR', 100)").run();
+    } finally {
+      raw.close();
+    }
+    expect(core.approvalCeremonyAuthoritative("APR-0001")).toBe(false);
+    expect(core.hasValidApproval("REQ-0001", draftRev, "planning-approval")).toBe(false);
+    const { signature, timestamp } = hostSign(draftRev, "accept draft", "no new trust boundary");
+    const done = core.finalizeApprovalTicket(
+      { ticketId, timestamp, signature, observation: OBSERVATION, ceremony: ceremonyFor(tempDir, ticketBinding(ticketId, draftRev), "ses-25", "req-25") },
+      gaspar
+    );
+    expect(done.ok).toBe(true);
+    expect(done.value!.approvalId).not.toBe("APR-0001");
+    expect(done.value!).toMatchObject({ duplicate: false, aliased: false, superseded: "APR-0001" });
+    // New approval is current and authoritative with v2 provenance.
+    expect(core.hasValidApproval("REQ-0001", draftRev, "planning-approval")).toBe(true);
+    expect(core.approvalCeremonyAuthoritative(done.value!.approvalId)).toBe(true);
+    expect(core.describeApprovalTicket(ticketId, gaspar).value!.consumed).toBe(true);
+    // History preserved: old row revoked append-only with an audit event.
+    expect(core.listApprovals()).toHaveLength(2);
+    const legacy = core.listApprovals().find((a) => a.id === "APR-0001");
+    expect(legacy?.revoked).toBe(true);
+    const audit = new Database(join(tempDir, ".chrono", "chrono.db"));
+    try {
+      const revocations = audit
+        .prepare("SELECT * FROM event_log WHERE event_type = 'ApprovalRevoked' AND entity_id = 'APR-0001'")
+        .all() as Array<{ payload: string }>;
+      expect(revocations).toHaveLength(1);
+      expect(JSON.parse(revocations[0]!.payload)).toMatchObject({ supersededByTicket: ticketId });
+      const grants = audit
+        .prepare("SELECT * FROM event_log WHERE event_type = 'ApprovalGranted' AND entity_id = ?")
+        .all(done.value!.approvalId) as Array<{ payload: string }>;
+      expect(grants).toHaveLength(1);
+      expect(JSON.parse(grants[0]!.payload)).toMatchObject({
+        ticketId,
+        ceremony: "question-answer-v2",
+        ceremonyKey: ceremonyFor(tempDir, ticketBinding(ticketId, draftRev), "ses-25", "req-25").key,
+      });
+    } finally {
+      audit.close();
+    }
+  });
+
   it("no new ticket needed once approved; chat alone still approves nothing", () => {
     const { ticketId } = requestTicket();
     const { signature, timestamp } = hostSign(draftRev, "accept draft", "no new trust boundary");

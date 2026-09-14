@@ -1012,6 +1012,24 @@ separate PO authorization for provider spend:
     --json` reports per-observation decision, result,
     Core-reported authoritative/current state, rejection reason,
     and duplicate/replay detection without secrets.
+- **Supersede repair — the TICKET-0025 provider-backed failure
+  (ADR-007 Addendum E2).** The exactly-once event path worked
+  (one finalized, duplicate observation-only, no false decline),
+  but finalization returned the historical alias APR-0002:
+  doctor `authoritative: false`, ticket consumed, OPEN-0001
+  stale — a consumed ticket with no current authoritative
+  approval. Root cause: the scope-bound alias returned any
+  active row including non-authoritative history, and the old
+  table-wide UNIQUE made revoke-then-create impossible.
+  Corrected: alias requires an already-authoritative row;
+  otherwise the old row is revoked append-only and a fresh
+  monotonic v2 approval is minted (migration v17 scopes
+  uniqueness to active rows via partial index); consumption and
+  validation of a current/authoritative result commit in one
+  transaction, else everything rolls back with the ticket live.
+  TICKET-0025 stays consumed as history with APR-0002
+  preserved; after init, a fresh ticket finalizes to a new
+  authoritative v2 approval.
 
 ### The single repair command for the existing pilot
 
@@ -1054,17 +1072,20 @@ no other role);
 `approval-tickets.test.ts` (Core ticket adversarial + same-ticket
 retry survival + same-ceremony no-op + forged-key/binding denial +
 concurrent-claim atomicity + fan-out guard + alias/monotonic-id
-proofs); `ceremony.test.ts` (domain key determinism/binding +
-multi-grant authority matrix); `migration.test.ts` (v16 ledger on
-v1/v15 upgrade paths + fan-out revocation precision +
-idempotence);
+proofs + v2 supersede of non-authoritative history with
+history-preserved revocation); `ceremony.test.ts` (domain key
+determinism/binding + multi-grant authority matrix);
+`migration.test.ts` (v16 ledger on v1/v15 upgrade paths +
+fan-out revocation precision + idempotence + v17 rebuild
+without data loss, guard survival, and active-only uniqueness);
 `key-transport-parity.test.ts` (D1 vectors + disposable-keychain
 integration where available);
 `planning-blackbox.test.ts` (hermetic discovery-to-grant flow).
 Packed: isolated tarball install, `init --dry-run` with zero writes,
 ceremony command surface (`--body-stdin`, `--security-implications`,
-`--require-question`), dist tool-runtime presence. Full
-`test:clean` PASS (49 files / 626 tests on Node 22.21.1 and Node
+`--require-question`, `--ceremony-key/session/request`), dist
+tool-runtime presence. Full
+`test:clean` PASS (49 files / 628 tests on Node 22.21.1 and Node
 24.20.0 clean exports — `npm ci`, lint, typecheck, build, suite
 each green from clean checkouts), `test:blackbox` 13/13,
 package-contents green, `lint` 0 errors,

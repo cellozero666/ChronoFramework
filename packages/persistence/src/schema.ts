@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -718,5 +718,57 @@ export const MIGRATIONS: Record<number, string> = {
       SELECT 1 FROM event_log revoked_yet
       WHERE revoked_yet.event_type = 'ApprovalRevoked' AND revoked_yet.entity_id = approval.id
     );
+  `,
+  17: `
+    -- Exactly-once repair, part 2 (TICKET-0025 class): a new valid v2
+    -- ceremony must never alias a non-authoritative historical
+    -- approval. The old UNIQUE(scope_artifact_id, scope_revision,
+    -- action) made revoke-then-create impossible, forcing aliasing of
+    -- invalid rows (consumed ticket, stale artifact, no current
+    -- authoritative approval). Rebuild the table without that
+    -- constraint and enforce at most one ACTIVE row per triple with a
+    -- partial unique index instead: superseded rows stay as history,
+    -- every reader keeps its revoked = 0 filter, and the finalize
+    -- transaction revokes-then-creates atomically.
+    CREATE TABLE approval_new (
+      id                 TEXT PRIMARY KEY,
+      action             TEXT NOT NULL,
+      scope_artifact_id  TEXT NOT NULL,
+      scope_revision     TEXT NOT NULL,
+      authority          TEXT NOT NULL,
+      signer             TEXT NOT NULL,
+      signature          TEXT NOT NULL,
+      rationale           TEXT NOT NULL,
+      timestamp           TEXT NOT NULL,
+      revoked             INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO approval_new (id, action, scope_artifact_id, scope_revision, authority, signer, signature, rationale, timestamp, revoked)
+      SELECT id, action, scope_artifact_id, scope_revision, authority, signer, signature, rationale, timestamp, revoked FROM approval;
+    DROP TABLE approval;
+    ALTER TABLE approval_new RENAME TO approval;
+    -- Triggers are dropped with the old table: recreate verbatim
+    -- (migration 3 definitions) so append-only semantics survive.
+    CREATE TRIGGER trg_approval_no_delete BEFORE DELETE ON approval
+    BEGIN
+      SELECT RAISE(ABORT, 'approval rows cannot be deleted: revoke instead');
+    END;
+    CREATE TRIGGER trg_approval_update_guard BEFORE UPDATE ON approval
+    WHEN NOT (
+      OLD.revoked = 0 AND NEW.revoked = 1
+      AND OLD.id IS NEW.id
+      AND OLD.action IS NEW.action
+      AND OLD.scope_artifact_id IS NEW.scope_artifact_id
+      AND OLD.scope_revision IS NEW.scope_revision
+      AND OLD.authority IS NEW.authority
+      AND OLD.signer IS NEW.signer
+      AND OLD.signature IS NEW.signature
+      AND OLD.rationale IS NEW.rationale
+      AND OLD.timestamp IS NEW.timestamp
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'approval rows are immutable except revocation (revoked 0 to 1)');
+    END;
+    CREATE UNIQUE INDEX idx_approval_active_triple
+      ON approval (scope_artifact_id, scope_revision, action) WHERE revoked = 0;
   `,
 };

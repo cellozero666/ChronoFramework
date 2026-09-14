@@ -1319,6 +1319,7 @@ export const ChronoGatePlugin = async (ctx) => {
         approval: receipt.approvalId, scope: ticket.scopeArtifactId, call: callID,
         revision: ticket.scopeRevision, action: ticket.action,
         aliased: receipt.aliased === true,
+        superseded: typeof receipt.superseded === "string" ? receipt.superseded : null,
       });
       return;
     }

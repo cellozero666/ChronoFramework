@@ -426,3 +426,89 @@ describe("Exactly-once ceremony ledger and fan-out repair (v16)", () => {
     expect(db.events().listByEntity("APR-0002").filter((e) => e.eventType === "ApprovalRevoked")).toHaveLength(1);
   });
 });
+
+describe("Approval supersede schema (v17)", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-supersede-mig-test-"));
+  });
+
+  afterEach(() => {
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rebuilds approval without data loss, keeps guards, and scopes uniqueness to active rows", () => {
+    for (const baseline of [1, 16]) {
+      const dir = mkdtempSync(join(tmpdir(), "chrono-v17-test-"));
+      try {
+        const first = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          first.migrate(baseline);
+          const raw = new Database(join(dir, "chrono.db"));
+          try {
+            raw
+              .prepare(
+                `INSERT INTO approval (id, action, scope_artifact_id, scope_revision, authority, signer, signature, rationale, timestamp, revoked)
+                 VALUES ('APR-0002', 'planning-approval', 'OPEN-0001', ?, 'PO', 'PO', 'sig', 'r', '2026-09-14T00:00:00.000Z', 0)`
+              )
+              .run(`sha256:${"a".repeat(64)}`);
+          } finally {
+            raw.close();
+          }
+        } finally {
+          first.close();
+        }
+        const second = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          second.migrate();
+          expect(second.schemaVersion()).toBe(SCHEMA_VERSION);
+          // History preserved across the rebuild.
+          expect(second.approvals().findById("APR-0002").revoked).toBe(false);
+          // Append-only guards survived the rebuild.
+          const raw = new Database(join(dir, "chrono.db"));
+          try {
+            const triggers = raw
+              .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'approval'")
+              .all() as { name: string }[];
+            expect(triggers.map((t) => t.name).sort()).toEqual(["trg_approval_no_delete", "trg_approval_update_guard"]);
+            const indexes = raw
+              .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'approval'")
+              .all() as { name: string; sql: string }[];
+            const active = indexes.find((i) => i.name === "idx_approval_active_triple");
+            expect(active?.sql).toContain("WHERE revoked = 0");
+            expect(() => raw.prepare("DELETE FROM approval WHERE id = 'APR-0002'").run()).toThrow(/revoke instead/);
+            expect(() => raw.prepare("UPDATE approval SET rationale = 'x' WHERE id = 'APR-0002'").run()).toThrow(/immutable/);
+          } finally {
+            raw.close();
+          }
+          // Revoke-then-create works: a superseding row for the same
+          // triple inserts once the historical row is revoked...
+          second.approvals().revoke("APR-0002");
+          expect(() =>
+            second.approvals().create({
+              id: "APR-0009", action: "planning-approval", scopeArtifactId: "OPEN-0001",
+              scopeRevision: `sha256:${"a".repeat(64)}`, authority: "PO", signer: "PO",
+              signature: "sig", rationale: "r", timestamp: "2026-09-14T00:00:00.000Z",
+            })
+          ).not.toThrow();
+          // ...while a second ACTIVE row for the same triple still collides.
+          expect(() =>
+            second.approvals().create({
+              id: "APR-0010", action: "planning-approval", scopeArtifactId: "OPEN-0001",
+              scopeRevision: `sha256:${"a".repeat(64)}`, authority: "PO", signer: "PO",
+              signature: "sig", rationale: "r", timestamp: "2026-09-14T00:00:00.000Z",
+            })
+          ).toThrow();
+          expect(second.approvals().findByScope("OPEN-0001", `sha256:${"a".repeat(64)}`, "planning-approval")?.id).toBe("APR-0009");
+        } finally {
+          second.close();
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+});

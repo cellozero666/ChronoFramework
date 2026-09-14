@@ -138,7 +138,7 @@ describe("OC-P11 ceremony commands", () => {
       as: "gaspar", sessionToken: gasparToken, json: true,
     });
     expect(recorded.exitCode).toBe(0);
-    expect(JSON.parse(recorded.stdout)).toMatchObject({ ok: true, duplicate: false, aliased: false });
+    expect(JSON.parse(recorded.stdout)).toMatchObject({ ok: true, duplicate: false, aliased: false, superseded: null });
     // Identical redelivery through the CLI is a durable no-op.
     const redelivered = runApprovalRecord(tempDir, {
       ticket: ticketId, timestamp, signature,

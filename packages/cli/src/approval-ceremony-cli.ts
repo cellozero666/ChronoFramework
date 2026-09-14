@@ -310,6 +310,7 @@ export function runApprovalRecord(projectPath: string, options: ApprovalRecordOp
             approvalId: result.value!.approvalId,
             duplicate: result.value!.duplicate,
             aliased: result.value!.aliased,
+            superseded: result.value!.superseded,
           },
           null,
           2
@@ -322,7 +323,9 @@ export function runApprovalRecord(projectPath: string, options: ApprovalRecordOp
       stdout:
         result.value!.duplicate === true
           ? `Approval ceremony already processed: '${result.value!.approvalId}' (duplicate delivery, no state change)`
-          : `Recorded permission-bound approval '${result.value!.approvalId}'`,
+          : result.value!.superseded !== null && result.value!.superseded !== undefined
+            ? `Recorded permission-bound approval '${result.value!.approvalId}' (superseded non-authoritative '${result.value!.superseded}', history preserved)`
+            : `Recorded permission-bound approval '${result.value!.approvalId}'`,
       stderr: "",
     };
   } finally {

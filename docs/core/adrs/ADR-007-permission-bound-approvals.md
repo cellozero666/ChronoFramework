@@ -135,6 +135,44 @@ stale/awaiting-signature, re-request and re-confirm). Duplicate
 redelivery is a durable no-op returning the winning approval;
 a new ceremony on a consumed ticket is replay-denied.
 
+## Addendum E2 (supersede repair: the TICKET-0025 provider-backed failure)
+
+The exactly-once event path worked (one `approval-finalized`,
+duplicate observation-only, no false decline), yet finalization
+returned the historical alias `APR-0002` for TICKET-0025: doctor
+reported `authoritative: false` (fan-out reuse or vulnerable
+ceremony), ticket consumed, OPEN-0001 stale. A consumed ticket
+without a current authoritative approval is an atomicity
+violation.
+
+Root cause: the scope-bound alias returned ANY active approval
+row for the triple, including non-authoritative history, and the
+old `UNIQUE(scope, revision, action)` constraint made
+revoke-then-create impossible — forcing the invalid alias.
+
+Correction (migration v17 + finalize rework):
+
+- Reuse is permitted ONLY when the existing active row is already
+  authoritative under the current policy and ceremony marker
+  (classic marker-less grants alias unchanged).
+- Otherwise the old row is revoked append-only (history
+  preserved, `ApprovalRevoked` audit with superseding ticket and
+  ceremony key) and a fresh monotonic id is allocated with
+  `question-answer-v2` provenance binding ticket, session,
+  request, ceremony key, scope, action, and revision.
+- Uniqueness is now a partial index over active rows only
+  (`idx_approval_active_triple WHERE revoked = 0`); readers keep
+  their `revoked = 0` filters unchanged.
+- Ticket consumption and in-transaction validation that the
+  resulting approval is current AND authoritative commit
+  together; any other outcome rolls back with the ticket live
+  and retryable.
+
+Repair note: TICKET-0025 stays consumed as history; APR-0002 is
+preserved. After `chrono init --runtime opencode`, a fresh ticket
+for the current revision finalizes to a new authoritative v2
+approval, superseding APR-0002 append-only.
+
 ## Addendum D5 (question availability: the confirmation UI must render)
 
 OpenCode denies tools to agents by default, so even a correct
