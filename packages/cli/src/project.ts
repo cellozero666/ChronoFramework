@@ -57,6 +57,17 @@ function canonicalDir(path: string): string | null {
   }
 }
 
+/**
+ * Canonical project spelling shared by init and doctor (OC-P6): the
+ * realpath of an existing directory, otherwise the resolved path.
+ * Broker account derivation must use this spelling on both sides or a
+ * symlinked invocation (e.g. `/tmp` vs `/private/tmp`) mismatches the
+ * account recorded at init.
+ */
+export function canonicalProjectDir(path: string): string {
+  return canonicalDir(path) ?? resolve(path);
+}
+
 function gitToplevel(canonicalStart: string): string | null {
   try {
     const raw = execFileSync("git", ["-C", canonicalStart, "rev-parse", "--show-toplevel"], {
@@ -161,8 +172,8 @@ export function findProjectRoot(startDir: string, options: ResolveOptions = {}):
 }
 
 /** Result of resolving the effective project directory for a command. */
-export function resolveProjectDir(cwd: string, explicitPath?: string): string {
-  if (explicitPath !== undefined && explicitPath.length > 0) {
+export function resolveProjectDir(cwd: string, explicitPath?: unknown): string {
+  if (typeof explicitPath === "string" && explicitPath.length > 0) {
     return canonicalDir(explicitPath) ?? explicitPath;
   }
   return resolveProject(cwd).root;

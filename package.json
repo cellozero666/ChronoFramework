@@ -14,7 +14,8 @@
     "test": "vitest run",
     "test:clean": "node scripts/verify-test-clean.mjs",
     "test:watch": "vitest",
-    "clean": "rimraf packages/*/dist packages/*/tsconfig.tsbuildinfo tsconfig.tsbuildinfo"
+    "clean": "rimraf packages/*/dist packages/*/tsconfig.tsbuildinfo tsconfig.tsbuildinfo",
+    "test:blackbox": "CHRONO_BLACKBOX=1 vitest run packages/cli/src/entry-blackbox.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

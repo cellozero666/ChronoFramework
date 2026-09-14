@@ -70,9 +70,9 @@ import {
   entrySessionCommand,
   kiroEntryRegistrationPath,
 } from "./gaspar-entry.js";
-import { BROKER_KEY_SERVICE, OsKeychainStore, PO_KEY_ACCOUNT, brokerAccountFor } from "./keychain.js";
+import { BROKER_KEY_SERVICE, OsKeychainStore, PO_KEY_ACCOUNT, brokerAccountFor, readPoPrivateKey } from "./keychain.js";
 import { constructionFailure } from "./project.js";
-import { openReadProject } from "./project.js";
+import { canonicalProjectDir, openReadProject } from "./project.js";
 import type { KeyStore } from "./keychain.js";
 
 /** Canonical runtime identifiers (never providers or models) [FW §22]. */
@@ -94,7 +94,7 @@ export interface FlowExecResult {
 }
 
 export interface FlowProbes {
-  execFile(cmd: string[], timeoutMs: number): FlowExecResult;
+  execFile(cmd: string[], timeoutMs: number, options?: { env?: Record<string, string> }): FlowExecResult;
   fetchSkill(url: string): Promise<string>;
   readFile(path: string): string | null;
   fileExists(path: string): boolean;
@@ -103,13 +103,14 @@ export interface FlowProbes {
   platform(): { os: string; arch: string; node: string };
 }
 
-function defaultExecFile(cmd: string[], timeoutMs: number): FlowExecResult {
+function defaultExecFile(cmd: string[], timeoutMs: number, options?: { env?: Record<string, string> }): FlowExecResult {
   try {
     const stdout = execFileSync(cmd[0] as string, cmd.slice(1), {
       encoding: "utf8",
       timeout: timeoutMs,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
+      ...(options?.env !== undefined ? { env: options.env } : {}),
     });
     return { exitCode: 0, stdout, stderr: "" };
   } catch (e) {
@@ -211,16 +212,18 @@ export function detectInit(
   const dbExists = probes.fileExists(join(root, ".chrono", "chrono.db"));
   const gitDir = probes.fileExists(join(root, ".git"));
   let gitPresent = false;
-  let newRepository = true;
+  // "New" means no CHRONO project here yet — not merely "no git
+  // commits". A git repository that already holds `.chrono` state is an
+  // existing CHRONO project even before its first commit; a committed
+  // repository without one is an existing (non-CHRONO) repository.
+  let newRepository = !dbExists;
   if (gitDir) {
     const rev = probes.execFile(["git", "-C", root, "rev-parse", "--is-inside-work-tree"], 15000);
     gitPresent = rev.exitCode === 0;
-    if (gitPresent) {
+    if (gitPresent && !dbExists) {
       const head = probes.execFile(["git", "-C", root, "rev-parse", "HEAD"], 15000);
       newRepository = head.exitCode !== 0;
     }
-  } else {
-    newRepository = true;
   }
   let existingState: string | null = null;
   let setupStep: string | null = null;
@@ -663,7 +666,7 @@ function bootstrapFlowSession(
       ),
     };
   }
-  const privateKey = safeReadKey(deps.store, PO_KEY_ACCOUNT);
+  const privateKey = readPoPrivateKey(deps.store);
   if (privateKey === null) {
     return {
       failure: approvalFailure(
@@ -725,11 +728,12 @@ export interface InitFlowOptions {
 }
 
 function stepFailure(step: string, code: string, reason: string, asJson: boolean): CliOutput {
+  const nextAction = "Re-run chrono init to resume from the recorded step";
   if (asJson) {
     return {
       exitCode: 1,
       stdout: JSON.stringify(
-        { ok: false, step, error: { code, message: reason }, resume: "Re-run chrono init to resume from the recorded step" },
+        { ok: false, step, error: { code, message: reason }, nextAction, resume: nextAction },
         null,
         2
       ),
@@ -739,20 +743,21 @@ function stepFailure(step: string, code: string, reason: string, asJson: boolean
   return {
     exitCode: 1,
     stdout: "",
-    stderr: [`FAILED [${code}] at ${step}: ${reason}`, "Resume: re-run chrono init to resume from the recorded step."].join("\n"),
+    stderr: [`FAILED [${code}] at ${step}: ${reason}`, `Resume: ${nextAction}.`].join("\n"),
   };
 }
 
 function consentFailure(missing: (keyof InitConsent)[], asJson: boolean): CliOutput {
   const reason = `Explicit consent required for: ${missing.join(", ")}. Pass --yes with scope flags or run interactively.`;
+  const nextAction = "Provide the missing consent scopes, then re-run chrono init to resume";
   if (asJson) {
     return {
       exitCode: 2,
-      stdout: JSON.stringify({ ok: false, error: { code: "CONSENT_REQUIRED", message: reason } }, null, 2),
+      stdout: JSON.stringify({ ok: false, step: "CONSENT", error: { code: "CONSENT_REQUIRED", message: reason }, nextAction }, null, 2),
       stderr: "",
     };
   }
-  return { exitCode: 2, stdout: "", stderr: `Error [CONSENT_REQUIRED]: ${reason}` };
+  return { exitCode: 2, stdout: "", stderr: `Error [CONSENT_REQUIRED] (step CONSENT): ${reason}\n  next: ${nextAction}` };
 }
 
 /** Prompt for plan consent on the controlling terminal (never stdin). */
@@ -886,7 +891,10 @@ export async function runInitFlow(
   confirm: (planText: string, challenge: string) => string | null = promptInitConsent
 ): Promise<CliOutput> {
   const asJson = options.json === true;
-  const root = resolve(projectPath);
+  // Canonical spelling (OC-P6): broker account derivation and every
+  // recorded path must match the spelling doctor derives, or symlinked
+  // invocations (`/tmp` vs `/private/tmp`) mismatch the account file.
+  const root = canonicalProjectDir(projectPath);
   const fail = (exitCode: number, code: string, reason: string): CliOutput =>
     asJson
       ? { exitCode, stdout: JSON.stringify({ ok: false, error: { code, message: reason } }, null, 2), stderr: "" }
@@ -969,6 +977,10 @@ export async function runInitFlow(
     return fail(1, "EXECUTION_DENIED", lock.locked);
   }
   let core: ChronoCore;
+  // Tracks the step whose work is executing so an unexpected throw
+  // inside apply becomes a stable step failure (never a silent exit).
+  // Declared outside the try: `catch` cannot see block-scoped `let`.
+  let activeStep: string | null = null;
   try {
     core = new ChronoCore({
       projectPath: root,
@@ -993,17 +1005,71 @@ export async function runInitFlow(
       return null;
     };
     const current = core.getSetupState();
-    const currentStep = current.ok && current.value !== null && current.value !== undefined ? current.value.step : null;
+    let currentStep = current.ok && current.value !== null && current.value !== undefined ? current.value.step : null;
+    // Upgrade/repair assessment (OC-P8): READY is a verified projection,
+    // not an irreversible stored label. When drift or stale evidence is
+    // discovered on an existing project, demote the stored label to a
+    // non-ready repair state (audited, history-preserving) before
+    // re-running the affected steps through the normal forward flow.
+    // This keeps `setupStep` and the public doctor in agreement and
+    // keeps `chrono init` as the sole orchestrator of normal repair —
+    // no manual `rtk verify/prove/promote/setup` is required.
+    if (currentStep !== null) {
+      const repair = assessInitRepairNeed(core, root, plan.runtimeIds, currentStep);
+      if (repair.needed && repair.demoteTo !== null) {
+        const demoted = core.demoteSetupForRepair(repair.demoteTo as never, {
+          cause: "OC-P8 automatic repair",
+          reasons: repair.reasons,
+          rerunFrom: repair.rerunFrom,
+        });
+        if (!demoted.ok) {
+          const alreadyBehind =
+            (demoted.error?.code ?? "") === "ILLEGAL_TRANSITION" &&
+            setupStepIndexOf(currentStep) <= setupStepIndexOf(repair.rerunFrom);
+          if (!alreadyBehind) {
+            lock.release();
+            return stepFailure(
+              repair.rerunFrom,
+              demoted.error?.code ?? "ILLEGAL_TRANSITION",
+              demoted.error?.message ?? "repair demotion denied",
+              asJson
+            );
+          }
+        } else {
+          currentStep = demoted.value?.step ?? repair.demoteTo;
+        }
+      }
+    }
     if (currentStep === "READY") {
-      const resumed = await resumeHealthCheck(core, root, asJson);
+      // Already-ready still re-verifies through the separate-process
+      // gate (OC-P6): a project whose broker was revoked after READY
+      // must report loudly, never "already ready" while doctor disagrees.
+      // At this point repair assessment found nothing to demote, so any
+      // remaining hook drift is file-level only and the gate still
+      // requires a fresh proof/promotion when regenerated bytes
+      // invalidate the proof snapshot (OC-P7 req 10).
+      const refreshed = refreshDriftedHooks(root, plan.runtimeIds, detection.rtk.binary ?? "rtk", probes, asJson);
+      if ("failure" in refreshed) {
+        lock.release();
+        return refreshed.failure;
+      }
+      const gate = runDoctorGate(root, probes, asJson);
       lock.release();
-      return resumed;
+      if (gate !== null) {
+        return gate;
+      }
+      return resumeHealthCheck(core, root, asJson);
     }
 
     const need = (step: string): boolean =>
       currentStep === null || setupStepIndexOf(currentStep) < setupStepIndexOf(step);
 
+    // Tracks the step whose work is executing so an unexpected throw
+    // below becomes a stable step failure (never a silent exit).
+    activeStep = currentStep ?? "DETECTED";
+
     // DETECTED + CONSENTED backfill (detection/consent precede all writes).
+    activeStep = "DETECTED";
     if (need("DETECTED")) {
       const failed =
         mark("DETECTED", { detectionHash: plan.detectionHash, runtimes: plan.runtimeIds }) ??
@@ -1019,6 +1085,7 @@ export async function runInitFlow(
     }
 
     // PROJECT_INITIALIZED.
+    activeStep = "PROJECT_INITIALIZED";
     if (need("PROJECT_INITIALIZED")) {
       const status = core.status();
       if (!status.ok) {
@@ -1039,6 +1106,7 @@ export async function runInitFlow(
     }
 
     // PO_ENROLLED.
+    activeStep = "PO_ENROLLED";
     if (need("PO_ENROLLED")) {
       if (core.poKeyRevision() === null) {
         const enrolled = runEnroll(
@@ -1067,6 +1135,9 @@ export async function runInitFlow(
     }
 
     // Privileged sessions for the remaining steps (PO-signed, keychain-held).
+    // Unexpected throws here (e.g. unparseable keychain material) are
+    // reported against the upcoming runtime step by the apply guard below.
+    activeStep = "RUNTIMES_SELECTED";
     // Each adapter gets sessions bound to its own id/runtime string so
     // routing proofs land in the scope dispatch will look up.
     const firstRuntime = plan.runtimeIds[0] ?? "init";
@@ -1099,6 +1170,7 @@ export async function runInitFlow(
     const gasparAuth = { actor: "gaspar", session: gasparSession.session };
 
     // RUNTIMES_SELECTED.
+    activeStep = "RUNTIMES_SELECTED";
     if (need("RUNTIMES_SELECTED")) {
       const runtime = projectRuntimeOf(core);
       if (plan.runtimeIds.length === 0) {
@@ -1130,6 +1202,7 @@ export async function runInitFlow(
       }
     }
     // RTK_VERIFIED_AND_ROUTED.
+    activeStep = "RTK_VERIFIED_AND_ROUTED";
     if (need("RTK_VERIFIED_AND_ROUTED")) {
       const verify = runRtkVerify(root, { json: true, session: gasparSession.session, resolveBinary: (b) => probes.which(b) }, defaultRtkExec(probes));
       if (verify.exitCode !== 0) {
@@ -1172,6 +1245,7 @@ export async function runInitFlow(
     }
 
     // SKILL_VERIFIED_AND_EMITTED.
+    activeStep = "SKILL_VERIFIED_AND_EMITTED";
     if (need("SKILL_VERIFIED_AND_EMITTED")) {
       const skill = core.describeSkillInstallation();
       if (!skill.installed) {
@@ -1197,6 +1271,7 @@ export async function runInitFlow(
     }
 
     // ADAPTERS_REGISTERED_AND_APPROVED.
+    activeStep = "ADAPTERS_REGISTERED_AND_APPROVED";
     if (need("ADAPTERS_REGISTERED_AND_APPROVED")) {
       const activated: string[] = [];
       const tmpBase = mkdtempSync(join(tmpdir(), "chrono-init-adapters-"));
@@ -1275,6 +1350,7 @@ export async function runInitFlow(
     }
 
     // NATIVE_HOOKS_INSTALLED.
+    activeStep = "NATIVE_HOOKS_INSTALLED";
     if (need("NATIVE_HOOKS_INSTALLED")) {
       for (const runtimeId of plan.runtimeIds) {
         const installed = runSetup(
@@ -1341,6 +1417,7 @@ export async function runInitFlow(
 
     // RUNTIME_CONFORMANCE_PASSED: conformance proofs already ran green
     // inside setup; the live gate smoke proves hooks reach the Core.
+    activeStep = "RUNTIME_CONFORMANCE_PASSED";
     if (need("RUNTIME_CONFORMANCE_PASSED")) {
       const smoke = runGate(root, {
         gate: "execution",
@@ -1367,6 +1444,7 @@ export async function runInitFlow(
     // the redeem loop and revoke the probe session (no orphans). Resume
     // reuses a live credential whose secret is still held; a credential
     // without its secret is revoked and replaced (audited recovery).
+    activeStep = "GASPAR_ENTRY_PREPARED";
     if (need("GASPAR_ENTRY_PREPARED")) {
       const account = brokerAccountFor(root);
       let brokerId: string | null = null;
@@ -1421,8 +1499,24 @@ export async function runInitFlow(
       }
     }
 
-    // READY: readiness projection and next action.
+    // READY: readiness projection and next action — gated on a FRESH
+    // SEPARATE-PROCESS normal-user `chrono doctor` (OC-P6): init may
+    // persist READY only if the exact command a user runs afterwards
+    // truthfully confirms readiness. The child inherits no session and
+    // a sanitized environment, so in-process privilege can never make
+    // the gate pass while public verification fails.
+    activeStep = "READY";
     const readiness = buildReadiness(core, root, plan, probes);
+    const refreshed = refreshDriftedHooks(root, plan.runtimeIds, detection.rtk.binary ?? "rtk", probes, asJson);
+    if ("failure" in refreshed) {
+      lock.release();
+      return refreshed.failure;
+    }
+    const gate = runDoctorGate(root, probes, asJson);
+    if (gate !== null) {
+      lock.release();
+      return gate;
+    }
     const done = mark("READY", readiness);
     if (done !== null) {
       lock.release();
@@ -1430,9 +1524,19 @@ export async function runInitFlow(
     }
     lock.release();
     const body = asJson
-      ? JSON.stringify({ ok: true, ready: true, project: root, runtimes: plan.runtimeIds, readiness }, null, 2)
-      : ["CHRONO project ready.", `  project: ${root}`, `  runtimes: ${plan.runtimeIds.join(", ")}`, `  next: ${String(readiness["nextAction"] ?? "open a configured runtime")}`].join("\n");
+      ? JSON.stringify({ ok: true, ready: true, step: "READY", project: root, runtimes: plan.runtimeIds, readiness }, null, 2)
+      : ["CHRONO project ready.", `  step: READY`, `  project: ${root}`, `  runtimes: ${plan.runtimeIds.join(", ")}`, `  next: ${String(readiness["nextAction"] ?? "open a configured runtime")}`].join("\n");
     return { exitCode: 0, stdout: body, stderr: "" };
+  } catch (e) {
+    // Last-resort guard: no throw inside apply may escape as a silent
+    // exit. Attribute it to the executing step with a resume action.
+    lock.release();
+    const code =
+      typeof e === "object" && e !== null && "code" in e && typeof (e as { code?: unknown }).code === "string"
+        ? (e as { code: string }).code
+        : "EXECUTION_DENIED";
+    const message = e instanceof Error ? e.message : String(e);
+    return stepFailure(activeStep ?? "DETECTED", code, message, asJson);
   } finally {
     try {
       core.close();
@@ -1472,7 +1576,148 @@ function setupStepIndexOf(step: string): number {
   return order.indexOf(step);
 }
 
+/**
+ * Upgrade/repair assessment for `chrono init` (OC-P8).
+ *
+ * Inspects an existing project for drift/stale evidence without writing:
+ * stale RTK attestation, missing/stale/candidate routing proofs or
+ * out-of-sync bindings, and drifted managed hooks. Returns the earliest
+ * step to re-run plus the predecessor to demote to (so the forward
+ * `need()` flow re-executes it), with secret-free reasons. Fresh
+ * projects (no stored step) or projects that never reached the affected
+ * stage never need repair — the forward flow handles them normally.
+ * Broker reuse/rotation stays inside GASPAR_ENTRY_PREPARED; adapters,
+ * identities, approvals, and proofs are never duplicated here.
+ */
+export function assessInitRepairNeed(
+  core: ChronoCore,
+  root: string,
+  runtimeIds: string[],
+  currentStep: string
+): { needed: boolean; rerunFrom: string; demoteTo: string | null; reasons: string[] } {
+  const none = { needed: false, rerunFrom: currentStep, demoteTo: null as string | null, reasons: [] as string[] };
+  const currentIndex = setupStepIndexOf(currentStep);
+  if (currentIndex < 0) {
+    return none;
+  }
+  const reasons: string[] = [];
+  let rerunFrom: string | null = null;
+  const consider = (step: string, reason: string): void => {
+    reasons.push(reason);
+    if (rerunFrom === null || setupStepIndexOf(step) < setupStepIndexOf(rerunFrom)) {
+      rerunFrom = step;
+    }
+  };
+  // Stale RTK attestation invalidates everything downstream of runtime
+  // selection. Only projects that already passed that stage repair;
+  // earlier projects establish it in the forward flow.
+  if (currentIndex >= setupStepIndexOf("RTK_VERIFIED_AND_ROUTED")) {
+    let attested = "missing";
+    try {
+      attested = core.attestationCurrency("rtk").state;
+    } catch {
+      attested = "missing";
+    }
+    if (attested !== "current") {
+      consider("RTK_VERIFIED_AND_ROUTED", `RTK attestation ${attested}: re-verify, re-prove, and promote`);
+    } else {
+      // Attestation current but routing may still be stale: missing,
+      // candidate-only, expired, or out-of-sync bindings (registration
+      // hash, binary, managed assets). Each selected runtime is checked;
+      // any failure re-runs the routing stage for all (proofs are
+      // per-runtime, promotion is idempotent).
+      for (const runtimeId of runtimeIds) {
+        let scopes: ReadonlyArray<{ runtime: string; authority: string; expired: boolean }> = [];
+        try {
+          scopes = core.routingProofScopes(runtimeId);
+        } catch {
+          consider("RTK_VERIFIED_AND_ROUTED", `routing proof scopes for '${runtimeId}' are unreadable: re-prove and promote`);
+          continue;
+        }
+        const live = scopes.filter((proof) => !proof.expired);
+        const authoritative = live.filter((proof) => proof.authority === "authoritative");
+        if (authoritative.length === 0) {
+          consider(
+            "RTK_VERIFIED_AND_ROUTED",
+            live.length > 0
+              ? `routing proof for '${runtimeId}' is a non-authoritative candidate: promote after approval`
+              : `no current routing proof for '${runtimeId}': re-prove and promote`
+          );
+          continue;
+        }
+        for (const proof of authoritative) {
+          let binding: ReturnType<ChronoCore["routingProofBinding"]>;
+          try {
+            binding = core.routingProofBinding(runtimeId, proof.runtime);
+          } catch {
+            binding = { ok: false };
+          }
+          if (!binding.ok || binding.value === null || binding.value === undefined || !binding.value.inSync) {
+            consider(
+              "RTK_VERIFIED_AND_ROUTED",
+              binding.ok && binding.value !== null && binding.value !== undefined
+                ? binding.value.reason
+                : `routing proof bindings for '${runtimeId}' are unverifiable: re-prove and promote`
+            );
+          }
+        }
+      }
+    }
+  }
+  // Managed-hook drift invalidates the proof snapshot and the entry
+  // path. Only projects that already installed hooks repair here.
+  // Drift re-runs the routing stage (not just hook reinstall): healing
+  // the files changes the managed-asset manifest, so the authoritative
+  // proof snapshot must be replaced by a fresh prove (pre-heal) plus a
+  // post-heal promotion in the same run (OC-P8). Demoting only to
+  // NATIVE_HOOKS would heal the files while keeping a snapshot bound
+  // to the drifted bytes, and entry redeem would deny on it.
+  if (currentIndex >= setupStepIndexOf("NATIVE_HOOKS_INSTALLED")) {
+    try {
+      const intact = checkManagedHooks(root, runtimeIds);
+      const drifted = Object.entries(intact)
+        .filter(([, ok]) => !ok)
+        .map(([path]) => path);
+      if (drifted.length > 0) {
+        consider("RTK_VERIFIED_AND_ROUTED", `managed-asset drift: ${drifted.join(", ")} — re-verify, re-prove, reinstall, and promote`);
+      }
+    } catch {
+      consider("RTK_VERIFIED_AND_ROUTED", "managed hooks unreadable: re-verify, reinstall, and re-prove");
+    }
+  }
+  if (rerunFrom === null) {
+    return none;
+  }
+  const target = rerunFrom as string;
+  // Demote to the predecessor so `need(target)` becomes true and the
+  // forward flow re-executes the affected stage idempotently. Demotion
+  // itself is audited and history-preserving (Core.demoteSetupForRepair).
+  const order = [
+    "DETECTED",
+    "CONSENTED",
+    "PROJECT_INITIALIZED",
+    "PO_ENROLLED",
+    "RUNTIMES_SELECTED",
+    "RTK_VERIFIED_AND_ROUTED",
+    "SKILL_VERIFIED_AND_EMITTED",
+    "ADAPTERS_REGISTERED_AND_APPROVED",
+    "NATIVE_HOOKS_INSTALLED",
+    "RUNTIME_CONFORMANCE_PASSED",
+    "GASPAR_ENTRY_PREPARED",
+    "READY",
+  ];
+  const targetIndex = order.indexOf(target);
+  const demoteTo = targetIndex > 0 ? (order[targetIndex - 1] as string) : null;
+  // Already at or before the predecessor: no demotion write needed; the
+  // forward flow resumes from the recorded step naturally.
+  if (demoteTo === null || currentIndex <= order.indexOf(demoteTo)) {
+    return { needed: true, rerunFrom: target, demoteTo: null, reasons };
+  }
+  return { needed: true, rerunFrom: target, demoteTo, reasons };
+}
+
 function prefixStepFailure(step: string, out: CliOutput, asJson: boolean): CliOutput {
+  const nextAction = "Re-run chrono init to resume from the recorded step";
   if (asJson) {
     let detail: unknown = null;
     try {
@@ -1483,7 +1728,7 @@ function prefixStepFailure(step: string, out: CliOutput, asJson: boolean): CliOu
     return {
       exitCode: 1,
       stdout: JSON.stringify(
-        { ok: false, step, error: detail, resume: "Re-run chrono init to resume from the recorded step" },
+        { ok: false, step, error: detail, nextAction, resume: nextAction },
         null,
         2
       ),
@@ -1494,7 +1739,7 @@ function prefixStepFailure(step: string, out: CliOutput, asJson: boolean): CliOu
   return {
     exitCode: 1,
     stdout: "",
-    stderr: [`FAILED at ${step}:`, reason, "Resume: re-run chrono init to resume from the recorded step."].join("\n"),
+    stderr: [`FAILED at ${step}:`, reason, `Resume: ${nextAction}.`].join("\n"),
   };
 }
 
@@ -1534,9 +1779,11 @@ function buildReadiness(core: ChronoCore, root: string, plan: InitPlan, probes: 
 
 async function resumeHealthCheck(core: ChronoCore, root: string, asJson: boolean): Promise<CliOutput> {
   const status = core.status();
+  const state = status.ok ? status.value?.state : "UNKNOWN";
+  const nextAction = "Open a configured runtime: Gaspar resumes the persisted state";
   const body = asJson
-    ? JSON.stringify({ ok: true, resumed: true, project: root, state: status.ok ? status.value?.state : "UNKNOWN" }, null, 2)
-    : `CHRONO project already ready at '${root}'. State: ${status.ok ? status.value?.state : "UNKNOWN"}.`;
+    ? JSON.stringify({ ok: true, resumed: true, step: "READY", project: root, state, nextAction }, null, 2)
+    : `CHRONO project already ready at '${root}'. State: ${state}.\n  step: READY\n  next: ${nextAction}`;
   return { exitCode: 0, stdout: body, stderr: "" };
 }
 
@@ -1544,19 +1791,301 @@ async function resumeHealthCheck(core: ChronoCore, root: string, asJson: boolean
 /* Doctor (read-only diagnostics)                                      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Regenerate drifted managed hooks during init resume/re-run (OC-P7
+ * req 10): when setup already installed hooks but the live bytes no
+ * longer match the canonical builders (e.g. an obsolete
+ * entry-session script passing `--secret-stdin`), re-running
+ * `chrono init` heals the files through the same `runSetup` the
+ * NATIVE_HOOKS step uses — without moving setup state (repair is
+ * file-level; the state machine stays forward-only). Regeneration
+ * changes the managed-asset manifest, which invalidates the
+ * authoritative proof snapshot: the READY gate then requires a fresh
+ * routing proof and promotion before reporting READY, so drift
+ * protection is preserved, not weakened. Returns a failure output
+ * when repair itself fails, else null (with `repaired` listing what
+ * was regenerated, empty when everything was already current).
+ */
+function refreshDriftedHooks(
+  root: string,
+  runtimeIds: string[],
+  rtkBinary: string,
+  probes: FlowProbes,
+  asJson: boolean
+): { failure: CliOutput } | { repaired: string[] } {
+  const intact = checkManagedHooks(root, runtimeIds);
+  const drifted = Object.entries(intact)
+    .filter(([, ok]) => !ok)
+    .map(([path]) => path);
+  if (drifted.length === 0) {
+    return { repaired: [] };
+  }
+  for (const runtimeId of runtimeIds) {
+    const repaired = runSetup(
+      root,
+      { adapter: runtimeId, runtime: runtimeId, rtkBinary, json: true },
+      defaultSetupExec(probes)
+    );
+    if (repaired.exitCode !== 0) {
+      return { failure: prefixStepFailure("NATIVE_HOOKS_INSTALLED", repaired, asJson) };
+    }
+  }
+  return { repaired: drifted };
+}
+
+/**
+ * Sanitized environment for the init completion gate's doctor child
+ * (OC-P6 req 9): allowlist only. Session carriers
+ * (`CHRONO_SESSION_TOKEN`), secret-bearing names, and code-preload
+ * vectors (`NODE_OPTIONS`, `LD_PRELOAD`, `DYLD_*`) never cross into the
+ * verification process, so a passing gate proves a normal user
+ * invocation confirms readiness.
+ */
+export function sanitizeDoctorEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+  const allow = new Set([
+    "PATH",
+    "HOME",
+    "SYSTEMROOT",
+    "SystemRoot",
+    "WINDIR",
+    "windir",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "LC_ALL",
+    "LC_MESSAGES",
+    "LANGUAGE",
+    "TZ",
+    "TERM",
+  ]);
+  const clean: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== "string" || !allow.has(key)) {
+      continue;
+    }
+    clean[key] = value;
+  }
+  return clean;
+}
+
+/** Argv re-invoking this CLI as `doctor --path <root> --json`. */
+function doctorChildArgv(root: string): string[] | null {
+  const entry = process.argv[1];
+  if (typeof entry !== "string" || entry.length === 0) {
+    return null;
+  }
+  return [process.execPath, entry, "doctor", "--path", root, "--json"];
+}
+
+function doctorGateRefusal(detail: string, asJson: boolean): CliOutput {
+  return stepFailure("READY", "EXECUTION_DENIED", `Separate-process doctor does not confirm readiness: ${detail}`, asJson);
+}
+
+/**
+ * Init completion gate (OC-P6 reqs 1, 6, 9): run `chrono doctor
+ * --json` in a separate process with a sanitized environment and no
+ * session, exactly as a user would run it afterwards. Returns null
+ * when the child truthfully confirms readiness (exit 0, ok true,
+ * entry ready); any other outcome is a loud READY-step failure, so
+ * READY can never persist while public verification disagrees.
+ */
+function runDoctorGate(root: string, probes: FlowProbes, asJson: boolean): CliOutput | null {
+  const argv = doctorChildArgv(root);
+  if (argv === null) {
+    return doctorGateRefusal("CLI entry unknown: refusing to mark READY", asJson);
+  }
+  let res: FlowExecResult;
+  try {
+    res = probes.execFile(argv, 120000, { env: sanitizeDoctorEnv(process.env) });
+  } catch (e) {
+    return doctorGateRefusal(`doctor process failed to run (${e instanceof Error ? e.message : String(e)})`, asJson);
+  }
+  if (res.exitCode !== 0) {
+    const detail = doctorChildDetail(res);
+    return doctorGateRefusal(detail, asJson);
+  }
+  let parsed: { ok?: unknown; doctor?: { entry?: { ready?: unknown }; setupStep?: unknown } } | null = null;
+  try {
+    parsed = JSON.parse(res.stdout) as { ok?: unknown; doctor?: { entry?: { ready?: unknown } } };
+  } catch {
+    parsed = null;
+  }
+  if (parsed === null || parsed.ok !== true || parsed.doctor?.entry?.ready !== true) {
+    return doctorGateRefusal("doctor output does not confirm entry readiness: refusing to mark READY", asJson);
+  }
+  return null;
+}
+
+/** Non-sensitive one-line summary of a failing doctor child (reasons only, capped). */
+function doctorChildDetail(res: FlowExecResult): string {
+  try {
+    const parsed = JSON.parse(res.stdout) as { doctor?: { entry?: { reasons?: unknown } } };
+    const reasons = parsed.doctor?.entry?.reasons;
+    if (Array.isArray(reasons)) {
+      const text = reasons.filter((r): r is string => typeof r === "string").join("; ");
+      if (text.length > 0) {
+        return text.slice(0, 500);
+      }
+    }
+  } catch {
+    // Fall through to stderr below.
+  }
+  const stderr = res.stderr.trim();
+  return (stderr.length > 0 ? stderr : "no diagnostic detail").slice(0, 500);
+}
+
+/** Broker-account file shape: non-secret account name + credential id. */
+function readBrokerAccountFile(root: string): { account: string; brokerId: string } | { error: string } {
+  let raw: string;
+  try {
+    raw = readFileSync(join(root, ".chrono", "broker-account"), "utf8");
+  } catch {
+    return { error: "broker account file missing or unreadable: run chrono init to resume setup" };
+  }
+  const lines = raw.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+  if (lines.length < 2 || lines[0] === undefined || lines[0].length === 0 || lines[1] === undefined || lines[1].length === 0) {
+    return { error: "broker account file malformed: run chrono init to resume setup" };
+  }
+  return { account: lines[0], brokerId: lines[1] };
+}
+
+type BrokerReportState = "active" | "missing" | "revoked" | "inconsistent" | "unknown";
+
+/**
+ * Public broker readiness verification (OC-P6). Cross-checks three
+ * non-sensitive sources without any session:
+ * 1. the Core-owned `brokerHealth` projection (registry state);
+ * 2. the `.chrono/broker-account` file (account name + credential id);
+ * 3. a non-destructive OS keychain read of the secret, validated by a
+ *    local SHA-256 comparison inside the Core (boolean only).
+ * Lack of permission (unreadable registry, inaccessible keychain) is
+ * reported as `unknown` — never conflated with "no active broker".
+ * Returns the report fragment plus whether entry may treat the broker
+ * as ready. Nothing secret-bearing ever appears in the report.
+ */
+function checkBrokerHealth(
+  core: ChronoCore,
+  root: string,
+  store: KeyStore
+): { report: DoctorReport["broker"]; healthy: boolean } {
+  const unhealthy = (
+    state: BrokerReportState,
+    detail: string,
+    counts?: { active: number; revoked: number }
+  ): { report: DoctorReport["broker"]; healthy: boolean } => ({
+    report: {
+      visible: state !== "unknown",
+      active: counts?.active ?? 0,
+      revoked: counts?.revoked ?? 0,
+      state,
+      brokerId: null,
+      detail,
+    },
+    healthy: false,
+  });
+  let health: ReturnType<ChronoCore["brokerHealth"]>;
+  try {
+    health = core.brokerHealth();
+  } catch {
+    return unhealthy("unknown", "broker registry unreadable: keychain and project state need diagnosis");
+  }
+  if (!health.ok || health.value === undefined) {
+    return unhealthy("unknown", `broker registry unreadable (${health.error?.code ?? "unknown"}): keychain and project state need diagnosis`);
+  }
+  const projection = health.value;
+  const counts = { active: projection.active, revoked: projection.revoked };
+  if (projection.state === "missing") {
+    return unhealthy("missing", projection.reason, counts);
+  }
+  if (projection.state === "revoked") {
+    return unhealthy("revoked", projection.reason, counts);
+  }
+  if (projection.state === "inconsistent" || projection.state === "unknown") {
+    return unhealthy(projection.state, projection.reason, counts);
+  }
+  const brokerId = projection.brokerId;
+  if (brokerId === null) {
+    return unhealthy("inconsistent", "broker registry reports active but names no credential: run chrono init to resume setup", counts);
+  }
+  const filed = readBrokerAccountFile(root);
+  if ("error" in filed) {
+    return unhealthy("inconsistent", filed.error, counts);
+  }
+  if (filed.brokerId !== brokerId) {
+    return unhealthy(
+      "inconsistent",
+      `broker account file identifies '${filed.brokerId}' but the registry holds '${brokerId}': run chrono init to resume setup`,
+      counts
+    );
+  }
+  if (filed.account !== brokerAccountFor(root)) {
+    return unhealthy(
+      "inconsistent",
+      "broker account file does not match this project directory: run chrono init to resume setup",
+      counts
+    );
+  }
+  let held: string | null;
+  try {
+    held = store.readKey(filed.account, BROKER_KEY_SERVICE);
+  } catch {
+    // Inaccessible is not missing (OC-P6 req 5): entry cannot be
+    // established, but the reason must say so explicitly.
+    return unhealthy("unknown", "broker keychain inaccessible: unlock the OS keychain and re-run chrono doctor", counts);
+  }
+  if (held === null || held.length === 0) {
+    return unhealthy("missing", `broker credential '${brokerId}' is registered but its secret is absent from the OS keychain: run chrono init to resume setup`, counts);
+  }
+  const digest = createHash("sha256").update(held, "utf8").digest("hex");
+  let verified: ReturnType<ChronoCore["verifyBrokerSecretHash"]>;
+  try {
+    verified = core.verifyBrokerSecretHash(brokerId, digest);
+  } catch {
+    return unhealthy("unknown", "broker registry unreadable: keychain and project state need diagnosis", counts);
+  }
+  if (!verified.ok || verified.value === undefined || verified.value.match !== true) {
+    return unhealthy("inconsistent", "broker secret does not match the project registry: run chrono init to resume setup", counts);
+  }
+  return {
+    report: {
+      visible: true,
+      active: projection.active,
+      revoked: projection.revoked,
+      state: "active",
+      brokerId,
+      detail: `broker credential '${brokerId}' is the single active credential and its keychain secret verifies`,
+    },
+    healthy: true,
+  };
+}
+
 export interface DoctorReport {
   readonly found: boolean;
   readonly projectRoot: string;
   readonly launcherVersion: string;
   readonly pinnedVersion: string | null;
   readonly versionMatch: boolean;
+  /** Effective verified projection (OC-P8): never READY while entry is blocked. */
   readonly setupStep: string | null;
+  /** Stored label before projection, for audit transparency (OC-P8). */
+  readonly storedSetupStep?: string | null | undefined;
   readonly projectState: string | null;
   readonly adapters: ReadonlyArray<{ id: string; status: string }>;
   readonly rtk: { attested: string; routing: Record<string, string> };
   readonly skill: { installed: boolean; state: string };
   readonly hooks: Record<string, boolean>;
-  readonly broker: { visible: boolean; active: number; revoked: number };
+  readonly broker: {
+    visible: boolean;
+    active: number;
+    revoked: number;
+    /** Public readiness state (OC-P6): active/missing/revoked/inconsistent/unknown. */
+    state: "active" | "missing" | "revoked" | "inconsistent" | "unknown";
+    /** Single active credential id when verified, else null (never a secret). */
+    brokerId: string | null;
+    /** Non-sensitive explanation of the state. */
+    detail: string;
+  };
   readonly entry: { ready: boolean; reasons: string[] };
 }
 
@@ -1564,18 +2093,28 @@ export interface DoctorOptions {
   readonly json?: boolean | undefined;
   readonly as?: string | undefined;
   readonly session?: { id: string; token: string } | undefined;
+  /**
+   * Keychain handle for the non-destructive broker-secret check (OC-P6).
+   * Production defaults to the OS keychain; tests inject a memory store
+   * holding the same content a separate process would read. The secret
+   * is only read and hash-compared: never printed or persisted.
+   */
+  readonly store?: KeyStore | undefined;
 }
 
 /**
  * Read-only project diagnostics [§7]: compatibility, setup state,
  * adapters, RTK routing, skill activation, hooks, broker, and Gaspar
  * entry readiness. Opens the Core read-only and never writes. Broker
- * credentials are listed only with a gaspar/PO session; every other
- * check is unauthenticated.
+ * readiness is verified through the public Core-owned projection plus
+ * the non-secret broker-account file and a non-destructive keychain
+ * read — no gaspar/PO session is required or consulted (OC-P6).
  */
 export function runDoctor(projectPath: string, options: DoctorOptions = {}): CliOutput {
   const asJson = options.json === true;
-  const root = resolve(projectPath);
+  // Canonical spelling (OC-P6): broker account derivation must match
+  // the spelling recorded at init, or symlinked invocations mismatch.
+  const root = canonicalProjectDir(projectPath);
   const fail = (report: DoctorReport): CliOutput =>
     asJson
       ? { exitCode: 1, stdout: JSON.stringify({ ok: false, doctor: report }, null, 2), stderr: "" }
@@ -1592,7 +2131,7 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
     rtk: { attested: "missing", routing: {} },
     skill: { installed: false, state: "missing" },
     hooks: {},
-    broker: { visible: false, active: 0, revoked: 0 },
+    broker: { visible: false, active: 0, revoked: 0, state: "unknown", brokerId: null, detail: "project not found" },
     entry: { ready: false, reasons: ["project not found"] },
   };
   const opened = openReadProject(root, asJson);
@@ -1630,6 +2169,51 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
       const authoritative = live.filter((proof) => proof.authority === "authoritative");
       if (authoritative.length > 0) {
         routing[adapter.id] = "proven";
+        // Attestation currency (OC-P8): an authoritative proof bound to
+        // a superseded/stale attestation authorizes nothing at dispatch
+        // (`requireCurrentRoutingProof` denies it), so the doctor must
+        // never report it as simply "proven". Explicit stale state plus
+        // a re-verify reason is required.
+        if (rtkAttested !== "current") {
+          routing[adapter.id] = "stale";
+          reasons.push(`routing proof for '${adapter.id}' binds a ${rtkAttested} RTK attestation: run chrono init to re-verify, re-prove, and promote`);
+        }
+        // Binding currency (OC-P7): an authoritative proof whose
+        // registration/asset snapshot no longer matches the live
+        // project (e.g. hooks regenerated by repair) reads as proven
+        // nowhere — dispatch would deny it, so the doctor must too.
+        // Every authoritative scope is checked, not just the first.
+        for (const proof of authoritative) {
+          let binding: ReturnType<ChronoCore["routingProofBinding"]>;
+          try {
+            binding = core.routingProofBinding(adapter.id, proof.runtime);
+          } catch {
+            binding = { ok: false };
+          }
+          if (binding.ok && binding.value !== undefined && binding.value !== null && !binding.value.inSync) {
+            routing[adapter.id] = "stale";
+            reasons.push(binding.value.reason);
+          } else if (!binding.ok) {
+            routing[adapter.id] = "stale";
+            reasons.push(`routing proof bindings for '${adapter.id}' are unverifiable: re-prove and promote`);
+          }
+        }
+        // Managed-asset drift invalidates the proof snapshot even when
+        // the manifest check above passes on a subset (OC-P8): hooks
+        // are part of the bound assets, so drifted hooks force stale.
+        if (routing[adapter.id] === "proven") {
+          try {
+            const hookCheck = checkManagedHooks(root, [adapter.id]);
+            const drifted = Object.entries(hookCheck).some(([, intact]) => !intact);
+            if (drifted) {
+              routing[adapter.id] = "stale";
+              reasons.push(`routing proof for '${adapter.id}' predates managed-asset drift: run chrono init to repair hooks, re-prove, and promote`);
+            }
+          } catch {
+            routing[adapter.id] = "stale";
+            reasons.push(`routing proof bindings for '${adapter.id}' are unverifiable: re-prove and promote`);
+          }
+        }
         continue;
       }
       if (live.length > 0) {
@@ -1669,25 +2253,39 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
     if (setupStep === null || setupStepIndex(setupStep) < setupStepIndex("ADAPTERS_REGISTERED_AND_APPROVED")) {
       reasons.push(`setup at '${setupStep ?? "not started"}': finish chrono init`);
     }
-    let broker = { visible: false, active: 0, revoked: 0 };
-    if (options.as !== undefined && options.session !== undefined) {
-      const listed = core.listBrokerCredentials({ actor: options.as, session: options.session });
-      if (listed.ok) {
-        const creds = listed.value ?? [];
-        const active = creds.filter((c: { revoked: boolean }) => !c.revoked).length;
-        const revoked = creds.filter((c: { revoked: boolean }) => c.revoked).length;
-        broker = { visible: true, active, revoked };
-        if (active === 0) {
-          reasons.push("no active broker credential");
-        }
-      } else {
-        reasons.push(`broker list denied (${listed.error?.code ?? "unknown"})`);
-      }
-    } else {
-      reasons.push("broker visibility needs a gaspar/PO session");
+    // Public broker verification (OC-P6): the Core-owned health
+    // projection, the non-secret broker-account file, and a
+    // non-destructive keychain read. No session is required or
+    // consulted; the doctor never handles broker secrets beyond a
+    // local hash comparison that is never printed or persisted.
+    const store = options.store ?? new OsKeychainStore();
+    const brokerCheck = checkBrokerHealth(core, root, store);
+    const broker = brokerCheck.report;
+    if (!brokerCheck.healthy) {
+      reasons.push(broker.detail);
     }
     if (pinnedVersion !== CHRONO_VERSION) {
       reasons.push(`pinned Core ${pinnedVersion ?? "none"} mismatches launcher ${CHRONO_VERSION}`);
+    }
+    // Effective READY projection (OC-P8): the stored label is never
+    // reported as READY while public verification disagrees. When entry
+    // is blocked on a stored READY project, project the earliest repair
+    // step so `setupStep` and `entry.ready` agree and `chrono init`
+    // knows where to resume without manual granular commands.
+    const storedSetupStep = setupStep;
+    const hookDrifted = Object.values(hooks).some((intact) => !intact);
+    const routingStale = Object.values(routing).some((state) => state !== "proven");
+    let effectiveSetupStep = storedSetupStep;
+    if (storedSetupStep === "READY" && reasons.length > 0) {
+      if (rtkAttested !== "current" || routingStale) {
+        effectiveSetupStep = "RTK_VERIFIED_AND_ROUTED";
+      } else if (hookDrifted) {
+        effectiveSetupStep = "NATIVE_HOOKS_INSTALLED";
+      } else if (!brokerCheck.healthy) {
+        effectiveSetupStep = "GASPAR_ENTRY_PREPARED";
+      } else {
+        effectiveSetupStep = "NATIVE_HOOKS_INSTALLED";
+      }
     }
     const filled: DoctorReport = {
       found: true,
@@ -1695,7 +2293,8 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
       launcherVersion: CHRONO_VERSION,
       pinnedVersion,
       versionMatch: pinnedVersion === CHRONO_VERSION,
-      setupStep,
+      setupStep: effectiveSetupStep,
+      storedSetupStep,
       projectState,
       adapters,
       rtk: { attested: rtkAttested, routing },
@@ -1789,9 +2388,9 @@ function renderDoctor(report: DoctorReport): string {
     `rtk: ${report.rtk.attested} (${Object.entries(report.rtk.routing).map(([k, v]) => `${k}=${v}`).join(", ") || "no adapters"})`,
     `skill: ${report.skill.state}`,
     `hooks: ${Object.entries(report.hooks).map(([k, v]) => `${k}=${v ? "ok" : "DRIFT"}`).join(", ")}`,
-    report.broker.visible
-      ? `broker: ${String(report.broker.active)} active, ${String(report.broker.revoked)} revoked`
-      : "broker: hidden (pass a gaspar/PO session to inspect)",
+    report.broker.visible && report.broker.state === "active"
+      ? `broker: ${report.broker.brokerId ?? "active"} active (${String(report.broker.revoked)} revoked, keychain verified)`
+      : `broker: ${report.broker.state.toUpperCase()} (${report.broker.detail})`,
     report.entry.ready ? "entry: READY" : `entry: BLOCKED (${report.entry.reasons.join("; ")})`,
   ];
   return lines.join("\n");

@@ -38,6 +38,60 @@ export class KeychainError extends Error {
 }
 
 /**
+ * Normalize keychain-read material to its canonical PEM form without
+ * ever weakening custody proof. CRLF becomes LF (CR is meaningless in
+ * PEM armor and base64); ASCII whitespace is trimmed at the very
+ * start/end; lowercase hex of even length that decodes to PEM-armored
+ * bytes is decoded (macOS `security -w` hex transport for multiline
+ * secrets). Interior bytes are never touched. Broker secrets (short
+ * hex without PEM armor) pass through unchanged.
+ */
+export function normalizeKeyTransport(material: string): string {
+  const edge = material.replace(/\r\n/g, "\n").replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, "");
+  if (/^[0-9a-f]+$/i.test(edge) && edge.length % 2 === 0 && edge.length >= 2) {
+    try {
+      const decoded = Buffer.from(edge, "hex").toString("utf8");
+      if (decoded.startsWith("-----BEGIN")) {
+        return decoded;
+      }
+    } catch {
+      // Not decodable hex: fall through to the edge-trimmed form.
+    }
+  }
+  return edge;
+}
+
+/**
+ * Read the PO private key in canonical, signable form, or null when no
+ * usable custody exists. Parse failures (malformed, truncated, wrong
+ * key type) and unreadable stores all yield null — callers fail closed
+ * without ever handling raw secret text beyond this boundary. Use at
+ * every PO signing site so macOS hex/trim transport variants sign
+ * exactly like in-memory material.
+ */
+export function readPoPrivateKey(store: KeyStore): string | null {
+  let raw: string | null;
+  try {
+    raw = store.readKey(PO_KEY_ACCOUNT);
+  } catch {
+    return null;
+  }
+  if (raw === null || raw.length === 0) {
+    return null;
+  }
+  const normalized = normalizeKeyTransport(raw);
+  try {
+    const key = createPrivateKey(normalized);
+    if (key.asymmetricKeyType !== "ed25519") {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  return normalized;
+}
+
+/**
  * Canonical key-custody verification: proves retrieved keychain
  * material is the private key pairing with the expected public key.
  *

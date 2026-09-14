@@ -27,6 +27,11 @@ import {
   entrySessionCommand,
   kiroEntryRegistrationPath,
 } from "./gaspar-entry.js";
+import {
+  ENTRY_COMMAND_NAME,
+  ENTRY_OPTIONS,
+  entryCommanderOption,
+} from "./entry-contract.js";
 import { constructionFailure, openReadProject, resolveProjectDir } from "./project.js";
 
 export { buildOpencodePlugin };
@@ -41,6 +46,7 @@ import {
   PO_KEY_SERVICE,
   PO_KEY_STAGING_ACCOUNT,
   isInteractiveTerminal,
+  readPoPrivateKey,
   verifyKeyCustody,
   type KeyStore,
 } from "./keychain.js";
@@ -352,7 +358,7 @@ export function runApprove(
     return constructionFailure(e, asJson);
   }
   try {
-    const privateKey = readPoKey(deps.store);
+    const privateKey = readPoPrivateKey(deps.store);
     if (privateKey === null) {
       return approvalRequired(
         "No PO signing key in the OS keychain",
@@ -369,7 +375,15 @@ export function runApprove(
       rationale: options.rationale,
       timestamp,
     });
-    const signature = signApprovalPayload(payload, privateKey);
+    let signature: string;
+    try {
+      signature = signApprovalPayload(payload, privateKey);
+    } catch {
+      return coreError(
+        { code: "SIGNATURE_INVALID", severity: "ERROR", message: "PO signing key is not usable for approvals" },
+        asJson
+      );
+    }
     const result = core.recordApproval({
       action: options.action,
       scopeArtifactId: options.scope,
@@ -411,7 +425,7 @@ export function runWaive(
     return constructionFailure(e, asJson);
   }
   try {
-    const privateKey = readPoKey(deps.store);
+    const privateKey = readPoPrivateKey(deps.store);
     if (privateKey === null) {
       return approvalRequired(
         "No PO signing key in the OS keychain",
@@ -432,7 +446,15 @@ export function runWaive(
       expiryReviewCondition: options.expiry,
       timestamp,
     });
-    const signature = signApprovalPayload(payload, privateKey);
+    let signature: string;
+    try {
+      signature = signApprovalPayload(payload, privateKey);
+    } catch {
+      return coreError(
+        { code: "SIGNATURE_INVALID", severity: "ERROR", message: "PO signing key is not usable for waivers" },
+        asJson
+      );
+    }
     const result = core.recordWaiver({
       scopeArtifactId: options.scope,
       scopeRevision: options.revision,
@@ -669,7 +691,7 @@ export function runKeysGenerate(
     return constructionFailure(e, asJson);
   }
   try {
-    const existingPrivate = readPoKey(deps.store);
+    const existingPrivate = readPoPrivateKey(deps.store);
     const registeredRevision = core.poKeyRevision();
     if (registeredRevision !== null) {
       if (existingPrivate === null) {
@@ -1705,7 +1727,7 @@ export function runSessionOpen(
       return humanOnlyRefusal("session open", asJson);
     }
     if (options.role === "gaspar" || options.role === "PO") {
-      const privateKey = readPoKey(deps.store);
+      const privateKey = readPoPrivateKey(deps.store);
       if (privateKey === null) {
         return approvalRequired(
           "Privileged sessions require the PO signing key from the OS keychain",
@@ -2583,7 +2605,7 @@ export function createProgram(cwd: string): Command {
     .option("--from-plan <file>", "apply a reviewed plan file (rejected on drift)")
     .option("--json", "machine-readable JSON output")
     .action(async (opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const { runInitFlow } = await import("./init-flow.js");
       const runtimes = Array.isArray(opts.runtime)
         ? opts.runtime.filter((r): r is string => typeof r === "string")
@@ -2611,7 +2633,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const out = runStatus(projectPath, { json: opts.json === true });
       if (out.stdout !== "") {
         console.log(out.stdout);
@@ -2630,7 +2652,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const out = runValidate(projectPath, { json: opts.json === true });
       if (out.stdout !== "") {
         console.log(out.stdout);
@@ -2654,7 +2676,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const out = runApprove(projectPath, {
         action: String(opts.action ?? ""),
         scope: String(opts.scope ?? ""),
@@ -2681,7 +2703,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const out = runWaive(projectPath, {
         scope: String(opts.scope ?? ""),
         revision: String(opts.revision ?? ""),
@@ -2704,7 +2726,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       emitProgramResult(
         program,
         runEnroll(projectPath, {
@@ -2724,7 +2746,7 @@ export function createProgram(cwd: string): Command {
     .option("--rationale <text>", "rationale bound into a rotation signature")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       emitProgramResult(
         program,
         runKeysGenerate(projectPath, {
@@ -2749,7 +2771,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((gate: string, opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       emitProgramResult(
         program,
         runGate(projectPath, {
@@ -2774,7 +2796,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       emitProgramResult(program, runAttestationStatus(projectPath, "rtk", { json: opts.json === true }));
     });
 
@@ -2786,7 +2808,7 @@ export function createProgram(cwd: string): Command {
     .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       emitProgramResult(
         program,
@@ -2811,7 +2833,7 @@ export function createProgram(cwd: string): Command {
     .option("--json", "machine-readable JSON output")
     .argument("<command...>", "raw pre-routing command (without the rtk prefix: mapped through 'rtk rewrite' by the flow)")
     .action((command: string[], opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       const ttl = typeof opts.ttl === "string" ? Number(opts.ttl) : undefined;
       const timeout = typeof opts.timeout === "string" ? Number(opts.timeout) : undefined;
@@ -2839,7 +2861,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       emitProgramResult(
         program,
@@ -2860,7 +2882,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       emitProgramResult(program, runAttestationStatus(projectPath, "skill", { json: opts.json === true }));
     });
 
@@ -2873,7 +2895,7 @@ export function createProgram(cwd: string): Command {
     .option("--ttl <seconds>", "attestation lifetime in seconds (default 86400)")
     .option("--json", "machine-readable JSON output")
     .action(async (opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       const ttl = typeof opts.ttl === "string" ? Number(opts.ttl) : undefined;
       emitProgramResult(
@@ -2902,7 +2924,7 @@ export function createProgram(cwd: string): Command {
     .option("--json", "machine-readable JSON output")
     .argument("<command...>", "command to dispatch (must start with the adapter entrypoint)")
     .action((command: string[], opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const timeout = typeof opts.timeout === "string" ? Number(opts.timeout) : undefined;
       emitProgramResult(
         program,
@@ -2932,7 +2954,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       if (token === null || typeof opts.as !== "string" || typeof opts.file !== "string") {
         emitProgramResult(
@@ -2955,7 +2977,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       emitProgramResult(program, runAdapterList(projectPath, { json: opts.json === true }));
     });
 
@@ -2969,7 +2991,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       if (token === null || typeof opts.as !== "string") {
         emitProgramResult(
@@ -3001,7 +3023,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       if (token === null || typeof opts.as !== "string") {
         emitProgramResult(
@@ -3026,7 +3048,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       emitProgramResult(
         program,
         runSetup(projectPath, {
@@ -3052,7 +3074,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const ttl = typeof opts.ttl === "string" ? Number(opts.ttl) : undefined;
       emitProgramResult(
         program,
@@ -3082,7 +3104,7 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((id: string, opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const token = resolveSessionToken(typeof opts.sessionToken === "string" ? opts.sessionToken : undefined);
       if (token === null || typeof opts.as !== "string") {
         emitProgramResult(
@@ -3103,11 +3125,11 @@ export function createProgram(cwd: string): Command {
     .command("doctor")
     .description("Read-only project diagnostics: compatibility, setup, hooks, RTK, skill, broker, entry readiness")
     .option("--path <dir>", "project directory (default: current directory)")
-    .option("--as <actor>", "identity for broker inspection (gaspar or PO)")
-    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--as <actor>", "accepted for compatibility; broker inspection is public and needs no session")
+    .option("--session-token <id/token>", "accepted for compatibility; the doctor never uses privileged sessions")
     .option("--json", "machine-readable JSON output")
     .action(async (opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const { runDoctor } = await import("./init-flow.js");
       const token =
         typeof opts.sessionToken === "string" && opts.sessionToken.length > 0
@@ -3133,7 +3155,7 @@ export function createProgram(cwd: string): Command {
     .option("--store", "write the secret straight to the OS keychain instead of printing it")
     .option("--json", "machine-readable JSON output")
     .action(async (opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const { runBrokerIssue } = await import("./init-flow.js");
       const token =
         typeof opts.sessionToken === "string" && opts.sessionToken.length > 0
@@ -3165,7 +3187,7 @@ export function createProgram(cwd: string): Command {
     .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
     .option("--json", "machine-readable JSON output")
     .action(async (id: string, opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const { runBrokerRevoke } = await import("./init-flow.js");
       const token =
         typeof opts.sessionToken === "string" && opts.sessionToken.length > 0
@@ -3190,7 +3212,7 @@ export function createProgram(cwd: string): Command {
     .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
     .option("--json", "machine-readable JSON output")
     .action(async (opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const { runBrokerList } = await import("./init-flow.js");
       const token =
         typeof opts.sessionToken === "string" && opts.sessionToken.length > 0
@@ -3206,17 +3228,22 @@ export function createProgram(cwd: string): Command {
       );
     });
 
-  program
-    .command("entry")
-    .description("Redeem Gaspar entry for a runtime adapter (secret on stdin, token to --token-out only)")
-    .requiredOption("--adapter <id>", "runtime adapter id")
-    .requiredOption("--broker <id>", "broker credential id (recorded in .chrono/broker-account)")
-    .option("--runtime <name>", "adapter runtime (default: project runtime, else adapter id)")
-    .requiredOption("--token-out <path>", "0600 file receiving the session token")
-    .option("--path <dir>", "project directory (default: current directory)")
-    .option("--json", "machine-readable JSON output")
-    .action(async (opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+  // The `entry` interface is owned by entry-contract.ts (OC-P7):
+  // Commander options derive from ENTRY_OPTIONS so the parser and
+  // the generated script cannot drift independently. The broker
+  // secret always travels on stdin; no flag may ever carry it.
+  const entryCommand = program
+    .command(ENTRY_COMMAND_NAME)
+    .description("Redeem Gaspar entry for a runtime adapter (secret on stdin, token to --token-out only)");
+  for (const spec of ENTRY_OPTIONS) {
+    if (spec.required) {
+      entryCommand.requiredOption(entryCommanderOption(spec), spec.description);
+    } else {
+      entryCommand.option(entryCommanderOption(spec), spec.description);
+    }
+  }
+  entryCommand.action(async (opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const { runEntry } = await import("./init-flow.js");
       if (process.stdin.isTTY === true) {
         emitProgramResult(
@@ -3265,7 +3292,7 @@ export function createProgram(cwd: string): Command {
     .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
     .option("--json", "machine-readable JSON output")
     .action(async (opts: CommandOpts) => {
-      const projectPath = typeof opts.path === "string" ? opts.path : resolveProjectDir(cwd);
+      const projectPath = resolveProjectDir(cwd, opts.path);
       const { runUninstall } = await import("./init-flow.js");
       const token =
         typeof opts.sessionToken === "string" && opts.sessionToken.length > 0

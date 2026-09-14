@@ -52,6 +52,26 @@ describe("Project root discovery", () => {
     expect(resolveProjectDir(join(tempDir, "sub"), tempDir)).toBe(realpathSync(tempDir));
   });
 
+  it("canonicalizes explicit symlinked paths identically to cwd resolution", () => {
+    expect(runInit(tempDir).exitCode).toBe(0);
+    const canonicalTemp = realpathSync(tempDir);
+    const link = join(tmpdir(), `chrono-iso-explink-${process.pid}`);
+    try {
+      symlinkSync(tempDir, link);
+      // Explicit --path through a symlink resolves to the same identity
+      // as cwd-based resolution: no command may compute identity
+      // differently based on spelling.
+      expect(resolveProjectDir(canonicalTemp, link)).toBe(canonicalTemp);
+      expect(resolveProjectDir(link)).toBe(canonicalTemp);
+      // Nonexistent explicit paths cannot canonicalize: verbatim fallback.
+      expect(resolveProjectDir(link, join(link, "sub"))).toBe(join(link, "sub"));
+    } finally {
+      // Symlink-to-directory cleanup: recursive removal unlinks on every
+      // supported Node LTS (bare rmSync throws EISDIR on some versions).
+      rmSync(link, { recursive: true, force: true });
+    }
+  });
+
   it("does not mistake sibling projects for parents", () => {
     expect(runInit(tempDir).exitCode).toBe(0);
     const sibling = mkdtempSync(join(tmpdir(), "chrono-root-sib-"));

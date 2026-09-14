@@ -22,6 +22,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChronoCore } from "@chrono/core";
+import Database from "better-sqlite3";
 import { MemoryKeyStore } from "./keychain.js";
 import { hashSkillSource, SKILL_RELEASE } from "@chrono/domain";
 import {
@@ -31,6 +32,7 @@ import {
   readInitPlanFile,
   runDoctor,
   runInitFlow,
+  sanitizeDoctorEnv,
   validatePlanReplay,
   writeInitPlanFile,
   type FlowProbes,
@@ -80,12 +82,35 @@ function makeBins(dir: string): FixtureBins {
   return { dir, rtk, runtime };
 }
 
-function flowProbes(bins: FixtureBins, opts: { failGainOnce?: boolean } = {}): FlowProbes & { gainCalls: () => number } {
+function flowProbes(
+  bins: FixtureBins,
+  opts: { failGainOnce?: boolean; doctorStore?: MemoryKeyStore } = {}
+): FlowProbes & {
+  gainCalls: () => number;
+  doctorStore: MemoryKeyStore | null;
+  doctorSeen: () => { argv: string[] | null; env: Record<string, string> | null };
+} {
   let gainCalls = 0;
   let failedOnce = false;
-  return {
+  const seen: { argv: string[] | null; env: Record<string, string> | null } = { argv: null, env: null };
+  const fake = {
     gainCalls: () => gainCalls,
-    execFile: (cmd: string[]) => {
+    // Wired by the test to the run's keychain: the simulated doctor
+    // child computes the REAL public verification against the same
+    // project dir + keychain content a separate process would see.
+    doctorStore: (opts.doctorStore ?? null) as MemoryKeyStore | null,
+    doctorSeen: () => seen,
+    execFile: (cmd: string[], _timeoutMs?: number, options?: { env?: Record<string, string> }) => {
+      if (cmd.includes("doctor")) {
+        seen.argv = cmd;
+        seen.env = options?.env ?? null;
+        const pathIndex = cmd.indexOf("--path");
+        const root = pathIndex >= 0 && typeof cmd[pathIndex + 1] === "string" ? (cmd[pathIndex + 1] as string) : null;
+        if (root === null || fake.doctorStore === null) {
+          return { exitCode: 1, stdout: "", stderr: "doctor child not wired in fixture" };
+        }
+        return runDoctor(root, { json: true, store: fake.doctorStore });
+      }
       const [binary, ...args] = cmd as [string, ...string[]];
       const name = binary.split("/").pop() ?? binary;
       if (name === "git") {
@@ -153,6 +178,7 @@ function flowProbes(bins: FixtureBins, opts: { failGainOnce?: boolean } = {}): F
     homedir: () => join(bins.dir, "home"),
     platform: () => ({ os: "linux", arch: "arm64", node: "v22.0.0" }),
   };
+  return fake;
 }
 
 function depsOf(store: MemoryKeyStore): { interactive: boolean; store: MemoryKeyStore } {
@@ -305,7 +331,7 @@ describe("Init happy path and resume", () => {
     const seen: string[] = [];
     const bins = makeBins(binDir);
     const store = new MemoryKeyStore();
-    const out = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins), autoConfirm(seen));
+    const out = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm(seen));
     expect(out.exitCode).toBe(0);
     const parsed = JSON.parse(out.stdout) as { ok: boolean; ready: boolean; runtimes: string[] };
     expect(parsed).toMatchObject({ ok: true, ready: true, runtimes: ["opencode"] });
@@ -354,6 +380,81 @@ describe("Init happy path and resume", () => {
       core2.close();
     }
   });
+
+  it("READY gate re-invokes the public doctor as a separate process with a sanitized environment", async () => {
+    // OC-P6 reqs 1+9: READY persists only if the exact normal-user
+    // `chrono doctor` confirms readiness; the child carries no session
+    // and a sanitized environment even when the parent is polluted.
+    const bins = makeBins(binDir);
+    const store = new MemoryKeyStore();
+    const probes = flowProbes(bins, { doctorStore: store });
+    const saved = {
+      session: process.env["CHRONO_SESSION_TOKEN"],
+      nodeOptions: process.env["NODE_OPTIONS"],
+      ldPreload: process.env["LD_PRELOAD"],
+      custom: process.env["MY_SECRET_TOKEN"],
+    };
+    process.env["CHRONO_SESSION_TOKEN"] = "GASPAR-1/deadbeef";
+    process.env["NODE_OPTIONS"] = "--require /tmp/evil.js";
+    process.env["LD_PRELOAD"] = "/tmp/evil.so";
+    process.env["MY_SECRET_TOKEN"] = "s3cret";
+    try {
+      const out = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), probes, autoConfirm([]));
+      expect(out.exitCode).toBe(0);
+    } finally {
+      if (saved.session === undefined) {
+        delete process.env["CHRONO_SESSION_TOKEN"];
+      } else {
+        process.env["CHRONO_SESSION_TOKEN"] = saved.session;
+      }
+      if (saved.nodeOptions === undefined) {
+        delete process.env["NODE_OPTIONS"];
+      } else {
+        process.env["NODE_OPTIONS"] = saved.nodeOptions;
+      }
+      if (saved.ldPreload === undefined) {
+        delete process.env["LD_PRELOAD"];
+      } else {
+        process.env["LD_PRELOAD"] = saved.ldPreload;
+      }
+      if (saved.custom === undefined) {
+        delete process.env["MY_SECRET_TOKEN"];
+      } else {
+        process.env["MY_SECRET_TOKEN"] = saved.custom;
+      }
+    }
+    const seen = probes.doctorSeen();
+    expect(seen.argv).not.toBe(null);
+    expect(seen.argv?.[0]).toBe(process.execPath);
+    expect(seen.argv).toContain("doctor");
+    const pathIndex = seen.argv?.indexOf("--path") ?? -1;
+    expect(pathIndex).toBeGreaterThanOrEqual(0);
+    expect(seen.argv?.[pathIndex + 1]).toBe(realpathSync(tempDir));
+    expect(seen.argv).toContain("--json");
+    // No privilege or secret carrier crosses into the verification
+    // process; the allowlist still passes PATH through.
+    expect(seen.env).not.toBe(null);
+    expect(seen.env?.["CHRONO_SESSION_TOKEN"]).toBeUndefined();
+    expect(seen.env?.["NODE_OPTIONS"]).toBeUndefined();
+    expect(seen.env?.["LD_PRELOAD"]).toBeUndefined();
+    expect(seen.env?.["MY_SECRET_TOKEN"]).toBeUndefined();
+    expect(seen.env?.["PATH"]).toBe(process.env["PATH"]);
+  });
+
+  it("sanitizeDoctorEnv passes an allowlist and drops session carriers", async () => {
+    const clean = sanitizeDoctorEnv({
+      PATH: "/usr/bin",
+      HOME: "/home/po",
+      CHRONO_SESSION_TOKEN: "GASPAR-1/deadbeef",
+      NODE_OPTIONS: "--require /tmp/evil.js",
+      LD_PRELOAD: "/tmp/evil.so",
+      DYLD_INSERT_LIBRARIES: "/tmp/evil.dylib",
+      MY_SECRET_TOKEN: "s3cret",
+      AWS_SECRET_ACCESS_KEY: "s3cret",
+    });
+    expect(clean).toMatchObject({ PATH: "/usr/bin", HOME: "/home/po" });
+    expect(Object.keys(clean).sort()).toEqual(["HOME", "PATH"]);
+  });
   it("opencode-only selection ignores absent Claude/Kiro runtimes", async () => {
     // No claude/kiro binaries exist in this fixture. Explicit opencode
     // selection must initialize cleanly, install no Claude/Kiro
@@ -364,14 +465,14 @@ describe("Init happy path and resume", () => {
       tempDir,
       { json: true, yes: true, runtimeIds: ["opencode"] },
       depsOf(store),
-      flowProbes(bins),
+      flowProbes(bins, { doctorStore: store }),
       autoConfirm([])
     );
     expect(out.exitCode).toBe(0);
     expect(JSON.parse(out.stdout) as object).toMatchObject({ ok: true, ready: true, runtimes: ["opencode"] });
     expect(existsSync(join(tempDir, ".claude", "settings.json"))).toBe(false);
     expect(existsSync(join(tempDir, ".kiro", "hooks"))).toBe(false);
-    const doctor = runDoctor(tempDir, { json: true });
+    const doctor = runDoctor(tempDir, { json: true, store });
     const reasons = (JSON.parse(doctor.stdout) as { doctor: { entry: { reasons: string[] } } }).doctor.entry.reasons;
     expect(reasons.some((r) => /claude|kiro/i.test(r))).toBe(false);
   });
@@ -380,8 +481,8 @@ describe("Init happy path and resume", () => {
     const bins = makeBins(binDir);
     const store = new MemoryKeyStore();
     const seen: string[] = [];
-    expect((await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins), autoConfirm(seen))).exitCode).toBe(0);
-    const again = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins), autoConfirm(seen));
+    expect((await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm(seen))).exitCode).toBe(0);
+    const again = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm(seen));
     expect(again.exitCode).toBe(0);
     const parsed = JSON.parse(again.stdout) as { resumed: boolean };
     expect(parsed.resumed).toBe(true);
@@ -393,12 +494,12 @@ describe("Init happy path and resume", () => {
   it("resumes after an injected failure without duplicates", async () => {
     const bins = makeBins(binDir);
     const store = new MemoryKeyStore();
-    const failing = flowProbes(bins, { failGainOnce: true });
+    const failing = flowProbes(bins, { failGainOnce: true, doctorStore: store });
     const seen: string[] = [];
     const first = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), failing, autoConfirm(seen));
     expect(first.exitCode).toBe(1);
     expect(first.stdout).toContain("RTK_VERIFIED_AND_ROUTED");
-    const second = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins), autoConfirm(seen));
+    const second = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm(seen));
     expect(second.exitCode).toBe(0);
     expect(JSON.parse(second.stdout) as object).toMatchObject({ ok: true, ready: true });
     const listed = runAdapterList(tempDir, { json: true });
@@ -412,7 +513,7 @@ describe("Init happy path and resume", () => {
       tempDir,
       { json: true },
       depsOf(store),
-      flowProbes(bins),
+      flowProbes(bins, { doctorStore: store }),
       () => "yes init wronghash"
     );
     expect(out.exitCode).toBe(2);
@@ -424,7 +525,7 @@ describe("Init happy path and resume", () => {
     const store = new MemoryKeyStore();
     mkdirSync(join(tempDir, ".chrono"), { recursive: true });
     writeFileSync(join(tempDir, ".chrono", "init.lock"), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
-    const out = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins), autoConfirm([]));
+    const out = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm([]));
     expect(out.exitCode).toBe(1);
     expect(out.stdout).toContain("already running");
   });
@@ -433,7 +534,7 @@ describe("Init happy path and resume", () => {
     const bins = makeBins(binDir);
     const store = new MemoryKeyStore();
     const seen: string[] = [];
-    const out = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins), autoConfirm(seen));
+    const out = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm(seen));
     expect(out.exitCode).toBe(0);
     const haystack = `${out.stdout} ${seen.join("\n")}`.toLowerCase();
     for (const banned of ["openai", "anthropic", "gpt-", "claude-sonnet", "gemini", "sonnet-4", "opus-4"]) {
@@ -451,13 +552,13 @@ describe("Init happy path and resume", () => {
     const probes = flowProbes(bins);
     const multi: FlowProbes = {
       ...probes,
-      execFile: (cmd: string[]) => {
+      execFile: (cmd: string[], timeoutMs?: number, options?: { env?: Record<string, string> }) => {
         const [binary, ...args] = cmd as [string, ...string[]];
         if (binary === claudeBin || binary === "claude") {
           return { exitCode: 0, stdout: "claude 9.9.9-test\n", stderr: "" };
         }
         void args;
-        return probes.execFile(cmd, 120000);
+        return probes.execFile(cmd, timeoutMs ?? 120000, options);
       },
       which: (binary: string): string | null => {
         if (binary === "claude") {
@@ -467,6 +568,7 @@ describe("Init happy path and resume", () => {
       },
     };
     const store = new MemoryKeyStore();
+    probes.doctorStore = store;
     const out = await runInitFlow(
       tempDir,
       { json: true, yes: true, runtimeIds: ["opencode", "claude-code"] },
@@ -547,5 +649,505 @@ describe("Init plan files", () => {
     expect(out.exitCode).toBe(0);
     expect(existsSync(planPath)).toBe(true);
     expect(existsSync(join(tempDir, ".chrono"))).toBe(false);
+  });
+});
+
+describe("Init resume and fail-closed driver (OC-P5)", () => {
+  // Regression suite for the real-pilot finding: a resumed `chrono
+  // init` silently returned after PO_ENROLLED. One invocation must
+  // flow through every non-interactive step; failures must be loud
+  // with step, code, and resume action; exit 0 means READY.
+
+  /** Store reproducing macOS `security -w` read semantics. */
+  class MacOsKeychainStore extends MemoryKeyStore {
+    override readKey(account: string): string | null {
+      const raw = super.readKey(account);
+      if (raw === null) {
+        return null;
+      }
+      if (raw.includes("\n")) {
+        return `${Buffer.from(raw, "utf8").toString("hex")}\n`;
+      }
+      const trimmed = raw.trim();
+      return trimmed.length === 0 ? null : trimmed;
+    }
+  }
+
+  let tempDir: string;
+  let binDir: string;
+  let restoreTty: () => void;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-init-ocp5-"));
+    binDir = mkdtempSync(join(tmpdir(), "chrono-init-ocp5-bins-"));
+    restoreTty = fakeInteractiveTerminal();
+  });
+
+  afterEach(() => {
+    restoreTty();
+    rmSync(tempDir, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  });
+
+  function setupStep(): string | null {
+    const core = new ChronoCore({ projectPath: tempDir });
+    try {
+      const state = core.getSetupState();
+      return state.ok && state.value !== undefined && state.value !== null ? state.value.step : null;
+    } finally {
+      core.close();
+    }
+  }
+
+  function activeAdapters(): string[] {
+    const core = new ChronoCore({ projectPath: tempDir });
+    try {
+      return core.listAdapters().filter((a) => a.status === "active").map((a) => a.id).sort();
+    } finally {
+      core.close();
+    }
+  }
+
+  function approvalCount(): number {
+    const core = new ChronoCore({ projectPath: tempDir });
+    try {
+      // The init flow records exactly one approval (adapter
+      // registration); enrollment is a ceremony, not an approval.
+      return core.listEvents().filter((e) => e.eventType === "ApprovalGranted").length;
+    } finally {
+      core.close();
+    }
+  }
+
+  function brokerAccountBytes(): string | null {
+    try {
+      return readFileSync(join(tempDir, ".chrono", "broker-account"), "utf8");
+    } catch {
+      return null;
+    }
+  }
+
+  it("completes a full init through macOS keychain semantics in one invocation", async () => {
+    // Exact hermetic reproduction of the pilot failure: multiline
+    // keychain reads come back hex-encoded, which previously threw
+    // out of session bootstrap into a silent exit.
+    const bins = makeBins(binDir);
+    const store = new MacOsKeychainStore();
+    const out = await runInitFlow(
+      tempDir,
+      { json: true, yes: true },
+      depsOf(store),
+      flowProbes(bins, { doctorStore: store }),
+      autoConfirm([])
+    );
+    expect(out.exitCode).toBe(0);
+    expect(JSON.parse(out.stdout) as object).toMatchObject({ ok: true, ready: true, step: "READY" });
+    expect(setupStep()).toBe("READY");
+    expect(activeAdapters()).toEqual(["opencode"]);
+    expect(brokerAccountBytes()).not.toBeNull();
+  });
+
+  it("resumes mid-flow past PO_ENROLLED and never duplicates authority records", async () => {
+    const bins = makeBins(binDir);
+    const store = new MacOsKeychainStore();
+    const seen: string[] = [];
+    const first = await runInitFlow(
+      tempDir,
+      { json: true, yes: true },
+      depsOf(store),
+      flowProbes(bins, { failGainOnce: true, doctorStore: store }),
+      autoConfirm(seen)
+    );
+    expect(first.exitCode).toBe(1);
+    // Stopped at the RTK step with enrollment done and marked: the
+    // exact pilot resume point (PO_ENROLLED behind, work ahead).
+    expect(setupStep()).toBe("RUNTIMES_SELECTED");
+    const second = await runInitFlow(
+      tempDir,
+      { json: true, yes: true },
+      depsOf(store),
+      flowProbes(bins, { doctorStore: store }),
+      autoConfirm(seen)
+    );
+    expect(second.exitCode).toBe(0);
+    expect(JSON.parse(second.stdout) as object).toMatchObject({ ok: true, ready: true });
+    expect(setupStep()).toBe("READY");
+    expect(activeAdapters()).toEqual(["opencode"]);
+    expect(approvalCount()).toBe(1);
+    const brokerBefore = brokerAccountBytes();
+    // A further resume is a health path that changes nothing.
+    const third = await runInitFlow(
+      tempDir,
+      { json: true, yes: true },
+      depsOf(store),
+      flowProbes(bins, { doctorStore: store }),
+      autoConfirm(seen)
+    );
+    expect(third.exitCode).toBe(0);
+    expect(brokerAccountBytes()).toBe(brokerBefore);
+    expect(activeAdapters()).toEqual(["opencode"]);
+    expect(approvalCount()).toBe(1);
+  });
+
+  it("reports failures loudly with step, code, and resume action", async () => {
+    const bins = makeBins(binDir);
+    const store = new MemoryKeyStore();
+    const failing = await runInitFlow(
+      tempDir,
+      { json: true, yes: true },
+      depsOf(store),
+      flowProbes(bins, { failGainOnce: true, doctorStore: store }),
+      autoConfirm([])
+    );
+    expect(failing.exitCode).toBe(1);
+    const parsed = JSON.parse(failing.stdout) as {
+      ok: boolean;
+      step: string;
+      error: { ok: boolean; error: { code: string } };
+      nextAction: string;
+      resume: string;
+    };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.step).toBe("RTK_VERIFIED_AND_ROUTED");
+    expect(parsed.error.error.code).toBe("BLOCKED_RTK");
+    expect(parsed.nextAction).toContain("chrono init");
+    expect(parsed.resume).toContain("chrono init");
+    // Human envelope carries the same contract (failing fixtures so
+    // the run stops loud at the RTK step instead of completing).
+    const humanDir = mkdtempSync(join(tmpdir(), "chrono-init-ocp5-human-"));
+    const humanBins = mkdtempSync(join(tmpdir(), "chrono-init-ocp5-humanbins-"));
+    try {
+      const human = await runInitFlow(
+        humanDir,
+        { yes: true },
+        depsOf(new MemoryKeyStore()),
+        flowProbes(makeBins(humanBins), { failGainOnce: true }),
+        autoConfirm([])
+      );
+      expect(human.exitCode).toBe(1);
+      expect(human.stdout).toBe("");
+      expect(human.stderr).toContain("FAILED");
+      expect(human.stderr).toContain("RTK_VERIFIED_AND_ROUTED");
+      expect(human.stderr).toContain("Resume:");
+    } finally {
+      rmSync(humanDir, { recursive: true, force: true });
+      rmSync(humanBins, { recursive: true, force: true });
+    }
+  });
+
+  it("uses distinct exit codes for READY, consent, blockers, and failures", async () => {
+    const bins = makeBins(binDir);
+    // READY → 0.
+    const readyStore = new MemoryKeyStore();
+    const ready = await runInitFlow(
+      tempDir,
+      { json: true, yes: true },
+      depsOf(readyStore),
+      flowProbes(bins, { doctorStore: readyStore }),
+      autoConfirm([])
+    );
+    expect(ready.exitCode).toBe(0);
+    // Missing consent → 2 with a CONSENT step.
+    const noConsentDir = mkdtempSync(join(tmpdir(), "chrono-init-ocp5-nc-"));
+    try {
+      const noConsent = await runInitFlow(
+        noConsentDir,
+        { json: true },
+        { interactive: false, store: new MemoryKeyStore() },
+        flowProbes(bins),
+        () => null
+      );
+      expect(noConsent.exitCode).toBe(2);
+      expect((JSON.parse(noConsent.stdout) as { step: string; error: { code: string } }).step).toBe("CONSENT");
+    } finally {
+      rmSync(noConsentDir, { recursive: true, force: true });
+    }
+    // External blocker (no RTK binary) → nonzero setup block.
+    const noRtk: FlowProbes = {
+      ...flowProbes(bins),
+      execFile: () => ({ exitCode: 1, stdout: "", stderr: "no rtk" }),
+      which: () => null,
+    };
+    const blockedDir = mkdtempSync(join(tmpdir(), "chrono-init-ocp5-bl-"));
+    try {
+      const blocked = await runInitFlow(
+        blockedDir,
+        { json: true, yes: true, runtimeIds: ["opencode"] },
+        depsOf(new MemoryKeyStore()),
+        noRtk,
+        autoConfirm([])
+      );
+      expect(blocked.exitCode).toBe(2);
+      expect(blocked.stdout).toContain("Setup blocked");
+    } finally {
+      rmSync(blockedDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the plan hash stable across identical detections", () => {
+    const bins = makeBins(binDir);
+    const first = detectInit(tempDir, {}, flowProbes(bins));
+    const second = detectInit(tempDir, {}, flowProbes(bins));
+    expect(detectionHash(first)).toBe(detectionHash(second));
+    expect(buildInitPlan(first, "2026-01-01T00:00:00.000Z").detectionHash).toBe(
+      buildInitPlan(second, "2026-06-01T00:00:00.000Z").detectionHash
+    );
+    // Pin volatile host state (real keychain contents) for a
+    // deterministic material-change check: only a documented input
+    // change may move the hash.
+    const pinned = { ...first, keychain: { available: true, enrolled: false, reason: "test" } };
+    const changed = { ...pinned, keychain: { available: true, enrolled: true, reason: "test" } };
+    expect(detectionHash(pinned)).toBe(detectionHash({ ...pinned }));
+    expect(detectionHash(changed)).not.toBe(detectionHash(pinned));
+  });
+
+  it("resuming from every persisted step never exits silently incomplete", async () => {
+    const steps = [
+      "DETECTED", "CONSENTED", "PROJECT_INITIALIZED", "PO_ENROLLED", "RUNTIMES_SELECTED",
+      "RTK_VERIFIED_AND_ROUTED", "SKILL_VERIFIED_AND_EMITTED", "ADAPTERS_REGISTERED_AND_APPROVED",
+      "NATIVE_HOOKS_INSTALLED", "RUNTIME_CONFORMANCE_PASSED", "GASPAR_ENTRY_PREPARED", "READY",
+    ] as const;
+    for (const seed of steps) {
+      const dir = mkdtempSync(join(tmpdir(), "chrono-init-ocp5-seed-"));
+      const seedBins = mkdtempSync(join(tmpdir(), "chrono-init-ocp5-seedbins-"));
+      try {
+        const core = new ChronoCore({ projectPath: dir });
+        try {
+          expect(core.init().ok).toBe(true);
+          let current: string | null = null;
+          for (const step of steps) {
+            const advanced = core.advanceSetupState(step as never, { seeded: true });
+            expect(advanced.ok).toBe(true);
+            current = step;
+            if (current === seed) {
+              break;
+            }
+          }
+        } finally {
+          core.close();
+        }
+        const seedStore = new MemoryKeyStore();
+        const out = await runInitFlow(
+          dir,
+          { json: true, yes: true },
+          depsOf(seedStore),
+          flowProbes(makeBins(seedBins), { doctorStore: seedStore }),
+          autoConfirm([])
+        );
+        if (out.exitCode === 0) {
+          const parsed = JSON.parse(out.stdout) as { ready?: boolean; resumed?: boolean };
+          expect(parsed.ready === true || parsed.resumed === true).toBe(true);
+        } else {
+          expect(out.exitCode).not.toBe(0);
+          const combined = `${out.stdout}\n${out.stderr}`;
+          expect(/step|FAILED|DENIED|CONSENT|Error|BLOCKED/i.test(combined)).toBe(true);
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+        rmSync(seedBins, { recursive: true, force: true });
+      }
+    }
+  }, 300000);
+});
+
+describe("Init upgrade/repair orchestration (OC-P8)", () => {
+  // Regression suite for the live-pilot finding: a READY project under
+  // a previous entry script failed repair at NATIVE_HOOKS_INSTALLED
+  // with BLOCKED_RTK ("run chrono rtk verify first"), left
+  // setupStep=READY while doctor reported not-ready, and demanded a
+  // manual granular command. `chrono init` now owns the full repair:
+  // demote the verified projection, re-verify, re-prove, promote,
+  // regenerate hooks, revalidate, and return to READY only on a
+  // separate-process doctor agreement — with zero manual commands.
+  let tempDir: string;
+  let binDir: string;
+  let restoreTty: () => void;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-init-ocp8-"));
+    binDir = mkdtempSync(join(tmpdir(), "chrono-init-ocp8-bins-"));
+    restoreTty = fakeInteractiveTerminal();
+  });
+
+  afterEach(() => {
+    restoreTty();
+    rmSync(tempDir, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  });
+
+  function storedStep(): string | null {
+    const core = new ChronoCore({ projectPath: tempDir });
+    try {
+      const state = core.getSetupState();
+      return state.ok && state.value !== undefined && state.value !== null ? state.value.step : null;
+    } finally {
+      core.close();
+    }
+  }
+
+  function staleRtkAttestation(): void {
+    // Trigger-legal staleness: current → stale preserves the row as
+    // historical evidence while denying authority (OC-P8 req 8).
+    const db = new Database(join(tempDir, ".chrono", "chrono.db"));
+    try {
+      db.prepare("UPDATE rtk_attestation SET status = 'stale' WHERE status = 'current'").run();
+    } finally {
+      db.close();
+    }
+  }
+
+  function driftEntryScript(): void {
+    const script = join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh");
+    const before = readFileSync(script, "utf8");
+    writeFileSync(script, `${before}\n# OC-P8 drift probe\n`, "utf8");
+  }
+
+  function snapshotIdentity(): { adapters: string[]; approvals: number; broker: string | null; projectId: string } {
+    const core = new ChronoCore({ projectPath: tempDir });
+    try {
+      const adapters = core.listAdapters().filter((a) => a.status === "active").map((a) => a.id).sort();
+      const approvals = core.listEvents().filter((e) => e.eventType === "ApprovalGranted").length;
+      let broker: string | null = null;
+      try {
+        broker = readFileSync(join(tempDir, ".chrono", "broker-account"), "utf8");
+      } catch {
+        broker = null;
+      }
+      return { adapters, approvals, broker, projectId: "default" };
+    } finally {
+      core.close();
+    }
+  }
+
+  it("demotes READY on drift/stale and repairs to READY with one init, no manual commands", async () => {
+    const bins = makeBins(binDir);
+    const store = new MemoryKeyStore();
+    const seen: string[] = [];
+    const first = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm(seen));
+    expect(first.exitCode).toBe(0);
+    expect(storedStep()).toBe("READY");
+    const before = snapshotIdentity();
+    // Exact live upgrade: previous entry script + stale attestation.
+    driftEntryScript();
+    staleRtkAttestation();
+    // Public doctor must not report proven routing or READY while the
+    // bound attestation/assets are stale (OC-P8 reqs 1, 2, 7).
+    const drifted = runDoctor(tempDir, { json: true, store });
+    expect(drifted.exitCode).toBe(1);
+    const report = JSON.parse(drifted.stdout) as {
+      ok: boolean;
+      doctor: { setupStep: string; storedSetupStep: string; rtk: { attested: string; routing: Record<string, string> }; entry: { ready: boolean; reasons: string[] } };
+    };
+    expect(report.doctor.entry.ready).toBe(false);
+    expect(report.doctor.setupStep).not.toBe("READY");
+    expect(report.doctor.storedSetupStep).toBe("READY");
+    expect(report.doctor.rtk.attested).toBe("stale");
+    expect(report.doctor.rtk.routing["opencode"]).toBe("stale");
+    // One-command repair: no granular rtk/setup/prove/promote runs.
+    const probes = flowProbes(bins, { doctorStore: store });
+    const repaired = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), probes, autoConfirm(seen));
+    expect(repaired.exitCode).toBe(0);
+    expect(JSON.parse(repaired.stdout) as object).toMatchObject({ ok: true, ready: true, step: "READY" });
+    expect(repaired.stdout).not.toMatch(/run chrono rtk (verify|prove|promote)/);
+    expect(repaired.stdout).not.toMatch(/run chrono setup/);
+    expect(storedStep()).toBe("READY");
+    // Separate-process doctor agreement was exercised in-process.
+    expect(probes.doctorSeen().argv).toContain("doctor");
+    expect(probes.doctorSeen().env?.["CHRONO_SESSION_TOKEN"]).toBeUndefined();
+    // Repair preserves identity without duplication (OC-P8 reqs 8, 9).
+    const after = snapshotIdentity();
+    expect(after.adapters).toEqual(before.adapters);
+    expect(after.approvals).toBe(before.approvals);
+    expect(after.broker).not.toBeNull();
+    // Idempotent second repair is a health path.
+    const again = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm(seen));
+    expect(again.exitCode).toBe(0);
+    expect(snapshotIdentity()).toEqual(after);
+    expect(storedStep()).toBe("READY");
+  });
+
+  it("re-proves stale routing bindings after hook replacement and promotes fresh candidates", async () => {
+    const bins = makeBins(binDir);
+    const store = new MemoryKeyStore();
+    const first = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm([]));
+    expect(first.exitCode).toBe(0);
+    const proofBefore = new ChronoCore({ projectPath: tempDir });
+    let authoritativeBefore = "";
+    try {
+      authoritativeBefore = proofBefore.routingProofScopes("opencode").find((p) => p.authority === "authoritative")?.id ?? "";
+    } finally {
+      proofBefore.close();
+    }
+    expect(authoritativeBefore.length).toBeGreaterThan(0);
+    driftEntryScript();
+    const repaired = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm([]));
+    expect(repaired.exitCode).toBe(0);
+    const proofAfter = new ChronoCore({ projectPath: tempDir });
+    try {
+      const scopes = proofAfter.routingProofScopes("opencode");
+      const authoritative = scopes.filter((p) => p.authority === "authoritative" && !p.expired);
+      expect(authoritative.length).toBeGreaterThan(0);
+      // Fresh promotion happened; history (including the superseded
+      // proof) is preserved as non-authoritative evidence.
+      const binding = proofAfter.routingProofBinding("opencode", "opencode");
+      expect(binding.ok && binding.value?.inSync).toBe(true);
+    } finally {
+      proofAfter.close();
+    }
+    const doctor = runDoctor(tempDir, { json: true, store });
+    expect(doctor.exitCode).toBe(0);
+    expect((JSON.parse(doctor.stdout) as { doctor: { rtk: { routing: Record<string, string> } } }).doctor.rtk.routing["opencode"]).toBe("proven");
+  });
+
+  it("fails loudly at the repair step without leaving READY while doctor disagrees", async () => {
+    const bins = makeBins(binDir);
+    const store = new MemoryKeyStore();
+    const first = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm([]));
+    expect(first.exitCode).toBe(0);
+    driftEntryScript();
+    staleRtkAttestation();
+    // Inject a failure at the repair's RTK stage: the second gain call
+    // (apply-phase verify) fails, so repair stops before READY.
+    const failing = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { failGainOnce: true, doctorStore: store }), autoConfirm([]));
+    expect(failing.exitCode).toBe(1);
+    const parsed = JSON.parse(failing.stdout) as { ok: boolean; step: string; nextAction: string; resume: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.step).toBe("RTK_VERIFIED_AND_ROUTED");
+    expect(parsed.nextAction).toContain("chrono init");
+    expect(parsed.resume).toContain("chrono init");
+    // Never READY while the public doctor disagrees (OC-P8 req 6).
+    expect(storedStep()).not.toBe("READY");
+    const doctor = runDoctor(tempDir, { json: true, store });
+    expect(doctor.exitCode).toBe(1);
+    expect((JSON.parse(doctor.stdout) as { doctor: { setupStep: string; entry: { ready: boolean } } }).doctor.setupStep).not.toBe("READY");
+    // Resume with healthy fixtures completes to READY.
+    const resumed = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm([]));
+    expect(resumed.exitCode).toBe(0);
+    expect(storedStep()).toBe("READY");
+  });
+
+  it("demotes setup state auditably without destroying history", () => {
+    const core = new ChronoCore({ projectPath: tempDir });
+    try {
+      expect(core.init().ok).toBe(true);
+      for (const step of ["DETECTED", "CONSENTED", "PROJECT_INITIALIZED", "PO_ENROLLED", "RUNTIMES_SELECTED", "RTK_VERIFIED_AND_ROUTED"] as const) {
+        expect(core.advanceSetupState(step as never, { seeded: true }).ok).toBe(true);
+      }
+      const eventsBefore = core.listEvents().filter((e) => e.entityId === "setup").length;
+      const demoted = core.demoteSetupForRepair("RUNTIMES_SELECTED" as never, { cause: "OC-P8 test", rerunFrom: "RTK_VERIFIED_AND_ROUTED" });
+      expect(demoted.ok).toBe(true);
+      expect(core.getSetupState().value?.step).toBe("RUNTIMES_SELECTED");
+      const eventsAfter = core.listEvents().filter((e) => e.entityId === "setup");
+      expect(eventsAfter.length).toBe(eventsBefore + 1);
+      expect(eventsAfter[eventsAfter.length - 1]?.eventType).toContain("StateTransition");
+      // Forward-only advance is preserved: skip-ahead still denies.
+      expect(core.advanceSetupState("READY" as never, {}).ok).toBe(false);
+      // Forward resumption from the demoted step still works.
+      expect(core.advanceSetupState("RTK_VERIFIED_AND_ROUTED" as never, { repaired: true }).ok).toBe(true);
+      // Secret-bearing repair detail is rejected.
+      expect(core.demoteSetupForRepair("RUNTIMES_SELECTED" as never, { token: "abc" }).ok).toBe(false);
+    } finally {
+      core.close();
+    }
   });
 });

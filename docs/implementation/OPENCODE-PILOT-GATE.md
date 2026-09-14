@@ -91,7 +91,6 @@ API cannot abort the first response from the current event/transform hooks,
 stop and document the exact capability mismatch instead of simulating success.
 
 ## Finding OC-P2 — Routing-proof promotion is not atomic with its audit event
-
 `promoteRoutingProof()` currently updates the proof row and appends the
 `ProofPromoted` event as separate writes. If event persistence fails after the
 update, an authoritative proof can exist without its required audit event.
@@ -225,6 +224,323 @@ exit 0, fingerprint recorded, no key material in output, Core
 custody; then exactly the enrolled credential deleted and the probe
 project removed (verified absent afterwards). No model, no provider,
 no OpenCode launch, no push/publish.
+
+## Finding OC-P5 — Resumed init silently returns after PO_ENROLLED
+
+A real `chrono init --runtime opencode` failed at `PO_ENROLLED` on
+macOS: fresh project initialized, enrollment completed, doctor
+reported `PO_ENROLLED`, and the re-run accepted `yes init <hash>`
+then returned silently with nothing created (no adapter, RTK, skill,
+hooks, broker) and no error, resume hint, or nonzero result. Root
+cause: the macOS Keychain returns multiline PEM material hex-encoded,
+so PO-session bootstrap crashed inside `signApprovalPayload` with an
+uncaught throw that escaped `runInitFlow` and died silently in the
+CLI's top-level catch (exit 1, zero output without `--json`).
+
+### Required correction (shipped same session)
+
+- Canonical key transport (`normalizeKeyTransport`) plus a single
+  `readPoPrivateKey` rule used at every PO signing site (approve,
+  waive, rotation, privileged sessions, flow bootstrap): boundary-only
+  normalization, hex-decode only into PEM-armored bytes, parse proof
+  required; broker secrets pass through byte-identical. Approve/waive
+  signer throws now map to stable `SIGNATURE_INVALID` envelopes.
+- The apply driver tracks the executing step and converts ANY
+  unexpected throw into a stable step failure (step, code, resume
+  action) — silent exits are structurally impossible. Exit 0 requires
+  `READY` (now gated on the doctor's own readiness verdict, so a
+  tampered/skipped flow can never complete silently) or the deliberate
+  already-ready path. Consent/resume/READY envelopes all carry step
+  and next action.
+- `newRepository` means "no CHRONO project here" (not "no git
+  commits"): an initialized repo reads as an existing CHRONO project
+  even before its first commit. Plan hash covers detection inputs and
+  moves only on material change (e.g. key enrolled).
+- Second live-found defect (same session): every command passed explicit
+  `--path` through verbatim, bypassing the canonical resolver — an
+  explicit `--path /tmp/...` displayed and recorded the non-canonical
+  spelling. All 28 `--path` call sites now route through
+  `resolveProjectDir(cwd, explicitPath)` (signature widened to accept
+  the raw option value), so explicit and cwd-derived resolution compute
+  identical identity; nonexistent explicit paths keep the verbatim
+  fallback.
+
+### Evidence
+
+`init-flow.test.ts` "resume and fail-closed driver" (6): full init
+through macOS hex keychain semantics in one invocation (the exact
+repro); resume past PO_ENROLLED with no duplicate adapters/approvals/
+broker state; loud JSON+human envelopes with step/code/resume;
+exit-code semantics (0 READY / 2 consent+blockers / 1 failures);
+plan-hash stability + material-change sensitivity; resume from every
+persisted step never exiting silently incomplete (tampered jumps fail
+loud at the READY doctor gate). `project.test.ts` gains an
+explicit-symlink case: `resolveProjectDir` through a symlinked path
+returns the same canonical identity as cwd resolution under both
+spellings. Live proof (2026-09-12, repacked `@chrono/* 0.1.0`
+`chrono-cli` sha256
+`e7e36f2a33febfc13dcfe12af942987574e04835da0758ea8736194588b97f14`,
+isolated install, fresh disposable projects): explicit
+`--path /tmp/chrono-ocp5-final2-<suffix>` AND cwd-form dry runs both
+report `project: /private/tmp/chrono-ocp5-final2-<suffix>` with 10
+planned steps and zero writes afterwards. Earlier live proof below:
+packed-CLI dry run
+in a new disposable Git project plus read-only doctor on the failed
+pilot project (untouched); enrollment itself re-proves on the
+PO-authorized pilot retry, which now flows through the fixed path.
+
+## Finding OC-P6 — READY/doctor consistency defect on the packed-CLI pilot
+
+A real `chrono init --runtime opencode` reported `step: READY`
+(`runtime: opencode`, `next: open runtime`), but a separate-process
+`chrono doctor --json` on the same project reported `setupStep:
+READY` with `broker.visible=false`, `broker.active=0`,
+`entry.ready=false` (`"broker visibility needs a gaspar/PO
+session"`), top-level `ok=false`. Root cause: the init completion
+gate ran the doctor **in-process with a gaspar session**, while the
+documented normal-user doctor had no session and therefore could
+never see the broker. READY was persisted on privileged evidence
+that public verification could not reproduce — a one-command
+readiness violation.
+
+### Required correction (shipped same session)
+
+- New Core-owned public broker health projection
+  (`brokerHealth`: active/missing/revoked/inconsistent/unknown over
+  counts plus the single active id and a non-sensitive reason; never
+  secret hashes) and a read-only digest-match check
+  (`verifyBrokerSecretHash`: timing-safe boolean only, no audit, no
+  distinguishing detail). Both unauthenticated, like the other
+  doctor-read projections.
+- The doctor verifies broker health publicly with no session:
+  registry projection × non-secret `.chrono/broker-account` file
+  (id and account cross-checked; forged/mismatched/malformed reads
+  as inconsistent) × non-destructive keychain read validated by a
+  local SHA-256 comparison inside the Core. Nothing secret is
+  printed, logged, or persisted. Unreadable registry or keychain
+  reads as `unknown` (inaccessible) — never conflated with "no
+  active broker".
+- The init completion gate (and the already-ready path) re-invoke
+  `chrono doctor --json` as a **separate process** (`[node, entry,
+  doctor, --path, root, --json]`) with an allowlist-sanitized
+  environment (no `CHRONO_SESSION_TOKEN`, no secret carriers, no
+  `NODE_OPTIONS`/`LD_PRELOAD`/`DYLD_*` preload vectors). READY
+  persists only on exit 0 + `ok:true` + `entry.ready:true`;
+  anything else is a loud READY-step refusal.
+- Doctor and init share one canonical project spelling, so
+  symlinked invocations derive the same broker account.
+
+### Evidence
+
+`chrono-core.test.ts` "Broker health projection" (4): missing /
+single-active / all-revoked states, hash non-exposure, digest
+match/mismatch/unknown/revoked/malformed semantics.
+`entry-ops.test.ts` "Broker health projection (OC-P6)" (7):
+missing DB record, missing keychain secret, revoked-with-READY
+setup, inaccessible-keychain unknown without absence conflation,
+forged/mismatched/malformed account files, JSON/human/exit-code
+consistency on both verdicts, zero secret leakage on every
+surface. `init-flow.test.ts`: gate argv/env sanitization test
+(separate-process invocation shape, session/secret/preload
+exclusion, PATH allowlist) plus `sanitizeDoctorEnv` unit test;
+every full-flow fixture now verifies through the simulated child
+doctor.
+
+Live repro proof (2026-09-13, repacked `@chrono/* 0.1.0`
+`chrono-cli` sha256
+`9df8d3695d238ca3db155fe6798c98db41fc541a79dbb0c2f735c529679222e7`,
+isolated install, fresh disposable Git project
+`/tmp/chrono-ocp6-live-<suffix>`, separate processes, clean env
+without `CHRONO_SESSION_TOKEN`):
+
+- `init --runtime opencode --dry-run --json` → 10 planned steps,
+  canonical `project: /private/tmp/chrono-ocp6-live-<suffix>`,
+  zero writes afterwards;
+- real `init --runtime opencode --yes --json` (headless) stops LOUD
+  at `PO_ENROLLED`, exit 1: `APPROVAL_REQUIRED` — "chrono enroll
+  requires an interactive human terminal … agents and scripts
+  cannot approve" — with step and resume action. The human-only
+  refusal precedes key generation, so the global PO keychain
+  custody is untouched; enrollment stays a PO act, never an
+  agent-automated one;
+- separate-process `doctor --json` then reports, exit 1:
+  `setupStep: PROJECT_INITIALIZED` (READY was never persisted),
+  `broker.state: missing` ("no broker credential: run chrono init
+  to resume setup"), `entry.ready: false`, `ok: false` — the exact
+  consistency the defect violated, now holding from the other
+direction. The full init→READY→doctor loop to double-READY
+requires the PO ceremony in a live terminal and re-runs on the
+PO-authorized pilot retry.
+
+## Finding OC-P7 — Generated entry script invokes a nonexistent CLI option
+
+The first neutral prompt in the real OpenCode Phase 6A pilot died
+with `[chrono] ENTRY_BLOCKED[ENTRY_DENIED]: entry script exited 3:
+error: unknown option '--secret-stdin'`. Root cause: producer/
+consumer drift — the generated
+`.chrono/hooks/chrono-entry-session.sh` passed `--secret-stdin`
+while the `chrono entry` command never registered it (it reads the
+broker secret from stdin unconditionally). The generator and the
+parser evolved independently with no shared contract, and one
+hermetic test even enshrined the obsolete flag.
+
+### Required correction (shipped same session)
+
+- Single source of truth (`packages/cli/src/entry-contract.ts`):
+  the `ENTRY_OPTIONS` spec owns every flag, its placeholder,
+  required-ness, and help text. The Commander `entry` command
+  builds its options from the spec; the generated script renders
+  its invocation through `renderEntryInvocation` with shell
+  values. No compatibility flag was added (the CLI's stdin
+  behavior was already correct); the obsolete flag is gone from
+  the generator. The broker secret travels on stdin only — never
+  argv, environment, output, or logs.
+- Binding currency (upgrade safety): new Core projection
+  `routingProofBinding` mirrors dispatch's registration/asset
+  checks, and the doctor reports `routing: stale` with a
+  re-prove/promote reason when the snapshot no longer matches —
+  so a regenerated script can never silently ride an old proof.
+- Upgrade/repair path (no project deletion, no weakened drift
+  protection): the doctor stays read-only and keeps reporting
+  drift; `chrono setup --adapter <id>` (documented scoped repair)
+  and re-running `chrono init --runtime <id>` both regenerate the
+  script from the shared contract without moving setup state;
+  when the regenerated bytes differ from the promoted snapshot
+  (generator upgrade), the READY gate refuses until a fresh
+  routing proof is recorded and promoted (entry itself supplies
+  the gaspar session for re-proving; promotion stays a PO act).
+  When repair restores byte-identity, the gate passes — healing
+  without authority re-confirmation is impossible by construction.
+
+### Evidence
+
+`entry-contract.test.ts` (7, always-run): script invocation equals
+the renderer output; every contract flag registered on the real
+Commander command; required flags present and nothing unregistered
+in the script; secret/compat flags banned; renderer omission
+semantics; unknown-option and missing-required failures through
+real Commander parsing. `entry-ops.test.ts` repair loop: obsolete
+plant → doctor reports drift + stale bindings → init re-run heals
+→ upgrade simulation (proof snapshotted over obsolete bytes) →
+gate refuses with re-prove → fresh prove/promote → doctor and
+init agree on READY. `entry-blackbox.test.ts`
+(`npm run test:blackbox`, `CHRONO_BLACKBOX=1`): isolated install
+of the four packed tarballs, disposable OpenCode-only project
+initialized through the packed binary under a pty-driven PO
+ceremony, PATH-injected file-backed `security` boundary (host
+keychain untouched), fixture `rtk`/`opencode` as real executables;
+the generated script runs unchanged via the packed binary with
+the secret on stdin — valid projection, fresh 0600 token per run,
+no secret/token/path in output; corrupt/missing secrets stay
+fail-closed (exit 3, no token); malformed/missing/extra options
+fail loudly against the packed binary. Live proof (2026-09-13,
+final `@chrono/* 0.1.0`, `chrono-cli` sha256
+`fcf26b4160b3804322742a4a1c24b1bc97381ac25beefd9fd9ca821361a484a0`,
+isolated installs, disposable OpenCode-only projects): the
+black-box ran green three times end to end (packed install →
+pty-driven PO ceremony → packed `init` READY → separate-process
+packed `doctor` READY → generated script unchanged through the
+packed binary with stdin secret → valid projection, fresh 0600
+token per run, zero leaks), and `chrono entry --help` on the final
+packed CLI shows exactly the contract flags (no `--secret-stdin`).
+
+Repair and retry on the pilot project (no deletion, drift
+protection intact): re-run `chrono init --runtime opencode` (it
+regenerates the obsolete script, then gates); if the gate demands
+it, record a fresh proof and promote
+(`chrono entry` supplies the gaspar session, promotion stays a PO
+act); the first OpenCode prompt then redeems through the fixed
+invocation.
+
+## Finding OC-P8 — Upgrade/repair leaves READY persisted and demands manual granular commands
+
+A real `chrono init --runtime opencode` on an existing READY project
+under the previous entry script failed repair at
+`NATIVE_HOOKS_INSTALLED` with `BLOCKED_RTK: "RTK attestation is not
+current: run chrono rtk verify first"`, instructed a bare re-run, and
+a separate `chrono doctor --json` then reported `setupStep: READY`
+with a stale attestation, `opencode` routing `proven`, a
+drifted/false entry hook, and `entry.ready: false`. The repair both
+left READY persisted while public verification disagreed and required
+an internal granular command even though `chrono init` is the public
+orchestrator. The live pilot project was preserved unrepaired as
+regression evidence; no granular fix, OpenCode launch, push, or
+publication was performed for it.
+
+### Required correction (shipped same session)
+
+- READY is a verified projection, not an irreversible stored label:
+  new Core `demoteSetupForRepair()` moves strictly backward to an
+  earlier valid step with an audited `SetupRepairDemoted` event,
+  preserving project identity, PO key/enrollment, valid broker,
+  unrelated files, audit history, and previous evidence as
+  historical non-authoritative data. Forward-only
+  `advanceSetupState` semantics are unchanged; secret-bearing repair
+  detail is rejected; forward resumption re-advances normally.
+- `chrono init --runtime opencode` assesses drift/stale evidence on
+  every existing project run and demotes before re-running: stale
+  attestation or routing (missing/candidate/expired/out-of-sync
+  bindings) demotes to `RUNTIMES_SELECTED` to re-run
+  `RTK_VERIFIED_AND_ROUTED`; managed-hook drift demotes to the
+  routing stage as well (healing changes the asset manifest, so a
+  fresh prove pre-heal plus post-heal promotion must happen in the
+  same run). The forward flow then re-verifies genuine RTK, records a
+  fresh attestation, proves effective routing, regenerates managed
+  assets, promotes the fresh candidate interactively (PO promotion
+  stays a human act), revalidates bindings, runs the separate-process
+  doctor gate, and persists READY only on agreement. No adapter,
+  identity, broker, approval, or authoritative-proof duplication.
+- Normal repair never instructs `chrono rtk verify/prove/promote`,
+  `setup`, session, or adapter commands; granular commands remain
+  diagnostic/expert interfaces. Failed repair returns nonzero with
+  the exact step plus one `chrono init` resume action and never
+  leaves `setupStep=READY` while the public doctor disagrees.
+- Doctor reports routing as `stale` (never simply `proven`) when its
+  bound attestation is not current or managed assets drifted, with an
+  explicit re-verify/re-prove reason; on a stored READY project with
+  blocked entry it projects the earliest repair step as `setupStep`
+  (keeping `storedSetupStep` for audit transparency).
+
+### Evidence
+
+Hermetic suites: `init-flow.test.ts` "Init upgrade/repair
+orchestration (OC-P8)" (4: READY demotion + one-command repair with
+zero manual instructions, stale-binding re-prove/promote, loud step
+failure without READY while doctor disagrees + resume, audited
+demotion without history loss); updated `entry-ops.test.ts`
+(revoked-broker projection `GASPAR_ENTRY_PREPARED` + stored READY;
+OC-P7 repair now asserts orchestrated prove/promote with exit 0 and
+an interactive terminal); full `test:clean` PASS (36 files / 459
+tests), `lint` / `typecheck` / `build` / `git diff --check` clean.
+
+Live repro proof (2026-09-14, packed `@chrono/* 0.1.0` built from
+this tree, isolated install, disposable Git project, PATH-injected
+file-backed `security` boundary with host keychain untouched, real
+RTK 0.44.0 + OpenCode 1.18.30 binaries, network for the pinned skill
+fetch only, no model/provider spend, no OpenCode launch, no
+push/publish — every step a separate process):
+
+- `init --dry-run` → exit 0, canonical project, zero writes;
+- pty-driven `init --runtime opencode --yes --json` → exit 0,
+  `step: READY`; separate-process `doctor` → `setupStep: READY`,
+  attestation current, routing proven, `entry.ready: true`;
+- planted previous-generator state (obsolete `--secret-stdin`
+  script) + trigger-legal attestation staleness
+  (`current → stale`, row preserved): separate-process `doctor` →
+  exit 1, `setupStep: RTK_VERIFIED_AND_ROUTED` (stored READY),
+  attestation stale, routing stale with re-verify + drift reasons,
+  `entry.ready: false` — the fixed contract (previously: READY +
+  proven while blocked);
+- pty-driven repair `init --runtime opencode --yes --json` →
+  exit 0, `step: READY`, zero `run chrono rtk/setup` instructions;
+  separate-process `doctor` → exit 0, READY/current/proven/ready;
+  script healed (no `--secret-stdin`); second `init` → idempotent
+  resume (`resumed: true`);
+- registry audit: 1 active adapter, 1 approval, single active broker
+  `BRK-0001` preserved; `RTK-0001` retained stale + `RTK-0002`
+  current; `RTE-0001` retained + `RTE-0002` authoritative; 1
+  `SetupRepairDemoted` event among 20 setup events; no secret
+  material in outputs, logs, or the repo.
 
 ## OpenCode pilot entry criteria
 

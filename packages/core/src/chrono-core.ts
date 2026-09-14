@@ -200,6 +200,27 @@ export interface CoreResult<T> {
 export type GateDecision = CoreResult<true>;
 
 /**
+ * Broker health states for the public readiness projection (OC-P6).
+ * active: exactly one active credential; missing: no record;
+ * revoked: records exist but none active; inconsistent: the
+ * single-active invariant is violated; unknown: registry unreadable.
+ */
+export type BrokerHealthState = "active" | "missing" | "revoked" | "inconsistent" | "unknown";
+
+/**
+ * Non-sensitive broker health projection (OC-P6). Carries counts, the
+ * single active credential id, and a reason — never secret hashes or
+ * credential material.
+ */
+export interface BrokerHealth {
+  readonly state: BrokerHealthState;
+  readonly brokerId: string | null;
+  readonly active: number;
+  readonly revoked: number;
+  readonly reason: string;
+}
+
+/**
  * Project status result [CORE §6, STATE §3]
  */
 export interface StatusResult {
@@ -2183,6 +2204,95 @@ export class ChronoCore {
     }
   }
 
+  /**
+   * Demote the persisted setup state for upgrade/repair (OC-P8).
+   *
+   * READY is a verified projection, not an irreversible stored label:
+   * when drift or stale evidence is discovered, init must immediately
+   * project a non-ready repair state before re-running the affected
+   * steps. Demotion moves strictly backward to an earlier valid step,
+   * appends an audited `SetupRepairDemoted` event, and preserves all
+   * historical audit evidence, approvals, attestations, and proofs as
+   * historical (non-authoritative) data. Forward progress resumes
+   * through `advanceSetupState`; demotion never deletes or rewrites
+   * history.
+   */
+  demoteSetupForRepair(target: SetupStep, detail: Record<string, unknown>): CoreResult<{ step: string }> {
+    try {
+      if (detail === null || typeof detail !== "object" || Array.isArray(detail)) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Setup repair detail must be a JSON object",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Record non-secret repair cause as key/value detail",
+        });
+      }
+      this.assertNoNestedSecrets(detail, "detail");
+      let serialized: string;
+      try {
+        serialized = JSON.stringify(detail);
+      } catch {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Setup repair detail is not JSON-serializable",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Record plain JSON values only",
+        });
+      }
+      const current = this.db.setup().get();
+      if (current === null) {
+        throw new ChronoError({
+          code: ErrorCode.ILLEGAL_TRANSITION,
+          severity: Severity.ERROR,
+          message: "Setup repair demotion requires persisted setup state: run chrono init from DETECTED",
+          invariantRef: "INV §3.2",
+          affectedTarget: "setup",
+          suggestedAction: "Run chrono init to establish setup state first",
+        });
+      }
+      const fromIndex = setupStepIndex(current.step);
+      const toIndex = setupStepIndex(target);
+      if (toIndex < 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Setup repair target '${target}' is not a known setup step`,
+          invariantRef: "INV §3.2",
+          affectedTarget: "setup",
+          suggestedAction: "Demote to a valid earlier setup step",
+        });
+      }
+      if (fromIndex < 0 || toIndex >= fromIndex) {
+        throw new ChronoError({
+          code: ErrorCode.ILLEGAL_TRANSITION,
+          severity: Severity.ERROR,
+          message: `Setup repair demotion requires a strictly earlier step: cannot move from '${current.step}' to '${target}'`,
+          invariantRef: "INV §3.2",
+          affectedTarget: "setup",
+          suggestedAction: "Resume from the recorded step instead of demoting forward",
+        });
+      }
+      const updatedAt = this.now();
+      this.db.transaction(() => {
+        this.db.setup().set(target, updatedAt, serialized);
+        this.events.append({
+          eventType: "StateTransition",
+          entityId: "setup",
+          payload: { entityType: "SETUP", eventType: "SetupRepairDemoted", fromState: current.step, toState: target, detail },
+          actor: "system",
+          priorState: current.step,
+          newState: target,
+          reasoning: "Init repair demoted verified READY projection on drift/stale evidence",
+        });
+      });
+      return { ok: true, value: { step: target } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
   /** Recursively reject secret-bearing keys and values in setup detail. */
   private assertNoNestedSecrets(value: unknown, path: string): void {
     if (typeof value === "string") {
@@ -2310,6 +2420,116 @@ export class ChronoCore {
         ok: true,
         value: this.db.brokerCredentials().listAll().map((c) => ({ id: c.id, createdAt: c.createdAt, revoked: c.revoked })),
       };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Public broker health projection for read-only diagnostics (OC-P6).
+   * Unauthenticated by design: it exposes only counts, the single
+   * active credential id, and a non-sensitive reason — never secret
+   * hashes or credential material. States:
+   * - active: exactly one active credential (single-active invariant);
+   * - missing: no broker record at all;
+   * - revoked: records exist but none is active;
+   * - inconsistent: multiple active credentials (invariant violated);
+   * - unknown: the registry itself is unreadable.
+   * Keychain-side validation (secret presence/match) is the CLI's job;
+   * the Core never sees broker secrets outside redemption.
+   */
+  brokerHealth(): CoreResult<BrokerHealth> {
+    try {
+      const creds = this.db.brokerCredentials().listAll();
+      const active = creds.filter((c) => !c.revoked);
+      const revoked = creds.length - active.length;
+      if (active.length > 1) {
+        return {
+          ok: true,
+          value: {
+            state: "inconsistent",
+            brokerId: null,
+            active: active.length,
+            revoked,
+            reason: `${String(active.length)} active broker credentials violate the single-active invariant: revoke down to one`,
+          },
+        };
+      }
+      if (active.length === 1) {
+        return {
+          ok: true,
+          value: {
+            state: "active",
+            brokerId: active[0]!.id,
+            active: 1,
+            revoked,
+            reason: `broker credential '${active[0]!.id}' is the single active credential`,
+          },
+        };
+      }
+      if (creds.length > 0) {
+        return {
+          ok: true,
+          value: {
+            state: "revoked",
+            brokerId: null,
+            active: 0,
+            revoked,
+            reason: "every broker credential is revoked: issue a fresh credential",
+          },
+        };
+      }
+      return {
+        ok: true,
+        value: {
+          state: "missing",
+          brokerId: null,
+          active: 0,
+          revoked: 0,
+          reason: "no broker credential: run chrono init to resume setup",
+        },
+      };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Non-sensitive broker secret match check for read-only diagnostics
+   * (OC-P6). Compares a caller-computed SHA-256 hex digest against the
+   * stored digest with a timing-safe comparison and returns only a
+   * boolean: no secret, hash, or distinguishing detail ever leaves the
+   * Core. Read-only: nothing is audited or written. Unknown ids,
+   * revoked credentials, and malformed digests all report match:false —
+   * the CLI maps false to "inconsistent" using its own registry view,
+   * so denial here never leaks which part mismatched.
+   */
+  verifyBrokerSecretHash(brokerId: string, secretHash: string): CoreResult<{ match: boolean }> {
+    try {
+      if (brokerId.length === 0 || brokerId.length > 64 || !/^[0-9a-f]{64}$/.test(secretHash)) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Broker verification requires a credential id and a SHA-256 hex digest",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Verify the held broker secret against the registry",
+        });
+      }
+      let credential;
+      try {
+        credential = this.db.brokerCredentials().findById(brokerId);
+      } catch {
+        return { ok: true, value: { match: false } };
+      }
+      if (credential.revoked) {
+        return { ok: true, value: { match: false } };
+      }
+      const presented = Buffer.from(secretHash, "hex");
+      const expected = Buffer.from(credential.secretHash, "hex");
+      if (presented.length !== expected.length || !timingSafeEqual(presented, expected)) {
+        return { ok: true, value: { match: false } };
+      }
+      return { ok: true, value: { match: true } };
     } catch (e) {
       return this.handleError(e);
     }
@@ -6878,6 +7098,52 @@ export class ChronoCore {
         expired: Date.parse(proof.validUntil) <= Date.parse(this.now()),
         authority: proof.authority,
       }));
+  }
+
+  /**
+   * Binding currency of the latest authoritative routing proof for one
+   * adapter/runtime scope (OC-P7). Mirrors the checks dispatch enforces
+   * in `requireCurrentRoutingProof` (registration hash + managed-asset
+   * manifest) so the read-only doctor reports the same verdict dispatch
+   * would reach: regenerating managed hooks (e.g. the entry-session
+   * script) invalidates the snapshot until a fresh proof is recorded
+   * and promoted. Unauthenticated metadata only: proof id, verdict,
+   * and a non-sensitive reason. Returns null when no authoritative,
+   * unexpired proof exists (nothing to bind-check).
+   */
+  routingProofBinding(
+    adapterId: string,
+    runtime: string
+  ): CoreResult<{ proofId: string; inSync: boolean; reason: string } | null> {
+    try {
+      const proof = this.db.routingProofs().latestAuthoritative(adapterId, runtime, "default");
+      if (proof === null || Date.parse(proof.validUntil) <= Date.parse(this.now())) {
+        return { ok: true, value: null };
+      }
+      if (proof.adapterHash === null || proof.adapterHash !== this.adapterRegistrationHash(adapterId)) {
+        return {
+          ok: true,
+          value: {
+            proofId: proof.id,
+            inSync: false,
+            reason: `routing proof '${proof.id}' predates the current adapter registration: re-prove and promote after the configuration change`,
+          },
+        };
+      }
+      if (proof.assetHash === null || proof.assetHash !== this.readManagedAssetManifest(adapterId).hash) {
+        return {
+          ok: true,
+          value: {
+            proofId: proof.id,
+            inSync: false,
+            reason: `routing proof '${proof.id}' predates managed-asset drift: reinstall hooks with chrono setup, re-prove, and promote`,
+          },
+        };
+      }
+      return { ok: true, value: { proofId: proof.id, inSync: true, reason: `routing proof '${proof.id}' binds the current registration and assets` } };
+    } catch (e) {
+      return this.handleError(e);
+    }
   }
 
   /**

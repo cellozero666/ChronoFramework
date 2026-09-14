@@ -33,6 +33,7 @@ import {
   parseKiroVersion,
 } from "./kiro-capability.js";
 import { buildKiroHook } from "./kiro-hook.js";
+import { entryShellValues, renderEntryInvocation } from "./entry-contract.js";
 import {
   buildEntrySessionScript,
   buildKiroEntryRegistration,
@@ -239,7 +240,12 @@ describe("Entry script fail-loud shape", () => {
   });
 
   it("keeps secrets out of process output and confines the token", () => {
-    expect(script).toContain("--secret-stdin");
+    // OC-P7: the obsolete `--secret-stdin` flag broke every first
+    // OpenCode prompt (the CLI never registered it). The invocation
+    // renders from the shared entry contract (single source of
+    // truth); the secret travels on stdin only.
+    expect(script).not.toContain("--secret-stdin");
+    expect(script).toContain(renderEntryInvocation('"$CHRONO_BIN"', entryShellValues()));
     expect(script).toContain("chmod 600");
     expect(script).not.toContain("echo $SECRET");
     expect(script).not.toContain('echo "$SECRET"');

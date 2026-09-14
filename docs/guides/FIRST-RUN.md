@@ -101,13 +101,13 @@ selection, no exported tokens, no repeated questions.
 ```sh
 chrono init        # on a configured project: validate + resume, never DUPLICATE
 chrono doctor      # read-only diagnostics, zero writes
-chrono doctor --as gaspar --session-token <id/token>  # includes broker visibility
 ```
 
 `doctor` reports project/Core compatibility, setup state, adapter
-approval, RTK routing per adapter (`proven`, `candidate`, or
-`unproven`), skill activation, hook drift, broker health, and Gaspar
-entry readiness with actionable reasons.
+approval, RTK routing per adapter (`proven`, `candidate`, `stale`,
+or `unproven`), skill activation, hook drift, broker health, and
+Gaspar entry readiness with actionable reasons. Broker health is
+public: no session is required or consulted.
 
 ### Project resolution (which directory is the project?)
 
@@ -143,6 +143,27 @@ session, after signed adapter approval) makes it AUTHORITATIVE. Binary
 replacement, adapter re-registration, or managed-asset drift
 invalidates proofs automatically — `doctor` tells you which binding
 broke. `chrono init` runs this whole sequence for you on new projects.
+
+### Repairing generated assets (obsolete entry script, hook drift)
+
+Managed hook files are generated, never hand-edited. If `doctor`
+reports `hook drift` (for example an entry script passing an option
+the CLI no longer registers), repair without deleting the project:
+
+```sh
+chrono setup --adapter <id>   # scoped repair: regenerates the shared
+                              # entry script plus this runtime's assets
+chrono init --runtime <id>    # re-run also regenerates, then gates
+```
+
+Regeneration changes the managed-asset manifest, so a proof promoted
+over the old bytes reads `stale` until a fresh proof is recorded and
+promoted (`rtk prove` with a gaspar session from `chrono entry`,
+then `rtk promote` with a PO session). When the repaired bytes
+restore identity with the promoted snapshot, the gate passes without
+re-proof. Drift protection is never weakened: `doctor` stays
+read-only and keeps reporting drift, and READY is refused until the
+public verification agrees.
 
 ## 5. Removal
 

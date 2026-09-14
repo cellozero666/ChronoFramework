@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { SCHEMA_VERSION } from "@chrono/persistence";
 import {
   buildApprovalPayload,
@@ -341,5 +341,80 @@ describe("Persistence: SQLite schema", () => {
 
     expect(count2).toBe(count1 + 1);
     po.restoreTty();
+  });
+});
+
+describe("Broker health projection (OC-P6)", () => {
+  let tempDir: string;
+  let core: ChronoCore;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-broker-health-"));
+    core = new ChronoCore({ projectPath: tempDir });
+    expect(core.init().ok).toBe(true);
+  });
+
+  afterEach(() => {
+    core.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function gasparAuth(): { actor: string; session: { id: string; token: string } } {
+    const po = setupTestPo(core);
+    const auth = po.gaspar;
+    po.restoreTty();
+    return auth;
+  }
+
+  it("reports missing when no broker record exists", () => {
+    const health = core.brokerHealth();
+    expect(health.ok).toBe(true);
+    expect(health.value?.state).toBe("missing");
+    expect(health.value?.brokerId).toBe(null);
+    expect(health.value?.active).toBe(0);
+    expect(health.value?.revoked).toBe(0);
+  });
+
+  it("reports the single active credential without exposing secret hashes", () => {
+    const auth = gasparAuth();
+    const issued = core.issueBrokerCredential(auth);
+    expect(issued.ok).toBe(true);
+    const health = core.brokerHealth();
+    expect(health.ok).toBe(true);
+    expect(health.value?.state).toBe("active");
+    expect(health.value?.brokerId).toBe(issued.value!.id);
+    expect(health.value?.active).toBe(1);
+    expect(JSON.stringify(health.value)).not.toContain("secretHash");
+    expect(JSON.stringify(health.value)).not.toContain("secret_hash");
+    expect(JSON.stringify(health.value)).not.toContain(issued.value!.secret);
+  });
+
+  it("reports revoked when every credential is revoked", () => {
+    const auth = gasparAuth();
+    const issued = core.issueBrokerCredential(auth);
+    expect(issued.ok).toBe(true);
+    expect(core.revokeBrokerCredential(issued.value!.id, auth).ok).toBe(true);
+    const health = core.brokerHealth();
+    expect(health.ok).toBe(true);
+    expect(health.value?.state).toBe("revoked");
+    expect(health.value?.brokerId).toBe(null);
+    expect(health.value?.active).toBe(0);
+    expect(health.value?.revoked).toBe(1);
+  });
+
+  it("verifies a held secret by digest comparison only", () => {
+    const auth = gasparAuth();
+    const issued = core.issueBrokerCredential(auth);
+    expect(issued.ok).toBe(true);
+    const digest = createHash("sha256").update(issued.value!.secret, "utf8").digest("hex");
+    expect(core.verifyBrokerSecretHash(issued.value!.id, digest).value?.match).toBe(true);
+    // Wrong digest, unknown id, revoked id, and malformed digests all
+    // report match:false without distinguishing the cause.
+    expect(core.verifyBrokerSecretHash(issued.value!.id, `0${digest.slice(1)}`).value?.match).toBe(false);
+    expect(core.verifyBrokerSecretHash("BRK-9999", digest).value?.match).toBe(false);
+    expect(core.verifyBrokerSecretHash(issued.value!.id, "not-hex").ok).toBe(false);
+    expect(core.verifyBrokerSecretHash("", digest).ok).toBe(false);
+    expect(core.revokeBrokerCredential(issued.value!.id, auth).ok).toBe(true);
+    expect(core.verifyBrokerSecretHash(issued.value!.id, digest).value?.match).toBe(false);
   });
 });

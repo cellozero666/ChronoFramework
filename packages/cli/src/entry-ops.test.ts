@@ -25,7 +25,7 @@ import {
   buildSessionAuthorizationPayload,
   signApprovalPayload,
 } from "@chrono/domain";
-import { runSetup } from "./index.js";
+import { runSetup, runRtkProve, runRtkPromote } from "./index.js";
 import {
   buildKiroEntryRegistration,
   kiroEntryRegistrationPath,
@@ -76,9 +76,24 @@ function makeBins(dir: string): { rtk: string; runtime: string } {
   return { rtk, runtime };
 }
 
-function flowProbes(bins: { rtk: string; runtime: string }): FlowProbes {
-  return {
+function flowProbes(
+  bins: { rtk: string; runtime: string },
+  opts: { doctorStore?: MemoryKeyStore } = {}
+): FlowProbes & { doctorStore: MemoryKeyStore | null } {
+  const fake: FlowProbes & { doctorStore: MemoryKeyStore | null } = {
+    // Wired by the caller to the run's keychain: the simulated doctor
+    // child computes the REAL public verification a separate process
+    // would see.
+    doctorStore: opts.doctorStore ?? null,
     execFile: (cmd: string[]) => {
+      if (cmd.includes("doctor")) {
+        const pathIndex = cmd.indexOf("--path");
+        const root = pathIndex >= 0 && typeof cmd[pathIndex + 1] === "string" ? (cmd[pathIndex + 1] as string) : null;
+        if (root === null || fake.doctorStore === null) {
+          return { exitCode: 1, stdout: "", stderr: "doctor child not wired in fixture" };
+        }
+        return runDoctor(root, { json: true, store: fake.doctorStore });
+      }
       const [binary, ...args] = cmd as [string, ...string[]];
       const name = binary.split("/").pop() ?? binary;
       if (name === "git") {
@@ -131,6 +146,7 @@ function flowProbes(bins: { rtk: string; runtime: string }): FlowProbes {
     homedir: () => join(bins.rtk, "..", "home"),
     platform: () => ({ os: "linux", arch: "arm64", node: "v22.0.0" }),
   };
+  return fake;
 }
 
 function bootstrapSession(
@@ -192,7 +208,7 @@ async function readyProject(dir: string, binDir: string): Promise<ReadyProject> 
       dir,
       { json: true, yes: true },
       { interactive: true, store },
-      flowProbes(bins),
+      flowProbes(bins, { doctorStore: store }),
       (_plan, challenge) => challenge
     );
     expect(out.exitCode).toBe(0);
@@ -229,38 +245,59 @@ describe("Doctor", () => {
   it("reports READY on a configured project with zero writes", async () => {
     const project = await readyProject(tempDir, binDir);
     const before = statSync(join(tempDir, ".chrono", "chrono.db")).mtimeMs;
-    const out = runDoctor(
-      tempDir,
-      { json: true, as: "gaspar", session: project.gaspar }
-    );
+    // No session: the public verification path alone must confirm
+    // readiness (OC-P6 one-command contract).
+    const out = runDoctor(tempDir, { json: true, store: project.store });
     expect(out.exitCode).toBe(0);
     const parsed = JSON.parse(out.stdout) as {
       ok: boolean;
-      doctor: { entry: { ready: boolean; reasons: string[] }; projectState: string; broker: { active: number } };
+      doctor: {
+        entry: { ready: boolean; reasons: string[] };
+        projectState: string;
+        setupStep: string;
+        broker: { active: number; state: string; brokerId: string | null };
+      };
     };
     expect(parsed.ok).toBe(true);
     expect(parsed.doctor.entry.ready).toBe(true);
     expect(parsed.doctor.projectState).toBe("ANALYZING");
+    expect(parsed.doctor.setupStep).toBe("READY");
     expect(parsed.doctor.broker.active).toBe(1);
+    expect(parsed.doctor.broker.state).toBe("active");
+    expect(typeof parsed.doctor.broker.brokerId).toBe("string");
     expect(statSync(join(tempDir, ".chrono", "chrono.db")).mtimeMs).toBe(before);
   });
 
   it("names drifted hooks with actionable reasons", async () => {
     const project = await readyProject(tempDir, binDir);
     writeFileSync(join(tempDir, ".opencode", "plugins", "chrono-gate.js"), "// drifted by hand\n", "utf8");
-    const out = runDoctor(tempDir, { json: true, as: "gaspar", session: project.gaspar });
+    const out = runDoctor(tempDir, { json: true, store: project.store });
     expect(out.exitCode).toBe(1);
     const parsed = JSON.parse(out.stdout) as { doctor: { entry: { reasons: string[] } } };
     expect(parsed.doctor.entry.reasons.some((r) => r.includes("chrono-gate.js"))).toBe(true);
   });
 
-  it("hides broker credentials without a privileged session", async () => {
-    await readyProject(tempDir, binDir);
-    const out = runDoctor(tempDir, { json: true });
-    expect(out.exitCode).toBe(1);
-    const parsed = JSON.parse(out.stdout) as { doctor: { entry: { reasons: string[] }; broker: { visible: boolean } } };
-    expect(parsed.doctor.broker.visible).toBe(false);
-    expect(parsed.doctor.entry.reasons.some((r) => r.includes("broker"))).toBe(true);
+  it("verifies broker health publicly without a privileged session", async () => {
+    // OC-P6: broker readiness is established without any gaspar/PO
+    // session; only non-sensitive metadata appears in the report.
+    const project = await readyProject(tempDir, binDir);
+    const account = readFileSync(join(tempDir, ".chrono", "broker-account"), "utf8").split("\n")[0] ?? "";
+    const secret = project.store.readKey(account) ?? "";
+    expect(secret.length).toBeGreaterThan(0);
+    const out = runDoctor(tempDir, { json: true, store: project.store });
+    expect(out.exitCode).toBe(0);
+    const parsed = JSON.parse(out.stdout) as {
+      ok: boolean;
+      doctor: { broker: { visible: boolean; active: number; revoked: number; state: string; brokerId: string } };
+    };
+    expect(parsed.ok).toBe(true);
+    expect(parsed.doctor.broker.visible).toBe(true);
+    expect(parsed.doctor.broker.state).toBe("active");
+    expect(parsed.doctor.broker.active).toBe(1);
+    const haystack = out.stdout;
+    expect(haystack).not.toContain(secret);
+    expect(haystack).not.toContain("secret_hash");
+    expect(haystack).not.toContain("secretHash");
   });
 });
 
@@ -425,7 +462,7 @@ describe("Uninstall scopes", () => {
     expect(existsSync(join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"))).toBe(false);
     expect(existsSync(join(tempDir, ".chrono", "broker-account"))).toBe(false);
     // Doctor now reports drift instead of passing.
-    const doctor = runDoctor(tempDir, { json: true });
+    const doctor = runDoctor(tempDir, { json: true, store: project.store });
     expect(doctor.exitCode).toBe(1);
   });
 
@@ -607,12 +644,12 @@ describe("Kiro entry (hermetic contract, real runtime open)", () => {
       stubExec(entrypoint, join(binDir, "rtk"))
     );
     expect(setupOut.exitCode).toBe(0);
-    const blocked = runDoctor(tempDir, { json: true, as: "gaspar", session: project.gaspar });
+    const blocked = runDoctor(tempDir, { json: true, store: project.store });
     expect(blocked.exitCode).toBe(1);
     const reasons = (JSON.parse(blocked.stdout) as { doctor: { entry: { reasons: string[] } } }).doctor.entry.reasons;
     expect(reasons.some((r) => r.includes("Kiro adapter present") && r.includes("C4"))).toBe(true);
     writeFileSync(join(tempDir, kiroEntryRegistrationPath("kiro")), '{"tampered":true}', "utf8");
-    const drifted = runDoctor(tempDir, { json: true, as: "gaspar", session: project.gaspar });
+    const drifted = runDoctor(tempDir, { json: true, store: project.store });
     expect(drifted.exitCode).toBe(1);
     const driftReasons = (JSON.parse(drifted.stdout) as { doctor: { entry: { reasons: string[] } } }).doctor.entry.reasons;
     expect(driftReasons.some((r) => r.includes("chrono-entry-kiro.json"))).toBe(true);
@@ -643,5 +680,327 @@ describe("Kiro entry (hermetic contract, real runtime open)", () => {
     expect(unproven.exitCode).toBe(1);
     expect((JSON.parse(unproven.stdout) as { error: { code: string } }).error.code).toBe("RTK_ROUTING_FAILURE");
     expect(existsSync(join(binDir, "k2.token"))).toBe(false);
+  });
+});
+
+describe("Broker health projection (OC-P6)", () => {
+  let tempDir: string;
+  let binDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-ocp6-"));
+    binDir = mkdtempSync(join(tmpdir(), "chrono-ocp6-bins-"));
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  });
+
+  /** Keychain that refuses every read: inaccessible is not missing. */
+  class LockedKeyStore extends MemoryKeyStore {
+    override readKey(_account: string): string | null {
+      throw new Error("OS keychain locked");
+    }
+  }
+
+  type BrokerFragment = {
+    visible: boolean;
+    active: number;
+    revoked: number;
+    state: string;
+    brokerId: string | null;
+    detail: string;
+  };
+
+  function brokerOf(out: { stdout: string }): BrokerFragment {
+    return (JSON.parse(out.stdout) as { doctor: { broker: BrokerFragment } }).doctor.broker;
+  }
+
+  function brokerSecret(project: ReadyProject): { account: string; secret: string } {
+    const account = readFileSync(join(project.dir, ".chrono", "broker-account"), "utf8").split("\n")[0] ?? "";
+    const secret = project.store.readKey(account) ?? "";
+    expect(secret.length).toBeGreaterThan(0);
+    return { account, secret };
+  }
+
+  it("reports a missing broker record without ever reading ready", async () => {
+    // A project initialized but never issued a broker credential:
+    // setup walked to GASPAR_ENTRY_PREPARED so the broker signal is
+    // isolated from setup noise.
+    const core = new ChronoCore({ projectPath: tempDir });
+    try {
+      expect(core.init().ok).toBe(true);
+      for (const step of ["DETECTED", "CONSENTED", "PROJECT_INITIALIZED", "PO_ENROLLED"] as const) {
+        expect(core.advanceSetupState(step as never, { seeded: true }).ok).toBe(true);
+      }
+    } finally {
+      core.close();
+    }
+    const out = runDoctor(tempDir, { json: true, store: new MemoryKeyStore() });
+    expect(out.exitCode).toBe(1);
+    const broker = brokerOf(out);
+    expect(broker.state).toBe("missing");
+    expect(broker.brokerId).toBe(null);
+    expect(broker.active).toBe(0);
+  });
+
+  it("reports a missing keychain secret as missing, never as unknown", async () => {
+    const project = await readyProject(tempDir, binDir);
+    const { account } = brokerSecret(project);
+    project.store.deleteKey(account);
+    const out = runDoctor(tempDir, { json: true, store: project.store });
+    expect(out.exitCode).toBe(1);
+    const parsed = JSON.parse(out.stdout) as { ok: boolean; doctor: { entry: { ready: boolean }; broker: BrokerFragment } };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.doctor.entry.ready).toBe(false);
+    expect(parsed.doctor.broker.state).toBe("missing");
+    expect(parsed.doctor.broker.detail).toContain("keychain");
+  });
+
+  it("reports a revoked broker while setup still reads READY", async () => {
+    const project = await readyProject(tempDir, binDir);
+    const listed = runBrokerList(tempDir, { json: true, as: "gaspar", session: project.gaspar });
+    const brokerId = (JSON.parse(listed.stdout) as { credentials: { id: string }[] }).credentials[0]!.id;
+    expect(runBrokerRevoke(tempDir, { id: brokerId, json: true, as: "gaspar", session: project.gaspar }).exitCode).toBe(0);
+    const out = runDoctor(tempDir, { json: true, store: project.store });
+    expect(out.exitCode).toBe(1);
+    const parsed = JSON.parse(out.stdout) as {
+      ok: boolean;
+      doctor: { setupStep: string; storedSetupStep: string; entry: { ready: boolean; reasons: string[] }; broker: BrokerFragment };
+    };
+    // OC-P8: READY is a verified projection, not a stored label. The
+    // stored label stays truthful (READY happened) while the effective
+    // projection demotes to the repair step and entry stays blocked.
+    expect(parsed.doctor.storedSetupStep).toBe("READY");
+    expect(parsed.doctor.setupStep).toBe("GASPAR_ENTRY_PREPARED");
+    expect(parsed.ok).toBe(false);
+    expect(parsed.doctor.entry.ready).toBe(false);
+    expect(parsed.doctor.broker.state).toBe("revoked");
+    expect(parsed.doctor.broker.revoked).toBe(1);
+  });
+
+  it("reports an inaccessible keychain as unknown without claiming no broker", async () => {
+    await readyProject(tempDir, binDir);
+    const out = runDoctor(tempDir, { json: true, store: new LockedKeyStore() });
+    expect(out.exitCode).toBe(1);
+    const parsed = JSON.parse(out.stdout) as { doctor: { entry: { reasons: string[] }; broker: BrokerFragment } };
+    expect(parsed.doctor.broker.state).toBe("unknown");
+    expect(parsed.doctor.broker.visible).toBe(false);
+    expect(parsed.doctor.entry.reasons.join("; ")).toContain("inaccessible");
+    // Permission failure must never read as absence (OC-P6 req 5).
+    expect(parsed.doctor.broker.detail).not.toMatch(/no active broker|no broker credential/i);
+  });
+
+  it("reports forged or mismatched broker-account files as inconsistent", async () => {
+    const project = await readyProject(tempDir, binDir);
+    const { account } = brokerSecret(project);
+    const file = join(tempDir, ".chrono", "broker-account");
+    const check = (): BrokerFragment => brokerOf(runDoctor(tempDir, { json: true, store: project.store }));
+    // Forged credential id.
+    writeFileSync(file, `${account}\nBRK-9999\n`, "utf8");
+    expect(runDoctor(tempDir, { json: true, store: project.store }).exitCode).toBe(1);
+    expect(check().state).toBe("inconsistent");
+    expect(check().detail).toContain("BRK-9999");
+    // Mismatched account name.
+    const real = new ChronoCore({ projectPath: tempDir });
+    let realId = "";
+    try {
+      realId = real.brokerHealth().value?.brokerId ?? "";
+    } finally {
+      real.close();
+    }
+    writeFileSync(file, `gaspar-entry-forged\n${realId}\n`, "utf8");
+    expect(check().state).toBe("inconsistent");
+    // Malformed file.
+    writeFileSync(file, "single-line-garbage\n", "utf8");
+    expect(check().state).toBe("inconsistent");
+  });
+
+  it("keeps JSON, human output, and exit codes consistent on both verdicts", async () => {
+    const project = await readyProject(tempDir, binDir);
+    // Healthy: exit 0, ok true, entry READY, human on stdout.
+    const healthyJson = runDoctor(tempDir, { json: true, store: project.store });
+    expect(healthyJson.exitCode).toBe(0);
+    const healthy = JSON.parse(healthyJson.stdout) as { ok: boolean; doctor: { entry: { ready: boolean } } };
+    expect(healthy.ok).toBe(true);
+    expect(healthy.doctor.entry.ready).toBe(true);
+    const healthyHuman = runDoctor(tempDir, { store: project.store });
+    expect(healthyHuman.exitCode).toBe(0);
+    expect(healthyHuman.stdout).toContain("entry: READY");
+    expect(healthyHuman.stdout).toContain("broker:");
+    expect(healthyHuman.stderr).toBe("");
+    // Unhealthy (revoked broker): exit 1, ok false, human on stderr.
+    const listed = runBrokerList(tempDir, { json: true, as: "gaspar", session: project.gaspar });
+    const brokerId = (JSON.parse(listed.stdout) as { credentials: { id: string }[] }).credentials[0]!.id;
+    expect(runBrokerRevoke(tempDir, { id: brokerId, json: true, as: "gaspar", session: project.gaspar }).exitCode).toBe(0);
+    const sickJson = runDoctor(tempDir, { json: true, store: project.store });
+    expect(sickJson.exitCode).toBe(1);
+    const sick = JSON.parse(sickJson.stdout) as { ok: boolean; doctor: { entry: { ready: boolean } } };
+    expect(sick.ok).toBe(false);
+    expect(sick.doctor.entry.ready).toBe(false);
+    const sickHuman = runDoctor(tempDir, { store: project.store });
+    expect(sickHuman.exitCode).toBe(1);
+    expect(sickHuman.stdout).toBe("");
+    expect(sickHuman.stderr).toContain("entry: BLOCKED");
+    expect(sickHuman.stderr).toContain("broker:");
+    expect(sickHuman.stderr).toContain("REVOKED");
+  });
+
+  it("leaks no secret material on any surface", async () => {
+    const project = await readyProject(tempDir, binDir);
+    const { secret } = brokerSecret(project);
+    const poKey = project.store.readKey("po") ?? "";
+    expect(poKey.length).toBeGreaterThan(0);
+    const forbidden = [secret, poKey, project.gaspar.token, project.po.token, "secret_hash", "secretHash"];
+    const healthyJson = runDoctor(tempDir, { json: true, store: project.store });
+    const healthyHuman = runDoctor(tempDir, { store: project.store });
+    for (const text of [healthyJson.stdout, healthyHuman.stdout]) {
+      for (const needle of forbidden) {
+        expect(text).not.toContain(needle);
+      }
+    }
+    // The credential id and account name are non-secret and may appear;
+    // the secret itself must not, even on the failure surface.
+    const listed = runBrokerList(tempDir, { json: true, as: "gaspar", session: project.gaspar });
+    const brokerId = (JSON.parse(listed.stdout) as { credentials: { id: string }[] }).credentials[0]!.id;
+    expect(healthyJson.stdout).toContain(brokerId);
+    expect(runBrokerRevoke(tempDir, { id: brokerId, json: true, as: "gaspar", session: project.gaspar }).exitCode).toBe(0);
+    const sickJson = runDoctor(tempDir, { json: true, store: project.store });
+    const sickHuman = runDoctor(tempDir, { store: project.store });
+    for (const text of [sickJson.stdout, sickHuman.stderr]) {
+      for (const needle of forbidden) {
+        expect(text).not.toContain(needle);
+      }
+    }
+  });
+});
+describe("Entry script repair (OC-P7 req 10, OC-P8 orchestration)", () => {
+  let tempDir: string;
+  let binDir: string;
+  let restoreTty: () => void;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-ocp7-repair-"));
+    binDir = mkdtempSync(join(tmpdir(), "chrono-ocp7-repair-bins-"));
+    restoreTty = fakeInteractiveTerminal();
+  });
+
+  afterEach(() => {
+    restoreTty();
+    rmSync(tempDir, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  });
+
+  it("repairs an obsolete entry script on init re-run and requires fresh proof before READY", async () => {
+    const project = await readyProject(tempDir, binDir);
+    const scriptPath = join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh");
+    const canonical = readFileSync(scriptPath, "utf8");
+    // Plant the exact pilot defect: the obsolete generator's flag.
+    const obsolete = canonical.replace(
+      '--broker "$BROKER" --token-out',
+      '--broker "$BROKER" --secret-stdin --token-out'
+    );
+    expect(obsolete).toContain("--secret-stdin");
+    const bins = { rtk: join(binDir, "rtk"), runtime: join(binDir, "opencode") };
+    const repairInit = (): Promise<{ exitCode: number; stdout: string; stderr: string }> =>
+      runInitFlow(
+        tempDir,
+        { json: true, yes: true },
+        { interactive: true, store: project.store },
+        flowProbes(bins, { doctorStore: project.store }),
+        () => null
+      );
+    const rtkPath = join(binDir, "rtk");
+    const spawn = (
+      cmd: string,
+      args: string[]
+    ): { status: number; stdout: string; stderr: string; timedOut: boolean } => {
+      if (cmd === rtkPath) {
+        if (args[0] === "--version") {
+          return { status: 0, stdout: "rtk 0.44.0-test\n", stderr: "", timedOut: false };
+        }
+        if (args[0] === "gain") {
+          return { status: 0, stdout: "Token Killer savings dashboard\n", stderr: "", timedOut: false };
+        }
+        if (args[0] === "rewrite") {
+          const mapped = args
+            .slice(1)
+            .map((word) => `'${word}'`)
+            .join(" ");
+          return { status: 0, stdout: `rtk ${mapped}\n`, stderr: "", timedOut: false };
+        }
+        if (args[0] === "ls") {
+          return { status: 0, stdout: "repaired\n", stderr: "", timedOut: false };
+        }
+      }
+      return { status: 1, stdout: "", stderr: "unknown fixture command", timedOut: false };
+    };
+    const freshProof = (): string => {
+      const proved = runRtkProve(
+        tempDir,
+        {
+          adapter: "opencode",
+          as: "gaspar",
+          session: project.gaspar,
+          binary: rtkPath,
+          resolveBinary: (binary: string) => (binary === "rtk" ? rtkPath : binary),
+          command: ["ls", tempDir],
+          // Same TTL the init flow uses: the fresh proof must outrank
+          // the older authoritative row in scope queries.
+          ttlSeconds: 86400,
+          json: true,
+        },
+        spawn
+      );
+      expect(proved.exitCode).toBe(0);
+      const proofId = (JSON.parse(proved.stdout) as { id: string }).id;
+      const promoted = runRtkPromote(tempDir, { proof: proofId, as: "PO", session: project.po, json: true });
+      expect(promoted.exitCode).toBe(0);
+      return proofId;
+    };
+    // Phase A: drifted bytes. Read-only drift protection reports the
+    // drift AND the stale proof bindings (re-prove direction); nothing
+    // auto-heals in the diagnostic path.
+    writeFileSync(scriptPath, obsolete, "utf8");
+    const drifted = runDoctor(tempDir, { json: true, store: project.store });
+    expect(drifted.exitCode).toBe(1);
+    expect(drifted.stdout).toContain("hook drift");
+    expect(drifted.stdout).toContain("re-prove");
+    // Init re-run heals the bytes and orchestrates the fresh
+    // proof/promotion itself (OC-P8): the healed assets and the new
+    // authoritative proof agree, so the gate passes in the same run
+    // with zero manual granular commands.
+    const healed = await repairInit();
+    expect(readFileSync(scriptPath, "utf8")).not.toContain("--secret-stdin");
+    expect(healed.exitCode).toBe(0);
+    expect(healed.stdout).not.toMatch(/run chrono rtk (verify|prove|promote)/);
+    // Phase B (generator-upgrade simulation): snapshot the proof while
+    // obsolete bytes are live, so the promoted snapshot predates the
+    // canonical repair. The read-only doctor still reports the drift
+    // plus the re-prove direction (diagnostic path never auto-heals),
+    // while init repair heals AND re-proves/promotes in one command.
+    writeFileSync(scriptPath, obsolete, "utf8");
+    freshProof();
+    const driftedAgain = runDoctor(tempDir, { json: true, store: project.store });
+    expect(driftedAgain.exitCode).toBe(1);
+    expect(driftedAgain.stdout).toContain("hook drift");
+    expect(driftedAgain.stdout).toContain("re-prove");
+    const repaired = await repairInit();
+    expect(readFileSync(scriptPath, "utf8")).not.toContain("--secret-stdin");
+    expect(repaired.exitCode).toBe(0);
+    const core = new ChronoCore({ projectPath: tempDir });
+    try {
+      expect(core.getSetupState().value?.step).toBe("READY");
+    } finally {
+      core.close();
+    }
+    // Public doctor and init agree on READY again after the
+    // orchestrated repair; a further re-run is an idempotent resume.
+    const healthy = runDoctor(tempDir, { json: true, store: project.store });
+    expect(healthy.exitCode).toBe(0);
+    const resumed = await repairInit();
+    expect(resumed.exitCode).toBe(0);
+    expect(JSON.parse(resumed.stdout) as object).toMatchObject({ resumed: true });
   });
 });
