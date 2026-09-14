@@ -8,7 +8,7 @@
  * PO signature denies at cryptographic verification.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -22,8 +22,10 @@ import {
   signApprovalPayload,
 } from "@chrono/domain";
 import { ChronoCore } from "@chrono/core";
-import { runApprovalRecord, runApprovalRequest, runApprovalTicket } from "./approval-ceremony-cli.js";
+import { checkQuestionSurface, runApprovalRecord, runApprovalRequest, runApprovalTicket } from "./approval-ceremony-cli.js";
 import { runArtifactPropose } from "./artifact-cli.js";
+import { runDoctor } from "./init-flow.js";
+import { MemoryKeyStore } from "./keychain.js";
 
 function fakeTty(): () => void {
   const stdinDesc = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
@@ -126,6 +128,66 @@ describe("OC-P11 ceremony commands", () => {
     });
     expect(recorded.exitCode).toBe(0);
     expect(JSON.parse(recorded.stdout).ok).toBe(true);
+  });
+
+  function fixtureBinary(name: string, script: string): string {
+    const path = join(tempDir, name);
+    writeFileSync(path, script, "utf8");
+    chmodSync(path, 0o755);
+    return path;
+  }
+
+  it("classifies the question surface from the debug-agent oracle", () => {
+    const yes = fixtureBinary("opencode-yes.sh", `#!/bin/sh\necho '{"tools":{"question":true}}'\n`);
+    expect(checkQuestionSurface(tempDir, yes)).toMatchObject({ available: true });
+    const no = fixtureBinary("opencode-no.sh", `#!/bin/sh\necho '{"tools":{"question":false}}'\n`);
+    const denied = checkQuestionSurface(tempDir, no);
+    expect(denied.available).toBe(false);
+    expect(denied.reason).toContain("question: allow");
+    const missing = fixtureBinary("opencode-missing.sh", `#!/bin/sh\necho '{"agent":"gaspar"}'\n`);
+    expect(checkQuestionSurface(tempDir, missing).available).toBe(false);
+    const garbage = fixtureBinary("opencode-garbage.sh", `#!/bin/sh\necho 'not json'\n`);
+    expect(checkQuestionSurface(tempDir, garbage).available).toBe(false);
+    const failing = fixtureBinary("opencode-failing.sh", `#!/bin/sh\nexit 3\n`);
+    expect(checkQuestionSurface(tempDir, failing).available).toBe(false);
+  });
+
+  it("refuses requireQuestion tickets unless the question tool is exposed", () => {
+    const yes = fixtureBinary("opencode-q-yes.sh", `#!/bin/sh\necho '{"tools":{"question":true}}'\n`);
+    const allowed = runApprovalRequest(tempDir, {
+      action: "planning-approval", scope: "REQ-0001", revision: draftRev,
+      rationale: "accept", securityImplications: "none",
+      as: "gaspar", sessionToken: gasparToken, json: true,
+      requireQuestion: true, opencodeBinary: yes,
+    });
+    expect(allowed.exitCode).toBe(0);
+    expect(JSON.parse(allowed.stdout)).toMatchObject({ ok: true });
+    const no = fixtureBinary("opencode-q-no.sh", `#!/bin/sh\necho '{"tools":{"question":false}}'\n`);
+    const refused = runApprovalRequest(tempDir, {
+      action: "planning-approval", scope: "REQ-0001", revision: draftRev,
+      rationale: "accept", securityImplications: "none",
+      as: "gaspar", sessionToken: gasparToken, json: true,
+      requireQuestion: true, opencodeBinary: no,
+    });
+    expect(refused.exitCode).toBe(1);
+    expect(JSON.parse(refused.stdout).error.message).toContain("approval ticket refused");
+  });
+
+  it("reports the question surface in doctor output", () => {
+    const yes = fixtureBinary("opencode-doc-yes.sh", `#!/bin/sh\necho '{"tools":{"question":true}}'\n`);
+    const saved = process.env["CHRONO_OPENCODE_BIN"];
+    process.env["CHRONO_OPENCODE_BIN"] = yes;
+    try {
+      const out = runDoctor(tempDir, { json: true, store: new MemoryKeyStore() });
+      const report = (JSON.parse(out.stdout) as { doctor: { ceremony: { questionSurface: { available: boolean } } } }).doctor;
+      expect(report.ceremony.questionSurface.available).toBe(true);
+    } finally {
+      if (saved === undefined) {
+        delete process.env["CHRONO_OPENCODE_BIN"];
+      } else {
+        process.env["CHRONO_OPENCODE_BIN"] = saved;
+      }
+    }
   });
 
   it("denies workers, missing sessions, forged signatures, and unknown tickets", () => {

@@ -213,7 +213,7 @@ describe("OC-P11 native planning tools", () => {
     writeFileSync(join(root, OPENCODE_TOOLS_PACKAGE_RELATIVE), buildPlanningToolsPackage(), "utf8");
     tools = (await import(pathToFileURL(join(root, OPENCODE_TOOLS_FILE_RELATIVE)).href)) as Record<string, unknown>;
     savedEnv = { ...process.env };
-    for (const key of ["CHRONO_BIN", "CHRONO_SESSION_TOKEN"]) {
+    for (const key of ["CHRONO_BIN", "CHRONO_OPENCODE_BIN", "CHRONO_SESSION_TOKEN"]) {
       delete process.env[key];
     }
     // Real CLI shape behind a node shim (same boundary OpenCode uses).
@@ -221,6 +221,13 @@ describe("OC-P11 native planning tools", () => {
     writeFileSync(shim, `#!/bin/sh\nexec node ${join(REPO_ROOT, "packages", "cli", "dist", "bin.js")} "$@"\n`, "utf8");
     chmodSync(shim, 0o755);
     process.env["CHRONO_BIN"] = shim;
+    // Fixture `opencode` oracle: native approval_request always passes
+    // --require-question, so fixtures answer the debug-agent question
+    // the way a question-enabled OpenCode answers in production.
+    const fixtureOpencode = join(root, "opencode-fixture.sh");
+    writeFileSync(fixtureOpencode, `#!/bin/sh\necho '{"tools":{"question":true}}'\n`, "utf8");
+    chmodSync(fixtureOpencode, 0o755);
+    process.env["CHRONO_OPENCODE_BIN"] = fixtureOpencode;
     // Real Core project with enrolled PO key and Gaspar session.
     core = new ChronoCore({ projectPath: root, runtime: "opencode" });
     expect(core.init().ok).toBe(true);
@@ -273,7 +280,7 @@ describe("OC-P11 native planning tools", () => {
       if (savedEnv[key] === undefined) delete process.env[key];
       else process.env[key] = savedEnv[key];
     }
-    for (const key of ["CHRONO_BIN", "CHRONO_SESSION_TOKEN"]) {
+    for (const key of ["CHRONO_BIN", "CHRONO_OPENCODE_BIN", "CHRONO_SESSION_TOKEN"]) {
       if (!(key in savedEnv)) delete process.env[key];
     }
     try {

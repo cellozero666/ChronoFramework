@@ -88,6 +88,7 @@ import {
 } from "./opencode-agent.js";
 import { BROKER_KEY_SERVICE, OsKeychainStore, PO_KEY_ACCOUNT, brokerAccountFor, readPoPrivateKey } from "./keychain.js";
 import { constructionFailure } from "./project.js";
+import { checkQuestionSurface } from "./approval-ceremony-cli.js";
 import { canonicalProjectDir, openReadProject } from "./project.js";
 import type { KeyStore } from "./keychain.js";
 
@@ -2236,6 +2237,13 @@ export interface DoctorReport {
       readonly detail: string;
     }>;
     readonly detail: string;
+    /**
+     * Native question-surface capability (availability blocker fix):
+     * whether OpenCode exposes the `question` tool to Gaspar, verified
+     * through `opencode debug agent gaspar`. Tickets must not be opened
+     * while this is unavailable. Null when the binary is absent.
+     */
+    readonly questionSurface: { readonly available: boolean | null; readonly reason: string };
   };
 }
 
@@ -2421,12 +2429,19 @@ const CEREMONY_KINDS = new Set([
  * one-line verdict Gaspar can quote: finalized approvals, live denials
  * with their layer, or the absence of any ceremony traffic.
  */
-export function readCeremonyEvidence(projectRoot: string): DoctorReport["ceremony"] {
+export function readCeremonyEvidence(
+  projectRoot: string,
+  questionSurface?: { readonly available: boolean | null; readonly reason: string }
+): DoctorReport["ceremony"] {
+  const surface = questionSurface ?? {
+    available: null as boolean | null,
+    reason: "question surface not probed",
+  };
   let raw: string;
   try {
     raw = readFileSync(join(projectRoot, ".chrono", "runtime-activation.jsonl"), "utf8");
   } catch {
-    return { events: [], detail: "no ceremony traffic observed" };
+    return { events: [], detail: "no ceremony traffic observed", questionSurface: surface };
   }
   const events: Array<{ at: string; kind: string; ticket: string | null; detail: string }> = [];
   for (const line of raw.split("\n")) {
@@ -2464,7 +2479,7 @@ export function readCeremonyEvidence(projectRoot: string): DoctorReport["ceremon
   }
   const tail = events.slice(-10);
   if (tail.length === 0) {
-    return { events: [], detail: "no ceremony traffic observed" };
+    return { events: [], detail: "no ceremony traffic observed", questionSurface: surface };
   }
   const last = tail[tail.length - 1] as { kind: string; ticket: string | null; detail: string };
   return {
@@ -2473,6 +2488,7 @@ export function readCeremonyEvidence(projectRoot: string): DoctorReport["ceremon
       last.kind === "approval-finalized"
         ? `latest ceremony finalized ${last.ticket ?? ""}: Core approval recorded`
         : `latest ceremony ${last.kind} ${last.ticket ?? ""}: no approval recorded by that observation`,
+    questionSurface: surface,
   };
 }
 
@@ -2531,7 +2547,7 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
     broker: { visible: false, active: 0, revoked: 0, state: "unknown", brokerId: null, detail: "project not found" },
     entry: { ready: false, reasons: ["project not found"] },
     activation: noActivation,
-    ceremony: readCeremonyEvidence(root),
+    ceremony: readCeremonyEvidence(root, checkQuestionSurface(root)),
   };
   const opened = openReadProject(root, asJson);
   if ("failure" in opened) {
@@ -2722,7 +2738,7 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
       broker,
       entry: { ready: reasons.length === 0, reasons },
       activation,
-      ceremony: readCeremonyEvidence(root),
+      ceremony: readCeremonyEvidence(root, checkQuestionSurface(root)),
     };
     const body = asJson ? JSON.stringify({ ok: filled.entry.ready, doctor: filled }, null, 2) : renderDoctor(filled);
     return filled.entry.ready
@@ -2844,6 +2860,14 @@ function renderDoctor(report: DoctorReport): string {
       "ceremony:",
       report.ceremony.events.length === 0 ? "no traffic" : `${String(report.ceremony.events.length)} observation(s), latest:`,
       report.ceremony.detail,
+    ].join(" "),
+    [
+      "question-surface:",
+      report.ceremony.questionSurface.available === true
+        ? "AVAILABLE (native question exposed to Gaspar)"
+        : report.ceremony.questionSurface.available === false
+          ? `UNAVAILABLE (${report.ceremony.questionSurface.reason})`
+          : `UNKNOWN (${report.ceremony.questionSurface.reason})`,
     ].join(" "),
   ];
   return lines.join("\n");

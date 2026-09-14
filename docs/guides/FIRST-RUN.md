@@ -100,11 +100,14 @@ selection, no exported tokens, no repeated questions.
 
 Gaspar works through its NATIVE governed tools (no shell, no temp
 files, no tokens): `chrono_artifact_propose` / `chrono_artifact_revise`
-with inline Markdown bodies, `chrono_artifact_status` for the safe
-projection, `chrono_approval_request` for single-use tickets, and
-`chrono_approval_confirm` for the human confirmation. Never generic
-file writes, never `chrono run` (execution grants are reserved for
-authorized implementation work).
+/ `chrono_artifact_supersede` with inline Markdown bodies,
+`chrono_artifact_status` for the safe projection, and
+`chrono_approval_request` for single-use tickets. There is no
+approval-confirm tool: the human confirmation travels only through
+the native `question` tool, which the Gaspar agent policy must
+explicitly allow (`question: allow` — OpenCode denies tools by
+default). Never generic file writes, never `chrono run` (execution
+grants are reserved for authorized implementation work).
 
 Each draft is approved **without leaving the runtime**: Gaspar opens
 a ticket, asks you through the native `question` UI showing the exact
@@ -121,7 +124,11 @@ approval sessions (auto mode cannot supply human confirmation and
 the ceremony refuses it); never paste session tokens anywhere. (The
 equivalent `chrono artifact --body-file/--body-stdin` and
 `chrono approval-request` shell commands exist for operators with an
-exported session; Gaspar must use the native tools.)
+exported session; Gaspar must use the native tools. The ticket
+request refuses when the native `question` tool is not exposed to
+Gaspar — `chrono doctor` reports the surface in its ceremony
+section, and the fix is `question: allow` in the Gaspar agent
+policy followed by `chrono init --runtime opencode`.)
 
 ## 4. Re-run, repair, and diagnose
 

@@ -72,6 +72,20 @@ describe("OpenCode role definitions (OC-P10)", () => {
     expect(gaspar).toContain("Core");
   });
 
+  it("exposes the native question tool to Gaspar and to no other role", () => {
+    // Availability fix: OpenCode denies tools by default, so the
+    // native `question` confirmation boundary only renders when the
+    // Gaspar agent policy explicitly allows it.
+    const gaspar = buildOpenCodeAgentDefinition("gaspar");
+    expect(gaspar).toContain("question: allow");
+    for (const role of CHRONO_OPENCODE_ROLES) {
+      if (role === "gaspar") {
+        continue;
+      }
+      expect(buildOpenCodeAgentDefinition(role as ChronoOpenCodeRole)).not.toContain("question: allow");
+    }
+  });
+
   it("is deterministic across generations", () => {
     for (const role of CHRONO_OPENCODE_ROLES) {
       expect(buildOpenCodeAgentDefinition(role as ChronoOpenCodeRole)).toBe(

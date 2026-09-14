@@ -278,9 +278,9 @@ export const approval_request = tool({
     const res = runChrono([
       "approval-request", "--action", args.action, "--scope", args.scope, "--revision", args.revision,
       "--rationale", args.rationale, "--security-implications", args.securityImplications,
-      ...commonArgs(root, token),
+      "--require-question", ...commonArgs(root, token),
     ]);
-    if (res.exit !== 0 || res.json?.ok !== true) {
+    if (res.exit !== 0 || !res.json || res.json.ok !== true) {
       deny(res.json, "approval request denied");
     }
     return JSON.stringify(res.json);

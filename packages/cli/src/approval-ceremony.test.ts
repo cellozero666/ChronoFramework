@@ -113,13 +113,46 @@ describe("OC-P11 integrated approval ceremony", () => {
   async function hooksFor(directory: string) {
     const module = (await import(pathToFileURL(pluginPath).href)) as {
       ChronoGatePlugin: (ctx: unknown) => Promise<{
+        event: (input: unknown) => Promise<unknown>;
         "chat.message": (input: unknown) => Promise<unknown>;
         "tool.execute.before": (input: unknown, output: unknown) => Promise<unknown>;
         "tool.execute.after": (input: unknown, output: unknown) => Promise<unknown>;
       }>;
     };
     const hooks = await module.ChronoGatePlugin({ directory });
-    return { message: hooks["chat.message"], before: hooks["tool.execute.before"], after: hooks["tool.execute.after"] };
+    return { event: hooks.event, message: hooks["chat.message"], before: hooks["tool.execute.before"], after: hooks["tool.execute.after"] };
+  }
+
+  function askedEvent(sessionID: string, requestID: string, line: string): unknown {
+    return {
+      event: {
+        type: "question.asked",
+        properties: {
+          id: requestID,
+          sessionID,
+          questions: [{ question: "CHRONO product decision", header: "Approval", options: [{ label: line, description: "Record signed PO approval" }, { label: "Deny", description: "Do nothing" }] }],
+          tool: { messageID: "m1", callID: "call-q" },
+        },
+      },
+    };
+  }
+
+  function repliedEvent(sessionID: string, requestID: string, answer: string): unknown {
+    return {
+      event: {
+        type: "question.replied",
+        properties: { sessionID, requestID, answers: [[answer]] },
+      },
+    };
+  }
+
+  function rejectedEvent(sessionID: string, requestID: string): unknown {
+    return {
+      event: {
+        type: "question.rejected",
+        properties: { sessionID, requestID },
+      },
+    };
   }
 
   function evidenceText(): string {
@@ -152,7 +185,7 @@ describe("OC-P11 integrated approval ceremony", () => {
     writeFileSync(join(root, ".opencode", "tools", "chrono.ts"), buildPlanningToolsFile(), "utf8");
     tools = (await import(pathToFileURL(join(root, ".opencode", "tools", "chrono.ts")).href)) as Record<string, unknown>;
     savedEnv = { ...process.env };
-    for (const key of ["CHRONO_BIN", "CHRONO_ENTRY_ADAPTER", "CHRONO_ENTRY_TIMEOUT_MS", "CHRONO_GATE_MODULE", "CHRONO_GATE_WP", "CHRONO_SESSION_TOKEN", "CHRONO_GATE_AS", "CHRONO_GATE_ROLE", "CHRONO_REQUESTER_TOKEN"]) {
+    for (const key of ["CHRONO_BIN", "CHRONO_OPENCODE_BIN", "CHRONO_ENTRY_ADAPTER", "CHRONO_ENTRY_TIMEOUT_MS", "CHRONO_GATE_MODULE", "CHRONO_GATE_WP", "CHRONO_SESSION_TOKEN", "CHRONO_GATE_AS", "CHRONO_GATE_ROLE", "CHRONO_REQUESTER_TOKEN"]) {
       delete process.env[key];
     }
     const shim = join(root, "chrono-shim.sh");
@@ -183,6 +216,16 @@ describe("OC-P11 integrated approval ceremony", () => {
     writeFileSync(join(fixtureBin, "security"), `#!/bin/sh\ncat "${keyFile}"\n`, "utf8");
     chmodSync(join(fixtureBin, "security"), 0o755);
     process.env["PATH"] = `${fixtureBin}${delimiter}${process.env["PATH"] ?? ""}`;
+    // Fixture `opencode` oracle for the question-surface gate: the
+    // native approval_request tool always passes --require-question,
+    // so hermetic fixtures must answer the same `debug agent gaspar`
+    // question OpenCode answers in production. No test seam in
+    // production bytes — CHRONO_OPENCODE_BIN is the supported probe
+    // override.
+    const fixtureOpencode = join(root, "opencode-fixture.sh");
+    writeFileSync(fixtureOpencode, `#!/bin/sh\necho '{"tools":{"question":true}}'\n`, "utf8");
+    chmodSync(fixtureOpencode, 0o755);
+    process.env["CHRONO_OPENCODE_BIN"] = fixtureOpencode;
     const sessionNonce = randomBytes(16).toString("hex");
     const sessionTimestamp = "2026-09-11T00:00:00.000Z";
     const sessionSig = domainSign(
@@ -208,7 +251,7 @@ describe("OC-P11 integrated approval ceremony", () => {
       if (savedEnv[key] === undefined) delete process.env[key];
       else process.env[key] = savedEnv[key];
     }
-    for (const key of ["CHRONO_BIN"]) {
+    for (const key of ["CHRONO_BIN", "CHRONO_OPENCODE_BIN"]) {
       if (!(key in savedEnv)) delete process.env[key];
     }
     try {
@@ -248,6 +291,69 @@ describe("OC-P11 integrated approval ceremony", () => {
   it("keychain identifiers match the CLI keystore (no drift)", () => {
     expect(PO_KEY_SERVICE).toBe("chrono-po-signing-key");
     expect(PO_KEY_ACCOUNT).toBe("po");
+  });
+
+  it("native question event chain finalizes on explicit Approve (asked/replied)", async () => {
+    const hooks = await hooksFor(root);
+    await hooks.message({ sessionID: sessionKey });
+    const spec = JSON.parse(await callTool("artifact_propose", { kind: "spec", id: "SP-0001", title: "Tasks", body: "Task contract." })) as {
+      revision: string;
+    };
+    const requested = JSON.parse(await callTool("approval_request", {
+      action: "planning-approval", scope: "SP-0001", revision: spec.revision, rationale: "accept", securityImplications: "none",
+    })) as { ticketId: string; challenge: string };
+    const line = `CHRONO approval ${requested.challenge} :: planning-approval SP-0001 @${spec.revision} :: accept`;
+    await hooks.event(askedEvent(sessionKey, "req-1", line));
+    await hooks.event(repliedEvent(sessionKey, "req-1", `Approve ${requested.challenge} — yes`));
+    expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(true);
+    expect(evidenceText()).toContain("approval-finalized");
+    // The tool-result channel stays idempotent: same answer again is a replay no-op.
+    await hooks.after(
+      { tool: "question", sessionID: sessionKey, callID: "call-dup", args: questionArgs(line) },
+      { title: "answer", output: `Approve ${requested.challenge} — yes`, metadata: {} }
+    );
+    expect(core.listApprovals()).toHaveLength(1);
+  });
+
+  it("event chain denies rejected, unmatched, and cross-session answers", async () => {
+    const hooks = await hooksFor(root);
+    await hooks.message({ sessionID: sessionKey });
+    const spec = JSON.parse(await callTool("artifact_propose", { kind: "spec", id: "SP-0001", title: "Tasks", body: "Task contract." })) as {
+      revision: string;
+    };
+    const requested = JSON.parse(await callTool("approval_request", {
+      action: "planning-approval", scope: "SP-0001", revision: spec.revision, rationale: "accept", securityImplications: "none",
+    })) as { ticketId: string; challenge: string };
+    const line = `CHRONO approval ${requested.challenge} :: planning-approval SP-0001 @${spec.revision} :: accept`;
+    // Explicit rejection cancels with no state change.
+    await hooks.event(askedEvent(sessionKey, "req-deny", line));
+    await hooks.event(rejectedEvent(sessionKey, "req-deny"));
+    expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(false);
+    expect(evidenceText()).toContain("approval-answer-declined");
+    // Reply without a prior asked (unknown requestID): no action.
+    await hooks.event(repliedEvent(sessionKey, "req-ghost", `Approve ${requested.challenge}`));
+    expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(false);
+    // Reply in another session for this session's ticket: denied at
+    // the session gate (no Core entry session there to bind to).
+    await hooks.event(askedEvent("other-session", "req-x", line));
+    await hooks.event(repliedEvent("other-session", "req-x", `Approve ${requested.challenge}`));
+    expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(false);
+    expect(evidenceText()).toContain("approval-no-session");
+  });
+
+  it("native approval_request denies when the question surface is unavailable", async () => {
+    const hooks = await hooksFor(root);
+    await hooks.message({ sessionID: sessionKey });
+    const spec = JSON.parse(await callTool("artifact_propose", { kind: "spec", id: "SP-0001", title: "Tasks", body: "Task contract." })) as {
+      revision: string;
+    };
+    const closed = join(root, "opencode-closed.sh");
+    writeFileSync(closed, `#!/bin/sh\necho '{"tools":{"question":false}}'\n`, "utf8");
+    chmodSync(closed, 0o755);
+    process.env["CHRONO_OPENCODE_BIN"] = closed;
+    await expect(callTool("approval_request", {
+      action: "planning-approval", scope: "SP-0001", revision: spec.revision, rationale: "accept", securityImplications: "none",
+    })).rejects.toThrow("approval ticket refused");
   });
 
   it("agent definition uses native tools and the question flow, never shell approval", async () => {

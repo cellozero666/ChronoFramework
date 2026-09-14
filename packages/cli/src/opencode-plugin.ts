@@ -83,14 +83,17 @@
  *
  * OC-P11 integrated approval ceremony (ADR-007, fail-open fix): the
  * native `question` tool carries the human confirmation for display
- * AND decision. `tool.execute.after` observes the runtime-delivered
- * result and finalizes ONLY on explicit human Approve (exact ticket
- * challenge, approval wording, no deny/cancel signal): it revalidates
- * ticket liveness, revision currency, and session binding through the
- * Core, refuses --auto, reads the OS-keychain PO key host-side (never
- * to the model), signs, and records. There is deliberately NO
- * approval-confirm tool: signing never follows model tool invocation
- * or execution permission. The plugin uses only
+ * AND decision. Both the `question.asked/replied/rejected` event
+ * chain and `tool.execute.after` observe runtime-delivered results
+ * and finalize ONLY on explicit human Approve (exact ticket
+ * challenge bound by requestID, approval wording, no deny/cancel
+ * signal): each path revalidates ticket liveness, revision currency,
+ * and session binding through the Core, refuses --auto, reads the
+ * OS-keychain PO key host-side (never to the model), signs, and
+ * records, sharing one single-use ticket so the two channels stay
+ * idempotent. There is deliberately NO approval-confirm tool:
+ * signing never follows model tool invocation or execution
+ * permission. The plugin uses only
  * `node:child_process` / `node:fs` / `node:path` / `node:crypto`, so
  * the generated file stays directly importable in tests with only
  * binaries substituted by fixtures.
@@ -955,6 +958,11 @@ export const ChronoGatePlugin = async (ctx) => {
   function dropSessionState(sessionId) {
     if (typeof sessionId === "string") {
       entryStates.delete(sessionId);
+      for (const key of [...pendingQuestions.keys()]) {
+        if (key.startsWith(sessionId + "|")) {
+          pendingQuestions.delete(key);
+        }
+      }
     }
     if (entryStates.size > 100) {
       const oldest = entryStates.keys().next();
@@ -962,6 +970,51 @@ export const ChronoGatePlugin = async (ctx) => {
         entryStates.delete(oldest.value);
       }
     }
+  }
+
+  // Pending native questions by "sessionID|requestID" (fail-open fix):
+  // question.asked records the exact rendered questions; a later
+  // question.replied for the same pair carries the explicit human
+  // answer; question.rejected is the explicit cancel path. Bounded
+  // (single-shot correlation, oldest evicted past 50).
+  const pendingQuestions = new Map();
+  function pendingKey(sessionID, requestID) {
+    return String(sessionID) + "|" + String(requestID);
+  }
+  function rememberQuestion(sessionID, requestID, questionText) {
+    pendingQuestions.set(pendingKey(sessionID, requestID), { questionText, at: new Date().toISOString() });
+    if (pendingQuestions.size > 50) {
+      const oldest = pendingQuestions.keys().next();
+      if (!oldest.done) {
+        pendingQuestions.delete(oldest.value);
+      }
+    }
+  }
+  function takeQuestion(sessionID, requestID) {
+    const key = pendingKey(sessionID, requestID);
+    const pending = pendingQuestions.get(key);
+    if (pending !== undefined) {
+      pendingQuestions.delete(key);
+    }
+    return pending;
+  }
+
+  function eventShape(raw) {
+    // Real OpenCode event shapes (verified against the installed SDK):
+    // either a flat { type, properties } event or a GlobalEvent-style
+    // { payload: { type, properties } } wrapper. Anything else is not
+    // classifiable and is ignored (fail-closed: no action).
+    if (raw === null || typeof raw !== "object") {
+      return null;
+    }
+    if (typeof raw.type === "string" && raw.properties !== undefined) {
+      return { type: raw.type, properties: raw.properties };
+    }
+    const payload = raw.payload;
+    if (payload !== null && typeof payload === "object" && typeof payload.type === "string") {
+      return { type: payload.type, properties: payload.properties };
+    }
+    return null;
   }
 
   function readHostToken(root, sessionKey) {
@@ -1133,6 +1186,81 @@ export const ChronoGatePlugin = async (ctx) => {
   // maybeFinalizeApproval below, which acts ONLY on explicit human
   // Approve and audits every other outcome without state change.
 
+  async function observeQuestionEvent(shaped, directory) {
+    // Native question event chain (fail-open fix): question.asked
+    // records the exact rendered questions; question.replied carries
+    // the explicit human answer bound by requestID; question.rejected
+    // is the explicit cancel path. Only a replied explicit Approve
+    // may trigger host-side signing, through the same
+    // maybeFinalizeApproval used by the tool-result path (ticket
+    // consumption keeps the two channels idempotent). Never throws.
+    const root = directory || process.cwd();
+    if (chronoProjectRoot(root) === null) {
+      return;
+    }
+    const props = shaped.properties;
+    if (props === null || typeof props !== "object") {
+      return;
+    }
+    const sessionID = typeof props.sessionID === "string" && props.sessionID.length > 0 ? props.sessionID : null;
+    if (sessionID === null) {
+      return;
+    }
+    const requestID =
+      typeof props.requestID === "string" && props.requestID.length > 0
+        ? props.requestID
+        : typeof props.id === "string" && props.id.length > 0
+          ? props.id
+          : null;
+    if (shaped.type === "question.asked") {
+      if (requestID === null) {
+        return;
+      }
+      let questionText = "";
+      try {
+        questionText = JSON.stringify(props.questions ?? "");
+      } catch {
+        questionText = "";
+      }
+      rememberQuestion(sessionID, requestID, questionText);
+      return;
+    }
+    if (shaped.type === "question.rejected") {
+      if (requestID === null) {
+        return;
+      }
+      const pending = takeQuestion(sessionID, requestID);
+      logEvidence(root, {
+        kind: "approval-answer-declined",
+        session: publicSessionKey(sessionID, root),
+        ticket: pending === undefined ? null : chronoExtractTicketIds(pending.questionText)[0] ?? null,
+        call: requestID,
+      });
+      return;
+    }
+    if (shaped.type !== "question.replied" || requestID === null) {
+      return;
+    }
+    const pending = takeQuestion(sessionID, requestID);
+    if (pending === undefined) {
+      logEvidence(root, {
+        kind: "approval-answer-no-match",
+        session: publicSessionKey(sessionID, root),
+        ticket: null,
+        call: requestID,
+      });
+      return;
+    }
+    let answerText = "";
+    try {
+      const answers = Array.isArray(props.answers) ? props.answers : [];
+      answerText = answers.map((a) => (Array.isArray(a) ? a.join(" ") : String(a ?? ""))).join(" ");
+    } catch {
+      answerText = "";
+    }
+    await maybeFinalizeApproval(root, sessionID, requestID, pending.questionText, answerText);
+  }
+
   try {
     const loadRoot = (ctx && ctx.directory) || process.cwd();
     const loadProject = chronoProjectRoot(loadRoot);
@@ -1149,8 +1277,14 @@ export const ChronoGatePlugin = async (ctx) => {
       // Prefetch optimization only (a throw here cannot abort
       // anything): starts entry early and sweeps stale token files.
       // Authoritative enforcement lives in chat.message, the system
-      // transform, and the tool hooks below.
+      // transform, and the tool hooks below. Native question events
+      // (asked/replied/rejected) feed the explicit-answer ceremony.
       try {
+        const shaped = eventShape(event);
+        if (shaped !== null && typeof shaped.type === "string" && shaped.type.indexOf("question.") === 0) {
+          await observeQuestionEvent(shaped, (ctx && ctx.directory) || process.cwd());
+          return;
+        }
         if (!event || (event.type !== "session.created" && event.type !== "session.deleted")) {
           return;
         }

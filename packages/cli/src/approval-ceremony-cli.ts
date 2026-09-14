@@ -16,6 +16,9 @@
  * native human confirmation), and only the signature crosses here.
  */
 
+import { execFileSync } from "node:child_process";
+import { accessSync, constants } from "node:fs";
+import { delimiter, join } from "node:path";
 import { ChronoCore } from "@chrono/core";
 import { approvalChallenge } from "@chrono/domain";
 import { CHRONO_VERSION } from "./version.js";
@@ -75,6 +78,85 @@ export interface ApprovalRequestOptions {
   readonly as: string;
   readonly sessionToken?: string | undefined;
   readonly json?: boolean | undefined;
+  /**
+   * Refuse the ticket unless the OpenCode `question` surface is
+   * available to the Gaspar agent (verified through
+   * `opencode debug agent gaspar`). Prevents tickets that could only
+   * wait for expiry because no human boundary can ever confirm them.
+   */
+  readonly requireQuestion?: boolean | undefined;
+  /** Override for the OpenCode binary probe (tests inject a fixture). */
+  readonly opencodeBinary?: string | undefined;
+}
+
+/**
+ * Capability probe: is OpenCode's native `question` tool exposed to
+ * the Gaspar agent in this project? Runs `opencode debug agent
+ * gaspar` and reads the resolved `tools.question` verdict — the same
+ * oracle used during development. Never touches sessions, models, or
+ * paid APIs: pure local configuration inspection.
+ */
+export function checkQuestionSurface(
+  projectPath: string,
+  opencodeBinary?: string
+): { available: boolean | null; reason: string } {
+  const binary = opencodeBinary ?? process.env["CHRONO_OPENCODE_BIN"] ?? resolveOpenCodeBinary();
+  if (binary === null) {
+    return { available: null, reason: "opencode binary not found on PATH: question-surface availability is unknown" };
+  }
+  let stdout: string;
+  try {
+    stdout = execFileSync(binary, ["debug", "agent", "gaspar"], {
+      encoding: "utf8",
+      cwd: projectPath,
+      timeout: 60000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (e) {
+    return {
+      available: false,
+      reason: `opencode debug agent gaspar failed: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return { available: false, reason: "opencode debug agent gaspar returned non-JSON output" };
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return { available: false, reason: "opencode debug agent gaspar returned a non-object document" };
+  }
+  const tools = (parsed as Record<string, unknown>)["tools"];
+  if (typeof tools !== "object" || tools === null) {
+    return { available: false, reason: "opencode debug agent gaspar reported no tool table" };
+  }
+  const question = (tools as Record<string, unknown>)["question"];
+  if (question === true) {
+    return { available: true, reason: "OpenCode exposes the native question tool to the Gaspar agent" };
+  }
+  return {
+    available: false,
+    reason: "OpenCode does not expose the native question tool to the Gaspar agent (tools.question is not true): add `question: allow` to the Gaspar agent permission policy, then re-run",
+  };
+}
+
+/** Resolve the OpenCode binary for capability probes (PATH lookup). */
+export function resolveOpenCodeBinary(): string | null {
+  const path = process.env["PATH"] ?? "";
+  for (const dir of path.split(delimiter)) {
+    if (dir.length === 0) {
+      continue;
+    }
+    const candidate = join(dir, process.platform === "win32" ? "opencode.exe" : "opencode");
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
 
 export interface ApprovalRecordOptions {
@@ -110,6 +192,19 @@ export function runApprovalRequest(projectPath: string, options: ApprovalRequest
       { code: "VALIDATION_ERROR", severity: "ERROR", message: "approval-request requires --session-token (or CHRONO_SESSION_TOKEN)" },
       asJson
     );
+  }
+  if (options.requireQuestion === true) {
+    const surface = checkQuestionSurface(projectPath, options.opencodeBinary);
+    if (surface.available !== true) {
+      return coreError(
+        {
+          code: "VALIDATION_ERROR",
+          severity: "ERROR",
+          message: `approval ticket refused: ${surface.reason}`,
+        },
+        asJson
+      );
+    }
   }
   let core: ChronoCore;
   try {

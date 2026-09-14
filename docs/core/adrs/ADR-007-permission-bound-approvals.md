@@ -41,13 +41,19 @@ and the published docs:
    approval — a confirm tool signing on `ask()` success recorded a
    real approval with no human UI, and has been DELETED (unknown
    `chrono_approval_confirm` is deny-by-default). Instead, the
-   generated plugin observes the runtime-delivered `question` result
-   and finalizes ONLY on explicit human Approve (exact challenge,
-   approval wording, no deny/cancel): it re-validates ticket
-   liveness, revision currency, and session binding, refuses `--auto`,
-   reads the OS-keychain PO key host-side, signs the canonical
-   payload (byte-identical serializer, contract-tested), and records
-   through `finalizeApprovalTicket`. Denial/cancellation/malformed/
+   generated plugin observes BOTH runtime-delivered channels — the
+   `question.asked/replied/rejected` event chain (asked records the
+   exact rendered questions keyed by `sessionID|requestID`; replied
+   carries the explicit human answer; rejected is the explicit
+   cancel path) and the `tool.execute.after` result — and finalizes
+   ONLY on explicit human Approve (exact challenge bound by
+   requestID, approval wording, no deny/cancel) through one shared
+   single-use ticket, so the two channels stay idempotent. Each
+   path re-validates ticket liveness, revision currency, and session
+   binding, refuses `--auto`, reads the OS-keychain PO key
+   host-side, signs the canonical payload (byte-identical
+   serializer, contract-tested), and records through
+   `finalizeApprovalTicket`. Denial/cancellation/malformed/
    missing/timeout answers change nothing.
 4. **Core verification** (`finalizeApprovalTicket`): Ed25519 under the
    registered PO key (same crypto!), single-use atomic ticket
@@ -76,6 +82,19 @@ and the published docs:
   memory and 0600 files only; signed bytes cross to the Core).
 - Every finalize is audited with ticket, scope, revision, observation,
   and policy version.
+
+## Addendum D5 (question availability: the confirmation UI must render)
+
+OpenCode denies tools to agents by default, so even a correct
+ceremony deadlocks when the native `question` tool is not exposed
+to Gaspar (`tools.question: deny` — proven live, with a ticket left
+`live` and unconsumable). The Gaspar agent policy therefore carries
+`question: allow`; `chrono approval-request --require-question`
+(which the native approval-request tool always passes) refuses
+tickets the human boundary could never confirm; `chrono doctor`
+reports `ceremony.questionSurface`; and finalization binds answers
+by `requestID` so a cross-session or replayed answer can never
+spend another session's ticket.
 
 ## Addendum D1/D4 (key custody parity and retry semantics)
 

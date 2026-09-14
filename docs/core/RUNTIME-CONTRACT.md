@@ -228,12 +228,18 @@ Adapters MUST distinguish four tool classes inside CHRONO projects:
 
 - **Governed planning mutation** — the NATIVE tools
   (`chrono_artifact_status/propose/revise/supersede`,
-  `chrono_approval_request/status/confirm` in
-  `.opencode/tools/chrono.ts`): real model-callable tools with stable
+  `chrono_approval_request/status` in
+  `.opencode/tools/chrono.ts`; there is deliberately NO
+  approval-confirm tool): real model-callable tools with stable
   schemas, host-held sessions, stdin bodies, and Core validation of
-  every call. Planning-governed, not generic shell mutation and not
-  implementation dispatch; the pre-tool gate requires proven entry,
-  nothing more. Bash compatibility (`chrono artifact ...`,
+  every call. Human confirmation travels only through the native
+  `question` tool, which the Gaspar agent policy MUST explicitly
+  allow (`question: allow` — OpenCode denies tools by default), and
+  the ticket request refuses (`--require-question`, always passed
+  by the native tool) unless that surface is available. Planning-
+  governed, not generic shell mutation and not implementation
+  dispatch; the pre-tool gate requires proven entry, nothing more.
+  Bash compatibility (`chrono artifact ...`,
   `chrono approval-request/ticket`, read-only
   `chrono doctor/status/validate`) uses the real two-argument
   `(input, output)` contract but is NOT a substitute for native tools.

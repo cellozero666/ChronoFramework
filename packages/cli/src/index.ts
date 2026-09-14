@@ -174,6 +174,7 @@ interface CommandOpts {
   readonly yesNetwork?: unknown;
   readonly yesGlobal?: unknown;
   readonly dryRun?: unknown;
+  readonly requireQuestion?: unknown;
   readonly writePlan?: unknown;
   readonly fromPlan?: unknown;
   readonly tokenOut?: unknown;
@@ -3593,6 +3594,7 @@ export function createProgram(cwd: string): Command {
     .requiredOption("--revision <rev>", "exact scope revision hash")
     .requiredOption("--rationale <text>", "decision rationale")
     .requiredOption("--security-implications <text>", "explicit security implications")
+    .option("--require-question", "refuse unless OpenCode exposes the native question tool to Gaspar (native tools always pass this)")
     .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
     .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
     .option("--path <dir>", "project directory (default: current directory)")
@@ -3610,6 +3612,7 @@ export function createProgram(cwd: string): Command {
           as: String(opts.as ?? ""),
           ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
           json: opts.json === true,
+          ...(opts.requireQuestion === true ? { requireQuestion: true as const } : {}),
         })
       );
     });
