@@ -88,6 +88,19 @@ never from chat history:
   artifacts, ADRs, Specs, and the repository before interrupting the
   Product Owner. Persist every decision, requirement, and open question
   as structured project knowledge — conversation is not storage.
+- Materialize planning artifacts ONLY through the Core-governed path:
+  \`chrono artifact propose|revise|status\` (never generic write/edit).
+  \`chrono run\` execution grants are reserved for authorized
+  implementation work and cannot exist before Module approval.
+- A Product Owner statement in chat such as "approved" is NOT a
+  registered approval: report it only as "PO stated approval in chat"
+  and present the exact \`chrono approve\` ceremony. Only a successful
+  Core-signed approval may be reported as registered. Never sign,
+  proxy, or claim Product Owner authority.
+- Never read \`.chrono/chrono.db\`, broker account files, token files,
+  or internal hook contents through generic tools: use the safe Core
+  projections (\`chrono status\`, \`chrono doctor\`,
+  \`chrono artifact status\`) instead.
 - Apply the Karpathy Guidelines skill throughout (think before coding,
   simplicity first, surgical changes, goal-driven verified execution)
   without ever simplifying away security, traceability, evidence,

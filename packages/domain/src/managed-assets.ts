@@ -40,8 +40,19 @@ export const ENTRY_SESSION_SCRIPT_ASSET: ManagedAssetSpec = {
  * the matching runtime. Each set is self-sufficient together with the
  * shared entry script.
  */
+/** Canonical CHRONO role agent definitions for OpenCode (OC-P10). */
+export const OPENCODE_AGENT_ASSETS: readonly ManagedAssetSpec[] = [
+  { path: ".opencode/agents/gaspar.md", kind: "exact" },
+  { path: ".opencode/agents/belthazar.md", kind: "exact" },
+  { path: ".opencode/agents/melchior.md", kind: "exact" },
+  { path: ".opencode/agents/prometheus.md", kind: "exact" },
+  { path: ".opencode/agents/lucca.md", kind: "exact" },
+  { path: ".opencode/agents/glenn.md", kind: "exact" },
+  { path: ".opencode/agents/spekkio.md", kind: "exact" },
+];
+
 export const RUNTIME_MANAGED_ASSETS: Record<KnownRuntimeId, readonly ManagedAssetSpec[]> = {
-  opencode: [{ path: ".opencode/plugins/chrono-gate.js", kind: "exact" }],
+  opencode: [{ path: ".opencode/plugins/chrono-gate.js", kind: "exact" }, ...OPENCODE_AGENT_ASSETS],
   "claude-code": [
     { path: ".chrono/hooks/chrono-claude-gate.js", kind: "exact" },
     { path: ".claude/settings.json", kind: "marker", marker: "chrono-claude-gate.js" },

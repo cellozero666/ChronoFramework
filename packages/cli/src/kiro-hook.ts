@@ -112,9 +112,15 @@ export function buildKiroHook(): string {
  *
  * Enforcement contract (explicit environment, never invented identity):
  * - Outside a CHRONO project (no .chrono/chrono.db under cwd): allow (0).
- * - Inside a CHRONO project: read-only tools allow without scope;
- *   mutable tools require CHRONO_GATE_MODULE (+ optional CHRONO_GATE_WP),
- *   CHRONO_GATE_AS, CHRONO_GATE_ROLE, CHRONO_SESSION_TOKEN and a live
+ * - Inside a CHRONO project: read-only tools allow without scope, except
+ *   reads referencing internal/security state (denied: use projections);
+ *   shell invocations that are EXACTLY a governed planning operation
+ *   (chrono artifact propose|revise|status, chrono doctor/status/validate)
+ *   allow with no dispatch scope — the planning CLI enforces the
+ *   Gaspar/PO session itself (OC-P11);
+ *   every other mutable tool requires CHRONO_GATE_MODULE (+ optional
+ *   CHRONO_GATE_WP), CHRONO_GATE_AS, CHRONO_GATE_ROLE,
+ *   CHRONO_SESSION_TOKEN and a live
  *   \`chrono gate execution\` AUTHORIZED verdict; unknown tools deny.
  */
 import { execFileSync } from "node:child_process";
@@ -255,11 +261,55 @@ async function main() {
   } catch {
     deny("TOOL_DENIED: PreToolUse payload is not parseable JSON.");
   }
+  let payloadText = "";
+  try {
+    const parsed = JSON.parse(raw);
+    payloadText = JSON.stringify(parsed.tool_input ?? "");
+  } catch {
+    payloadText = "";
+  }
+  // OC-P11 req 16: generic reads never serve internal/security state.
+  const FORBIDDEN = [".chrono/chrono.db", ".chrono/broker-account", ".chrono/hooks/", "chrono-gaspar-", ".token", "CHRONO_SESSION_TOKEN"];
   if (READ_TOOLS.has(tool)) {
+    if (FORBIDDEN.some((needle) => payloadText.includes(needle))) {
+      deny("SECRET_DETECTED: this read references CHRONO internal or security state: use chrono doctor or chrono artifact status projections instead.");
+    }
     process.exit(0);
   }
   if (!MUTATE_TOOLS.has(tool)) {
-    deny("TOOL_DENIED: tool '" + tool + "' is not classified by CHRONO tool policy v1: deny-by-default until reviewed.");
+    deny("TOOL_DENIED: tool '" + tool + "' is not classified by CHRONO tool policy v2: deny-by-default until reviewed.");
+  }
+  // OC-P11 planning path: a shell invocation that is EXACTLY a governed
+  // planning operation (no chaining/substitution) needs no dispatch
+  // scope; the planning CLI enforces the Gaspar/PO session itself.
+  if (tool === "shell" || tool === "execute_bash" || tool === "execute_cmd") {
+    const PLANNING = ["chrono artifact propose", "chrono artifact revise", "chrono artifact status", "chrono discovery record", "chrono plan status", "chrono status", "chrono validate", "chrono doctor"];
+    let command = null;
+    try {
+      const parsed = JSON.parse(raw);
+      const input = parsed.tool_input;
+      if (typeof input === "string") {
+        command = input;
+      } else if (input !== null && typeof input === "object") {
+        for (const key of ["command", "cmd", "input", "script"]) {
+          if (typeof input[key] === "string" && input[key].trim().length > 0) {
+            command = input[key];
+            break;
+          }
+        }
+      }
+    } catch {
+      command = null;
+    }
+    if (typeof command === "string") {
+      const normalized = command.trim().replace(/\\s+/g, " ");
+      if (!/[;|&$\\\`]/.test(normalized)) {
+        const candidate = normalized.replace(/^([\\w\\-./\\\\:]+\\/)?chrono(\\.exe|\\.cmd|\\.bat)? /, "chrono ");
+        if (PLANNING.some((prefix) => candidate === prefix || candidate.startsWith(prefix + " "))) {
+          process.exit(0);
+        }
+      }
+    }
   }
   const module = readEnv("CHRONO_GATE_MODULE");
   if (module === null) {

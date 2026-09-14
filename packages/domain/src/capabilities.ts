@@ -27,13 +27,16 @@ export const AUTHORITY_POLICY_VERSION = "4";
  * independently from the authority matrix: tool classification affects
  * pre-tool gate decisions, never grant semantics.
  */
-export const TOOL_POLICY_VERSION = "1";
+export const TOOL_POLICY_VERSION = "2";
 
 export type CapabilityHolder = AgentRole | "PO";
 
 /** Core operations governed by the matrix. */
 export type CoreOperation =
   | "artifact.register"
+  | "planning.propose"
+  | "planning.revise"
+  | "planning.status"
   | "architecture.propose"
   | "architecture.enact"
   | "harness.record"
@@ -63,6 +66,9 @@ const ALL_WORKERS: readonly AgentRole[] = ["belthazar", "melchior", "prometheus"
  */
 export const ROLE_CAPABILITIES: Record<CoreOperation, readonly CapabilityHolder[]> = {
   "artifact.register": ["gaspar", "PO"],
+  "planning.propose": ["gaspar", "PO"],
+  "planning.revise": ["gaspar", "PO"],
+  "planning.status": ["gaspar", "PO"],
   "architecture.propose": ["gaspar", "PO"],
   "architecture.enact": ["gaspar", "PO"],
   "harness.record": ["gaspar", "PO"],

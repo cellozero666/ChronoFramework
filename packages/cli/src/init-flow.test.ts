@@ -1066,6 +1066,38 @@ describe("Init upgrade/repair orchestration (OC-P8)", () => {
     expect(storedStep()).toBe("READY");
   });
 
+  it("installs the corrected OpenCode plugin on repair and refreshes the proof automatically (OC-P9)", async () => {
+    // The pilot project runs a previous plugin generator (no
+    // chat.message gate, fictional session shapes). Re-running init
+    // must install the corrected bytes and refresh the invalidated RTK
+    // proof in the same command — no manual granular steps.
+    const bins = makeBins(binDir);
+    const store = new MemoryKeyStore();
+    const first = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm([]));
+    expect(first.exitCode).toBe(0);
+    const pluginFile = join(tempDir, ".opencode", "plugins", "chrono-gate.js");
+    expect(readFileSync(pluginFile, "utf8")).toContain("chat.message");
+    // Simulate the previous generator: strip the message gate.
+    const previous = readFileSync(pluginFile, "utf8").replaceAll("\"chat.message\"", "\"chat.legacy\"");
+    expect(previous).not.toContain("\"chat.message\"");
+    writeFileSync(pluginFile, previous, "utf8");
+    const drifted = runDoctor(tempDir, { json: true, store });
+    expect(drifted.exitCode).toBe(1);
+    expect(drifted.stdout).toContain("hook drift");
+    const repaired = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm([]));
+    expect(repaired.exitCode).toBe(0);
+    expect(JSON.parse(repaired.stdout) as object).toMatchObject({ ok: true, ready: true, step: "READY" });
+    expect(repaired.stdout).not.toMatch(/run chrono rtk (verify|prove|promote)/);
+    expect(repaired.stdout).not.toMatch(/run chrono setup/);
+    const healed = readFileSync(pluginFile, "utf8");
+    expect(healed).toContain("\"chat.message\"");
+    expect(healed).toContain("experimental.chat.system.transform");
+    expect(healed).toContain("chrono-gaspar-entry");
+    const doctor = runDoctor(tempDir, { json: true, store });
+    expect(doctor.exitCode).toBe(0);
+    expect((JSON.parse(doctor.stdout) as { doctor: { rtk: { routing: Record<string, string> } } }).doctor.rtk.routing["opencode"]).toBe("proven");
+  });
+
   it("re-proves stale routing bindings after hook replacement and promotes fresh candidates", async () => {
     const bins = makeBins(binDir);
     const store = new MemoryKeyStore();
@@ -1124,6 +1156,110 @@ describe("Init upgrade/repair orchestration (OC-P8)", () => {
     const resumed = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm([]));
     expect(resumed.exitCode).toBe(0);
     expect(storedStep()).toBe("READY");
+  });
+
+  it("rotates a lost broker secret through one init without manual commands (OC-P9)", async () => {
+    const bins = makeBins(binDir);
+    const store = new MemoryKeyStore();
+    const first = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm([]));
+    expect(first.exitCode).toBe(0);
+    const brokerBefore = readFileSync(join(tempDir, ".chrono", "broker-account"), "utf8");
+    // Lose the broker secret (wiped keychain / new machine): the public
+    // doctor fails while everything else stays valid. The account binds
+    // the canonical project spelling (OC-P6), not the symlinked /tmp one.
+    const { brokerAccountFor } = await import("./keychain.js");
+    const { canonicalProjectDir } = await import("./project.js");
+    store.deleteKey(brokerAccountFor(canonicalProjectDir(tempDir)));
+    const sick = runDoctor(tempDir, { json: true, store });
+    expect(sick.exitCode).toBe(1);
+    // One-command repair revokes the secret-less credential, issues a
+    // fresh one, and returns to READY with no duplicates.
+    const repaired = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm([]));
+    expect(repaired.exitCode).toBe(0);
+    expect(JSON.parse(repaired.stdout) as object).toMatchObject({ ok: true, ready: true, step: "READY" });
+    expect(repaired.stdout).not.toMatch(/run chrono (rtk|broker|setup)/);
+    expect(readFileSync(join(tempDir, ".chrono", "broker-account"), "utf8")).not.toBe(brokerBefore);
+    const after = snapshotIdentity();
+    expect(after.adapters).toEqual(["opencode"]);
+    expect(after.approvals).toBe(1);
+    const doctor = runDoctor(tempDir, { json: true, store });
+    expect(doctor.exitCode).toBe(0);
+  });
+
+  it("installs native Gaspar agent configuration on repair (OC-P10)", async () => {
+    const { buildOpenCodeAgentDefinition } = await import("./opencode-agent.js");
+    const bins = makeBins(binDir);
+    const store = new MemoryKeyStore();
+    const first = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm([]));
+    expect(first.exitCode).toBe(0);
+    // Fresh init selects Gaspar natively with a model-neutral definition.
+    // Req 14: every generated asset is byte-identical to its builder —
+    // disk and CLI options cannot drift.
+    const { CHRONO_OPENCODE_ROLES } = await import("./opencode-agent.js");
+    for (const role of CHRONO_OPENCODE_ROLES) {
+      expect(readFileSync(join(tempDir, ".opencode", "agents", `${role}.md`), "utf8")).toBe(
+        buildOpenCodeAgentDefinition(role as "gaspar")
+      );
+    }
+    const configured = runDoctor(tempDir, { json: true, store });
+    expect(configured.exitCode).toBe(0);
+    const ready = JSON.parse(configured.stdout) as {
+      ok: boolean;
+      doctor: { activation: { observed: boolean; defaultAgent: string | null; selectedAgent: string | null } };
+    };
+    expect(ready.ok).toBe(true);
+    // No runtime session ran yet: setup is READY but activation is
+    // unobserved — static assets alone never prove Gaspar selection.
+    expect(ready.doctor.activation.defaultAgent).toBe("gaspar");
+    expect(ready.doctor.activation.selectedAgent).toBeNull();
+    expect(ready.doctor.activation.observed).toBe(false);
+    // Drift the agent file and the user-owned default away: repair
+    // restores both in one command with zero manual instructions.
+    writeFileSync(join(tempDir, ".opencode", "agents", "gaspar.md"), "hand-edited\n", "utf8");
+    const configFile = join(tempDir, "opencode.json");
+    writeFileSync(configFile, readFileSync(configFile, "utf8").replace("gaspar", "build"), "utf8");
+    const drifted = runDoctor(tempDir, { json: true, store });
+    expect(drifted.exitCode).toBe(1);
+    expect(drifted.stdout).toContain("hook drift");
+    const repaired = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm([]));
+    expect(repaired.exitCode).toBe(0);
+    expect(JSON.parse(repaired.stdout) as object).toMatchObject({ ok: true, ready: true, step: "READY" });
+    expect(repaired.stdout).not.toMatch(/run chrono (rtk|setup|broker)/);
+    expect(readFileSync(join(tempDir, ".opencode", "agents", "gaspar.md"), "utf8")).toBe(buildOpenCodeAgentDefinition("gaspar"));
+    const healed = runDoctor(tempDir, { json: true, store });
+    expect(healed.exitCode).toBe(0);
+    expect((JSON.parse(healed.stdout) as { doctor: { activation: { defaultAgent: string } } }).doctor.activation.defaultAgent).toBe("gaspar");
+  });
+
+  it("explains default=gaspar but session=build without false activation (OC-P10)", async () => {
+    const bins = makeBins(binDir);
+    const store = new MemoryKeyStore();
+    const first = await runInitFlow(tempDir, { json: true, yes: true }, depsOf(store), flowProbes(bins, { doctorStore: store }), autoConfirm([]));
+    expect(first.exitCode).toBe(0);
+    // Crafted runtime telemetry: projection injected, but the exact
+    // session kept OpenCode's built-in Build primary.
+    writeFileSync(
+      join(tempDir, ".chrono", "runtime-activation.jsonl"),
+      [
+        JSON.stringify({ v: 1, ts: "2026-09-14T00:00:00.000Z", adapter: "opencode", kind: "plugin-load" }),
+        JSON.stringify({ v: 1, ts: "2026-09-14T00:01:00.000Z", adapter: "opencode", kind: "projection-injected", session: "ses_old", entrySession: "SES-0001", projectionHash: "aa", hook: "experimental.chat.system.transform", skillIncluded: true }),
+        JSON.stringify({ v: 1, ts: "2026-09-14T00:02:00.000Z", adapter: "opencode", kind: "agent-selected", session: "ses_old", agent: "build" }),
+      ].join("\n") + "\n",
+      "utf8"
+    );
+    const out = runDoctor(tempDir, { json: true, store });
+    const parsed = JSON.parse(out.stdout) as {
+      ok: boolean;
+      doctor: { activation: { observed: boolean; defaultAgent: string | null; selectedAgent: string | null; detail: string } };
+    };
+    // Setup stays READY (static configuration is correct) while
+    // activation is honestly unobserved for Gaspar.
+    expect(parsed.ok).toBe(true);
+    expect(parsed.doctor.activation.observed).toBe(false);
+    expect(parsed.doctor.activation.defaultAgent).toBe("gaspar");
+    expect(parsed.doctor.activation.selectedAgent).toBe("build");
+    expect(parsed.doctor.activation.detail).toContain("ses_old");
+    expect(parsed.doctor.activation.detail).toContain("build");
   });
 
   it("demotes setup state auditably without destroying history", () => {

@@ -672,6 +672,33 @@ export class ArtifactRepository {
     return row?.id ?? null;
   }
 
+  /**
+   * Record a material content revision: appends immutable history and moves
+   * the current pointer atomically (OC-P11). Prior revisions stay
+   * resolvable, so approvals bound to them go stale deterministically
+   * instead of silently following the new content [DOM §2.3, P3.5].
+   */
+  reviseContent(
+    id: string,
+    revision: string,
+    status: string,
+    contentHash: string,
+    content: string
+  ): void {
+    const now = new Date().toISOString();
+    const current = this.findById(id);
+    const tx = this.db.transaction(() => {
+      this.db.prepare(
+        `INSERT INTO artifact_revision (id, revision, type, status, content_hash, content, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(id, revision, current.type, status, contentHash, content, now);
+      this.db.prepare(
+        `UPDATE artifact SET revision = ?, status = ?, updated_at = ?, content_hash = ? WHERE id = ? AND deleted = 0`
+      ).run(revision, status, now, contentHash, id);
+    });
+    tx();
+  }
+
   /** Mark deleted (tombstone) — preserves references [DOM §2.4] */
   softDelete(id: string): void {
     this.db.prepare("UPDATE artifact SET deleted = 1 WHERE id = ?").run(id);

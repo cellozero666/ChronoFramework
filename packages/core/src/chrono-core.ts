@@ -5,8 +5,8 @@
  */
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { accessSync, constants as fsConstants, readFileSync, realpathSync } from "node:fs";
-import { join as joinPath } from "node:path";
+import { accessSync, constants as fsConstants, existsSync as fsExistsSync, lstatSync as fsLstatSync, mkdirSync as fsMkdirSync, readFileSync, realpathSync, renameSync as fsRenameSync, rmSync as fsRmSync, writeFileSync as fsWriteFileSync } from "node:fs";
+import { dirname as pathDirname, join as joinPath, resolve as pathResolve, sep as pathSep } from "node:path";
 import {
   ChronoDatabase,
   type AdapterRecord,
@@ -63,12 +63,20 @@ import {
   SKILL_RELEASE,
   SKILL_RUNTIME_PATHS,
   SKILL_UPSTREAM,
+  assertPlanningContent,
+  assertPlanningId,
+  assertPlanningKind,
   isCapable,
   mayEnactEvent,
+  planningFilename,
+  PLANNING_KIND_DIR,
+  PLANNING_KIND_FAMILY,
+  PLANNING_ALLOC_FAMILY,
   ChronoError,
   ErrorCode,
   Severity,
   type CoreOperation,
+  type PlanningKind,
 } from "@chrono/domain";
 import type { ProjectState, EntityType, ApprovalPayload, WaiverPayload, AgentRole, SetupStep, GasparEntryProjection } from "@chrono/domain";
 
@@ -4722,6 +4730,13 @@ export class ChronoCore {
     try {
       return this.artifacts.findById(scopeId).revision;
     } catch {
+      // File-tracked planning drafts resolve by their recorded revision
+      // (OC-P11): revision changes invalidate prior approvals
+      // deterministically through the standard stale check.
+      const planned = this.db.runtimeConfig().get(this.planningRevisionKey(scopeId));
+      if (planned !== null) {
+        return planned;
+      }
       // Adapter scopes resolve by registration hash [RUNTIME §13].
       try {
         return this.adapterRegistrationHash(scopeId);
@@ -7182,6 +7197,545 @@ export class ChronoCore {
       };
     }
     return { installed: true, code: "OK", reason: "Skill attestation current and artifacts intact" };
+  }
+
+  // ---------------------------------------------------------------------------
+  // OC-P11: Core-governed planning/artifact-authoring path.
+  //
+  // Bootstrap deadlock fixed: Gaspar materializes planning artifacts
+  // (analysis, requirements, architecture/ADRs, Specs, harness drafts,
+  // security proposals, roadmap/plans) BEFORE any implementation Module/WP
+  // exists — without generic filesystem/shell authority and without an
+  // execution grant. `chrono run` grants stay reserved for authorized
+  // implementation work. Every operation enforces the Gaspar capability
+  // matrix; model content is untrusted DRAFT/PROPOSED material; chat text
+  // never becomes PO authority (only the signed interactive ceremony
+  // records approvals, bound to exact revisions).
+  // ---------------------------------------------------------------------------
+
+  /** Runtime-config key tracking the current revision of a file-tracked plan. */
+  private planningRevisionKey(id: string): string {
+    return `planning.revision.${id}`;
+  }
+
+  /** Runtime-config key holding the JSON index of planning ids. */
+  private planningIndexKey(): string {
+    return "planning.index";
+  }
+
+  private readPlanningIndex(): string[] {
+    const raw = this.db.runtimeConfig().get(this.planningIndexKey());
+    if (raw === null) {
+      return [];
+    }
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((e): e is string => typeof e === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private addPlanningIndex(id: string): void {
+    const index = this.readPlanningIndex();
+    if (!index.includes(id)) {
+      index.push(id);
+      this.db.runtimeConfig().set(this.planningIndexKey(), JSON.stringify(index));
+    }
+  }
+
+  /**
+   * Deterministic managed destination for a planning artifact (OC-P11
+   * req 8). Derived from (kind, id) only — there is no caller-supplied
+   * path, so traversal, symlinks, product-code writes, and escapes are
+   * structurally impossible. Throws when the resolved destination would
+   * leave the project or collide with internal state.
+   */
+  private planningDestination(kind: PlanningKind, id: string): string {
+    const dir = PLANNING_KIND_DIR[kind];
+    const file = planningFilename(kind, id);
+    if (file.includes("/") || file.includes("\\") || file.includes("..")) {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: `Planning filename for '${id}' escapes its managed directory: denied`,
+        invariantRef: "INV §14.4",
+        affectedTarget: id,
+        suggestedAction: "Use the canonical identifier for this planning kind",
+      });
+    }
+    const root = pathResolve(this.config.projectPath);
+    const dest = pathResolve(root, dir, file);
+    if (dest !== root && !dest.startsWith(root + pathSep)) {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: `Planning destination for '${id}' leaves the project: denied`,
+        invariantRef: "INV §14.4",
+        affectedTarget: id,
+        suggestedAction: "Propose only canonical managed artifact locations",
+      });
+    }
+    return dest;
+  }
+
+  /** Render the authoritative Markdown document for a planning artifact. */
+  private renderPlanningFile(kind: PlanningKind, id: string, title: string, body: string, revision: string): string {
+    return [
+      "---",
+      `id: ${id}`,
+      `kind: ${kind}`,
+      `revision: ${revision}`,
+      `status: DRAFT`,
+      `generated_by: chrono-planning`,
+      "---",
+      "",
+      `# ${title}`,
+      "",
+      body.trim(),
+      "",
+    ].join("\n");
+  }
+
+  /**
+   * Propose and materialize a planning artifact (OC-P11 req 1,4-9,17-19).
+   *
+   * Gaspar/PO only (`planning.propose`). Validates kind, identifier,
+   * lifecycle entry state, references, destination, schema, and size;
+   * writes the authoritative Markdown/YAML plus the SQLite registry/event
+   * changes atomically or compensatably; restricts writes to canonical
+   * managed locations. Untrusted model content enters as DRAFT/PROPOSED.
+   * An optional id is allocated by the Core when omitted.
+   */
+  proposePlanningArtifact(
+    input: {
+      kind: string;
+      id?: string;
+      title: string;
+      body: string;
+      references?: string[];
+    },
+    auth: CallerAuth
+  ): CoreResult<{ id: string; revision: string; path: string; approvalCommand: string }> {
+    try {
+      const caller = this.requireCapability("planning.propose", this.resolveCaller(auth, "propose planning artifact"));
+      assertPlanningKind(input.kind);
+      const kind = input.kind;
+      // Allocate or validate the identifier (exact, never normalized).
+      let id = input.id?.trim() ?? "";
+      if (id.length === 0) {
+        const family = PLANNING_ALLOC_FAMILY[kind];
+        if (family === null) {
+          throw new ChronoError({
+            code: ErrorCode.VALIDATION_ERROR,
+            severity: Severity.ERROR,
+            message: `Planning kind '${kind}' requires an explicit id (fixed singleton identity)`,
+            invariantRef: "INV §10.1",
+            affectedTarget: kind,
+            suggestedAction: "Pass the canonical singleton id for this kind",
+          });
+        }
+        id = this.sequences.allocate(family);
+        if (kind === "discovery" && id.startsWith("OPEN-") === false) {
+          throw new ChronoError({
+            code: ErrorCode.VALIDATION_ERROR,
+            severity: Severity.ERROR,
+            message: `Internal sequence mismatch for discovery: denied`,
+            invariantRef: "INV §10.1",
+            affectedTarget: kind,
+            suggestedAction: "Retry the planning proposal",
+          });
+        }
+      }
+      if (kind === "architecture") {
+        id = "ARCH";
+      }
+      if (kind === "roadmap" && id !== "ROADMAP" && !/^MOD-[0-9]{4}$/.test(id)) {
+        id = "ROADMAP";
+      }
+      if (kind === "discovery" && id === "OPEN") {
+        id = "DISCOVERY";
+      }
+      assertPlanningId(kind, id);
+      assertPlanningContent(kind, input.title, input.body, id);
+      // Duplicate proposal denied (revise instead) — except the fixed
+      // singletons ARCH/ROADMAP/DISCOVERY, which revise in place.
+      const singleton = id === "ARCH" || id === "ROADMAP" || id === "DISCOVERY";
+      if (!singleton && this.readPlanningIndex().includes(id)) {
+        throw new ChronoError({
+          code: ErrorCode.DUPLICATE_IDENTITY,
+          severity: Severity.ERROR,
+          message: `Planning artifact '${id}' already exists: revise it instead of re-proposing`,
+          invariantRef: "INV §10.1",
+          affectedTarget: id,
+          suggestedAction: "Use planning revise to record a new revision",
+        });
+      }
+      // References must resolve (no dangling planning contracts).
+      for (const ref of input.references ?? []) {
+        try {
+          this.artifacts.findById(ref);
+        } catch {
+          if (this.db.runtimeConfig().get(this.planningRevisionKey(ref)) === null) {
+            throw new ChronoError({
+              code: ErrorCode.REFERENCE_UNRESOLVABLE,
+              severity: Severity.ERROR,
+              message: `Planning reference '${ref}' does not resolve: denied`,
+              invariantRef: "INV §10.2",
+              affectedTarget: id,
+              suggestedAction: "Reference an existing artifact or planning draft",
+            });
+          }
+        }
+      }
+      const dest = this.planningDestination(kind, id);
+      const family = PLANNING_KIND_FAMILY[kind];
+      const structured = family === "SP" || family === "MOD" || family === "WP";
+      const structuredContent =
+        family === "SP"
+          ? { id, title: input.title, purpose: input.title, body: input.body, planningDraft: true, dependencies: input.references ?? [] }
+          : family === "MOD"
+            ? { id, name: input.title, purpose: input.title, body: input.body, specs: input.references ?? [] }
+            : family === "WP"
+              ? { id, name: input.title, module: (input.references ?? [])[0] ?? id, body: input.body, dependsOn: [] }
+              : null;
+      // Pre-validate structured registration before touching the FS.
+      if (structured && structuredContent !== null) {
+        if (family === "SP") {
+          assertRequiredFields("SP", structuredContent);
+        } else if (family === "MOD") {
+          const specs = structuredContent["specs"];
+          if (!Array.isArray(specs) || specs.length === 0) {
+            throw new ChronoError({
+              code: ErrorCode.VALIDATION_ERROR,
+              severity: Severity.ERROR,
+              message: `Planning module '${id}' requires at least one Spec reference: a Module without Specs is orphan work`,
+              invariantRef: "INV §10.5",
+              affectedTarget: id,
+              suggestedAction: "Propose the Specs first, then reference them from the Module plan",
+            });
+          }
+        } else if (family === "WP") {
+          const refs = input.references ?? [];
+          if (refs.length === 0) {
+            throw new ChronoError({
+              code: ErrorCode.VALIDATION_ERROR,
+              severity: Severity.ERROR,
+              message: `Planning work package '${id}' requires --ref <owning-module>: a WorkPackage without a Module is orphan work`,
+              invariantRef: "INV §10.5",
+              affectedTarget: id,
+              suggestedAction: "Propose the Module plan first, then reference it with --ref",
+            });
+          }
+        }
+      }
+      const revision = computeRevisionHash({ kind, id, title: input.title, body: input.body });
+      const file = this.renderPlanningFile(kind, id, input.title, input.body, revision);
+      // File first to tmp, then DB transaction, then atomic rename. A
+      // rename failure after commit compensates with tombstone + event.
+      fsMkdirSync(pathDirname(dest), { recursive: true });
+      const tmp = `${dest}.chrono-tmp-${process.pid}`;
+      fsWriteFileSync(tmp, file, "utf8");
+      let committed = false;
+      try {
+        this.db.transaction(() => {
+          if (structured && structuredContent !== null) {
+            const canonical = canonicalize(structuredContent);
+            const contentHash = computeRevisionHash({ id, content: structuredContent });
+            // Structured revision is the planning revision: one identity,
+            // one current revision across file and registry.
+            this.artifacts.create(id, family as string, revision, family === "WP" ? "PLANNED" : "DRAFT", contentHash, canonical);
+          }
+          if (kind === "architecture") {
+            // The file revision IS the architecture revision: proposing
+            // architecture evidences sufficient analysis [P1.8] and the
+            // architecture-security approval binds this exact revision.
+            this.projects.setArchitecture("default", "ARCH", revision, "proposed");
+            this.projects.markSystemAnalysisComplete("default");
+            this.events.append({
+              eventType: "ArtifactCreated",
+              entityId: "ARCH",
+              payload: { type: "ARCHITECTURE", revision },
+              actor: caller.auditActor,
+              priorState: undefined,
+              newState: "proposed",
+              reasoning: "Architecture proposed through the planning path",
+            });
+          }
+          if (kind === "security-profile") {
+            // The proposal carries the profile version: gates read the
+            // versioned profile row, humans read the file. Same revision.
+            const version = this.db.securityProfiles().listAll().length + 1;
+            this.db.securityProfiles().create(id, version, revision);
+          }
+          this.db.runtimeConfig().set(this.planningRevisionKey(id), revision);
+          this.addPlanningIndex(id);
+          this.events.append({
+            eventType: "ArtifactCreated",
+            entityId: id,
+            payload: { type: "PLANNING_DRAFT", kind, revision, title: input.title },
+            actor: caller.auditActor,
+            priorState: undefined,
+            newState: "DRAFT",
+            reasoning: `Planning draft proposed (${kind})`,
+          });
+        });
+        committed = true;
+        fsRenameSync(tmp, dest);
+      } catch (e) {
+        try {
+          fsRmSync(tmp, { force: true });
+        } catch {
+          // Tmp cleanup is best-effort.
+        }
+        if (committed) {
+          // DB committed but the file did not land: tombstone the
+          // registry row (structured kinds) so no half-materialized
+          // draft is ever presented as ready, and audit the failure.
+          try {
+            if (structured) {
+              this.artifacts.softDelete(id);
+            }
+            this.events.append({
+              eventType: "ArtifactCreated",
+              entityId: id,
+              payload: { type: "PLANNING_COMPENSATED", kind, revision },
+              actor: caller.auditActor,
+              priorState: "DRAFT",
+              newState: "compensated",
+              reasoning: "Planning file materialization failed after commit: registry compensated",
+            });
+          } catch {
+            // Compensation is best-effort; the original error stands.
+          }
+        }
+        throw e;
+      }
+      this.syncProjectState();
+      const approvalCommand =
+        `chrono approve --action planning-approval --scope ${id} --revision ${revision} ` +
+        `--authority <PO> --rationale "<decision rationale>" --path <project>`;
+      return { ok: true, value: { id, revision, path: dest, approvalCommand } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Revise a planning draft (OC-P11 req 7,22). New file revision +
+   * registry revision atomically; prior planning-approvals bound to the
+   * old revision go stale deterministically (hasValidApproval compares
+   * against the current revision).
+   */
+  revisePlanningArtifact(
+    id: string,
+    input: { title: string; body: string },
+    auth: CallerAuth
+  ): CoreResult<{ id: string; revision: string; path: string; approvalCommand: string }> {
+    try {
+      const caller = this.requireCapability("planning.revise", this.resolveCaller(auth, "revise planning artifact"));
+      const index = this.readPlanningIndex();
+      if (!index.includes(id)) {
+        throw new ChronoError({
+          code: ErrorCode.ENTITY_NOT_FOUND,
+          severity: Severity.ERROR,
+          message: `Planning artifact '${id}' not found: propose it first`,
+          invariantRef: "INV §10.2",
+          affectedTarget: id,
+          suggestedAction: "Propose the planning draft before revising it",
+        });
+      }
+      // Recover the kind from the identifier pattern (one id, one kind:
+      // destinations derive from (kind, id), so the accepting pattern
+      // is the kind).
+      const resolvedKind = (Object.keys(PLANNING_KIND_DIR) as PlanningKind[]).find((k) => {
+        try {
+          assertPlanningId(k, id);
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      if (resolvedKind === undefined) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Planning artifact '${id}' has no resolvable kind: denied`,
+          invariantRef: "INV §14.4",
+          affectedTarget: id,
+          suggestedAction: "Propose the draft again with a canonical identifier",
+        });
+      }
+      assertPlanningContent(resolvedKind, input.title, input.body, id);
+      const dest = this.planningDestination(resolvedKind, id);
+      const revision = computeRevisionHash({ kind: resolvedKind, id, title: input.title, body: input.body });
+      const current = this.db.runtimeConfig().get(this.planningRevisionKey(id));
+      if (current === revision) {
+        throw new ChronoError({
+          code: ErrorCode.DUPLICATE_IDENTITY,
+          severity: Severity.ERROR,
+          message: `Planning revision for '${id}' is unchanged: nothing to revise`,
+          invariantRef: "INV §10.1",
+          affectedTarget: id,
+          suggestedAction: "Change the title or body to record a new revision",
+        });
+      }
+      const file = this.renderPlanningFile(resolvedKind, id, input.title, input.body, revision);
+      const family = PLANNING_KIND_FAMILY[resolvedKind];
+      const structured = family === "SP" || family === "MOD" || family === "WP";
+      fsMkdirSync(pathDirname(dest), { recursive: true });
+      const tmp = `${dest}.chrono-tmp-${process.pid}`;
+      fsWriteFileSync(tmp, file, "utf8");
+      let committed = false;
+      try {
+        this.db.transaction(() => {
+          if (structured) {
+            const artifact = this.artifacts.findById(id);
+            const nextContent =
+              family === "SP"
+                ? { id, title: input.title, purpose: input.title, body: input.body, planningDraft: true }
+                : family === "MOD"
+                  ? { id, name: input.title, purpose: input.title, body: input.body, specs: this.registrationContent(id)["specs"] ?? [] }
+                  : { id, name: input.title, module: this.registrationContent(id)["module"] ?? id, body: input.body, dependsOn: this.registrationContent(id)["dependsOn"] ?? [] };
+            const canonical = canonicalize(nextContent);
+            const contentHash = computeRevisionHash({ id, content: nextContent });
+            this.artifacts.reviseContent(id, revision, artifact.status, contentHash, canonical);
+          }
+          this.db.runtimeConfig().set(this.planningRevisionKey(id), revision);
+          if (resolvedKind === "architecture") {
+            // The file revision stays the architecture revision: prior
+            // architecture-security approvals go stale deterministically.
+            this.projects.setArchitecture("default", "ARCH", revision, "proposed");
+          }
+          if (resolvedKind === "security-profile") {
+            const version = this.db.securityProfiles().listAll().length + 1;
+            this.db.securityProfiles().create(id, version, revision);
+          }
+          this.events.append({
+            eventType: "ArtifactRevised",
+            entityId: id,
+            payload: { type: "PLANNING_DRAFT", kind: resolvedKind, revision, priorRevision: current },
+            actor: caller.auditActor,
+            priorState: "DRAFT",
+            newState: "DRAFT",
+            reasoning: "Planning draft revised: prior approvals are stale",
+          });
+        });
+        committed = true;
+        fsRenameSync(tmp, dest);
+      } catch (e) {
+        try {
+          fsRmSync(tmp, { force: true });
+        } catch {
+          // Best-effort.
+        }
+        if (committed) {
+          try {
+            this.events.append({
+              eventType: "ArtifactRevised",
+              entityId: id,
+              payload: { type: "PLANNING_COMPENSATED", kind: resolvedKind, revision },
+              actor: caller.auditActor,
+              priorState: "DRAFT",
+              newState: "compensated",
+              reasoning: "Planning file rewrite failed after commit: re-run revise to recover",
+            });
+          } catch {
+            // Best-effort.
+          }
+        }
+        throw e;
+      }
+      this.syncProjectState();
+      const approvalCommand =
+        `chrono approve --action planning-approval --scope ${id} --revision ${revision} ` +
+        `--authority <PO> --rationale "<decision rationale>" --path <project>`;
+      return { ok: true, value: { id, revision, path: dest, approvalCommand } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Explicit planning status projection (OC-P11 req 21): proposed,
+   * awaiting PO signature, approved, rejected, and stale — without
+   * secrets. Gaspar/PO only. Chat text never appears here: only
+   * Core-signed approvals count as approved.
+   */
+  planningStatus(auth: CallerAuth): CoreResult<{
+    items: ReadonlyArray<{
+      id: string;
+      kind: string;
+      revision: string;
+      filePresent: boolean;
+      approval: "approved" | "awaiting-signature" | "stale" | "rejected";
+      detail: string;
+    }>;
+  }> {
+    try {
+      const caller = this.requireCapability("planning.status", this.resolveCaller(auth, "planning status"));
+      void caller;
+      const items: Array<{
+        id: string;
+        kind: string;
+        revision: string;
+        filePresent: boolean;
+        approval: "approved" | "awaiting-signature" | "stale" | "rejected";
+        detail: string;
+      }> = [];
+      for (const id of this.readPlanningIndex()) {
+        // ARCH tracks its revision on the project row (single source for
+        // the architecture-security approval); every other draft tracks
+        // its revision in runtime config.
+        const revision =
+          id === "ARCH"
+            ? this.projects.findById("default").architectureRevision
+            : this.db.runtimeConfig().get(this.planningRevisionKey(id));
+        if (revision === null) {
+          continue;
+        }
+        const kind =
+          (Object.keys(PLANNING_KIND_DIR) as PlanningKind[]).find((k) => {
+            try {
+              assertPlanningId(k, id);
+              return true;
+            } catch {
+              return false;
+            }
+          }) ?? "unknown";
+        let filePresent = false;
+        if (kind !== "unknown") {
+          try {
+            const dest = this.planningDestination(kind, id);
+            filePresent = fsExistsSync(dest) && fsLstatSync(dest).isFile();
+          } catch {
+            filePresent = false;
+          }
+        }
+        // Approval state from Core-signed rows only (never chat claims).
+        // ARCH additionally honors the architecture-security decision,
+        // which binds the same file revision.
+        const approved =
+          this.hasValidApproval(id, revision, "planning-approval") ||
+          (id === "ARCH" && this.hasValidApproval(id, revision, "architecture-security"));
+        const anyApproval = this.db.approvals().listAll().some((a) => a.scopeArtifactId === id && !a.revoked);
+        const stale = anyApproval && !approved;
+        // Rejected = a revoked planning-approval with no current approval.
+        const rejected = this.db.approvals().listAll().some((a) => a.scopeArtifactId === id && a.revoked) && !approved && !stale;
+        const approval = approved ? "approved" : rejected ? "rejected" : stale ? "stale" : "awaiting-signature";
+        const detail = approved
+          ? `PO-signed planning-approval is current for ${revision.slice(0, 16)}…`
+          : stale
+            ? `Revision changed since the last PO signature: a new signed approval is required`
+            : rejected
+              ? `The PO approval was revoked: re-propose or revise, then request a new signature`
+              : `PO stated approval in chat is NOT registered: only a successful Core-signed approval counts; run the approval ceremony for this exact revision`;
+        items.push({ id, kind, revision, filePresent, approval, detail });
+      }
+      return { ok: true, value: { items } };
+    } catch (e) {
+      return this.handleError(e);
+    }
   }
 
   /** PO-selected project runtime identifier, or null when unset (read-only). */

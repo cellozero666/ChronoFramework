@@ -80,6 +80,28 @@ export {
   type ProjectProjectionInput,
 } from "./validator.js";
 
+// Planning/artifact-authoring path (OC-P11): Gaspar bootstrap without dispatch
+export {
+  FORBIDDEN_READ_SUBSTRINGS,
+  PLANNING_ALLOC_FAMILY,
+  PLANNING_BASH_PREFIXES,
+  PLANNING_KINDS,
+  PLANNING_KIND_DIR,
+  PLANNING_KIND_FAMILY,
+  PLANNING_MAX_BYTES,
+  PLANNING_MIN_BYTES,
+  assertNoSecrets,
+  assertPlanningContent,
+  assertPlanningId,
+  assertPlanningKind,
+  extractBashCommand,
+  isPlanningBashCommand,
+  isPlanningKind,
+  planningFilename,
+  referencesForbiddenState,
+  type PlanningKind,
+} from "./planning.js";
+
 // Managed-asset inventory for routing drift binding [FIXES-SL-10.1 C2]
 export {
   ENTRY_SESSION_SCRIPT_ASSET,

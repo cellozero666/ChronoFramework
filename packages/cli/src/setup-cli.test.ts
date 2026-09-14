@@ -392,6 +392,7 @@ describe("OpenCode automatic Gaspar entry (fail-closed, OC-P1)", () => {
 
   async function fullHooks(directory: string): Promise<{
     event: (event: unknown) => Promise<unknown>;
+    message: (input: unknown) => Promise<unknown>;
     transform: (input: unknown, output: { system: unknown[] }) => Promise<unknown>;
     before: (input: unknown) => Promise<unknown>;
     dispose: () => Promise<unknown>;
@@ -399,6 +400,7 @@ describe("OpenCode automatic Gaspar entry (fail-closed, OC-P1)", () => {
     const module = (await import(pathToFileURL(pluginPath).href)) as {
       ChronoGatePlugin: (ctx: unknown) => Promise<{
         event: (event: unknown) => Promise<unknown>;
+        "chat.message": (input: unknown) => Promise<unknown>;
         "experimental.chat.system.transform": (input: unknown, output: { system: unknown[] }) => Promise<unknown>;
         "tool.execute.before": (input: unknown) => Promise<unknown>;
         dispose: () => Promise<unknown>;
@@ -407,20 +409,33 @@ describe("OpenCode automatic Gaspar entry (fail-closed, OC-P1)", () => {
     const hooks = await module.ChronoGatePlugin({ directory });
     return {
       event: hooks.event,
+      message: hooks["chat.message"],
       transform: hooks["experimental.chat.system.transform"],
       before: hooks["tool.execute.before"],
       dispose: hooks.dispose,
     };
   }
 
+  /** Real @opencode-ai/sdk@1.18.30 session.created shape. */
+  function createdEvent(id: string): unknown {
+    return { event: { type: "session.created", properties: { info: { id } } } };
+  }
+
+  function deletedEvent(id: string): unknown {
+    return { event: { type: "session.deleted", properties: { info: { id } } } };
+  }
+
   it("injects the validated entry projection exactly once per session", async () => {
     const { event, transform } = await fullHooks(tempDir);
-    await event({ event: { type: "session.created", properties: { sessionID: "s1" } } });
+    await event(createdEvent("s1"));
     const output = { system: [] as unknown[] };
     await transform({ sessionID: "s1" }, output);
     expect(output.system).toHaveLength(1);
     const injected = String(output.system[0]);
-    expect(injected).toContain("chrono-entry");
+    expect(injected).toContain("chrono-gaspar-entry");
+    expect(injected).toContain("Gaspar");
+    expect(injected).toContain("Product Owner");
+    expect(injected).toContain("karpathy-guidelines");
     expect(injected).toContain("SES-0001");
     expect(injected).toContain("resume-discovery");
     // Atomic payload: extract the injected JSON and check completeness.
@@ -447,7 +462,7 @@ describe("OpenCode automatic Gaspar entry (fail-closed, OC-P1)", () => {
     const plain = mkdtempSync(join(tmpdir(), "chrono-plain-"));
     try {
       const { event, transform, before } = await fullHooks(plain);
-      await event({ event: { type: "session.created", properties: { sessionID: "s1" } } });
+      await event(createdEvent("s1"));
       const output = { system: [] as unknown[] };
       await transform({ sessionID: "s1" }, output);
       expect(output.system).toHaveLength(0);
@@ -460,7 +475,7 @@ describe("OpenCode automatic Gaspar entry (fail-closed, OC-P1)", () => {
   it("denies entry when the script is missing (transform and every tool)", async () => {
     rmSync(join(tempDir, ".chrono", "hooks", "chrono-entry-session.sh"));
     const { event, transform, before } = await fullHooks(tempDir);
-    await event({ event: { type: "session.created", properties: { sessionID: "s2" } } });
+    await event(createdEvent("s2"));
     const output = { system: [] as unknown[] };
     await expect(transform({ sessionID: "s2" }, output)).rejects.toThrow(/ENTRY_BLOCKED\[ENTRY_SCRIPT_MISSING\]/);
     expect(output.system).toHaveLength(0);
@@ -556,11 +571,11 @@ describe("OpenCode automatic Gaspar entry (fail-closed, OC-P1)", () => {
       const { utimesSync } = await import("node:fs");
       utimesSync(stale, old / 1000, old / 1000);
       const { event, dispose } = await fullHooks(tempDir);
-      await event({ event: { type: "session.created", properties: { sessionID: "s-sweep" } } });
+      await event(createdEvent("s-sweep"));
       expect(existsSync(stale)).toBe(false);
       expect(existsSync(fresh)).toBe(true);
       expect(existsSync(other)).toBe(true);
-      await event({ event: { type: "session.deleted", properties: { sessionID: "s-sweep" } } });
+      await event(deletedEvent("s-sweep"));
       await expect(dispose()).resolves.toBeUndefined();
     } finally {
       rmSync(fakeTmp, { recursive: true, force: true });

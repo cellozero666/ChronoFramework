@@ -107,7 +107,14 @@ chrono doctor      # read-only diagnostics, zero writes
 approval, RTK routing per adapter (`proven`, `candidate`, `stale`,
 or `unproven`), skill activation, hook drift, broker health, and
 Gaspar entry readiness with actionable reasons. Broker health is
-public: no session is required or consulted.
+public: no session is required or consulted. A separate `activation`
+section reports OBSERVED runtime evidence recorded by the OpenCode
+plugin (plugin load, entry redeem, projection injection for the exact
+session) — static managed assets alone are never reported as
+activation, so setup readiness stays distinct from "Gaspar was
+actually activated". After a failed first message, `doctor` tells
+you whether the plugin ever loaded and injected, without exposing
+any credential.
 
 ### Project resolution (which directory is the project?)
 
@@ -165,6 +172,18 @@ re-proof. Drift protection is never weakened: `doctor` stays
 read-only and keeps reporting drift, and READY is refused until the
 public verification agrees.
 
+### Repairing native agent configuration (gaspar primary, default_agent)
+
+The same `chrono init --runtime opencode` re-run regenerates the
+`.opencode/agents/*.md` role definitions and re-merges
+`default_agent: gaspar` into the project configuration (backup
+preserved, unrelated content untouched), then re-proves and returns
+to READY automatically. Afterwards fully quit OpenCode and reopen it
+into a NEW session: existing sessions keep whichever agent they
+started with (usually Build) by OpenCode behavior, and CHRONO never
+forces an already-existing session silently. The new session must
+show Gaspar as the primary agent before the first message.
+
 ## 5. Removal
 
 ```sh
@@ -198,6 +217,7 @@ install/uninstall lifecycle hooks — asserted by test).
 | hook drift in `doctor` | hand-edited managed asset | re-run setup/init to reconcile by ownership and hash |
 | keychain failure | locked keychain / missing helper | unlock the login keychain (`security`) or install `libsecret-tools` |
 | broker entry denied | revoked credential / stale routing | `chrono doctor` names the cause; re-prove routing or rotate the broker |
+| OpenCode answers as a generic assistant | Gaspar activation never injected (see `activation` in `doctor`) | confirm `.opencode/plugins/chrono-gate.js` is current via `chrono init --runtime opencode`, then open OpenCode normally and send a message; `doctor` must show `activation: OBSERVED` |
 
 ## 7. Security notes
 

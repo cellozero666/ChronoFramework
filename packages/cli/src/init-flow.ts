@@ -70,6 +70,16 @@ import {
   entrySessionCommand,
   kiroEntryRegistrationPath,
 } from "./gaspar-entry.js";
+import {
+  CHRONO_OPENCODE_ROLES,
+  OPENCODE_CONFIG_SIDECAR_RELATIVE,
+  buildOpenCodeAgentDefinition,
+  checkOpenCodeDefaultAgent,
+  openCodeAgentPath,
+  readProjectDefaultAgent,
+  resolveOpenCodeConfigFile,
+  restoreOpenCodeDefaultAgent,
+} from "./opencode-agent.js";
 import { BROKER_KEY_SERVICE, OsKeychainStore, PO_KEY_ACCOUNT, brokerAccountFor, readPoPrivateKey } from "./keychain.js";
 import { constructionFailure } from "./project.js";
 import { canonicalProjectDir, openReadProject } from "./project.js";
@@ -345,11 +355,30 @@ export function detectInit(
   // shared entry script and broker account. An OpenCode-only plan never
   // promises Claude/Kiro files.
   const selectedIds = selected.map((r) => r.id);
+  // The OpenCode project configuration is user-owned: disclose creation
+  // vs merge explicitly (OC-P10). An existing file lands in
+  // filesToModify with a backup; a missing one is created canonically.
+  const opencodeConfigProbe = (() => {
+    if (!selectedIds.includes("opencode")) {
+      return { create: [] as string[], modify: [] as string[], backup: [] as string[] };
+    }
+    const selection = resolveOpenCodeConfigFile(root);
+    if (selection.kind === "file") {
+      return {
+        create: [] as string[],
+        modify: [selection.relative],
+        backup: [`${selection.relative}.chrono-bak (only when an existing file changes)`],
+      };
+    }
+    return { create: ["opencode.json"], modify: [] as string[], backup: [] as string[] };
+  })();
   const filesToCreate = [
     ".chrono/chrono.db",
     ".chrono/hooks/chrono-entry-session.sh",
     ".chrono/broker-account",
-    ...(selectedIds.includes("opencode") ? [".opencode/plugins/chrono-gate.js"] : []),
+    ...(selectedIds.includes("opencode")
+      ? [".opencode/plugins/chrono-gate.js", ...CHRONO_OPENCODE_ROLES.map((role) => openCodeAgentPath(role)), ...opencodeConfigProbe.create]
+      : []),
     ...(selectedIds.includes("claude-code")
       ? [".chrono/hooks/chrono-claude-gate.js", ".claude/agents/gaspar.md"]
       : []),
@@ -357,10 +386,17 @@ export function detectInit(
       ? [".chrono/hooks/chrono-kiro-gate.js", ".kiro/hooks/chrono-gate.json"]
       : []),
   ];
-  const filesToModify = selectedIds.includes("claude-code") ? [".claude/settings.json"] : [];
-  const backups = selectedIds.includes("claude-code")
-    ? [".claude/settings.json.chrono-bak (only when an existing file changes)"]
-    : [];
+  const filesToModify = [
+    ...(selectedIds.includes("claude-code") ? [".claude/settings.json"] : []),
+    ...opencodeConfigProbe.modify,
+    ...(selectedIds.includes("opencode")
+      ? ["project default_agent merged to 'gaspar' (model selection untouched; close OpenCode and open a fresh session afterwards)"]
+      : []),
+  ];
+  const backups = [
+    ...(selectedIds.includes("claude-code") ? [".claude/settings.json.chrono-bak (only when an existing file changes)"] : []),
+    ...opencodeConfigProbe.backup,
+  ];
   const needsNetwork: string[] = [];
   if (!skillInstalled) {
     needsNetwork.push("fetch the pinned Karpathy Guidelines skill release");
@@ -1015,7 +1051,7 @@ export async function runInitFlow(
     // keeps `chrono init` as the sole orchestrator of normal repair —
     // no manual `rtk verify/prove/promote/setup` is required.
     if (currentStep !== null) {
-      const repair = assessInitRepairNeed(core, root, plan.runtimeIds, currentStep);
+      const repair = assessInitRepairNeed(core, root, plan.runtimeIds, currentStep, deps.store);
       if (repair.needed && repair.demoteTo !== null) {
         const demoted = core.demoteSetupForRepair(repair.demoteTo as never, {
           cause: "OC-P8 automatic repair",
@@ -1593,7 +1629,8 @@ export function assessInitRepairNeed(
   core: ChronoCore,
   root: string,
   runtimeIds: string[],
-  currentStep: string
+  currentStep: string,
+  store?: KeyStore | undefined
 ): { needed: boolean; rerunFrom: string; demoteTo: string | null; reasons: string[] } {
   const none = { needed: false, rerunFrom: currentStep, demoteTo: null as string | null, reasons: [] as string[] };
   const currentIndex = setupStepIndexOf(currentStep);
@@ -1683,6 +1720,56 @@ export function assessInitRepairNeed(
       }
     } catch {
       consider("RTK_VERIFIED_AND_ROUTED", "managed hooks unreadable: re-verify, reinstall, and re-prove");
+    }
+  }
+  // Broker credential health (OC-P9 black-box finding): a READY project
+  // whose broker secret is lost (keychain wiped, wrong machine) fails
+  // the public doctor while the early-READY shortcut would never reach
+  // the GASPAR_ENTRY rotation path (revoke secret-less credential and
+  // issue a fresh one). Demote so the forward flow heals it in the same
+  // `chrono init` run. Only projects that already prepared entry repair
+  // here; earlier projects issue their first credential normally.
+  if (currentIndex >= setupStepIndexOf("GASPAR_ENTRY_PREPARED")) {
+    let brokerBroken: string | null = null;
+    try {
+      const health = core.brokerHealth();
+      if (!health.ok || health.value === undefined) {
+        brokerBroken = "broker registry unreadable: re-issue entry credentials";
+      } else if (health.value.state !== "active") {
+        brokerBroken = `broker credential ${health.value.state}: re-issue entry credentials`;
+      } else {
+        const brokerId = health.value.brokerId;
+        let filed: { account: string; brokerId: string } | null = null;
+        try {
+          const raw = readFileSync(join(root, ".chrono", "broker-account"), "utf8");
+          const lines = raw.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+          if (lines.length >= 2 && lines[0] !== undefined && lines[0].length > 0 && lines[1] !== undefined && lines[1].length > 0) {
+            filed = { account: lines[0], brokerId: lines[1] };
+          }
+        } catch {
+          filed = null;
+        }
+        if (filed === null) {
+          brokerBroken = "broker account file missing or malformed: re-issue entry credentials";
+        } else if (filed.brokerId !== brokerId || filed.account !== brokerAccountFor(root)) {
+          brokerBroken = "broker account file does not match the project registry: re-issue entry credentials";
+        } else if (store !== undefined) {
+          let held: string | null = null;
+          try {
+            held = store.readKey(filed.account, BROKER_KEY_SERVICE);
+          } catch {
+            held = null;
+          }
+          if (held === null || held.length === 0) {
+            brokerBroken = "broker secret absent from the OS keychain: revoke and re-issue entry credentials";
+          }
+        }
+      }
+    } catch {
+      brokerBroken = "broker health unverifiable: re-issue entry credentials";
+    }
+    if (brokerBroken !== null) {
+      consider("GASPAR_ENTRY_PREPARED", brokerBroken);
     }
   }
   if (rerunFrom === null) {
@@ -2087,6 +2174,202 @@ export interface DoctorReport {
     detail: string;
   };
   readonly entry: { ready: boolean; reasons: string[] };
+  /**
+   * Observed runtime activation evidence (OC-P9): records left by the
+   * OpenCode plugin when it loaded, redeemed entry, and injected the
+   * Gaspar projection for a real session. Informational only — it never
+   * affects `entry.ready`, and absence never blocks setup: static
+   * assets alone are never reported as activation.
+   */
+  readonly activation: {
+    /**
+     * True only when runtime evidence shows the exact session selected
+     * Gaspar as its primary agent AND the projection/skill were
+     * injected before generation (OC-P10). Projection injection alone
+     * never counts: a Build session with injected context is still
+     * Build. Model self-identification is never consulted here.
+     */
+    readonly observed: boolean;
+    readonly lastInjection: {
+      readonly at: string;
+      readonly session: string;
+      readonly entrySession: string;
+      readonly projectionHash: string;
+      readonly hook: string;
+      readonly skillIncluded: boolean;
+    } | null;
+    readonly lastBlock: { readonly at: string; readonly code: string } | null;
+    /** Latest visible primary-agent selection observed at runtime. */
+    readonly lastSelection: { readonly at: string; readonly session: string; readonly agent: string } | null;
+    /** Agent of the latest visible selection, or null when never observed. */
+    readonly selectedAgent: string | null;
+    /** Project-configured default agent (structural read, may be null). */
+    readonly defaultAgent: string | null;
+    readonly pluginLoads: number;
+    readonly detail: string;
+  };
+}
+
+/**
+ * Observed OpenCode runtime activation evidence (OC-P9, read-only).
+ *
+ * Reads the non-secret `.chrono/runtime-activation.jsonl` records left
+ * by the generated plugin when it loaded, redeemed Gaspar entry, and
+ * injected the projection for a real OpenCode session. A missing or
+ * unparsable file reports `observed: false` — static managed assets
+ * alone are NEVER reported as activation, so `doctor ok` (setup
+ * readiness) stays distinct from "Gaspar was actually activated".
+ * Nothing secret is ever read here: the file by construction holds
+ * only adapter/session/projection metadata.
+ */
+/** Hidden OpenCode system agents: never confuse them with the selected primary. */
+const OPENCODE_HIDDEN_AGENTS = new Set(["compaction", "title", "summary"]);
+
+export function readActivationEvidence(projectRoot: string): DoctorReport["activation"] {
+  const absent = (detail: string): DoctorReport["activation"] => ({
+    observed: false,
+    lastInjection: null,
+    lastBlock: null,
+    lastSelection: null,
+    selectedAgent: null,
+    defaultAgent: null,
+    pluginLoads: 0,
+    detail,
+  });
+  let raw: string;
+  try {
+    raw = readFileSync(join(projectRoot, ".chrono", "runtime-activation.jsonl"), "utf8");
+  } catch {
+    return absent("no runtime activation evidence recorded: static assets alone never prove Gaspar activation — open OpenCode in this project and send a message, then re-run chrono doctor");
+  }
+  let loads = 0;
+  let lastInjection: DoctorReport["activation"]["lastInjection"] = null;
+  let lastBlock: DoctorReport["activation"]["lastBlock"] = null;
+  // Latest injection and visible primary-agent selection per session
+  // (hidden system agents never count as the selected primary).
+  const injections = new Map<string, { at: string; skillIncluded: boolean }>();
+  const selections = new Map<string, { at: string; agent: string }>();
+  let lastSelection: DoctorReport["activation"]["lastSelection"] = null;
+  for (const line of raw.split("\n")) {
+    if (line.length === 0) {
+      continue;
+    }
+    let record: unknown;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof record !== "object" || record === null) {
+      continue;
+    }
+    const entry = record as Record<string, unknown>;
+    if (entry["adapter"] !== "opencode") {
+      continue;
+    }
+    if (entry["kind"] === "plugin-load") {
+      loads += 1;
+    } else if (entry["kind"] === "projection-injected") {
+      if (
+        typeof entry["ts"] === "string" &&
+        typeof entry["session"] === "string" &&
+        typeof entry["entrySession"] === "string" &&
+        typeof entry["projectionHash"] === "string" &&
+        typeof entry["hook"] === "string"
+      ) {
+        lastInjection = {
+          at: entry["ts"],
+          session: entry["session"],
+          entrySession: entry["entrySession"],
+          projectionHash: entry["projectionHash"].slice(0, 12),
+          hook: entry["hook"],
+          skillIncluded: entry["skillIncluded"] === true,
+        };
+        injections.set(entry["session"], {
+          at: entry["ts"],
+          skillIncluded: entry["skillIncluded"] === true,
+        });
+      }
+    } else if (entry["kind"] === "agent-selected") {
+      if (typeof entry["ts"] === "string" && typeof entry["session"] === "string" && typeof entry["agent"] === "string") {
+        const agent = entry["agent"];
+        if (!OPENCODE_HIDDEN_AGENTS.has(agent)) {
+          selections.set(entry["session"], { at: entry["ts"], agent });
+          lastSelection = { at: entry["ts"], session: entry["session"], agent };
+        }
+      }
+    } else if (entry["kind"] === "entry-blocked") {
+      if (typeof entry["ts"] === "string" && typeof entry["code"] === "string") {
+        lastBlock = { at: entry["ts"], code: entry["code"] };
+      }
+    }
+  }
+  const selectedAgent = lastSelection?.agent ?? null;
+  // OC-P10 verdict: projection injection alone is NEVER Gaspar
+  // activation. Observed requires some exact session to have selected
+  // Gaspar as its primary agent with the projection and skill context
+  // injected at or before that selection (any matching pair across
+  // restarts counts; latest reporting stays global). Model
+  // self-identification is never consulted — only native runtime
+  // selection evidence counts.
+  let gasparSession: string | null = null;
+  for (const [session, selection] of selections) {
+    if (selection.agent !== "gaspar") {
+      continue;
+    }
+    const injection = injections.get(session);
+    if (
+      injection !== undefined &&
+      injection.skillIncluded &&
+      Date.parse(selection.at) >= Date.parse(injection.at)
+    ) {
+      gasparSession = session;
+    }
+  }
+  if (gasparSession === null) {
+    if (lastInjection === null) {
+      return {
+        observed: false,
+        lastInjection: null,
+        lastBlock,
+        lastSelection,
+        selectedAgent,
+        defaultAgent: null,
+        pluginLoads: loads,
+        detail:
+          lastBlock !== null
+            ? `plugin ran but the last entry attempt was blocked (${lastBlock.code} at ${lastBlock.at}): run chrono doctor for recovery, then send a new OpenCode message`
+            : "plugin loaded but no Gaspar projection was ever injected for a session: send a message in OpenCode, then re-run chrono doctor",
+      };
+    }
+    const selection = selections.get(lastInjection.session);
+    const detail =
+      selection === undefined
+        ? `projection injected for session '${lastInjection.session}' but no primary-agent selection was observed for it: projection alone never proves Gaspar activation — verify the session runs the gaspar agent, then send a new message`
+        : selection.agent !== "gaspar"
+          ? `projection injected for session '${lastInjection.session}' but that session selected '${selection.agent}', not Gaspar: close OpenCode and open a fresh session (existing sessions keep their agent), then send a new message`
+          : `session '${lastInjection.session}' selected Gaspar but the projection or skill context was injected after that selection: send a new message so injection precedes generation`;
+    return {
+      observed: false,
+      lastInjection,
+      lastBlock,
+      lastSelection,
+      selectedAgent,
+      defaultAgent: null,
+      pluginLoads: loads,
+      detail,
+    };
+  }
+  return {
+    observed: true,
+    lastInjection,
+    lastBlock,
+    lastSelection,
+    selectedAgent,
+    defaultAgent: null,
+    pluginLoads: loads,
+    detail: `session '${gasparSession}' selected Gaspar as primary agent with projection and skill context injected before generation`,
+  };
 }
 
 export interface DoctorOptions {
@@ -2119,6 +2402,16 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
     asJson
       ? { exitCode: 1, stdout: JSON.stringify({ ok: false, doctor: report }, null, 2), stderr: "" }
       : { exitCode: 1, stdout: "", stderr: renderDoctor(report) };
+  const noActivation: DoctorReport["activation"] = {
+    observed: false,
+    lastInjection: null,
+    lastBlock: null,
+    lastSelection: null,
+    selectedAgent: null,
+    defaultAgent: null,
+    pluginLoads: 0,
+    detail: "no runtime activation evidence recorded",
+  };
   const report: DoctorReport = {
     found: false,
     projectRoot: root,
@@ -2133,6 +2426,7 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
     hooks: {},
     broker: { visible: false, active: 0, revoked: 0, state: "unknown", brokerId: null, detail: "project not found" },
     entry: { ready: false, reasons: ["project not found"] },
+    activation: noActivation,
   };
   const opened = openReadProject(root, asJson);
   if ("failure" in opened) {
@@ -2287,6 +2581,26 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
         effectiveSetupStep = "NATIVE_HOOKS_INSTALLED";
       }
     }
+    // Observed runtime activation (OC-P9/OC-P10): evidence the
+    // OpenCode plugin recorded when it loaded, redeemed entry, injected
+    // the Gaspar projection, and observed the native primary-agent
+    // selection for a real session. Static managed assets alone never
+    // count as activation, and this section never changes the
+    // setup-readiness verdict above.
+    const activationBase = readActivationEvidence(root);
+    const defaultAgent = readProjectDefaultAgent(root);
+    let activation = { ...activationBase, defaultAgent };
+    if (!activationBase.observed && defaultAgent === "gaspar" && activationBase.lastInjection === null) {
+      activation = {
+        ...activation,
+        detail: `${activationBase.detail} (project default_agent is 'gaspar'; no observed session has selected it yet — open OpenCode normally into a fresh session and send a message)`,
+      };
+    } else if (activationBase.observed && defaultAgent !== null && defaultAgent !== "gaspar") {
+      activation = {
+        ...activation,
+        detail: `${activationBase.detail}; note: project default_agent is now '${defaultAgent}' — re-run chrono init to restore 'gaspar'`,
+      };
+    }
     const filled: DoctorReport = {
       found: true,
       projectRoot: root,
@@ -2302,6 +2616,7 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
       hooks,
       broker,
       entry: { ready: reasons.length === 0, reasons },
+      activation,
     };
     const body = asJson ? JSON.stringify({ ok: filled.entry.ready, doctor: filled }, null, 2) : renderDoctor(filled);
     return filled.entry.ready
@@ -2355,6 +2670,15 @@ export function checkManagedHooks(
   const unknownAdapters = activeAdapterIds.filter((id) => !isKnownRuntimeId(id));
   if (runtimes.includes("opencode") || unknownAdapters.length > 0) {
     checks[".opencode/plugins/chrono-gate.js"] = checkBytes(".opencode/plugins/chrono-gate.js", buildOpencodePlugin());
+    // Native primary-agent activation (OC-P10): the canonical role
+    // definitions are byte-exact managed assets; the user-owned project
+    // configuration is verified structurally (default_agent must select
+    // gaspar) so unrelated user edits never count as drift.
+    for (const role of CHRONO_OPENCODE_ROLES) {
+      const relative = openCodeAgentPath(role);
+      checks[relative] = checkBytes(relative, buildOpenCodeAgentDefinition(role));
+    }
+    checks["opencode.json:default_agent"] = checkOpenCodeDefaultAgent(projectRoot, "gaspar").state === "ok";
   }
   if (runtimes.includes("claude-code") || unknownAdapters.length > 0) {
     checks[".chrono/hooks/chrono-claude-gate.js"] = checkBytes(".chrono/hooks/chrono-claude-gate.js", buildClaudeHook());
@@ -2392,6 +2716,16 @@ function renderDoctor(report: DoctorReport): string {
       ? `broker: ${report.broker.brokerId ?? "active"} active (${String(report.broker.revoked)} revoked, keychain verified)`
       : `broker: ${report.broker.state.toUpperCase()} (${report.broker.detail})`,
     report.entry.ready ? "entry: READY" : `entry: BLOCKED (${report.entry.reasons.join("; ")})`,
+    [
+      "activation:",
+      report.activation.observed ? "OBSERVED" : "NO RUNTIME EVIDENCE",
+      `default_agent=${report.activation.defaultAgent ?? "(unknown)"}`,
+      `selected=${report.activation.selectedAgent ?? "(unobserved)"}`,
+      report.activation.lastInjection !== null
+        ? `injected=${report.activation.lastInjection.at} (${report.activation.lastInjection.session})`
+        : "injected=never",
+      `(${report.activation.detail})`,
+    ].join(" "),
   ];
   return lines.join("\n");
 }
@@ -2687,7 +3021,34 @@ function removeManagedAssets(root: string): string[] {
       // Absent files are not an error.
     }
   }
+  // Canonical CHRONO role definitions are removed by exact name only:
+  // unrelated user agents in the same directory are never touched.
+  for (const role of CHRONO_OPENCODE_ROLES) {
+    const relative = openCodeAgentPath(role);
+    try {
+      rmSync(join(root, relative));
+      removed.push(relative);
+    } catch {
+      // Absent files are not an error.
+    }
+  }
   return removed;
+}
+
+/**
+ * Restore the pre-merge OpenCode default agent on uninstall (OC-P10):
+ * the prior default returns (or the CHRONO-added key is removed when
+ * the file had none) while every unrelated byte stays. The managed
+ * sidecar is consumed afterwards so a later install starts clean.
+ */
+function removeOpenCodeManagedEntries(root: string): { restored: boolean; detail: string } {
+  const result = restoreOpenCodeDefaultAgent(root);
+  try {
+    rmSync(join(root, OPENCODE_CONFIG_SIDECAR_RELATIVE), { force: true });
+  } catch {
+    // Best effort: the sidecar is repair state, not audit history.
+  }
+  return { restored: result.restored, detail: result.detail };
 }
 
 /** Strip CHRONO-managed entries from Claude settings, restoring backup. */
@@ -2798,9 +3159,14 @@ export function runUninstall(
   if (scope === "hooks") {
     const removed = removeManagedAssets(root);
     const claude = removeClaudeManagedEntries(root);
+    const opencode = removeOpenCodeManagedEntries(root);
     const body = asJson
-      ? JSON.stringify({ ok: true, scope, removed, claudeSettingsRestored: claude.restored }, null, 2)
-      : [`Removed ${String(removed.length)} managed asset(s).`, claude.restored ? "Claude settings restored from backup." : "Claude settings: no CHRONO entries found."].join("\n");
+      ? JSON.stringify({ ok: true, scope, removed, claudeSettingsRestored: claude.restored, opencodeConfig: opencode.detail }, null, 2)
+      : [
+          `Removed ${String(removed.length)} managed asset(s).`,
+          claude.restored ? "Claude settings restored from backup." : "Claude settings: no CHRONO entries found.",
+          `OpenCode default_agent: ${opencode.detail}.`,
+        ].join("\n");
     return { exitCode: 0, stdout: body, stderr: "" };
   }
   if (scope === "project-data") {

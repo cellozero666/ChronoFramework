@@ -26,6 +26,7 @@ import { canonicalize } from "./revision.js";
 /** Approval actions (module/security decisions). Waivers use action "waiver". */
 export const APPROVAL_ACTIONS = [
   "module-approval",
+  "planning-approval",
   "architecture-security",
   "implementation-security",
   "adapter-registration",

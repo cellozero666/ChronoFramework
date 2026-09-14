@@ -542,11 +542,224 @@ push/publish — every step a separate process):
   `SetupRepairDemoted` event among 20 setup events; no secret
   material in outputs, logs, or the repo.
 
+## Finding OC-P9 — Automatic Gaspar activation failed on the provider-backed run
+
+Real provider-backed observation (2026-09-14, PO-authorized model
+spend, no other paid execution in this session):
+
+1. Packed CHRONO 0.1.0 project was READY; separate-process `chrono
+   doctor` returned `ok=true` with `entry.ready=true`.
+2. OpenCode 1.18.30 opened in the project without visible plugin errors.
+3. The Product Owner sent only: "Olá".
+4. The first response was a generic greeting ("Olá! Como posso ajudar
+   você hoje?") with no Gaspar identification, PO recognition, CHRONO
+   state, mandatory skill activation, or discovery interview.
+
+This is an actual provider-backed failure. Startup success and doctor
+readiness are NOT proof of Gaspar activation. The live pilot project
+was preserved as regression evidence; no paid retry, push, or
+publication was performed here.
+
+### Diagnosis against the installed OpenCode 1.18.30 contract
+
+Verified against `@opencode-ai/plugin@1.18.30` /
+`@opencode-ai/sdk@1.18.30` sources and the installed binary:
+
+- Project plugins in `.opencode/plugins/` auto-load; a module exports
+  one or more `(ctx) => Promise<Hooks>` functions. Path and export
+  shape were correct.
+- `session.created`/`session.deleted` events carry
+  `properties.info.id` — the previous plugin correlated on fictional
+  shapes (`properties.sessionID`) with a catch-all `"default"`
+  bucket, so prefetch state never matched the requesting session.
+- `experimental.chat.system.transform` declares `sessionID?`
+  (OPTIONAL) and fires during request preparation; `chat.message`
+  declares `sessionID` (required) and fires when a user message is
+  received, before generation; `tool.execute.before` declares
+  `sessionID` (required). Nothing gated the first *message*, so a
+  skipped or silent transform path fell through to the default agent.
+- A second live-found defect: the plugin spawned the entry script
+  inheriting the host process cwd while the script resolves its
+  project from its own working directory — redeeming (or silently
+  skipping) the wrong project when they differ.
+
+### Required correction (shipped same session)
+
+- One per-session promise/state machine (`pending`/`ok`/`blocked`,
+  bounded attempts, terminal determinism): `session.created`
+  prefetch, `chat.message` gating, system-transform injection, and
+  the tool backstop all await the SAME shared entry work.
+  Correctness never depends on event ordering or timing; concurrent
+  callers deduplicate to a single entry execution.
+- `chat.message` is now a fail-closed first-message gate: missing,
+  pending-unresolved, failed, malformed, oversized, or expired
+  projections throw stable secret-safe `ENTRY_BLOCKED` instead of
+  producing an ordinary default-agent response.
+- Transform awaits bounded entry completion (async execution with
+  hard timeout kill, `CHRONO_ENTRY_TIMEOUT_MS` override) and injects
+  a strong deterministic contract exactly once: Gaspar identity, PO
+  recognition, state-aware opening from the validated projection,
+  mandatory karpathy-guidelines activation (pinned commit + source
+  hash, Core-reported install state), Core-decision compliance, and
+  Gaspar-only authority. A failed first request may retry after
+  recovery within the documented budget; it never falls through.
+- Entry children start with `cwd` set to the validated project root.
+- Non-secret runtime evidence (plugin load, entry redeem, projection
+  injection with session/entry-session/projection-hash/skill metadata)
+  appends to `.chrono/runtime-activation.jsonl`. Prompts, user
+  content, secrets, tokens, and credentials are structurally excluded.
+  `chrono doctor` reports it as a separate `activation` section that
+  NEVER claims activation from static assets and never changes the
+  setup-readiness verdict — the PO diagnostic after a failed attempt.
+- Repair path: the corrected plugin bytes change the managed-asset
+  manifest, so the existing OC-P8 machinery demotes, regenerates,
+  re-proves, and promotes automatically on `chrono init --runtime
+  opencode`; broker-secret loss additionally demotes to the entry
+  rotation step (revoke secret-less credential, issue fresh) in the
+  same run.
+
+### Evidence
+
+Hermetic: `opencode-activation.test.ts` (18: message gate,
+transform-before-event, pending-join, prefetch-failure recovery,
+concurrent-transform dedup, below/above-timeout delays, duplicate
+events, anonymous-transform join, silence outside projects, evidence
+content/secrecy, restart, legacy shape; plus 3 doctor-evidence
+unit tests); updated OC-P1 legacy tests to the real event shape;
+`init-flow.test.ts` gains plugin-repair (previous-generator bytes →
+healed `chat.message` bytes + READY, zero manual instructions) and
+broker-rotation tests. Full `test:clean` PASS (38 files / 480
+tests), `lint` / `typecheck` / `build` / `git diff --check` clean;
+Node 22.21.1 + 24.4.1 clean-export matrices green.
+
+Packed black-box (`npm run test:blackbox`, 8/8 with the OC-P7 entry
+suite): isolated tarball install, pty-driven PO ceremony to READY,
+GENERATED plugin bytes driven through the packed CLI with a real
+entry subprocess — racing message + transforms inject the Gaspar
+contract exactly once with matching session evidence and zero
+secrets; lost-secret fail-closed plus one-command init repair back
+to READY verified live in separate processes.
+
+## Finding OC-P10 — Projection injected, but OpenCode stayed on Build
+
+Real provider-backed observation (2026-09-14, PO-authorized model
+spend, no other paid execution in this session):
+
+- OpenCode first response: "Olá! Como posso ajudar você hoje?";
+  the UI still displayed the built-in Build primary agent.
+- `chrono doctor` reported `activation.observed=true` because a
+  projection had been injected.
+- Therefore the OC-P9 telemetry was a false positive:
+  projectionInjected != GasparSelected.
+
+The live pilot project was preserved as regression evidence; no paid
+retry, push, or publication was performed here.
+
+### Diagnosis against the installed OpenCode 1.18.30 contract
+
+Verified against the docs, `@opencode-ai/sdk` v2 types, the installed
+binary oracles (`opencode debug config`, `opencode debug agent
+<name>`), and a scratch project:
+
+- Custom primary agents are project-local markdown files in
+  `.opencode/agents/` (filename becomes the agent name; `description`
+  required; `mode: primary`; no `model` field means the agent uses the
+  externally configured OpenCode model).
+- The project `default_agent` (`opencode.json` or `opencode.jsonc`,
+  merged with global config, project winning) decides which primary a
+  new session uses; unknown/subagent defaults fall back to `build`.
+- CHRONO generated no agent definition and never set
+  `default_agent`, so new sessions correctly kept Build no matter how
+  perfect the injected context was. No prompt injection can substitute
+  for native primary-agent selection, and model self-identification
+  ("I am Gaspar") is behavioral hearsay, never runtime evidence.
+
+### Required correction (shipped same session)
+
+- `chrono setup`/`chrono init --runtime opencode` generate the seven
+  canonical role definitions
+  (`.opencode/agents/{gaspar,belthazar,melchior,prometheus,lucca,glenn,spekkio}.md`):
+  Gaspar is the visible `primary`; the rest are subagents per the
+  normative role model. Model-neutral (no `model` field ever), no
+  secrets/tokens/credentials, deterministic bytes, drift-checked like
+  every managed asset (proof bindings invalidate on regeneration).
+- The user-owned project configuration is merged structurally, never
+  rewritten: exactly the top-level `default_agent` key becomes
+  `gaspar`; unrelated keys, comments, and formatting survive
+  byte-for-byte; no provider/model is ever written. `opencode.jsonc`
+  wins when only it exists; both files present, duplicate keys,
+  non-string values, or malformed JSON/JSONC fail closed with
+  remediation. Permission-preserving backup (`<file>.chrono-bak`,
+  once) precedes the first change; a managed sidecar
+  (`.chrono/opencode-config.json`) records ownership and the prior
+  value for drift repair and exact uninstall restoration (prior
+  default returns, or the added key is removed; unrelated bytes stay;
+  user agents in the same directory are never touched).
+- `init` discloses every agent/config file it will create or modify
+  and requests consent; re-runs are byte-idempotent; uninstall
+  restores the prior default exactly.
+- The plugin records native selection via the official `chat.params`
+  hook (`agent` per session; hidden `compaction`/`title`/`summary`
+  excluded from the verdict). Activation evidence is now five distinct
+  fields: plugin load, broker redemption, projection injection,
+  skill-context injection, native primary-agent selection.
+  `activation.observed` requires the exact session to have selected
+  Gaspar with projection+skill injected at or before that selection.
+  Doctor reports `default_agent`, the latest selected agent, and
+  explains mismatches (`default_agent=gaspar` but session=build:
+  close OpenCode, open a fresh session — existing sessions keep their
+  agent by OpenCode behavior; nothing is forced silently).
+
+### Evidence
+
+Hermetic: `opencode-agent.test.ts` (17: exact role names, Gaspar
+primary / others subagent, model-neutrality, determinism, merge
+preservation/idempotence, duplicate/non-string/malformed refusal,
+no-model/provider writes, key removal, jsonc resolution, comment
+stripping, backup-once with mode bits, drift, uninstall restore with
+user-agent preservation); `opencode-activation.test.ts` +5 (exact-
+session Gaspar observed, Build never Gaspar, projection-only
+unobserved, injection-before-selection ordering, hidden agents);
+`init-flow.test.ts` +2 (fresh init writes byte-identical agents and
+selects gaspar; drift repair reheals; default=gaspar/session=build
+mismatch reported without false activation). Full `test:clean` PASS
+(39 files / 504 tests), `lint` / `typecheck` / `build` /
+`git diff --check` clean; Node 22.21.1 + 24.4.1 clean-export
+matrices green.
+
+Packed black-box (9/9 with the OC-P7/OC-P9 suites): the GENERATED
+plugin plus the GENERATED agents/config, driven through the packed
+CLI and the REAL `opencode` binary oracles — `debug config`
+resolves `default_agent: gaspar`, `debug agent gaspar` resolves
+`name=gaspar mode=primary` with no model override, built-in `build`
+preserved; racing message/transforms inject exactly once with
+matching session evidence; lost-secret fail-closed plus one-command
+init repair back to READY verified live in separate processes.
+
+### Pilot retry procedure (prepared, not executed)
+
+On the existing pilot project (untouched by this session):
+
+1. `chrono init --runtime opencode` — installs/merges the native
+   agent configuration, invalidates affected asset bindings, and
+   automatically re-proves/re-promotes RTK to READY (OC-P8
+   machinery; no granular commands).
+2. Fully quit OpenCode (existing sessions retain Build by OpenCode
+   behavior — never force them).
+3. Reopen OpenCode in the project into a NEW session; confirm the UI
+   shows Gaspar as the primary agent.
+4. Send the probe message; Gaspar must identify itself, recognize
+   the PO, and begin/resume from persisted state.
+5. `chrono doctor --json` must show setup READY plus
+   `activation.observed=true` with the exact session selected as
+   Gaspar. Any paid step needs fresh PO authorization immediately
+   beforehand.
+
 ## OpenCode pilot entry criteria
 
 The real test may start only when:
 
-1. OC-P1 and OC-P2 are fixed and their adversarial tests pass;
+1. OC-P1, OC-P2, OC-P8, OC-P9, and OC-P10 are fixed and their adversarial tests pass;
 2. the generated plugin imports and registers through the installed OpenCode
    version without experimental-hook errors;
 3. a packed, isolated CHRONO installation passes `chrono init --dry-run` and

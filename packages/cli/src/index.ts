@@ -28,11 +28,19 @@ import {
   kiroEntryRegistrationPath,
 } from "./gaspar-entry.js";
 import {
+  CHRONO_OPENCODE_ROLES,
+  OPENCODE_CONFIG_SIDECAR_RELATIVE,
+  applyOpenCodeDefaultAgent,
+  buildOpenCodeAgentDefinition,
+  openCodeAgentPath,
+} from "./opencode-agent.js";
+import {
   ENTRY_COMMAND_NAME,
   ENTRY_OPTIONS,
   entryCommanderOption,
 } from "./entry-contract.js";
 import { constructionFailure, openReadProject, resolveProjectDir } from "./project.js";
+import { runArtifactPropose, runArtifactRevise, runArtifactStatus } from "./artifact-cli.js";
 
 export { buildOpencodePlugin };
 export { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook, mergeClaudeHookGroup, mergeClaudeSettings };
@@ -108,6 +116,10 @@ interface CommandOpts {
   readonly language?: unknown;
   readonly gasparAutonomy?: unknown;
   readonly runtime?: unknown;
+  readonly kind?: unknown;
+  readonly title?: unknown;
+  readonly bodyFile?: unknown;
+  readonly ref?: unknown;
   readonly json?: unknown;
   readonly action?: unknown;
   readonly scope?: unknown;
@@ -2469,6 +2481,18 @@ export function runSetup(
       writeBytes(sessionScriptPath, buildEntrySessionScript());
       if (writesOpencode) {
         writeBytes(pluginPath, buildOpencodePlugin());
+        // Native primary-agent activation (OC-P10): the canonical role
+        // definitions plus the project default_agent merge. The merge is
+        // user-owned configuration: backup-once, comment-preserving,
+        // model-neutral, fail-closed on ambiguity.
+        for (const role of CHRONO_OPENCODE_ROLES) {
+          writeBytes(join(projectPath, openCodeAgentPath(role)), buildOpenCodeAgentDefinition(role));
+        }
+        try {
+          applyOpenCodeDefaultAgent(projectPath, "gaspar", CHRONO_VERSION);
+        } catch (e) {
+          return fail(2, "VALIDATION_ERROR", e instanceof Error ? e.message : "OpenCode default_agent merge refused");
+        }
       }
       if (writesClaude) {
         writeBytes(claudeHookPath, buildClaudeHook());
@@ -2537,7 +2561,9 @@ export function runSetup(
     }
     const managedHooks = [
       ENTRY_SESSION_SCRIPT_RELATIVE_PATH,
-      ...(writesOpencode ? [".opencode/plugins/chrono-gate.js"] : []),
+      ...(writesOpencode
+        ? [".opencode/plugins/chrono-gate.js", ...CHRONO_OPENCODE_ROLES.map((role) => openCodeAgentPath(role)), OPENCODE_CONFIG_SIDECAR_RELATIVE]
+        : []),
       ...(writesClaude ? [CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH] : []),
       ...(writesKiro ? [KIRO_HOOK_RELATIVE_PATH, KIRO_HOOK_REGISTRATION_RELATIVE_PATH] : []),
       ...(options.runtime === "claude-code" ? [GASPAR_DEFINITION_RELATIVE_PATH] : []),
@@ -2567,6 +2593,12 @@ export function runSetup(
           "  skill: current, artifacts intact",
           `  proofs: ${String(proofs.length)} green`,
           ...(writesOpencode ? ["  plugin: .opencode/plugins/chrono-gate.js"] : []),
+          ...(writesOpencode
+            ? [
+                "  agents: .opencode/agents/{gaspar,belthazar,melchior,prometheus,lucca,glenn,spekkio}.md (gaspar is the primary; no model is written)",
+                "  default_agent: gaspar (project config merged, backup preserved; close OpenCode and open a fresh session afterwards)",
+              ]
+            : []),
           `  hooks: ${managedHooks.join(", ")}`,
         ].join("\n");
     return { exitCode: 0, stdout: body, stderr: "" };
@@ -2668,7 +2700,7 @@ export function createProgram(cwd: string): Command {
   program
     .command("approve")
     .description("Record an interactive human-only signed PO approval")
-    .requiredOption("--action <action>", "approval action (module-approval, architecture-security, implementation-security, adapter-registration)")
+    .requiredOption("--action <action>", "approval action (module-approval, planning-approval, architecture-security, implementation-security, adapter-registration)")
     .requiredOption("--scope <id>", "artifact scope identifier (or ARCH)")
     .requiredOption("--revision <rev>", "exact scope revision hash")
     .requiredOption("--authority <name>", "PO signer identity")
@@ -3280,6 +3312,88 @@ export function createProgram(cwd: string): Command {
           },
           stdinText
         )
+      );
+    });
+
+  // OC-P11: Core-governed planning/artifact-authoring path. Narrow native
+  // tools for Gaspar's bootstrap — distinct from implementation execution.
+  // `chrono run` grants stay reserved for authorized implementation work;
+  // these commands materialize planning drafts (analysis, requirements,
+  // architecture/ADRs, Specs, harness drafts, security proposals, plans)
+  // without generic write/edit/bash authority.
+  const artifactCmd = program.command("artifact").description("Core-governed planning drafts (Gaspar/PO sessions; chat text is never authority)");
+
+  artifactCmd
+    .command("propose")
+    .description("Propose and materialize a planning draft (untrusted DRAFT until PO-signed approval)")
+    .requiredOption("--kind <kind>", "planning kind (discovery, requirement, architecture, adr, spec, harness-draft, security-profile, roadmap, module, workpackage)")
+    .option("--id <id>", "canonical identifier (allocated by the Core when omitted)")
+    .requiredOption("--title <text>", "draft title")
+    .requiredOption("--body-file <path>", "markdown body file")
+    .option("--ref <id>", "reference an existing artifact or draft (repeatable)", collectStrings, [])
+    .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      const refs = Array.isArray(opts.ref) ? opts.ref.filter((r): r is string => typeof r === "string") : [];
+      emitProgramResult(
+        program,
+        runArtifactPropose(projectPath, {
+          kind: String(opts.kind ?? ""),
+          ...(typeof opts.id === "string" && opts.id.length > 0 ? { id: opts.id } : {}),
+          title: String(opts.title ?? ""),
+          bodyFile: String(opts.bodyFile ?? ""),
+          ...(refs.length > 0 ? { references: refs } : {}),
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  artifactCmd
+    .command("revise")
+    .description("Revise a planning draft to a new revision (prior approvals go stale)")
+    .requiredOption("--id <id>", "planning artifact identifier")
+    .requiredOption("--title <text>", "revised title")
+    .requiredOption("--body-file <path>", "revised markdown body file")
+    .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runArtifactRevise(projectPath, {
+          id: String(opts.id ?? ""),
+          title: String(opts.title ?? ""),
+          bodyFile: String(opts.bodyFile ?? ""),
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  artifactCmd
+    .command("status")
+    .description("Explicit planning status: proposed, awaiting PO signature, approved, rejected, stale (Core-signed rows only)")
+    .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runArtifactStatus(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          json: opts.json === true,
+        })
       );
     });
 
