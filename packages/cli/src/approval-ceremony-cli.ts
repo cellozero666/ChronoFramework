@@ -165,6 +165,15 @@ export interface ApprovalRecordOptions {
   readonly signature: string;
   readonly permissionCallId: string;
   readonly decidedAt: string;
+  /**
+   * Exactly-once ceremony binding (required): the Core recomputes
+   * the ceremony key from its canonical root plus these components
+   * and the ticket row, then claims it atomically inside the
+   * finalize transaction. Redelivery is a durable no-op.
+   */
+  readonly ceremonyKey: string;
+  readonly ceremonySession: string;
+  readonly ceremonyRequest: string;
   readonly as: string;
   readonly sessionToken?: string | undefined;
   readonly json?: boolean | undefined;
@@ -281,6 +290,11 @@ export function runApprovalRecord(projectPath: string, options: ApprovalRecordOp
           decidedAt: options.decidedAt,
           autoModeProbed: true,
         },
+        ceremony: {
+          key: options.ceremonyKey,
+          sessionId: options.ceremonySession,
+          requestId: options.ceremonyRequest,
+        },
       },
       { actor: options.as, session }
     );
@@ -288,9 +302,29 @@ export function runApprovalRecord(projectPath: string, options: ApprovalRecordOp
       return coreError(result.error, asJson);
     }
     if (asJson) {
-      return { exitCode: 0, stdout: JSON.stringify({ ok: true, approvalId: result.value!.approvalId }, null, 2), stderr: "" };
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify(
+          {
+            ok: true,
+            approvalId: result.value!.approvalId,
+            duplicate: result.value!.duplicate,
+            aliased: result.value!.aliased,
+          },
+          null,
+          2
+        ),
+        stderr: "",
+      };
     }
-    return { exitCode: 0, stdout: `Recorded permission-bound approval '${result.value!.approvalId}'`, stderr: "" };
+    return {
+      exitCode: 0,
+      stdout:
+        result.value!.duplicate === true
+          ? `Approval ceremony already processed: '${result.value!.approvalId}' (duplicate delivery, no state change)`
+          : `Recorded permission-bound approval '${result.value!.approvalId}'`,
+      stderr: "",
+    };
   } finally {
     core.close();
   }

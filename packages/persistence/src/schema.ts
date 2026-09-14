@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -672,5 +672,51 @@ export const MIGRATIONS: Record<number, string> = {
       consumed              INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX idx_ticket_scope ON approval_ticket(scope_artifact_id, scope_revision);
+  `,
+  16: `
+    -- Exactly-once approval ceremonies: durable claim ledger binding
+    -- canonical project, runtime session, question/request id, exactly
+    -- one ticket, scope, action, and revision. The claim is inserted
+    -- atomically inside the finalize transaction; redelivery of the
+    -- same ceremony collides on the primary key instead of consuming
+    -- the ticket or recording twice. Claims are never updated or
+    -- deleted: replay collides, always fail-closed.
+    CREATE TABLE ceremony_claim (
+      ceremony_key TEXT PRIMARY KEY,
+      ticket_id    TEXT NOT NULL,
+      approval_id  TEXT,
+      claimed_at   TEXT NOT NULL
+    );
+    CREATE INDEX idx_claim_ticket ON ceremony_claim(ticket_id);
+    -- Repair for the dual-path fan-out (TICKET-0024 class): an approval
+    -- id granted for SEVERAL tickets by ONE native observation is one
+    -- human Approve fanned out over many tickets. Those rows are
+    -- revoked append-only (row and history kept; affected artifacts
+    -- return to stale/awaiting-signature). Genuinely separate
+    -- ceremonies aliasing one row (distinct native observations) and
+    -- classic approvals (no ticket marker) are untouched.
+    UPDATE approval SET revoked = 1 WHERE id IN (
+      SELECT entity_id FROM event_log
+      WHERE event_type = 'ApprovalGranted'
+      GROUP BY entity_id
+      HAVING COUNT(DISTINCT json_extract(payload, '$.ticketId')) > 1
+         AND COUNT(DISTINCT json_extract(payload, '$.nativeObservation.permissionCallId')) = 1
+    );
+    INSERT INTO event_log (event_type, entity_id, payload, actor, timestamp, prior_state, new_state, reasoning)
+    SELECT 'ApprovalRevoked', id,
+      json_object('reason', 'exactly-once repair: approval id granted for several tickets by one native observation (fan-out); re-request and re-confirm the current revision',
+                  'repairMigration', 16),
+      'PO', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'granted', 'revoked',
+      'Fan-out repair: one human Approve must never authorize several tickets'
+    FROM approval WHERE revoked = 1 AND id IN (
+      SELECT entity_id FROM event_log
+      WHERE event_type = 'ApprovalGranted'
+      GROUP BY entity_id
+      HAVING COUNT(DISTINCT json_extract(payload, '$.ticketId')) > 1
+         AND COUNT(DISTINCT json_extract(payload, '$.nativeObservation.permissionCallId')) = 1
+    ) AND NOT EXISTS (
+      SELECT 1 FROM event_log revoked_yet
+      WHERE revoked_yet.event_type = 'ApprovalRevoked' AND revoked_yet.entity_id = approval.id
+    );
   `,
 };

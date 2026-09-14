@@ -140,6 +140,9 @@ interface CommandOpts {
   readonly securityImplications?: unknown;
   readonly permissionCallId?: unknown;
   readonly decidedAt?: unknown;
+  readonly ceremonyKey?: unknown;
+  readonly ceremonySession?: unknown;
+  readonly ceremonyRequest?: unknown;
   readonly ticket?: unknown;
   readonly timestamp?: unknown;
   readonly signature?: unknown;
@@ -3625,6 +3628,9 @@ export function createProgram(cwd: string): Command {
     .requiredOption("--signature <base64>", "Ed25519 signature over the canonical ticket payload")
     .requiredOption("--permission-call-id <id>", "native observation: permission/question call id")
     .requiredOption("--decided-at <ts>", "native observation: human decision time")
+    .requiredOption("--ceremony-key <hex>", "exactly-once ceremony key binding project, session, request, ticket, scope, action, revision")
+    .requiredOption("--ceremony-session <id>", "exactly-once ceremony: runtime session id")
+    .requiredOption("--ceremony-request <id>", "exactly-once ceremony: native question/request id")
     .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
     .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
     .option("--path <dir>", "project directory (default: current directory)")
@@ -3639,6 +3645,9 @@ export function createProgram(cwd: string): Command {
           signature: String(opts.signature ?? ""),
           permissionCallId: String(opts.permissionCallId ?? ""),
           decidedAt: String(opts.decidedAt ?? ""),
+          ceremonyKey: String(opts.ceremonyKey ?? ""),
+          ceremonySession: String(opts.ceremonySession ?? ""),
+          ceremonyRequest: String(opts.ceremonyRequest ?? ""),
           as: String(opts.as ?? ""),
           ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
           json: opts.json === true,

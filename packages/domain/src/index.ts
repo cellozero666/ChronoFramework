@@ -99,13 +99,18 @@ export {
   assertPlanningContent,
   assertPlanningId,
   assertPlanningKind,
+  buildCeremonyKey,
   canonicalizeJson,
+  CEREMONY_MARKER_CURRENT,
+  CEREMONY_MARKERS,
   extractBashCommand,
   isPlanningBashCommand,
   isPlanningKind,
+  approvalGrantsAuthoritative,
   permissionBoundApprovalAuthoritative,
   planningFilename,
   referencesForbiddenState,
+  type CeremonyBinding,
   type PlanningKind,
 } from "./planning.js";
 

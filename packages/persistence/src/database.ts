@@ -21,6 +21,7 @@ import {
   GrantRepository,
   HarnessRepository,
   BrokerRepository,
+  CeremonyClaimRepository,
   ProjectRepository,
   QaRepository,
   RtkRepository,
@@ -238,6 +239,10 @@ export class ChronoDatabase {
 
   approvalTickets(): ApprovalTicketRepository {
     return new ApprovalTicketRepository(this.db);
+  }
+
+  ceremonyClaims(): CeremonyClaimRepository {
+    return new CeremonyClaimRepository(this.db);
   }
 
   /**

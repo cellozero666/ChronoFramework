@@ -236,9 +236,18 @@ Adapters MUST distinguish four tool classes inside CHRONO projects:
   `question` tool, which the Gaspar agent policy MUST explicitly
   allow (`question: allow` — OpenCode denies tools by default), and
   the ticket request refuses (`--require-question`, always passed
-  by the native tool) unless that surface is available. Planning-
-  governed, not generic shell mutation and not implementation
-  dispatch; the pre-tool gate requires proven entry, nothing more.
+  by the native tool) unless that surface is available. Exactly-once
+  authority invariant (ADR-007 Addendum E1): the `question.replied`
+  event is the SINGLE authoritative finalization path for exactly
+  one bound ticket; `tool.execute.after` on question results is
+  observation-only and MUST never finalize, deny, or consume. The
+  Core claims the recomputed ceremony key (canonical project,
+  session, request, ticket, scope, action, revision) atomically
+  with ticket consumption and approval registration — one human
+  Approve authorizes at most one ceremony claim and at most one
+  approval row. Planning-governed, not generic shell mutation and
+  not implementation dispatch; the pre-tool gate requires proven
+  entry, nothing more.
   Bash compatibility (`chrono artifact ...`,
   `chrono approval-request/ticket`, read-only
   `chrono doctor/status/validate`) uses the real two-argument

@@ -2228,13 +2228,40 @@ export interface DoctorReport {
    * this section to report WHERE a confirmation stands — host
    * boundary vs Core — without ever seeing credentials. Informational
    * only; it never changes the setup-readiness verdict.
+   * Mutable on the live report only so runDoctor can resolve
+   * finalized rows to the Core-reported authoritative/current
+   * state after the project opens (read-only enrichment).
    */
-  readonly ceremony: {
+  ceremony: {
     readonly events: ReadonlyArray<{
       readonly at: string;
       readonly kind: string;
       readonly ticket: string | null;
       readonly detail: string;
+      /**
+       * Exactly-once repair (req 11): explicit UI decision behind the
+       * observation (approve / deny / unknown / observed), the
+       * finalization result (recorded / no-change / refused / no-op /
+       * observed), Core-reported authoritativeness for finalized rows
+       * (null when not finalized or Core-unreadable), the rejection
+       * reason, and duplicate/redelivery detection — all without
+       * secrets.
+       */
+      readonly decision: "approve" | "deny" | "unknown" | "observed" | null;
+      readonly result: "recorded" | "no-change" | "refused" | "no-op" | "observed" | null;
+      readonly authoritative: boolean | null;
+      readonly reason: string | null;
+      readonly duplicate: boolean;
+      /**
+       * Non-secret Core coordinates for finalized rows (approval id,
+       * scope, revision, action): runDoctor resolves them to the
+       * Core-reported authoritative/current state. Null on
+       * non-finalized rows.
+       */
+      readonly approval: string | null;
+      readonly scope: string | null;
+      readonly revision: string | null;
+      readonly action: string | null;
     }>;
     readonly detail: string;
     /**
@@ -2412,6 +2439,9 @@ export function readActivationEvidence(projectRoot: string): DoctorReport["activ
 /** Approval-ceremony evidence kinds the plugin host may record (all non-secret). */
 const CEREMONY_KINDS = new Set([
   "approval-finalized",
+  "approval-duplicate-ceremony",
+  "approval-multi-ticket",
+  "approval-result-observed",
   "approval-answer-declined",
   "approval-answer-no-match",
   "approval-ticket-not-live",
@@ -2422,6 +2452,64 @@ const CEREMONY_KINDS = new Set([
   "approval-record-denied",
   "approval-skipped-auto",
 ]);
+
+/**
+ * Static decision/result/reason projection for one ceremony evidence
+ * kind (exactly-once repair, req 11). `authoritative` and `current`
+ * validity for finalized rows come from the Core (see runDoctor
+ * enrichment below), never from this static map.
+ */
+function ceremonyVerdict(kind: string, entry: Record<string, unknown>): {
+  decision: "approve" | "deny" | "unknown" | "observed" | null;
+  result: "recorded" | "no-change" | "refused" | "no-op" | "observed" | null;
+  reason: string | null;
+} {
+  switch (kind) {
+    case "approval-finalized":
+      return {
+        decision: "approve",
+        result: "recorded",
+        reason:
+          entry["aliased"] === true
+            ? "separate ceremony aliasing one pre-existing approval row"
+            : null,
+      };
+    case "approval-duplicate-ceremony":
+      return { decision: "approve", result: "no-op", reason: "same ceremony redelivered: already processed, no state change" };
+    case "approval-multi-ticket":
+      return {
+        decision: "approve",
+        result: "refused",
+        reason: `one question named ${typeof entry["count"] === "number" ? String(entry["count"]) : "several"} tickets: exactly one required, nothing consumed`,
+      };
+    case "approval-result-observed":
+      return { decision: "observed", result: "observed", reason: null };
+    case "approval-answer-declined":
+      return { decision: "deny", result: "no-change", reason: "human declined or cancelled in the native UI" };
+    case "approval-answer-no-match":
+      return { decision: "unknown", result: "no-change", reason: "no explicit Approve carrying the ticket challenge" };
+    case "approval-ticket-not-live":
+      return { decision: "approve", result: "no-change", reason: "ticket not live at finalize time (consumed, expired, or stale)" };
+    case "approval-cross-session":
+      return { decision: "approve", result: "no-change", reason: "ticket bound to another session" };
+    case "approval-no-session":
+      return { decision: "approve", result: "no-change", reason: "no host session credential for the runtime session" };
+    case "approval-no-key":
+      return { decision: "approve", result: "no-change", reason: "PO signing key unavailable in the OS keychain" };
+    case "approval-sign-failed":
+      return { decision: "approve", result: "no-change", reason: "host signing failed (key, payload, or ceremony binding invalid)" };
+    case "approval-record-denied":
+      return {
+        decision: "approve",
+        result: "no-change",
+        reason: typeof entry["code"] === "string" ? `Core refused recording (${entry["code"]})` : "Core refused recording",
+      };
+    case "approval-skipped-auto":
+      return { decision: "approve", result: "no-change", reason: "auto mode refuses the ceremony" };
+    default:
+      return { decision: null, result: null, reason: null };
+  }
+}
 
 /**
  * Observed approval-ceremony evidence (fail-open fix, read-only).
@@ -2443,7 +2531,15 @@ export function readCeremonyEvidence(
   } catch {
     return { events: [], detail: "no ceremony traffic observed", questionSurface: surface };
   }
-  const events: Array<{ at: string; kind: string; ticket: string | null; detail: string }> = [];
+  const events: Array<DoctorReport["ceremony"]["events"][number]> = [];
+  // Duplicate/redelivery detection (req 11): the same ticket decided
+  // through the same native call more than once is a replay signal,
+  // never a second decision. Likewise, ANY non-finalized observation
+  // for a ticket that already finalized (the TICKET-0024
+  // finalized-plus-declined contradiction) is redelivery noise after
+  // the authoritative decision — flagged, never a second decision.
+  const seenCalls = new Set<string>();
+  const finalizedTickets = new Set<string>();
   for (const line of raw.split("\n")) {
     if (line.length === 0) {
       continue;
@@ -2461,7 +2557,23 @@ export function readCeremonyEvidence(
     if (entry["adapter"] !== "opencode" || typeof entry["kind"] !== "string" || !CEREMONY_KINDS.has(entry["kind"])) {
       continue;
     }
+    const kind = entry["kind"];
     const ticket = typeof entry["ticket"] === "string" ? entry["ticket"] : null;
+    const call = typeof entry["call"] === "string" ? entry["call"] : null;
+    const callKey = `${ticket ?? ""}|${call ?? ""}|${kind}`;
+    const repeatedCall = call !== null && seenCalls.has(callKey);
+    if (call !== null) {
+      seenCalls.add(callKey);
+    }
+    // Redelivery after the authoritative decision for the same
+    // ticket (exactly-once repair): never a second decision.
+    const afterFinalize =
+      ticket !== null && kind !== "approval-finalized" && finalizedTickets.has(ticket);
+    if (kind === "approval-finalized" && ticket !== null) {
+      finalizedTickets.add(ticket);
+    }
+    const duplicate = repeatedCall || afterFinalize;
+    const verdict = ceremonyVerdict(kind, entry);
     const extra =
       typeof entry["approval"] === "string"
         ? `approval ${entry["approval"]}`
@@ -2470,18 +2582,32 @@ export function readCeremonyEvidence(
           : typeof entry["scope"] === "string"
             ? entry["scope"]
             : "";
+    const approval = typeof entry["approval"] === "string" ? entry["approval"] : null;
     events.push({
       at: typeof entry["ts"] === "string" ? entry["ts"] : "unknown-time",
-      kind: entry["kind"],
+      kind,
       ticket,
-      detail: extra.length > 0 ? `${entry["kind"]} ${ticket ?? ""} ${extra}`.trim() : `${entry["kind"]} ${ticket ?? ""}`.trim(),
+      detail: `${extra.length > 0 ? `${kind} ${ticket ?? ""} ${extra}`.trim() : `${kind} ${ticket ?? ""}`.trim()}${duplicate ? " [duplicate delivery]" : ""}`,
+      decision: verdict.decision,
+      result: duplicate && verdict.result === "recorded" ? "no-op" : verdict.result,
+      authoritative: null,
+      reason: afterFinalize
+        ? `redelivery after the authoritative decision for ${ticket}: no state change`
+        : duplicate
+          ? "duplicate delivery of an already-observed ceremony"
+          : verdict.reason,
+      duplicate,
+      approval,
+      scope: typeof entry["scope"] === "string" ? entry["scope"] : null,
+      revision: typeof entry["revision"] === "string" ? entry["revision"] : null,
+      action: typeof entry["action"] === "string" ? entry["action"] : null,
     });
   }
   const tail = events.slice(-10);
   if (tail.length === 0) {
     return { events: [], detail: "no ceremony traffic observed", questionSurface: surface };
   }
-  const last = tail[tail.length - 1] as { kind: string; ticket: string | null; detail: string };
+  const last = tail[tail.length - 1] as DoctorReport["ceremony"]["events"][number];
   return {
     events: tail,
     detail:
@@ -2554,6 +2680,48 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
     return fail(report);
   }
   const core = opened.core;
+  // Exactly-once repair (req 11): resolve finalized rows to the
+  // Core-reported authoritative/current state. Provenance
+  // (ceremony marker, single-ticket binding, policy) comes from
+  // approvalCeremonyAuthoritative; currency (unrevoked, revision
+  // still current) from hasValidApproval. Both are session-free
+  // read-only Core judgments. Any Core failure leaves the row
+  // unresolved (authoritative null) rather than misreported.
+  report.ceremony = {
+    ...report.ceremony,
+    events: report.ceremony.events.map((event) => {
+      if (
+        (event.kind !== "approval-finalized" && event.kind !== "approval-duplicate-ceremony") ||
+        event.approval === null ||
+        event.scope === null ||
+        event.revision === null ||
+        event.action === null
+      ) {
+        return event;
+      }
+      try {
+        const provenance = core.approvalCeremonyAuthoritative(event.approval);
+        const current = core.hasValidApproval(event.scope, event.revision, event.action);
+        if (!provenance) {
+          return {
+            ...event,
+            authoritative: false,
+            reason: "Core reports non-authoritative provenance (fan-out reuse or vulnerable ceremony): re-request and re-confirm",
+          };
+        }
+        if (!current) {
+          return {
+            ...event,
+            authoritative: false,
+            reason: `${event.reason ?? "recorded"}; not current (stale, revoked, or superseded): re-request and re-confirm the current revision`,
+          };
+        }
+        return { ...event, authoritative: true };
+      } catch {
+        return event;
+      }
+    }),
+  };
   try {
     const reasons: string[] = [];
     const pinnedVersion = core.pinnedCoreVersion();
@@ -2738,7 +2906,9 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
       broker,
       entry: { ready: reasons.length === 0, reasons },
       activation,
-      ceremony: readCeremonyEvidence(root, checkQuestionSurface(root)),
+      // Reuse the Core-enriched ceremony resolved above (provenance +
+      // currency per finalized row), never a fresh unenriched read.
+      ceremony: report.ceremony,
     };
     const body = asJson ? JSON.stringify({ ok: filled.entry.ready, doctor: filled }, null, 2) : renderDoctor(filled);
     return filled.entry.ready

@@ -31,6 +31,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import {
   approvalChallenge,
+  buildCeremonyKey,
   buildEnrollmentChallenge,
   buildEnrollmentPayload,
   buildSessionAuthorizationPayload,
@@ -44,6 +45,9 @@ import { ChronoCore } from "@chrono/core";
 import { buildOpencodePlugin } from "./opencode-plugin.js";
 import { buildOpenCodeAgentDefinition } from "./opencode-agent.js";
 import { buildPlanningToolsFile } from "./opencode-planning-tools.js";
+import { runDoctor } from "./init-flow.js";
+import { MemoryKeyStore } from "./keychain.js";
+import { CHRONO_VERSION } from "./version.js";
 import { PO_KEY_ACCOUNT, PO_KEY_SERVICE } from "./keychain.js";
 
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
@@ -306,13 +310,31 @@ describe("OC-P11 integrated approval ceremony", () => {
     await hooks.event(askedEvent(sessionKey, "req-1", line));
     await hooks.event(repliedEvent(sessionKey, "req-1", `Approve ${requested.challenge} — yes`));
     expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(true);
+    expect(core.approvalCeremonyAuthoritative(core.listApprovals()[0]?.id ?? "")).toBe(true);
     expect(evidenceText()).toContain("approval-finalized");
-    // The tool-result channel stays idempotent: same answer again is a replay no-op.
+    // Bare reply redelivery (pending already consumed) is audited
+    // with no state change.
+    await hooks.event(repliedEvent(sessionKey, "req-1", `Approve ${requested.challenge} — yes`));
+    expect(core.listApprovals()).toHaveLength(1);
+    // Full asked+replied redelivery (restart replay shape) is
+    // refused at the liveness gate — the ticket is consumed, so the
+    // Core finalize path is never re-entered: no-op, no second row.
+    await hooks.event(askedEvent(sessionKey, "req-1", line));
+    await hooks.event(repliedEvent(sessionKey, "req-1", `Approve ${requested.challenge} — yes`));
+    expect(core.listApprovals()).toHaveLength(1);
+    expect(evidenceText()).toContain("approval-ticket-not-live");
+    // The tool-result channel is observation-only: the same answer
+    // passing through tool.execute.after records an observation and
+    // never finalizes, denies, or consumes — even when its output
+    // payload carries the unselected Deny option label (the exact
+    // TICKET-0024 false-decline shape).
     await hooks.after(
       { tool: "question", sessionID: sessionKey, callID: "call-dup", args: questionArgs(line) },
-      { title: "answer", output: `Approve ${requested.challenge} — yes`, metadata: {} }
+      { title: "answer", output: { answer: `Approve ${requested.challenge} — yes`, options: [{ label: `Approve ${requested.challenge}`, description: "Record" }, { label: "Deny", description: "Do nothing" }] }, metadata: {} }
     );
     expect(core.listApprovals()).toHaveLength(1);
+    expect(evidenceText()).toContain("approval-result-observed");
+    expect(evidenceText()).not.toContain("approval-answer-declined");
   });
 
   it("event chain denies rejected, unmatched, and cross-session answers", async () => {
@@ -383,11 +405,11 @@ describe("OC-P11 integrated approval ceremony", () => {
       rationale: "accept", securityImplications: "none",
     })) as { ticketId: string; challenge: string };
     expect(requested.challenge).toBe(approvalChallenge(requested.ticketId));
-    // Native question with the exact canonical line; explicit Approve.
-    await hooks.after(
-      { tool: "question", sessionID: sessionKey, callID: "call-1", args: questionArgs(`CHRONO approval ${requested.challenge} :: planning-approval SP-0001 @${spec.revision} :: accept`) },
-      { title: "answer", output: `Approve ${requested.challenge} — yes, ship it`, metadata: {} }
-    );
+    // Native question with the exact canonical line; explicit Approve
+    // through the single authoritative path (asked/replied events).
+    const flowLine = `CHRONO approval ${requested.challenge} :: planning-approval SP-0001 @${spec.revision} :: accept`;
+    await hooks.event(askedEvent(sessionKey, "req-flow", flowLine));
+    await hooks.event(repliedEvent(sessionKey, "req-flow", `Approve ${requested.challenge} — yes, ship it`));
     expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(true);
     const recorded = core.listApprovals().find((a) => a.scopeArtifactId === "SP-0001");
     expect(recorded?.signature.length).toBeGreaterThan(10);
@@ -415,33 +437,38 @@ describe("OC-P11 integrated approval ceremony", () => {
       action: "planning-approval", scope: "SP-0001", revision: spec.revision, rationale: "accept", securityImplications: "none",
     })) as { ticketId: string; challenge: string };
     const line = `CHRONO approval ${first.challenge} :: planning-approval SP-0001 @${spec.revision} :: accept`;
-    // Chat-only "approval": no tool event fires, so nothing records.
+    // Chat-only "approval": no native event fires, so nothing records.
     await expect(hooks.message({ sessionID: sessionKey })).resolves.toBeUndefined();
     expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(false);
-    // Explicit Deny.
+    // Explicit Deny through the authoritative path.
+    await hooks.event(askedEvent(sessionKey, "req-deny", line));
+    await hooks.event(rejectedEvent(sessionKey, "req-deny"));
+    expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(false);
+    expect(evidenceText()).toContain("approval-answer-declined");
+    // Cancel wording with challenge present.
+    await hooks.event(askedEvent(sessionKey, "req-cancel", line));
+    await hooks.event(repliedEvent(sessionKey, "req-cancel", `Cancel ${first.challenge}`));
+    expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(false);
+    // Answer without the challenge.
+    await hooks.event(askedEvent(sessionKey, "req-vague", line));
+    await hooks.event(repliedEvent(sessionKey, "req-vague", "Approve it, looks good"));
+    expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(false);
+    // Tool-result observations never trigger the ceremony, even for
+    // Deny wording: observation-only by construction.
     await hooks.after(
       { tool: "question", sessionID: sessionKey, callID: "call-deny", args: questionArgs(line) },
       { title: "answer", output: `Deny ${first.challenge} — not yet`, metadata: {} }
     );
     expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(false);
-    // Cancel wording with challenge present.
-    await hooks.after(
-      { tool: "question", sessionID: sessionKey, callID: "call-cancel", args: questionArgs(line) },
-      { title: "answer", output: `Cancel ${first.challenge}`, metadata: {} }
-    );
-    expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(false);
-    // Answer without the challenge.
-    await hooks.after(
-      { tool: "question", sessionID: sessionKey, callID: "call-vague", args: questionArgs(line) },
-      { title: "answer", output: "Approve it, looks good", metadata: {} }
-    );
-    expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(false);
+    expect(evidenceText()).toContain("approval-result-observed");
     // Non-question tool results never trigger the ceremony.
     await hooks.after(
       { tool: "read", sessionID: sessionKey, callID: "call-read", args: { filePath: "x" } },
       { title: "read", output: `Approve ${first.challenge}`, metadata: {} }
     );
     expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(false);
+    // The ticket survives every denial: the human can still confirm.
+    expect(core.listApprovals()).toHaveLength(0);
   });
 
   it("replay, stale, forged, cross-session, cross-project, and auto all deny", async () => {
@@ -454,25 +481,39 @@ describe("OC-P11 integrated approval ceremony", () => {
       action: "planning-approval", scope: "SP-0001", revision: spec.revision, rationale: "accept", securityImplications: "none",
     })) as { ticketId: string; challenge: string };
     const line = `CHRONO approval ${first.challenge} :: planning-approval SP-0001 @${spec.revision} :: accept`;
-    const approve = (callID: string, session: string, text: string) =>
-      hooks.after(
-        { tool: "question", sessionID: session, callID, args: questionArgs(line) },
-        { title: "answer", output: text, metadata: {} }
-      );
+    const askApprove = async (requestId: string, session: string, questionLine: string, answer: string) => {
+      await hooks.event({
+        event: {
+          type: "question.asked",
+          properties: {
+            id: requestId,
+            sessionID: session,
+            questions: [{ question: "CHRONO product decision", header: "Approval", options: [{ label: questionLine, description: "Record signed PO approval" }] }],
+          },
+        },
+      });
+      await hooks.event({ event: { type: "question.replied", properties: { sessionID: session, requestID: requestId, answers: [[answer]] } } });
+    };
     // Forged confirmation for an unknown ticket.
-    await hooks.after(
-      { tool: "question", sessionID: sessionKey, callID: "call-forge", args: questionArgs("CHRONO approval approve-TICKET-9999 :: planning-approval SP-0001 @x :: y") },
-      { title: "answer", output: "Approve approve-TICKET-9999 — yes", metadata: {} }
-    );
+    await askApprove("req-forge", sessionKey, "CHRONO approval approve-TICKET-9999 :: planning-approval SP-0001 @x :: y", "Approve approve-TICKET-9999 — yes");
     expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(false);
-    // Genuine approval, then replay of the same answer denies.
-    await approve("call-2", sessionKey, `Approve ${first.challenge} — yes`);
+    expect(evidenceText()).toContain("approval-ticket-not-live");
+    // Genuine approval, then redelivery of the same ceremony: no-op.
+    await askApprove("req-2", sessionKey, line, `Approve ${first.challenge} — yes`);
     expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(true);
     const countAfterFirst = core.listApprovals().length;
-    await approve("call-3", sessionKey, `Approve ${first.challenge} — yes again`);
+    // Redelivery of the same ceremony refuses at the liveness gate —
+    // the ticket is consumed, so the Core finalize path is never
+    // re-entered (and no record is even attempted).
+    await askApprove("req-2", sessionKey, line, `Approve ${first.challenge} — yes again`);
     expect(core.listApprovals()).toHaveLength(countAfterFirst);
-    // Cross-session answer: no entry token for that session, no signing.
-    await approve("call-4", "other-session", `Approve ${first.challenge} — yes`);
+    expect(evidenceText()).toContain("approval-ticket-not-live");
+    expect(evidenceText()).not.toContain("approval-record-denied");
+    // A new ceremony on the consumed ticket: ticket-not-live, no change.
+    await askApprove("req-3", sessionKey, line, `Approve ${first.challenge} — yes`);
+    expect(core.listApprovals()).toHaveLength(countAfterFirst);
+    // Cross-session answer: no host token for that session, no signing.
+    await askApprove("req-4", "other-session", line, `Approve ${first.challenge} — yes`);
     expect(core.listApprovals()).toHaveLength(countAfterFirst);
     // Stale: revise after requesting, then answer the old challenge.
     const req2 = JSON.parse(await callTool("artifact_propose", { kind: "requirement", id: "REQ-0001", title: "R", body: "One." })) as {
@@ -482,10 +523,7 @@ describe("OC-P11 integrated approval ceremony", () => {
       action: "planning-approval", scope: "REQ-0001", revision: req2.revision, rationale: "accept", securityImplications: "none",
     })) as { ticketId: string; challenge: string };
     const revised = JSON.parse(await callTool("artifact_revise", { id: "REQ-0001", title: "R2", body: "Changed." })) as { revision: string };
-    await hooks.after(
-      { tool: "question", sessionID: sessionKey, callID: "call-5", args: questionArgs(`CHRONO approval ${ticket.challenge} :: planning-approval REQ-0001 @${req2.revision} :: accept`) },
-      { title: "answer", output: `Approve ${ticket.challenge} — yes`, metadata: {} }
-    );
+    await askApprove("req-5", sessionKey, `CHRONO approval ${ticket.challenge} :: planning-approval REQ-0001 @${req2.revision} :: accept`, `Approve ${ticket.challenge} — yes`);
     expect(core.hasValidApproval("REQ-0001", revised.revision, "planning-approval")).toBe(false);
     // Auto mode refuses deterministically with audit evidence.
     process.argv.push("--auto");
@@ -496,10 +534,7 @@ describe("OC-P11 integrated approval ceremony", () => {
       const auto = JSON.parse(await callTool("approval_request", {
         action: "planning-approval", scope: "REQ-0002", revision: req3.revision, rationale: "accept", securityImplications: "none",
       })) as { ticketId: string; challenge: string };
-      await hooks.after(
-        { tool: "question", sessionID: sessionKey, callID: "call-auto", args: questionArgs(`CHRONO approval ${auto.challenge} :: x`) },
-        { title: "answer", output: `Approve ${auto.challenge} — yes`, metadata: {} }
-      );
+      await askApprove("req-auto", sessionKey, `CHRONO approval ${auto.challenge} :: x`, `Approve ${auto.challenge} — yes`);
       expect(core.hasValidApproval("REQ-0002", req3.revision, "planning-approval")).toBe(false);
       expect(evidenceText()).toContain("approval-skipped-auto");
     } finally {
@@ -529,6 +564,168 @@ describe("OC-P11 integrated approval ceremony", () => {
       { title: "answer", output: "Approve approve-TICKET-0001", metadata: {} }
     );
     expect(core.listApprovals()).toHaveLength(0);
+  });
+
+  it("one question naming two tickets finalizes neither (TICKET-0024 fan-out repair)", async () => {
+    const hooks = await hooksFor(root);
+    await hooks.message({ sessionID: sessionKey });
+    const spec = JSON.parse(await callTool("artifact_propose", { kind: "spec", id: "SP-0001", title: "Tasks", body: "Task contract." })) as {
+      revision: string;
+    };
+    const first = JSON.parse(await callTool("approval_request", {
+      action: "planning-approval", scope: "SP-0001", revision: spec.revision, rationale: "accept", securityImplications: "none",
+    })) as { ticketId: string; challenge: string };
+    const second = JSON.parse(await callTool("approval_request", {
+      action: "planning-approval", scope: "SP-0001", revision: spec.revision, rationale: "accept again", securityImplications: "none",
+    })) as { ticketId: string; challenge: string };
+    expect(second.ticketId).not.toBe(first.ticketId);
+    // Accumulated question context naming both tickets: one human
+    // Approve must never authorize many tickets.
+    const both = `CHRONO approval ${first.challenge} :: planning-approval SP-0001 @${spec.revision} :: accept AND ${second.challenge}`;
+    await hooks.event(askedEvent(sessionKey, "req-fan", both));
+    await hooks.event(repliedEvent(sessionKey, "req-fan", `Approve ${first.challenge} and ${second.challenge} — yes to both`));
+    expect(core.listApprovals()).toHaveLength(0);
+    expect(evidenceText()).toContain("approval-multi-ticket");
+    expect(evidenceText()).not.toContain("approval-finalized");
+  });
+
+  it("historical event replay after restart produces no side effects", async () => {
+    const hooks = await hooksFor(root);
+    await hooks.message({ sessionID: sessionKey });
+    const spec = JSON.parse(await callTool("artifact_propose", { kind: "spec", id: "SP-0001", title: "Tasks", body: "Task contract." })) as {
+      revision: string;
+    };
+    const requested = JSON.parse(await callTool("approval_request", {
+      action: "planning-approval", scope: "SP-0001", revision: spec.revision, rationale: "accept", securityImplications: "none",
+    })) as { ticketId: string; challenge: string };
+    // Second ticket requested BEFORE the first finalizes (request
+    // denies once a current approval exists).
+    const other = JSON.parse(await callTool("approval_request", {
+      action: "planning-approval", scope: "SP-0001", revision: spec.revision, rationale: "second", securityImplications: "none",
+    })) as { ticketId: string; challenge: string };
+    const line = `CHRONO approval ${requested.challenge} :: planning-approval SP-0001 @${spec.revision} :: accept`;
+    await hooks.event(askedEvent(sessionKey, "req-live", line));
+    await hooks.event(repliedEvent(sessionKey, "req-live", `Approve ${requested.challenge} — yes`));
+    expect(core.listApprovals()).toHaveLength(1);
+    // Simulate a restart: a FRESH plugin instance has an empty
+    // in-memory pending map, so the redelivered reply has no prior
+    // asked to bind to — audited, never finalized.
+    const restarted = await hooksFor(root);
+    await restarted.event(repliedEvent(sessionKey, "req-live", `Approve ${requested.challenge} — yes`));
+    expect(core.listApprovals()).toHaveLength(1);
+    expect(evidenceText()).toContain("approval-answer-no-match");
+    // A redelivered reply for a still-LIVE ticket is equally inert
+    // without its asked half: the ticket survives for a genuine
+    // re-confirmation.
+    await restarted.event(repliedEvent(sessionKey, "req-orphan", `Approve ${other.challenge} — yes`));
+    expect(core.listApprovals()).toHaveLength(1);
+    expect(core.hasValidApproval("SP-0001", spec.revision, "planning-approval")).toBe(true);
+  });
+
+  it("approving one artifact never changes any other artifact", async () => {
+    const hooks = await hooksFor(root);
+    await hooks.message({ sessionID: sessionKey });
+    const first = JSON.parse(await callTool("artifact_propose", { kind: "spec", id: "SP-0001", title: "One", body: "First." })) as {
+      revision: string;
+    };
+    const second = JSON.parse(await callTool("artifact_propose", { kind: "spec", id: "SP-0002", title: "Two", body: "Second." })) as {
+      revision: string;
+    };
+    const requested = JSON.parse(await callTool("approval_request", {
+      action: "planning-approval", scope: "SP-0001", revision: first.revision, rationale: "accept", securityImplications: "none",
+    })) as { ticketId: string; challenge: string };
+    const line = `CHRONO approval ${requested.challenge} :: planning-approval SP-0001 @${first.revision} :: accept`;
+    await hooks.event(askedEvent(sessionKey, "req-scope", line));
+    await hooks.event(repliedEvent(sessionKey, "req-scope", `Approve ${requested.challenge} — yes`));
+    expect(core.hasValidApproval("SP-0001", first.revision, "planning-approval")).toBe(true);
+    expect(core.hasValidApproval("SP-0002", second.revision, "planning-approval")).toBe(false);
+    expect(core.listApprovals()).toHaveLength(1);
+    expect(core.listApprovals()[0]?.scopeArtifactId).toBe("SP-0001");
+  });
+
+  it("malformed and historical event shapes never crash the plugin or approve", async () => {
+    const hooks = await hooksFor(root);
+    await hooks.message({ sessionID: sessionKey });
+    const malformed: unknown[] = [
+      { event: null },
+      { event: "question.replied" },
+      { event: { type: "question.replied" } },
+      { event: { type: "question.replied", properties: null } },
+      { event: { type: "question.replied", properties: { sessionID: "", requestID: "", answers: "Approve" } } },
+      { event: { type: "question.replied", properties: { sessionID: sessionKey } } },
+      { event: { type: "question.asked", properties: { sessionID: sessionKey, questions: [{ challenge: "Approve approve-TICKET-0001" }] } } },
+      { event: { payload: { type: "question.v2.replied", properties: { sessionID: sessionKey, requestID: "req-hist", answers: [["Approve approve-TICKET-0001"]] } } } },
+      { event: { type: "session.created", properties: {} } },
+    ];
+    for (const shape of malformed) {
+      await expect(hooks.event(shape)).resolves.toBeUndefined();
+    }
+    // Hostile after-path payloads are observations, never crashes.
+    await expect(hooks.after(null, null)).resolves.toBeUndefined();
+    await expect(hooks.after({ tool: "question", sessionID: sessionKey, callID: "c" }, undefined)).resolves.toBeUndefined();
+    expect(core.listApprovals()).toHaveLength(0);
+    expect(evidenceText()).not.toContain("approval-finalized");
+  });
+
+  it("generated ceremony key matches the domain binding byte-for-byte", async () => {
+    const module = (await import(pathToFileURL(pluginPath).href)) as Record<string, unknown>;
+    const generated = module["chronoCeremonyKey"] as (b: unknown) => string | null;
+    expect(typeof generated).toBe("function");
+    const binding = {
+      action: "planning-approval",
+      project: root,
+      requestId: "req-1",
+      scopeArtifactId: "SP-0001",
+      scopeRevision: `sha256:${"c".repeat(64)}`,
+      sessionId: sessionKey,
+      ticketId: "TICKET-0024",
+    };
+    expect(generated(binding)).toBe(buildCeremonyKey(binding));
+    expect(generated({ ...binding, ticketId: "TICKET-24" })).toBeNull();
+    expect(generated({ ...binding, sessionId: "" })).toBeNull();
+    expect(generated(null)).toBeNull();
+    const sanitize = module["sanitizeSigningPayload"] as (t: unknown, ts: string) => unknown;
+    expect(sanitize({ action: "a" }, FIXED_TIME)).toBeNull();
+    expect(sanitize(null, FIXED_TIME)).toBeNull();
+    const safe = module["safeCanonicalizeJson"] as (v: unknown) => string | null;
+    expect(safe(undefined)).toBeNull();
+    expect(safe({ b: 1, a: [1, 2] })).toBe('{"a":[1,2],"b":1}');
+  });
+
+  it("doctor reports decision, result, authority, reason, and duplicates without secrets", async () => {
+    const hooks = await hooksFor(root);
+    await hooks.message({ sessionID: sessionKey });
+    const spec = JSON.parse(await callTool("artifact_propose", { kind: "spec", id: "SP-0001", title: "Tasks", body: "Task contract." })) as {
+      revision: string;
+    };
+    const requested = JSON.parse(await callTool("approval_request", {
+      action: "planning-approval", scope: "SP-0001", revision: spec.revision, rationale: "accept", securityImplications: "none",
+    })) as { ticketId: string; challenge: string };
+    const line = `CHRONO approval ${requested.challenge} :: planning-approval SP-0001 @${spec.revision} :: accept`;
+    await hooks.event(askedEvent(sessionKey, "req-doc", line));
+    await hooks.event(rejectedEvent(sessionKey, "req-doc"));
+    await hooks.event(askedEvent(sessionKey, "req-doc-ok", line));
+    await hooks.event(repliedEvent(sessionKey, "req-doc-ok", `Approve ${requested.challenge} — yes`));
+    // Pin the Core version so doctor opens the project read-only and
+    // resolves finalized rows to Core-reported authority (an unpinned
+    // project reports the failure path instead).
+    const pin = new ChronoCore({ projectPath: root, runtime: "opencode", pinnedVersion: CHRONO_VERSION });
+    pin.close();
+    const out = runDoctor(root, { json: true, store: new MemoryKeyStore() });
+    const report = JSON.parse(out.stdout) as {
+      doctor: {
+        ceremony: {
+          events: Array<{ kind: string; ticket: string | null; decision: string | null; result: string | null; authoritative: boolean | null; reason: string | null; duplicate: boolean }>;
+        };
+      };
+    };
+    const finalized = report.doctor.ceremony.events.find((e) => e.kind === "approval-finalized");
+    expect(finalized).toMatchObject({ ticket: requested.ticketId, decision: "approve", result: "recorded", authoritative: true, duplicate: false });
+    const declined = report.doctor.ceremony.events.find((e) => e.kind === "approval-answer-declined");
+    expect(declined).toMatchObject({ decision: "deny", result: "no-change" });
+    expect(typeof declined?.reason).toBe("string");
+    expect(JSON.stringify(report.doctor.ceremony)).not.toContain(gasparToken);
+    expect(JSON.stringify(report.doctor.ceremony)).not.toContain(signingKey.slice(0, 20));
   });
 
   it("no product code is writable before implementation dispatch", async () => {

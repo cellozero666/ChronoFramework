@@ -81,19 +81,25 @@
  * files, internal hooks) are denied even though reads otherwise pass
  * without dispatch scope.
  *
- * OC-P11 integrated approval ceremony (ADR-007, fail-open fix): the
- * native `question` tool carries the human confirmation for display
- * AND decision. Both the `question.asked/replied/rejected` event
- * chain and `tool.execute.after` observe runtime-delivered results
- * and finalize ONLY on explicit human Approve (exact ticket
- * challenge bound by requestID, approval wording, no deny/cancel
- * signal): each path revalidates ticket liveness, revision currency,
- * and session binding through the Core, refuses --auto, reads the
- * OS-keychain PO key host-side (never to the model), signs, and
- * records, sharing one single-use ticket so the two channels stay
- * idempotent. There is deliberately NO approval-confirm tool:
- * signing never follows model tool invocation or execution
- * permission. The plugin uses only
+ * OC-P11 integrated approval ceremony (ADR-007, fail-open fix,
+ * exactly-once repair): the native `question` tool carries the human
+ * confirmation for display AND decision. The `question.replied`
+ * event is the SINGLE authoritative finalization path: it carries
+ * the exact requestID correlation plus the human-selected answers
+ * only, and finalizes ONLY on explicit human Approve (exact ticket
+ * challenge, approval wording, no deny/cancel signal) for EXACTLY
+ * ONE bound ticket. `tool.execute.after` on question results is
+ * observation-only (audit, never finalize/deny/consume): its output
+ * payload includes unselected option labels, which once produced a
+ * false `approval-answer-declined` contradicting the authoritative
+ * `approval-finalized` for the same ceremony. The single path
+ * revalidates ticket liveness, revision currency, and session
+ * binding through the Core, refuses --auto, reads the OS-keychain
+ * PO key host-side (never to the model), signs, and records through
+ * one atomic Core transaction (ceremony claim, ticket consume,
+ * approval record, audit event — all or nothing). There is
+ * deliberately NO approval-confirm tool: signing never follows
+ * model tool invocation or execution permission. The plugin uses only
  * `node:child_process` / `node:fs` / `node:path` / `node:crypto`, so
  * the generated file stays directly importable in tests with only
  * binaries substituted by fixtures.
@@ -143,12 +149,15 @@ export function buildOpencodePlugin(): string {
    *   verdict. Unknown tools are denied until classified (deny-by-default).
    *   While entry is unproven, EVERY tool (including reads) is denied.
    *   Anything missing or DENIED throws (fail-closed).
-   * - Integrated approval ceremony (ADR-007, fail-open fix): the native
-   *   \`question\` tool carries the human confirmation. Its
-   *   runtime-delivered result is observed here and finalizes ONLY on
-   *   explicit human Approve (exact challenge, approval wording, no
-   *   deny/cancel). There is deliberately NO approval-confirm tool:
-   *   signing never follows model invocation or execution permission.
+    * - Integrated approval ceremony (ADR-007, fail-open fix,
+    *   exactly-once repair): the native \`question\` tool carries the
+    *   human confirmation. The \`question.replied\` event is the SINGLE
+    *   authoritative finalization path (exact requestID correlation,
+    *   exactly one bound ticket, explicit Approve only).
+    *   \`tool.execute.after\` on question results is observation-only
+    *   and never finalizes, denies, or consumes. There is deliberately
+    *   NO approval-confirm tool: signing never follows model
+    *   invocation or execution permission.
    * - Runtime evidence lands in .chrono/runtime-activation.jsonl
    *   (non-secret metadata only). Session tokens are never held here,
    *   never logged, never modeled.
@@ -299,6 +308,97 @@ export function chronoApprovalMatch(questionText, answerText, challenge) {
   return String(questionText ?? "").includes(challenge) && String(answerText ?? "").includes(challenge);
 }
 
+/**
+ * Parity copy of domain buildCeremonyKey (exactly-once repair): the
+ * ceremony key binds canonical project, runtime session,
+ * question/request id, exactly one ticket, scope, action, and
+ * revision as SHA-256 over canonical JSON with sorted keys
+ * (action, project, requestId, scopeArtifactId, scopeRevision,
+ * sessionId, ticketId — the literal below is already in that
+ * order, so JSON.stringify is byte-identical to the domain
+ * canonicalizer for these plain string values). The Core recomputes
+ * the same key and claims it atomically. Returns null on invalid
+ * components (fail-closed, never throws). Exported for hermetic
+ * parity tests.
+ */
+export function chronoCeremonyKey(binding) {
+  if (binding === null || typeof binding !== "object") {
+    return null;
+  }
+  const action = binding.action;
+  const project = binding.project;
+  const requestId = binding.requestId;
+  const scopeArtifactId = binding.scopeArtifactId;
+  const scopeRevision = binding.scopeRevision;
+  const sessionId = binding.sessionId;
+  const ticketId = binding.ticketId;
+  for (const part of [action, project, requestId, scopeArtifactId, scopeRevision, sessionId, ticketId]) {
+    if (typeof part !== "string" || part.length === 0 || part.length > 1024) {
+      return null;
+    }
+  }
+  if (!/^TICKET-[0-9]{4}$/.test(ticketId)) {
+    return null;
+  }
+  try {
+    const canonical = JSON.stringify({
+      action,
+      project,
+      requestId,
+      scopeArtifactId,
+      scopeRevision,
+      sessionId,
+      ticketId,
+    });
+    return createHash("sha256").update(canonical, "utf8").digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Signing payload built ONLY from validated plain strings
+ * (exactly-once repair, hardening): every required field must be a
+ * non-empty string, else null (fail-closed BEFORE canonical
+ * signing — an undefined property must never reach
+ * chronoCanonicalizeJson, which throws "unsupported value" by
+ * contract). Exported for hermetic contract tests.
+ */
+export function sanitizeSigningPayload(ticket, observedAt) {
+  if (ticket === null || typeof ticket !== "object") {
+    return null;
+  }
+  const payload = {
+    action: ticket.action,
+    scope_artifact_id: ticket.scopeArtifactId,
+    scope_revision: ticket.scopeRevision,
+    authority: "PO",
+    rationale: ticket.rationale,
+    timestamp: observedAt,
+    security_implications: ticket.securityImplications,
+  };
+  for (const value of Object.values(payload)) {
+    if (typeof value !== "string" || value.length === 0) {
+      return null;
+    }
+  }
+  return payload;
+}
+
+/**
+ * Non-throwing canonical JSON wrapper (hardening): malformed or
+ * hostile values yield null instead of an uncaught
+ * "chronoCanonicalizeJson: unsupported value" escaping plugin
+ * initialization or an event observer.
+ */
+export function safeCanonicalizeJson(value) {
+  try {
+    return chronoCanonicalizeJson(value);
+  } catch {
+    return null;
+  }
+}
+
 // Fail-closed entry bounds (documented, deterministic).
 // CHRONO_ENTRY_TIMEOUT_MS overrides the entry execution timeout per
 // attempt (default 30000); non-numeric or non-positive values fall
@@ -313,7 +413,7 @@ const TOKEN_FILE_PREFIX = "chrono-gaspar-";
 const TOKEN_FILE_SUFFIX = ".token";
 const ACTIVATION_EVIDENCE_REL = ".chrono/runtime-activation.jsonl";
 const ACTIVATION_EVIDENCE_MAX_LINES = 300;
-const PLUGIN_GENERATOR = "chrono-gate/oc-p9";
+const PLUGIN_GENERATOR = "chrono-gate/oc-p10";
 
 function readEnv(name) {
   const value = process.env[name];
@@ -1083,102 +1183,149 @@ export const ChronoGatePlugin = async (ctx) => {
   }
 
   function signHostApprovalPayload(keyPem, payload) {
-    const key = createPrivateKey(String(keyPem));
-    const bytes = Buffer.from(chronoCanonicalizeJson(payload), "utf8");
-    return sign(null, bytes, key).toString("base64");
+    // Null (never throws) on any key or canonicalization failure:
+    // callers audit approval-sign-failed with no state change.
+    try {
+      const key = createPrivateKey(String(keyPem));
+      const canonical = safeCanonicalizeJson(payload);
+      if (canonical === null) {
+        return null;
+      }
+      const bytes = Buffer.from(canonical, "utf8");
+      return sign(null, bytes, key).toString("base64");
+    } catch {
+      return null;
+    }
   }
 
-  async function maybeFinalizeApproval(root, sessionKey, callID, questionText, answerText) {
-    // Explicit-answer ceremony (fail-open fix): ONLY an explicit human
-    // Approve in a runtime-delivered question result may trigger
-    // host-side signing. Permission to execute, chat text, cached or
+  async function maybeFinalizeApproval(root, sessionKey, callID, questionText, answerText, ceremony) {
+    // Explicit-answer ceremony (fail-open fix, exactly-once repair):
+    // ONLY an explicit human Approve arriving through the SINGLE
+    // authoritative path (question.replied event, exact requestID
+    // correlation) may trigger host-side signing, for EXACTLY ONE
+    // bound ticket. Permission to execute, chat text, cached or
     // auto-resolved answers, and malformed output all end here as
-    // audits with no state change.
-    const ticketIds = chronoExtractTicketIds(questionText + "\\n" + answerText);
+    // audits with no state change. Never throws into the runtime.
+    //
+    // Single-ticket binding (TICKET-0024 repair): the ceremony binds
+    // the ticket named in the RENDERED QUESTION ONLY — never the
+    // answer, never accumulated context. Zero tickets: unrelated
+    // question traffic, ignored silently. Several tickets: one human
+    // Approve must never authorize many tickets — refused fail-closed
+    // (approval-multi-ticket), nothing consumed.
+    const ticketIds = chronoExtractTicketIds(questionText);
     if (ticketIds.length === 0) {
       return;
     }
     const publicKey = typeof sessionKey === "string" && !sessionKey.startsWith("anonymous@") ? sessionKey : "anonymous";
+    if (ticketIds.length > 1) {
+      logEvidence(root, {
+        kind: "approval-multi-ticket", session: publicKey,
+        ticket: ticketIds[0] ?? null, call: callID, count: ticketIds.length,
+      });
+      return;
+    }
+    const ticketId = ticketIds[0];
     if (process.argv.includes("--auto")) {
-      for (const ticketId of ticketIds) {
-        logEvidence(root, { kind: "approval-skipped-auto", session: publicKey, ticket: ticketId, call: callID });
-      }
+      logEvidence(root, { kind: "approval-skipped-auto", session: publicKey, ticket: ticketId, call: callID });
       return;
     }
     const token = readHostToken(root, sessionKey);
     if (token === null) {
-      for (const ticketId of ticketIds) {
-        logEvidence(root, { kind: "approval-no-session", session: publicKey, ticket: ticketId, call: callID });
-      }
+      logEvidence(root, { kind: "approval-no-session", session: publicKey, ticket: ticketId, call: callID });
       return;
     }
     const tokenId = token.slice(0, token.indexOf("/"));
     const chronoBin = readEnv("CHRONO_BIN") ?? "chrono";
     const observedAt = new Date().toISOString();
-    for (const ticketId of ticketIds) {
-      const challenge = CHALLENGE_PREFIX + ticketId;
-      const decision = chronoApprovalDecision(questionText, answerText, challenge);
-      if (decision !== "approve") {
-        logEvidence(root, {
-          kind: decision === "decline" ? "approval-answer-declined" : "approval-answer-no-match",
-          session: publicKey, ticket: ticketId, call: callID,
-        });
-        continue;
-      }
-      // Liveness, revision currency, AND session binding through the
-      // Core immediately before signing: a stale, consumed, foreign,
-      // or cross-session ticket can never authorize.
-      const ticket = runChronoJson(chronoBin, [
-        "approval-ticket", "--ticket", ticketId, "--as", "gaspar",
-        "--session-token", token, "--path", root, "--json",
-      ], 30000);
-      if (ticket === null || ticket.ok !== true || ticket.live !== true) {
-        logEvidence(root, { kind: "approval-ticket-not-live", session: publicKey, ticket: ticketId, call: callID });
-        continue;
-      }
-      if (typeof ticket.requesterSession === "string" && ticket.requesterSession.length > 0 && ticket.requesterSession !== tokenId) {
-        logEvidence(root, { kind: "approval-cross-session", session: publicKey, ticket: ticketId, call: callID });
-        continue;
-      }
-      const parsed = parsePoKey(readHostPoKey());
-      if (parsed === null) {
-        logEvidence(root, { kind: "approval-no-key", session: publicKey, ticket: ticketId, call: callID });
-        continue;
-      }
-      const payload = {
-        action: ticket.action,
-        scope_artifact_id: ticket.scopeArtifactId,
-        scope_revision: ticket.scopeRevision,
-        authority: "PO",
-        rationale: ticket.rationale,
-        timestamp: observedAt,
-        security_implications: ticket.securityImplications,
-      };
-      let signature;
-      try {
-        signature = signHostApprovalPayload(parsed.pem, payload);
-      } catch {
-        logEvidence(root, { kind: "approval-sign-failed", session: publicKey, ticket: ticketId, call: callID });
-        continue;
-      }
-      const receipt = runChronoJson(chronoBin, [
-        "approval-record", "--ticket", ticketId, "--timestamp", observedAt,
-        "--signature", signature, "--permission-call-id", callID,
-        "--decided-at", observedAt, "--as", "gaspar",
-        "--session-token", token, "--path", root, "--json",
-      ], 60000);
-      if (receipt !== null && receipt.ok === true && typeof receipt.approvalId === "string") {
-        logEvidence(root, {
-          kind: "approval-finalized", session: publicKey, ticket: ticketId,
-          approval: receipt.approvalId, scope: ticket.scopeArtifactId, call: callID,
-        });
-      } else {
-        const code = receipt !== null && typeof receipt.error === "object" && receipt.error !== null && typeof receipt.error.code === "string"
-          ? receipt.error.code
-          : "RECORD_DENIED";
-        logEvidence(root, { kind: "approval-record-denied", session: publicKey, ticket: ticketId, call: callID, code });
-      }
+    const challenge = CHALLENGE_PREFIX + ticketId;
+    const decision = chronoApprovalDecision(questionText, answerText, challenge);
+    if (decision !== "approve") {
+      logEvidence(root, {
+        kind: decision === "decline" ? "approval-answer-declined" : "approval-answer-no-match",
+        session: publicKey, ticket: ticketId, call: callID,
+      });
+      return;
     }
+    // Liveness, revision currency, AND session binding through the
+    // Core immediately before signing: a stale, consumed, foreign,
+    // or cross-session ticket can never authorize.
+    const ticket = runChronoJson(chronoBin, [
+      "approval-ticket", "--ticket", ticketId, "--as", "gaspar",
+      "--session-token", token, "--path", root, "--json",
+    ], 30000);
+    if (ticket === null || ticket.ok !== true || ticket.live !== true) {
+      logEvidence(root, { kind: "approval-ticket-not-live", session: publicKey, ticket: ticketId, call: callID });
+      return;
+    }
+    if (typeof ticket.requesterSession === "string" && ticket.requesterSession.length > 0 && ticket.requesterSession !== tokenId) {
+      logEvidence(root, { kind: "approval-cross-session", session: publicKey, ticket: ticketId, call: callID });
+      return;
+    }
+    const parsed = parsePoKey(readHostPoKey());
+    if (parsed === null) {
+      logEvidence(root, { kind: "approval-no-key", session: publicKey, ticket: ticketId, call: callID });
+      return;
+    }
+    // Exactly-once ceremony key (TICKET-0024 repair): binds canonical
+    // project, runtime session, question/request id, the one ticket,
+    // scope, action, and revision. The Core recomputes and claims it
+    // atomically; redelivery is a durable no-op.
+    const ceremonyKey = ceremony !== null && typeof ceremony === "object"
+      ? chronoCeremonyKey({
+        action: ticket.action,
+        project: canonicalRoot(root),
+        requestId: ceremony.requestId,
+        scopeArtifactId: ticket.scopeArtifactId,
+        scopeRevision: ticket.scopeRevision,
+        sessionId: ceremony.sessionId,
+        ticketId,
+      })
+      : null;
+    if (ceremonyKey === null) {
+      logEvidence(root, { kind: "approval-sign-failed", session: publicKey, ticket: ticketId, call: callID });
+      return;
+    }
+    const payload = sanitizeSigningPayload(ticket, observedAt);
+    if (payload === null) {
+      logEvidence(root, { kind: "approval-sign-failed", session: publicKey, ticket: ticketId, call: callID });
+      return;
+    }
+    const signature = signHostApprovalPayload(parsed.pem, payload);
+    if (signature === null) {
+      logEvidence(root, { kind: "approval-sign-failed", session: publicKey, ticket: ticketId, call: callID });
+      return;
+    }
+    const receipt = runChronoJson(chronoBin, [
+      "approval-record", "--ticket", ticketId, "--timestamp", observedAt,
+      "--signature", signature, "--permission-call-id", callID,
+      "--decided-at", observedAt,
+      "--ceremony-key", ceremonyKey,
+      "--ceremony-session", ceremony.sessionId,
+      "--ceremony-request", ceremony.requestId,
+      "--as", "gaspar",
+      "--session-token", token, "--path", root, "--json",
+    ], 60000);
+    if (receipt !== null && receipt.ok === true && typeof receipt.approvalId === "string") {
+      if (receipt.duplicate === true) {
+        logEvidence(root, {
+          kind: "approval-duplicate-ceremony", session: publicKey, ticket: ticketId,
+          approval: receipt.approvalId, call: callID,
+        });
+        return;
+      }
+      logEvidence(root, {
+        kind: "approval-finalized", session: publicKey, ticket: ticketId,
+        approval: receipt.approvalId, scope: ticket.scopeArtifactId, call: callID,
+        revision: ticket.scopeRevision, action: ticket.action,
+        aliased: receipt.aliased === true,
+      });
+      return;
+    }
+    const code = receipt !== null && typeof receipt.error === "object" && receipt.error !== null && typeof receipt.error.code === "string"
+      ? receipt.error.code
+      : "RECORD_DENIED";
+    logEvidence(root, { kind: "approval-record-denied", session: publicKey, ticket: ticketId, call: callID, code });
   }
 
   // auditApprovalQuestion was removed with the permission-gated
@@ -1187,13 +1334,16 @@ export const ChronoGatePlugin = async (ctx) => {
   // Approve and audits every other outcome without state change.
 
   async function observeQuestionEvent(shaped, directory) {
-    // Native question event chain (fail-open fix): question.asked
-    // records the exact rendered questions; question.replied carries
-    // the explicit human answer bound by requestID; question.rejected
-    // is the explicit cancel path. Only a replied explicit Approve
-    // may trigger host-side signing, through the same
-    // maybeFinalizeApproval used by the tool-result path (ticket
-    // consumption keeps the two channels idempotent). Never throws.
+    // Native question event chain (fail-open fix, exactly-once
+    // repair): question.asked records the exact rendered questions;
+    // question.replied carries the explicit human answer bound by
+    // requestID and is the SINGLE authoritative finalization path;
+    // question.rejected is the explicit cancel path (audit only).
+    // The in-memory pending map is single-shot correlation: a reply
+    // without a prior asked (unknown requestID, or any replay after
+    // restart when the map is empty) is audited with no state change,
+    // so old events can never create approvals after restart. Never
+    // throws: hostile shapes are ignored safely.
     const root = directory || process.cwd();
     if (chronoProjectRoot(root) === null) {
       return;
@@ -1258,7 +1408,10 @@ export const ChronoGatePlugin = async (ctx) => {
     } catch {
       answerText = "";
     }
-    await maybeFinalizeApproval(root, sessionID, requestID, pending.questionText, answerText);
+    await maybeFinalizeApproval(root, sessionID, requestID, pending.questionText, answerText, {
+      sessionId: sessionID,
+      requestId: requestID,
+    });
   }
 
   try {
@@ -1546,12 +1699,18 @@ export const ChronoGatePlugin = async (ctx) => {
       throw new Error(\`[chrono] \${code}: \${reason}\`);
     },
     "tool.execute.after": async (input, output) => {
-      // Explicit-answer ceremony (fail-open fix, ADR-007). Fires on
-      // runtime-delivered tool results only — the model cannot
-      // fabricate these events. maybeFinalizeApproval signs and
-      // records ONLY on explicit human Approve; every other outcome
-      // is audited with no state change. This handler never throws
-      // into the runtime.
+      // Observation ONLY (exactly-once repair, ADR-007). The
+      // question.replied event is the single authoritative
+      // finalization path; this handler NEVER finalizes, denies, or
+      // consumes, so its output payload — which includes UNSELECTED
+      // option labels and once produced a false
+      // approval-answer-declined contradicting the authoritative
+      // approval-finalized for the same ceremony — can never
+      // contradict the authoritative decision again. It records one
+      // audit row per runtime-delivered question result for
+      // duplicate/replay visibility in chrono doctor. Never throws
+      // into the runtime; hostile payload shapes yield an
+      // unticketed observation, never a crash.
       try {
         const root = (ctx && ctx.directory) || process.cwd();
         if (chronoProjectRoot(root) === null) {
@@ -1562,15 +1721,24 @@ export const ChronoGatePlugin = async (ctx) => {
           return;
         }
         const key = resolveSessionKey(input, root);
-        const questionText = JSON.stringify(input !== null && typeof input === "object" && input.args !== undefined ? input.args : "");
-        const answerText = JSON.stringify(
-          output !== null && typeof output === "object" && output.output !== undefined ? output.output : output
-        );
+        let questionText = "";
+        try {
+          questionText = JSON.stringify(input !== null && typeof input === "object" && input.args !== undefined ? input.args : "");
+        } catch {
+          questionText = "";
+        }
+        const ticketIds = chronoExtractTicketIds(questionText);
         const callID =
           input !== null && typeof input === "object" && typeof input.callID === "string" && input.callID.length > 0
             ? input.callID
             : "unknown-call";
-        await maybeFinalizeApproval(root, key, callID, questionText, answerText);
+        logEvidence(root, {
+          kind: "approval-result-observed",
+          session: publicSessionKey(key, root),
+          ticket: ticketIds.length > 0 ? (ticketIds[0] ?? null) : null,
+          call: callID,
+        });
+        void output;
       } catch {
         // Observation is advisory; enforcement lives in the Core.
       }

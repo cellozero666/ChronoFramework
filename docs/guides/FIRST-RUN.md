@@ -113,12 +113,16 @@ Each draft is approved **without leaving the runtime**: Gaspar opens
 a ticket, asks you through the native `question` UI showing the exact
 artifact, revision, and rationale, and — only on your explicit
 Approve answer — the runtime host signs with the OS-keychain PO key
-and records the approval. There is no approval-confirm tool and no
-permission setting that can substitute: execution permission, cached
-or wildcard allows, auto mode, and chat text can never produce a
-signature. A chat "approved" alone starts this flow but records
-nothing; status reports `awaiting-signature` until the Core records
-it. Revising a draft stales prior approvals; re-request and
+and records the approval. Exactly once: one Approve authorizes one
+ticket and produces one approval — redelivery is a no-op, a new
+ceremony on a consumed ticket is replay-denied, and one question
+can never approve several tickets (a multi-ticket question is
+refused with nothing consumed). There is no approval-confirm tool
+and no permission setting that can substitute: execution permission,
+cached or wildcard allows, auto mode, and chat text can never
+produce a signature. A chat "approved" alone starts this flow but
+records nothing; status reports `awaiting-signature` until the Core
+records it. Revising a draft stales prior approvals; re-request and
 re-confirm the new revision. Never run OpenCode with `--auto` for
 approval sessions (auto mode cannot supply human confirmation and
 the ceremony refuses it); never paste session tokens anywhere. (The
@@ -129,6 +133,10 @@ request refuses when the native `question` tool is not exposed to
 Gaspar — `chrono doctor` reports the surface in its ceremony
 section, and the fix is `question: allow` in the Gaspar agent
 policy followed by `chrono init --runtime opencode`.)
+`chrono doctor --json` reports every ceremony observation with the
+explicit UI decision, finalization result, Core-reported
+authoritative/current state, rejection reason, and duplicate or
+replay detection — without secrets.
 
 ## 4. Re-run, repair, and diagnose
 

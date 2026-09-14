@@ -36,32 +36,44 @@ and the published docs:
    `question` tool carrying the exact canonical line
    `CHRONO approval <challenge> :: <action> <scope> @<revision> ::
    <rationale>`. Chat text alone never authorizes.
-3. **Host-finalized explicit answer (fail-open correction)**:
-   `ToolContext.ask()` is tool-execution permission, NOT product
-   approval — a confirm tool signing on `ask()` success recorded a
-   real approval with no human UI, and has been DELETED (unknown
-   `chrono_approval_confirm` is deny-by-default). Instead, the
-   generated plugin observes BOTH runtime-delivered channels — the
-   `question.asked/replied/rejected` event chain (asked records the
-   exact rendered questions keyed by `sessionID|requestID`; replied
-   carries the explicit human answer; rejected is the explicit
-   cancel path) and the `tool.execute.after` result — and finalizes
-   ONLY on explicit human Approve (exact challenge bound by
-   requestID, approval wording, no deny/cancel) through one shared
-   single-use ticket, so the two channels stay idempotent. Each
-   path re-validates ticket liveness, revision currency, and session
-   binding, refuses `--auto`, reads the OS-keychain PO key
-   host-side, signs the canonical payload (byte-identical
+3. **Host-finalized explicit answer (fail-open correction,
+   exactly-once repair)**: `ToolContext.ask()` is tool-execution
+   permission, NOT product approval — a confirm tool signing on
+   `ask()` success recorded a real approval with no human UI, and
+   has been DELETED (unknown `chrono_approval_confirm` is
+   deny-by-default). The `question.replied` event is the SINGLE
+   authoritative finalization path (exact `requestID` correlation,
+   human-selected answers only, exactly one bound ticket); the
+   `question.asked` event records the rendered question and
+   `question.rejected` is the explicit cancel path (audit only).
+   `tool.execute.after` on question results is observation-only and
+   NEVER finalizes, denies, or consumes: its output payload includes
+   unselected option labels, which once produced a false
+   `approval-answer-declined` contradicting the authoritative
+   `approval-finalized` for the same ceremony (TICKET-0024 class).
+   The single path re-validates ticket liveness, revision currency,
+   and session binding, refuses `--auto`, reads the OS-keychain PO
+   key host-side, signs the canonical payload (byte-identical
    serializer, contract-tested), and records through
    `finalizeApprovalTicket`. Denial/cancellation/malformed/
    missing/timeout answers change nothing.
 4. **Core verification** (`finalizeApprovalTicket`): Ed25519 under the
-   registered PO key (same crypto!), single-use atomic ticket
-   consumption, scope-revision currency (drift burns the ticket),
-   expiry, explicit-answer ceremony marker, and a recorded native
-   observation (question call id, decision time). No TTY is required
-   on this path: human presence is proven by the ticket plus the
-   observed explicit answer instead of a terminal check.
+   registered PO key (same crypto!), a REQUIRED exactly-once
+   ceremony binding (canonical project, runtime session,
+   question/request id, one ticket, scope, action, revision — the
+   key is recomputed Core-side and claimed atomically inside the
+   finalize transaction, so redelivery is a durable no-op),
+   single-use atomic ticket consumption, scope-revision currency
+   (drift burns the ticket), expiry, explicit-answer ceremony
+   marker (`question-answer-v2`), and a recorded native observation
+   (question call id, decision time). Ticket consumption and
+   authoritative approval registration commit in ONE transaction:
+   either the approval is current and authoritative and the ticket
+   is consumed, or neither state change commits. Invalid provenance
+   (bad signature, forged ceremony key) denies with the ticket
+   untouched and retryable. No TTY is required on this path: human
+   presence is proven by the ticket plus the observed explicit
+   answer instead of a terminal check.
 5. **Classic path unchanged**: `recordApproval` keeps the TTY rule;
    `planning-approval` joins the canonical action set; signatures with
    `security_implications` verify alongside legacy ones (absent field
@@ -82,6 +94,46 @@ and the published docs:
   memory and 0600 files only; signed bytes cross to the Core).
 - Every finalize is audited with ticket, scope, revision, observation,
   and policy version.
+
+## Addendum E1 (exactly-once repair: the TICKET-0024 provider-backed failure)
+
+Real provider-backed pilot evidence (PO-selected `Approve
+approve-TICKET-0024` for `planning-approval OPEN-0001
+@sha256:bdad…25e`): the runtime recorded BOTH `approval-finalized`
+for TICKET-0024 (producing APR-0002) AND `approval-answer-declined`
+for the same ticket/question flow. Final state: TICKET-0024
+consumed, OPEN-0001 stale, no current authoritative approval.
+
+Root causes, all corrected:
+
+1. **Dual finalization paths.** The `question.replied` event and
+   `tool.execute.after(question)` BOTH finalized. "Idempotent via
+   single-use ticket" was false confidence.
+2. **Multi-ticket fan-out.** Finalization extracted EVERY
+   `TICKET-dddd` from question+answer text and finalized each: one
+   Approve consumed many tickets, and the scope-bound alias
+   returned one shared approval id for several tickets (the
+   observed APR-0002 reuse — the sequence allocator itself is
+   atomic and monotonic and never collides).
+3. **False decline from option-label pollution.** The
+   `tool.execute.after` answer text stringified the whole tool
+   output including the unselected Deny option, tripping the
+   deny-veto: the contradictory declined evidence for an approved
+   ticket.
+4. **No durable ceremony deduplication.** In-memory correlation
+   only; redelivery across paths or restarts could re-enter
+   finalize.
+
+Authority invariant (binding): one human Approve authorizes at
+most one ceremony claim and at most one approval row. New
+ceremonies record marker `question-answer-v2`; `v1`
+single-ticket grants are grandfathered authoritative;
+multi-ticket fan-out grants (one observation, several tickets)
+are non-authoritative; migration v16 revokes fan-out approval
+rows append-only (history preserved, artifacts return to
+stale/awaiting-signature, re-request and re-confirm). Duplicate
+redelivery is a durable no-op returning the winning approval;
+a new ceremony on a consumed ticket is replay-denied.
 
 ## Addendum D5 (question availability: the confirmation UI must render)
 

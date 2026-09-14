@@ -29,7 +29,7 @@ import {
   SKILL_UPSTREAM,
 } from "@chrono/domain";
 import { ChronoCore, type CallerAuth } from "./chrono-core.js";
-import { ChronoDatabase } from "@chrono/persistence";
+import { ChronoDatabase, SCHEMA_VERSION } from "@chrono/persistence";
 
 const FIXED_TIME = "2026-06-01T00:00:00.000Z";
 const SPEC = {
@@ -1936,7 +1936,7 @@ describe.each([11, 12])("Routing proof migration (v%i → current)", (baseline) 
 
   it("preserves vintage rows as non-authoritative candidates", () => {
     const { applied } = seedVintageDb();
-    expect(applied[applied.length - 1]).toBe(15);
+    expect(applied[applied.length - 1]).toBe(SCHEMA_VERSION);
     const db = new ChronoDatabase({ path: dbPath() });
     try {
       const row = db.routingProofs().findById("RTE-0001");

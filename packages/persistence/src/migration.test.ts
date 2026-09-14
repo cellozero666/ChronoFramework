@@ -278,3 +278,151 @@ describe("Routing-proof promotion guard (OC-P2)", () => {
     expect(second.record.authority).toBe("authoritative");
   });
 });
+
+describe("Exactly-once ceremony ledger and fan-out repair (v16)", () => {
+  let tempDir: string;
+  let db: ChronoDatabase;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-ceremony-mig-test-"));
+  });
+
+  afterEach(() => {
+    try {
+      db.close();
+    } catch {
+      // Already closed or never opened.
+    }
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  function grantPayload(ticketId: string, callId: string | null, ceremony = "question-answer-v2"): string {
+    return JSON.stringify({
+      action: "planning-approval",
+      scopeArtifactId: "OPEN-0001",
+      scopeRevision: `sha256:${"a".repeat(64)}`,
+      authority: "PO",
+      ticketId,
+      ceremony,
+      nativeObservation: callId === null ? undefined : { permissionCallId: callId, decidedAt: "2026-09-14T00:00:00.000Z", autoModeProbed: true },
+      policyVersion: "8",
+    });
+  }
+
+  function seedApproval(id: string): void {
+    const raw = new Database(join(tempDir, "chrono.db"));
+    try {
+      raw
+        .prepare(
+          `INSERT INTO approval (id, action, scope_artifact_id, scope_revision, authority, signer, signature, rationale, timestamp, revoked)
+           VALUES (?, 'planning-approval', 'OPEN-0001', ?, 'PO', 'PO', 'sig', 'r', '2026-09-14T00:00:00.000Z', 0)`
+        )
+        .run(id, `sha256:${"a".repeat(64)}`);
+    } finally {
+      raw.close();
+    }
+  }
+
+  function seedGrant(approvalId: string, ticketId: string, callId: string | null, ceremony = "question-answer-v2"): void {
+    const raw = new Database(join(tempDir, "chrono.db"));
+    try {
+      raw
+        .prepare(
+          `INSERT INTO event_log (event_type, entity_id, payload, actor, timestamp, prior_state, new_state, reasoning)
+           VALUES ('ApprovalGranted', ?, ?, 'PO', '2026-09-14T00:00:00.000Z', 'granted', 'granted', 'test')`
+        )
+        .run(approvalId, grantPayload(ticketId, callId, ceremony));
+    } finally {
+      raw.close();
+    }
+  }
+
+  it("creates the claim ledger on every upgrade path and revokes only fan-out rows", () => {
+    for (const baseline of [1, 15]) {
+      const dir = mkdtempSync(join(tmpdir(), "chrono-v16-test-"));
+      try {
+        const first = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          first.migrate(baseline);
+        } finally {
+          first.close();
+        }
+        // Seed the TICKET-0024 class BEFORE the v16 repair runs: one
+        // approval id granted for two tickets by one observation.
+        const raw = new Database(join(dir, "chrono.db"));
+        try {
+          raw
+            .prepare(
+              `INSERT INTO approval (id, action, scope_artifact_id, scope_revision, authority, signer, signature, rationale, timestamp, revoked)
+               VALUES ('APR-0002', 'planning-approval', 'OPEN-0001', ?, 'PO', 'PO', 'sig', 'r', '2026-09-14T00:00:00.000Z', 0)`
+            )
+            .run(`sha256:${"a".repeat(64)}`);
+          raw
+            .prepare(
+              `INSERT INTO approval (id, action, scope_artifact_id, scope_revision, authority, signer, signature, rationale, timestamp, revoked)
+               VALUES ('APR-0003', 'planning-approval', 'OPEN-0001', ?, 'PO', 'PO', 'sig', 'r', '2026-09-14T00:00:00.000Z', 0)`
+            )
+            .run(`sha256:${"b".repeat(64)}`);
+          raw
+            .prepare(
+              `INSERT INTO approval (id, action, scope_artifact_id, scope_revision, authority, signer, signature, rationale, timestamp, revoked)
+               VALUES ('APR-0004', 'module-approval', 'MOD-0001', ?, 'PO', 'PO', 'sig', 'r', '2026-09-14T00:00:00.000Z', 0)`
+            )
+            .run(`sha256:${"c".repeat(64)}`);
+          const grant = raw.prepare(
+            `INSERT INTO event_log (event_type, entity_id, payload, actor, timestamp, prior_state, new_state, reasoning)
+             VALUES ('ApprovalGranted', ?, ?, 'PO', '2026-09-14T00:00:00.000Z', 'granted', 'granted', 'test')`
+          );
+          // Fan-out: APR-0002 granted for two tickets, one observation.
+          grant.run("APR-0002", grantPayload("TICKET-0024", "req-7"));
+          grant.run("APR-0002", grantPayload("TICKET-0025", "req-7"));
+          // Legit alias: APR-0003 granted for two tickets, two observations.
+          grant.run("APR-0003", grantPayload("TICKET-0030", "req-a"));
+          grant.run("APR-0003", grantPayload("TICKET-0031", "req-b"));
+          // Classic: no ticket marker at all.
+          grant.run("APR-0004", JSON.stringify({ action: "module-approval" }));
+        } finally {
+          raw.close();
+        }
+        const second = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          second.migrate();
+          expect(second.schemaVersion()).toBe(SCHEMA_VERSION);
+          // The ledger exists and is writable.
+          expect(second.ceremonyClaims().insert("k".repeat(64), "TICKET-0001", "APR-0001", "2026-09-14T00:00:00.000Z")).toBe(true);
+          expect(second.ceremonyClaims().insert("k".repeat(64), "TICKET-0001", "APR-0001", "2026-09-14T00:00:00.000Z")).toBe(false);
+          expect(second.ceremonyClaims().findByKey("k".repeat(64))).toMatchObject({ ticketId: "TICKET-0001", approvalId: "APR-0001" });
+          // Fan-out row revoked with an audit event; history preserved.
+          expect(second.approvals().findById("APR-0002").revoked).toBe(true);
+          const revocations = second.events().listByEntity("APR-0002").filter((e) => e.eventType === "ApprovalRevoked");
+          expect(revocations).toHaveLength(1);
+          // Legit alias and classic rows untouched.
+          expect(second.approvals().findById("APR-0003").revoked).toBe(false);
+          expect(second.approvals().findById("APR-0004").revoked).toBe(false);
+          expect(second.events().listByEntity("APR-0003").filter((e) => e.eventType === "ApprovalRevoked")).toHaveLength(0);
+        } finally {
+          second.close();
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("v16 migration is idempotent: re-running adds no second revocation", () => {
+    db = new ChronoDatabase({ path: join(tempDir, "chrono.db") });
+    db.migrate(15);
+    seedApproval("APR-0002");
+    seedGrant("APR-0002", "TICKET-0024", "req-7");
+    seedGrant("APR-0002", "TICKET-0025", "req-7");
+    db.migrate();
+    expect(db.schemaVersion()).toBe(SCHEMA_VERSION);
+    expect(db.approvals().findById("APR-0002").revoked).toBe(true);
+    expect(db.events().listByEntity("APR-0002").filter((e) => e.eventType === "ApprovalRevoked")).toHaveLength(1);
+    // Re-running the migrator applies nothing and adds no duplicate audit.
+    expect(db.migrate()).toHaveLength(0);
+    expect(db.events().listByEntity("APR-0002").filter((e) => e.eventType === "ApprovalRevoked")).toHaveLength(1);
+  });
+});

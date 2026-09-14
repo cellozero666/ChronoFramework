@@ -35,7 +35,9 @@ import {
   isStaleReference,
   parseArtifactId,
   approvalChallenge,
-  permissionBoundApprovalAuthoritative,
+  approvalGrantsAuthoritative,
+  buildCeremonyKey,
+  CEREMONY_MARKER_CURRENT,
   APPROVAL_TICKET_TTL_SECONDS,
   assertBlockerType,
   assertRequiredFields,
@@ -255,6 +257,17 @@ export interface StatusResult {
     readonly createdAt: string;
     readonly updatedAt: string;
   };
+}
+
+/**
+ * Control-flow signal for a lost concurrent ceremony claim
+ * (exactly-once repair). Thrown INSIDE the finalize transaction so
+ * consume/record/audit roll back atomically; the finalize catch
+ * converts a known winner into the durable duplicate no-op. Never
+ * escapes as a CoreResult error itself.
+ */
+class DuplicateCeremonyDelivery {
+  constructor(readonly approvalId: string | null) {}
 }
 
 export class ChronoCore {
@@ -4742,23 +4755,21 @@ export class ChronoCore {
    * fails closed here, in `validate`, and in status projections.
    */
   approvalCeremonyAuthoritative(approvalId: string): boolean {
-    let grantEvent: { payload: string } | null = null;
+    const grants: Record<string, unknown>[] = [];
     for (const event of this.events.listByEntity(approvalId)) {
-      if (event.eventType === "ApprovalGranted") {
-        grantEvent = { payload: event.payload };
-        break;
+      if (event.eventType !== "ApprovalGranted") {
+        continue;
+      }
+      try {
+        const payload = JSON.parse(event.payload) as Record<string, unknown>;
+        if (typeof payload === "object" && payload !== null) {
+          grants.push(payload);
+        }
+      } catch {
+        return false;
       }
     }
-    if (grantEvent === null) {
-      return false;
-    }
-    let payload: Record<string, unknown>;
-    try {
-      payload = JSON.parse(grantEvent.payload) as Record<string, unknown>;
-    } catch {
-      return false;
-    }
-    return permissionBoundApprovalAuthoritative(payload, AUTHORITY_POLICY_VERSION);
+    return approvalGrantsAuthoritative(grants, AUTHORITY_POLICY_VERSION);
   }
 
   /**
@@ -8205,9 +8216,10 @@ export class ChronoCore {
       timestamp: string;
       signature: string;
       observation: { permissionCallId: string; decidedAt: string; autoModeProbed: boolean };
+      ceremony: { key: string; sessionId: string; requestId: string };
     },
     auth: CallerAuth
-  ): CoreResult<{ approvalId: string }> {
+  ): CoreResult<{ approvalId: string; duplicate: boolean; aliased: boolean }> {
     try {
       const caller = this.requireCapability("approval.finalize", this.resolveCaller(auth, "finalize approval ticket"));
       void caller;
@@ -8221,8 +8233,44 @@ export class ChronoCore {
           suggestedAction: "Finalize only from an observed native human confirmation",
         });
       }
+      // Exactly-once repair: every native finalize binds exactly one
+      // ceremony (canonical project, runtime session, question/request
+      // id, one ticket, scope, action, revision). A missing or
+      // malformed ceremony denies BEFORE any ticket state changes.
+      const ceremony = input.ceremony;
+      if (
+        ceremony === null ||
+        typeof ceremony !== "object" ||
+        typeof ceremony.key !== "string" ||
+        !/^[0-9a-f]{64}$/.test(ceremony.key) ||
+        typeof ceremony.sessionId !== "string" ||
+        ceremony.sessionId.length === 0 ||
+        ceremony.sessionId.length > 256 ||
+        typeof ceremony.requestId !== "string" ||
+        ceremony.requestId.length === 0 ||
+        ceremony.requestId.length > 256
+      ) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Permission-bound finalize requires the exactly-once ceremony binding (key, session id, request id) for ticket '${input.ticketId}': refusing without consuming`,
+          invariantRef: "INV §14.4",
+          affectedTarget: input.ticketId,
+          suggestedAction: "Finalize only from a bound native ceremony carrying key, session id, and request id",
+        });
+      }
       this.assertFreshTimestamp(input.timestamp, input.ticketId);
       const ticket = this.db.approvalTickets().findById(input.ticketId);
+      // Fast path: this exact ceremony already finalized (redelivered
+      // event, restart replay, concurrent duplicate). Durable no-op
+      // returning the winning approval — checked BEFORE liveness so
+      // redelivery of a consumed ticket answers idempotently instead
+      // of denying. A claim exists only when its approval was
+      // recorded, so this path can never authorize anything new.
+      const prior = this.db.ceremonyClaims().findByKey(ceremony.key);
+      if (prior !== null && prior.approvalId !== null) {
+        return { ok: true, value: { approvalId: prior.approvalId, duplicate: true, aliased: false } };
+      }
       if (ticket.consumed) {
         throw new ChronoError({
           code: ErrorCode.EXECUTION_DENIED,
@@ -8268,17 +8316,89 @@ export class ChronoCore {
         securityImplications: ticket.securityImplications,
       });
       this.verifySignatureOrThrow(unsigned, input.signature, ticket.scopeArtifactId);
-      // Idempotent when the approval already landed (same ticket,
-      // same signature): consume and return the existing row instead
-      // of colliding.
-      const existing = this.approvals.findByScope(ticket.scopeArtifactId, ticket.scopeRevision, ticket.action);
-      let approvalId: string;
-      this.db.transaction(() => {
-        this.db.approvalTickets().consume(ticket.id);
+      // The ceremony key MUST recompute from the Core's own canonical
+      // root plus the presented components and the ticket row: the
+      // binding (project, session, request, one ticket, scope, action,
+      // revision) is verified, never trusted. Mismatch denies with the
+      // ticket untouched.
+      const expectedKey = buildCeremonyKey({
+        project: this.canonicalProjectPath(),
+        sessionId: ceremony.sessionId,
+        requestId: ceremony.requestId,
+        ticketId: ticket.id,
+        scopeArtifactId: ticket.scopeArtifactId,
+        action: ticket.action,
+        scopeRevision: ticket.scopeRevision,
+      });
+      if (expectedKey !== ceremony.key) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Permission-bound finalize ceremony key does not bind ticket '${ticket.id}' to its session, request, scope, and revision: refusing without consuming`,
+          invariantRef: "INV §14.4",
+          affectedTarget: ticket.id,
+          suggestedAction: "Finalize only from the bound native ceremony for this exact ticket",
+        });
+      }
+      // Atomic exactly-once finalize: claim, consume, record, and
+      // audit commit together, or none of them does. A losing
+      // concurrent duplicate collides on the claim inside this same
+      // transaction and returns the winner without touching the
+      // ticket. Invalid provenance (bad signature) never reaches
+      // here: verification above throws before any state change, so
+      // the ticket stays live and retryable.
+      const outcome = this.db.transaction(() => {
+        const existing = this.approvals.findByScope(ticket.scopeArtifactId, ticket.scopeRevision, ticket.action);
+        let approvalId: string;
+        let aliased: boolean;
         if (existing !== null && !existing.revoked) {
+          // Fan-out guard (TICKET-0024 repair): the same native
+          // observation must never authorize two tickets against one
+          // row. One question naming several tickets (old
+          // multi-ticket loop shape) denies here with the ticket
+          // untouched; genuinely separate ceremonies (distinct
+          // observations) alias explicitly below.
+          for (const granted of this.events.listByEntity(existing.id)) {
+            if (granted.eventType !== "ApprovalGranted") {
+              continue;
+            }
+            let prior: Record<string, unknown>;
+            try {
+              prior = JSON.parse(granted.payload) as Record<string, unknown>;
+            } catch {
+              continue;
+            }
+            const priorTicket = prior["ticketId"];
+            const priorObservation = prior["nativeObservation"];
+            const priorCall =
+              typeof priorObservation === "object" && priorObservation !== null
+                ? (priorObservation as Record<string, unknown>)["permissionCallId"]
+                : undefined;
+            if (
+              typeof priorTicket === "string" &&
+              priorTicket !== ticket.id &&
+              typeof priorCall === "string" &&
+              priorCall === input.observation.permissionCallId
+            ) {
+              throw new ChronoError({
+                code: ErrorCode.EXECUTION_DENIED,
+                severity: Severity.BLOCKER,
+                message: `Fan-out denied: native observation '${input.observation.permissionCallId}' already granted ticket '${priorTicket}' for this scope and revision; one ceremony authorizes exactly one ticket`,
+                invariantRef: "INV §14.4",
+                affectedTarget: ticket.id,
+                suggestedAction: "Use the existing approval or request a fresh ticket confirmed through its own ceremony",
+              });
+            }
+          }
+          // Genuinely separate ceremony aliasing one pre-existing
+          // row (the schema keeps one row per scope/revision/
+          // action): no second row, no reused-pointer ambiguity —
+          // the per-ticket grant event below keeps the audit exact.
           approvalId = existing.id;
+          aliased = true;
         } else {
           approvalId = this.sequences.allocate("APR");
+          aliased = false;
           try {
             this.approvals.create({
               id: approvalId,
@@ -8295,6 +8415,19 @@ export class ChronoCore {
             throw this.mapConstraintToDuplicate(e, approvalId);
           }
         }
+        const claimed = this.db
+          .ceremonyClaims()
+          .insert(ceremony.key, ticket.id, approvalId, this.now());
+        if (!claimed) {
+          // Lost a concurrent ceremony claim: throw INSIDE the
+          // transaction so the consume/record/audit above roll back
+          // atomically. The outer catch converts a known winner into
+          // the durable duplicate no-op; an unresolvable collision
+          // stays a fail-closed denial with the ticket untouched.
+          const winner = this.db.ceremonyClaims().findByKey(ceremony.key);
+          throw new DuplicateCeremonyDelivery(winner?.approvalId ?? null);
+        }
+        this.db.approvalTickets().consume(ticket.id);
         this.events.append({
           eventType: "ApprovalGranted",
           entityId: approvalId,
@@ -8306,11 +8439,14 @@ export class ChronoCore {
             rationale: ticket.rationale,
             securityImplications: ticket.securityImplications,
             ticketId: ticket.id,
-            // Explicit-answer ceremony marker (fail-open fix): only
-            // question-answer-v1 grants recorded at the current policy
-            // are authoritative. Older permission-bound grants stay in
-            // history but every gate rejects them.
-            ceremony: "question-answer-v1",
+            // Exactly-once ceremony marker: only question-answer-v2
+            // grants (single bound ceremony per ticket) recorded at
+            // the current policy are authoritative. question-answer-v1
+            // single-ticket grants are grandfathered (see
+            // approvalGrantsAuthoritative); older permission-bound
+            // grants stay in history but every gate rejects them.
+            ceremony: CEREMONY_MARKER_CURRENT,
+            ceremonyKey: ceremony.key,
             nativeObservation: input.observation,
             policyVersion: AUTHORITY_POLICY_VERSION,
           },
@@ -8319,10 +8455,26 @@ export class ChronoCore {
           newState: "granted",
           reasoning: "PO approval recorded through the native explicit-answer ceremony",
         });
+        return { duplicate: false as const, approvalId, aliased };
       });
       this.syncProjectState();
-      return { ok: true, value: { approvalId: approvalId! } };
+      return { ok: true, value: { approvalId: outcome.approvalId, duplicate: false, aliased: outcome.aliased } };
     } catch (e) {
+      if (e instanceof DuplicateCeremonyDelivery) {
+        if (e.approvalId !== null) {
+          return { ok: true, value: { approvalId: e.approvalId, duplicate: true, aliased: false } };
+        }
+        return this.handleError(
+          new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Approval ceremony for ticket '${input.ticketId}' collides with an unresolvable prior claim: replay denied`,
+            invariantRef: "INV §5.1",
+            affectedTarget: input.ticketId,
+            suggestedAction: "Request a fresh ticket for the current revision",
+          })
+        );
+      }
       return this.handleError(e);
     }
   }
@@ -8335,5 +8487,21 @@ export class ChronoCore {
   /** Project root this Core instance operates on (read-only). */
   projectPath(): string {
     return this.config.projectPath;
+  }
+
+  /**
+   * Canonical project root for ceremony binding (exactly-once
+   * repair): symlinks and `/var` vs `/private/var` skew resolved
+   * once, so the plugin host and the Core compute the same ceremony
+   * key for the same project. Falls back to the configured path
+   * when canonicalization fails (same fallback the CLI resolver
+   * uses); read-only.
+   */
+  canonicalProjectPath(): string {
+    try {
+      return realpathSync(this.config.projectPath);
+    } catch {
+      return this.config.projectPath;
+    }
   }
 }

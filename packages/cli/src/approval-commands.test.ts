@@ -8,12 +8,13 @@
  * PO signature denies at cryptographic verification.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
   buildApprovalPayload,
+  buildCeremonyKey,
   buildEnrollmentChallenge,
   buildEnrollmentPayload,
   buildSessionAuthorizationPayload,
@@ -121,13 +122,51 @@ describe("OC-P11 ceremony commands", () => {
       action: "planning-approval", scopeArtifactId: "REQ-0001", scopeRevision: draftRev,
       authority: "PO", rationale: "accept", timestamp, securityImplications: "none",
     }), signingKey);
+    const ceremonyKey = buildCeremonyKey({
+      project: realpathSync(tempDir),
+      sessionId: "ses-cli-1",
+      requestId: "req-cli-1",
+      ticketId,
+      scopeArtifactId: "REQ-0001",
+      action: "planning-approval",
+      scopeRevision: draftRev,
+    });
     const recorded = runApprovalRecord(tempDir, {
       ticket: ticketId, timestamp, signature,
       permissionCallId: "call-1", decidedAt: timestamp,
+      ceremonyKey, ceremonySession: "ses-cli-1", ceremonyRequest: "req-cli-1",
       as: "gaspar", sessionToken: gasparToken, json: true,
     });
     expect(recorded.exitCode).toBe(0);
-    expect(JSON.parse(recorded.stdout).ok).toBe(true);
+    expect(JSON.parse(recorded.stdout)).toMatchObject({ ok: true, duplicate: false, aliased: false });
+    // Identical redelivery through the CLI is a durable no-op.
+    const redelivered = runApprovalRecord(tempDir, {
+      ticket: ticketId, timestamp, signature,
+      permissionCallId: "call-1", decidedAt: timestamp,
+      ceremonyKey, ceremonySession: "ses-cli-1", ceremonyRequest: "req-cli-1",
+      as: "gaspar", sessionToken: gasparToken, json: true,
+    });
+    expect(redelivered.exitCode).toBe(0);
+    expect(JSON.parse(redelivered.stdout)).toMatchObject({ ok: true, duplicate: true });
+  });
+
+  it("approval-record without a ceremony binding denies and leaves the ticket live", () => {
+    const { ticketId } = request();
+    const timestamp = new Date().toISOString();
+    const signature = signApprovalPayload(buildApprovalPayload({
+      action: "planning-approval", scopeArtifactId: "REQ-0001", scopeRevision: draftRev,
+      authority: "PO", rationale: "accept", timestamp, securityImplications: "none",
+    }), signingKey);
+    const denied = runApprovalRecord(tempDir, {
+      ticket: ticketId, timestamp, signature,
+      permissionCallId: "call-1", decidedAt: timestamp,
+      ceremonyKey: "", ceremonySession: "", ceremonyRequest: "",
+      as: "gaspar", sessionToken: gasparToken, json: true,
+    });
+    expect(denied.exitCode).toBe(1);
+    expect(JSON.parse(denied.stdout).error.code).toBe("VALIDATION_ERROR");
+    const described = runApprovalTicket(tempDir, { ticket: ticketId, as: "gaspar", sessionToken: gasparToken, json: true });
+    expect(JSON.parse(described.stdout)).toMatchObject({ consumed: false, live: true });
   });
 
   function fixtureBinary(name: string, script: string): string {
@@ -218,9 +257,23 @@ describe("OC-P11 ceremony commands", () => {
       action: "planning-approval", scopeArtifactId: "REQ-0001", scopeRevision: draftRev,
       authority: "PO", rationale: "accept", timestamp, securityImplications: "none",
     }), generateApprovalKeyPair().privateKeyPem);
+    const ceremonyFor = (ticket: string, session: string, request: string): { ceremonyKey: string; ceremonySession: string; ceremonyRequest: string } => ({
+      ceremonyKey: buildCeremonyKey({
+        project: realpathSync(tempDir),
+        sessionId: session,
+        requestId: request,
+        ticketId: ticket,
+        scopeArtifactId: "REQ-0001",
+        action: "planning-approval",
+        scopeRevision: draftRev,
+      }),
+      ceremonySession: session,
+      ceremonyRequest: request,
+    });
     const forgedRecord = runApprovalRecord(tempDir, {
       ticket: ticketId, timestamp, signature: forged,
       permissionCallId: "call-9", decidedAt: timestamp,
+      ...ceremonyFor(ticketId, "ses-cli-9", "req-cli-9"),
       as: "gaspar", sessionToken: gasparToken, json: true,
     });
     expect(forgedRecord.exitCode).toBe(1);
@@ -228,12 +281,14 @@ describe("OC-P11 ceremony commands", () => {
     const unknown = runApprovalRecord(tempDir, {
       ticket: "TICKET-9999", timestamp, signature: forged,
       permissionCallId: "call-9", decidedAt: timestamp,
+      ...ceremonyFor("TICKET-9999", "ses-cli-9", "req-cli-9"),
       as: "gaspar", sessionToken: gasparToken, json: true,
     });
     expect(unknown.exitCode).toBe(1);
     const missingObservation = runApprovalRecord(tempDir, {
       ticket: ticketId, timestamp, signature: forged,
       permissionCallId: "   ", decidedAt: timestamp,
+      ...ceremonyFor(ticketId, "ses-cli-9", "req-cli-9"),
       as: "gaspar", sessionToken: gasparToken, json: true,
     });
     expect(missingObservation.exitCode).toBe(1);

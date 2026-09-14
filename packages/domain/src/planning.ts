@@ -21,6 +21,7 @@
  * text never becomes PO authority.
  */
 
+import { createHash } from "node:crypto";
 import { ChronoError, ErrorCode, Severity } from "./errors.js";
 
 /** Planning artifact kinds Gaspar may propose before implementation exists. */
@@ -407,14 +408,117 @@ export function permissionBoundApprovalAuthoritative(
   eventPayload: Record<string, unknown>,
   currentPolicyVersion: string
 ): boolean {
-  const ticketId = eventPayload["ticketId"];
-  if (ticketId === undefined || ticketId === null) {
+  return approvalGrantsAuthoritative([eventPayload], currentPolicyVersion);
+}
+
+/** Explicit-answer ceremony markers, oldest first. */
+export const CEREMONY_MARKERS = ["question-answer-v1", "question-answer-v2"] as const;
+
+/** Current explicit-answer ceremony marker (exactly-once repair). */
+export const CEREMONY_MARKER_CURRENT = "question-answer-v2";
+
+/**
+ * Authority judgment over EVERY ApprovalGranted event payload recorded
+ * for one approval id (exactly-once repair).
+ *
+ * One human Approve authorizes exactly one ceremony for exactly one
+ * ticket: when several grant events share an approval id but name
+ * DIFFERENT tickets decided by the SAME native observation (one
+ * question fanning out over many tickets — the TICKET-0024 class),
+ * the approval is NOT authoritative, even when each payload alone
+ * carries a valid marker. Genuinely separate ceremonies that alias
+ * one pre-existing approval row (distinct tickets, distinct native
+ * observations) keep the row authoritative.
+ *
+ * Classic interactive approvals (no ticket marker) are unaffected.
+ * The vulnerable ask()-gated ceremony (no valid marker) stays
+ * non-authoritative. History is never rewritten: callers revoke the
+ * row append-only when this returns false for fan-out.
+ */
+export function approvalGrantsAuthoritative(
+  grantPayloads: ReadonlyArray<Record<string, unknown>>,
+  currentPolicyVersion: string
+): boolean {
+  if (grantPayloads.length === 0) {
+    return false;
+  }
+  const ticketed = grantPayloads.filter(
+    (payload) => payload["ticketId"] !== undefined && payload["ticketId"] !== null
+  );
+  if (ticketed.length === 0) {
     return true;
   }
-  return (
-    eventPayload["ceremony"] === "question-answer-v1" &&
-    eventPayload["policyVersion"] === currentPolicyVersion
+  for (const payload of ticketed) {
+    const ceremony = payload["ceremony"];
+    if (ceremony !== "question-answer-v1" && ceremony !== CEREMONY_MARKER_CURRENT) {
+      return false;
+    }
+    if (payload["policyVersion"] !== currentPolicyVersion) {
+      return false;
+    }
+  }
+  const ticketIds = new Set(ticketed.map((payload) => String(payload["ticketId"])));
+  if (ticketIds.size <= 1) {
+    return true;
+  }
+  const observations = new Set(
+    ticketed.map((payload) => {
+      const observation = payload["nativeObservation"];
+      if (typeof observation !== "object" || observation === null) {
+        return `missing:${String(payload["ticketId"])}`;
+      }
+      const callId = (observation as Record<string, unknown>)["permissionCallId"];
+      return typeof callId === "string" ? callId : `missing:${String(payload["ticketId"])}`;
+    })
   );
+  return observations.size > 1;
+}
+
+/** Components bound by one exactly-once approval ceremony. */
+export interface CeremonyBinding {
+  readonly project: string;
+  readonly sessionId: string;
+  readonly requestId: string;
+  readonly ticketId: string;
+  readonly scopeArtifactId: string;
+  readonly action: string;
+  readonly scopeRevision: string;
+}
+
+/**
+ * Deterministic ceremony key binding canonical project, runtime
+ * session, question/request id, exactly one ticket, scope, action,
+ * and revision (exactly-once repair). The Core recomputes this key
+ * from its own canonical root plus the presented components and the
+ * ticket row, then claims it atomically inside the finalize
+ * transaction: redelivery of the same ceremony is a durable no-op,
+ * and a different ticket can never share the key. Uses SHA-256 over
+ * canonical JSON (Node and the standalone generated plugin bytes
+ * share the algorithm; parity is locked by test).
+ */
+export function buildCeremonyKey(binding: CeremonyBinding): string {
+  for (const [name, value] of Object.entries(binding)) {
+    if (typeof value !== "string" || value.length === 0 || value.length > 1024) {
+      throw new Error(`buildCeremonyKey: invalid ceremony component '${name}'`);
+    }
+  }
+  if (!/^TICKET-[0-9]{4}$/.test(binding.ticketId)) {
+    throw new Error("buildCeremonyKey: ticket id is not a well-formed approval ticket");
+  }
+  return createHash("sha256")
+    .update(
+      canonicalizeJson({
+        action: binding.action,
+        project: binding.project,
+        requestId: binding.requestId,
+        scopeArtifactId: binding.scopeArtifactId,
+        scopeRevision: binding.scopeRevision,
+        sessionId: binding.sessionId,
+        ticketId: binding.ticketId,
+      }),
+      "utf8"
+    )
+    .digest("hex");
 }
 
 /**

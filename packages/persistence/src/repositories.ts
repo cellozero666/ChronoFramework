@@ -2749,4 +2749,73 @@ export class ApprovalTicketRepository {
   }
 }
 
+export interface CeremonyClaimRecord {
+  ceremonyKey: string;
+  ticketId: string;
+  approvalId: string | null;
+  claimedAt: string;
+}
+
+/**
+ * Durable exactly-once ledger for native approval ceremonies
+ * (TICKET-0024 repair). One row per ceremony key (canonical
+ * project, runtime session, question/request id, one ticket,
+ * scope, action, revision), inserted atomically inside the
+ * finalize transaction. Redelivery collides on the primary key
+ * instead of consuming the ticket or recording twice. Rows are
+ * never updated or deleted.
+ */
+export class CeremonyClaimRepository {
+  constructor(private readonly db: Database) {}
+
+  /**
+   * Insert a claim. Returns true when this caller won the ceremony,
+   * false when the ceremony was already processed (duplicate
+   * redelivery — read the winner via findByKey; no state changes).
+   */
+  insert(key: string, ticketId: string, approvalId: string, claimedAt: string): boolean {
+    const info = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO ceremony_claim (ceremony_key, ticket_id, approval_id, claimed_at)
+         VALUES (?, ?, ?, ?)`
+      )
+      .run(key, ticketId, approvalId, claimedAt);
+    return info.changes === 1;
+  }
+
+  findByKey(key: string): CeremonyClaimRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM ceremony_claim WHERE ceremony_key = ?")
+      .get(key) as
+      | { ceremony_key: string; ticket_id: string; approval_id: string | null; claimed_at: string }
+      | undefined;
+    if (row === undefined) {
+      return null;
+    }
+    return {
+      ceremonyKey: row.ceremony_key,
+      ticketId: row.ticket_id,
+      approvalId: row.approval_id,
+      claimedAt: row.claimed_at,
+    };
+  }
+
+  findByTicket(ticketId: string): CeremonyClaimRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM ceremony_claim WHERE ticket_id = ? ORDER BY claimed_at ASC")
+      .all(ticketId) as Array<{
+      ceremony_key: string;
+      ticket_id: string;
+      approval_id: string | null;
+      claimed_at: string;
+    }>;
+    return rows.map((row) => ({
+      ceremonyKey: row.ceremony_key,
+      ticketId: row.ticket_id,
+      approvalId: row.approval_id,
+      claimedAt: row.claimed_at,
+    }));
+  }
+}
+
 export { type Database };

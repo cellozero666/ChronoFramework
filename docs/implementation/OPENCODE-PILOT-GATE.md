@@ -965,14 +965,53 @@ separate PO authorization for provider spend:
   - `chrono doctor` reports the surface in the ceremony section
     (`questionSurface.available/reason`), so Gaspar names the exact
     layer: unavailable surface vs host vs Core.
-  - Finalization observes BOTH runtime-delivered channels — the
-    `question.asked/replied/rejected` event chain (asked records the
-    exact rendered questions keyed by `sessionID|requestID`; replied
-    carries the explicit answer; rejected is the explicit cancel
-    path) and the `tool.execute.after` result — through one shared
-    single-use ticket, so the two channels stay idempotent and a
+  - Finalization runs through the `question.asked/replied/rejected`
+    event chain (asked records the exact rendered questions keyed by
+    `sessionID|requestID`; replied carries the explicit human answer
+    and is the single authoritative path; rejected is the explicit
+    cancel path); `tool.execute.after` is observation-only, so a
     cross-session or replayed answer can never spend another
-    session's ticket.
+    session's ticket (see the exactly-once repair below).
+- **Exactly-once repair — the TICKET-0024 provider-backed failure
+  (ADR-007 Addendum E1).** The PO explicitly selected `Approve
+  approve-TICKET-0024` for `planning-approval OPEN-0001
+  @sha256:bdad…25e`, yet the runtime recorded BOTH
+  `approval-finalized` (producing APR-0002) AND
+  `approval-answer-declined` for the same ticket/question flow,
+  ending with TICKET-0024 consumed, OPEN-0001 stale, and no current
+  authoritative approval. Root causes, all corrected without
+  touching the pilot:
+  - Dual finalization paths (`question.replied` AND
+    `tool.execute.after` both finalized).
+  - A multi-ticket fan-out loop (every `TICKET-dddd` in
+    question+answer text finalized; several tickets collapsed onto
+    one shared approval id — the APR-0002 reuse; the sequence
+    allocator is atomic/monotonic and never collides).
+  - A false decline: the after-path answer text included the
+    unselected Deny option label, tripping the deny-veto.
+  - No durable ceremony deduplication (in-memory only).
+  - Corrected authority invariant: one human Approve authorizes at
+    most one ceremony claim and at most one approval row. The
+    `question.replied` event is the SINGLE authoritative path for
+    exactly one bound ticket; `tool.execute.after` is
+    observation-only and can never finalize, deny, or consume. The
+    Core recomputes the ceremony key (canonical project, session,
+    request, ticket, scope, action, revision) and claims it
+    atomically with ticket consumption and approval registration
+    (all or nothing); redelivery is a durable no-op, a new ceremony
+    on a consumed ticket is replay-denied, one question can never
+    approve several tickets, and invalid provenance leaves the
+    ticket live. New grants carry marker `question-answer-v2`;
+    one-observation fan-out grants are non-authoritative.
+  - Repair behavior: migration v16 adds the `ceremony_claim`
+    ledger and revokes fan-out approval rows append-only (history
+    preserved, affected artifacts return to
+    stale/awaiting-signature for re-request and re-confirmation);
+    `chrono init --runtime opencode` installs the corrected managed
+    assets (plugin generator `chrono-gate/oc-p10`); `chrono doctor
+    --json` reports per-observation decision, result,
+    Core-reported authoritative/current state, rejection reason,
+    and duplicate/replay detection without secrets.
 
 ### The single repair command for the existing pilot
 
@@ -1001,25 +1040,34 @@ confirmation, signed approval, cancel/replay/stale/forge/auto/
 ticketless/cross-session/cross-project denial, setup repair);
 `approval-ceremony.test.ts` (conversational orchestration across
 plugin gate, native tools, question audit, Core, and filesystem;
-native question event-chain finalize on explicit Approve; rejected/
-unmatched/cross-session denial; native-request denial when the
-surface is unavailable);
+single-path event finalize on explicit Approve with Core-reported
+authority; observation-only tool results (no false decline);
+rejected/unmatched/cross-session denial; multi-ticket refusal;
+restart-replay inertness; artifact scope isolation; malformed-event
+survival; key/sanitizer parity; doctor decision/result/authority/
+duplicate reporting without secrets);
 `approval-commands.test.ts` (question-surface oracle matrix:
 exposed/unexposed/missing/non-JSON/failing binary; `--require-
 question` refuse/allow; doctor `questionSurface`);
 `opencode-agent.test.ts` (`question: allow` present for Gaspar and
 no other role);
 `approval-tickets.test.ts` (Core ticket adversarial + same-ticket
-retry survival);
+retry survival + same-ceremony no-op + forged-key/binding denial +
+concurrent-claim atomicity + fan-out guard + alias/monotonic-id
+proofs); `ceremony.test.ts` (domain key determinism/binding +
+multi-grant authority matrix); `migration.test.ts` (v16 ledger on
+v1/v15 upgrade paths + fan-out revocation precision +
+idempotence);
 `key-transport-parity.test.ts` (D1 vectors + disposable-keychain
 integration where available);
 `planning-blackbox.test.ts` (hermetic discovery-to-grant flow).
 Packed: isolated tarball install, `init --dry-run` with zero writes,
 ceremony command surface (`--body-stdin`, `--security-implications`,
 `--require-question`), dist tool-runtime presence. Full
-`test:clean` PASS (48 files / 602 tests on Node 22.21.1 and Node
+`test:clean` PASS (49 files / 626 tests on Node 22.21.1 and Node
 24.20.0 clean exports — `npm ci`, lint, typecheck, build, suite
-each green from clean checkouts), `lint` exit 0,
+each green from clean checkouts), `test:blackbox` 13/13,
+package-contents green, `lint` 0 errors,
 `git diff --check` clean. Real-runtime evidence: NONE YET — the
 retry below must produce it.
 
