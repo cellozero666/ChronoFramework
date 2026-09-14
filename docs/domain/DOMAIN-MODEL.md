@@ -671,9 +671,11 @@ BEFORE any implementation Module/WP exists, without arbitrary
 filesystem, shell, or implementation authority. `chrono run` execution
 grants stay reserved for authorized implementation work.
 
-- Operations `planning.propose`, `planning.revise`, and
-  `planning.status` are Core-owned and capability-gated to Gaspar and
-  the PO only; workers are denied by the matrix.
+- Operations `planning.propose`, `planning.revise`,
+  `planning.status`, and `planning.supersede` are Core-owned and
+  capability-gated to Gaspar and the PO only; workers are denied by
+  the matrix. Supersession retires drafts with replacement pointers
+  and bannered files; missing files heal in place.
 - Every operation validates kind, identifier, lifecycle entry state,
   revision, references, allowed destination, schema, and content size.
 - Destinations derive deterministically from (kind, id) under

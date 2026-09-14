@@ -86,6 +86,14 @@ export interface ArtifactReviseOptions {
   readonly json?: boolean | undefined;
 }
 
+export interface ArtifactSupersedeOptions {
+  readonly id: string;
+  readonly supersededBy: string;
+  readonly as: string;
+  readonly sessionToken?: string | undefined;
+  readonly json?: boolean | undefined;
+}
+
 export interface ArtifactStatusOptions {
   readonly as: string;
   readonly sessionToken?: string | undefined;
@@ -250,7 +258,7 @@ export function runArtifactRevise(projectPath: string, options: ArtifactReviseOp
       return {
         exitCode: 0,
         stdout: JSON.stringify(
-          { ok: true, id: v.id, revision: v.revision, path: v.path, approvalCommand: v.approvalCommand },
+          { ok: true, id: v.id, revision: v.revision, path: v.path, approvalCommand: v.approvalCommand, healed: v.healed },
           null,
           2
         ),
@@ -259,11 +267,66 @@ export function runArtifactRevise(projectPath: string, options: ArtifactReviseOp
     }
     return {
       exitCode: 0,
+      stdout: v.healed
+        ? [
+            `Planning file rematerialized: ${v.id} @ ${v.revision.slice(0, 16)}… (same revision; approvals intact)`,
+            `  file: ${v.path}`,
+          ].join("\n")
+        : [
+            `Planning draft revised: ${v.id} @ ${v.revision.slice(0, 16)}… (prior approvals are stale)`,
+            `  file: ${v.path}`,
+            `Request a new PO signature with exactly:`,
+            `  ${v.approvalCommand}`,
+          ].join("\n"),
+      stderr: "",
+    };
+  } finally {
+    core.close();
+  }
+}
+
+/** Supersede one planning draft by its replacement (D3). */
+export function runArtifactSupersede(projectPath: string, options: ArtifactSupersedeOptions): CliOutput {
+  const asJson = options.json === true;
+  if (options.id.length === 0 || options.supersededBy.length === 0) {
+    return coreError(
+      { code: "VALIDATION_ERROR", severity: "ERROR", message: "artifact supersede requires --id and --by <replacement-id>" },
+      asJson
+    );
+  }
+  if (options.as.length === 0) {
+    return coreError(
+      { code: "VALIDATION_ERROR", severity: "ERROR", message: "artifact supersede requires --as <gaspar|PO> matching the caller session" },
+      asJson
+    );
+  }
+  const session = resolveSessionToken(options.sessionToken);
+  if (session === null) {
+    return coreError(
+      { code: "VALIDATION_ERROR", severity: "ERROR", message: "artifact supersede requires --session-token (or CHRONO_SESSION_TOKEN)" },
+      asJson
+    );
+  }
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    const result = core.supersedePlanningArtifact(options.id, options.supersededBy, { actor: options.as, session });
+    if (!result.ok) {
+      return coreError(result.error, asJson);
+    }
+    const v = result.value!;
+    if (asJson) {
+      return { exitCode: 0, stdout: JSON.stringify({ ok: true, ...v }, null, 2), stderr: "" };
+    }
+    return {
+      exitCode: 0,
       stdout: [
-        `Planning draft revised: ${v.id} @ ${v.revision.slice(0, 16)}… (prior approvals are stale)`,
-        `  file: ${v.path}`,
-        `Request a new PO signature with exactly:`,
-        `  ${v.approvalCommand}`,
+        `Planning draft superseded: ${v.id} → ${v.supersededBy} @ ${v.revision.slice(0, 16)}…`,
+        `  file: ${v.path} (bannered, body preserved for audit)`,
       ].join("\n"),
       stderr: "",
     };

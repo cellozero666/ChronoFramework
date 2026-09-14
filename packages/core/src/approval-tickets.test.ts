@@ -230,6 +230,25 @@ describe("OC-P11 approval tickets (ADR-007)", () => {
     expect(core.describeApprovalTicket(ticketId, gaspar).value!.consumed).toBe(false);
   });
 
+  it("failed finalize preserves the ticket: same-ticket retry succeeds (D4)", () => {
+    const { ticketId } = requestTicket();
+    // Host-side failure BEFORE any signed request: forged signature
+    // denies and the ticket survives for a genuine retry.
+    const forged = signApprovalPayload(buildApprovalPayload({
+      action: "planning-approval", scopeArtifactId: "REQ-0001", scopeRevision: draftRev,
+      authority: "PO", rationale: "accept draft", timestamp: FIXED_TIME, securityImplications: "no new trust boundary",
+    }), generateApprovalKeyPair().privateKeyPem);
+    const failed = core.finalizeApprovalTicket({ ticketId, timestamp: FIXED_TIME, signature: forged, observation: OBSERVATION }, gaspar);
+    expect(failed.ok).toBe(false);
+    expect(failed.error?.code).toBe("SIGNATURE_INVALID");
+    expect(core.describeApprovalTicket(ticketId, gaspar).value!.consumed).toBe(false);
+    // Same ticket, genuine signature: records, no replay ambiguity.
+    const { signature, timestamp } = hostSign(draftRev, "accept draft", "no new trust boundary");
+    const done = core.finalizeApprovalTicket({ ticketId, timestamp, signature, observation: OBSERVATION }, gaspar);
+    expect(done.ok).toBe(true);
+    expect(core.hasValidApproval("REQ-0001", draftRev, "planning-approval")).toBe(true);
+  });
+
   it("no new ticket needed once approved; chat alone still approves nothing", () => {
     const { ticketId } = requestTicket();
     const { signature, timestamp } = hostSign(draftRev, "accept draft", "no new trust boundary");

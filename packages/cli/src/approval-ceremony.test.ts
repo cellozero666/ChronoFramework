@@ -31,7 +31,7 @@ import {
   mkdirSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import {
@@ -165,7 +165,7 @@ describe("OC-P11 integrated approval ceremony", () => {
     writeFileSync(join(root, ".opencode", "package.json"), JSON.stringify({ dependencies: { "@opencode-ai/plugin": "1.18.30" } }, null, 2), "utf8");
     tools = (await import(pathToFileURL(join(root, ".opencode", "tools", "chrono.ts")).href)) as Record<string, unknown>;
     savedEnv = { ...process.env };
-    for (const key of ["CHRONO_BIN", "CHRONO_KEY_HELPER", "CHRONO_ENTRY_ADAPTER", "CHRONO_ENTRY_TIMEOUT_MS", "CHRONO_GATE_MODULE", "CHRONO_GATE_WP", "CHRONO_SESSION_TOKEN", "CHRONO_GATE_AS", "CHRONO_GATE_ROLE", "CHRONO_REQUESTER_TOKEN"]) {
+    for (const key of ["CHRONO_BIN", "CHRONO_ENTRY_ADAPTER", "CHRONO_ENTRY_TIMEOUT_MS", "CHRONO_GATE_MODULE", "CHRONO_GATE_WP", "CHRONO_SESSION_TOKEN", "CHRONO_GATE_AS", "CHRONO_GATE_ROLE", "CHRONO_REQUESTER_TOKEN"]) {
       delete process.env[key];
     }
     const shim = join(root, "chrono-shim.sh");
@@ -186,12 +186,16 @@ describe("OC-P11 integrated approval ceremony", () => {
     );
     expect(core.enrollPo({ publicKeyPem: pair.publicKeyPem, nonce, timestamp, rationale: "test", confirmation, signature }).ok).toBe(true);
     signingKey = pair.privateKeyPem;
+    // Fixture `security` on PATH printing the enrolled key (no test
+    // seam in production bytes; PATH injection mirrors the macOS
+    // helper contract).
     const keyFile = join(root, "po-key.pem");
     writeFileSync(keyFile, signingKey, { mode: 0o600 });
-    const helper = join(root, "key-helper.sh");
-    writeFileSync(helper, `#!/bin/sh\ncat "${keyFile}"\n`, "utf8");
-    chmodSync(helper, 0o755);
-    process.env["CHRONO_KEY_HELPER"] = helper;
+    const fixtureBin = join(root, "fixture-bin");
+    mkdirSync(fixtureBin, { recursive: true });
+    writeFileSync(join(fixtureBin, "security"), `#!/bin/sh\ncat "${keyFile}"\n`, "utf8");
+    chmodSync(join(fixtureBin, "security"), 0o755);
+    process.env["PATH"] = `${fixtureBin}${delimiter}${process.env["PATH"] ?? ""}`;
     const sessionNonce = randomBytes(16).toString("hex");
     const sessionTimestamp = "2026-09-11T00:00:00.000Z";
     const sessionSig = domainSign(
@@ -219,7 +223,7 @@ describe("OC-P11 integrated approval ceremony", () => {
       if (savedEnv[key] === undefined) delete process.env[key];
       else process.env[key] = savedEnv[key];
     }
-    for (const key of ["CHRONO_BIN", "CHRONO_KEY_HELPER"]) {
+    for (const key of ["CHRONO_BIN"]) {
       if (!(key in savedEnv)) delete process.env[key];
     }
     try {

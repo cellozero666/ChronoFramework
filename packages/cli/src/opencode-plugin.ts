@@ -163,6 +163,7 @@ const PLANNING_TOOLS = new Set([
   "chrono_artifact_status",
   "chrono_artifact_propose",
   "chrono_artifact_revise",
+  "chrono_artifact_supersede",
   "chrono_approval_request",
   "chrono_approval_status",
   "chrono_approval_confirm",

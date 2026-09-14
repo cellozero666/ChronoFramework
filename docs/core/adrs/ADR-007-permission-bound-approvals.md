@@ -69,6 +69,18 @@ and the published docs:
 - Every finalize is audited with ticket, scope, revision, observation,
   and policy version.
 
+## Addendum D1/D4 (key custody parity and retry semantics)
+
+- Keychain reads normalize through one shared algorithm
+  (lower/UPPERCASE hex, trim, CRLF) with Ed25519 validation and
+  fingerprint binding, in CLI flows and in generated native tools
+  (parity-locked copies). Failures are secret-safe denials; the
+  ticket survives host-boundary failures and the same ticket is
+  retryable, while consumed/stale/expired tickets require a fresh
+  request. Every confirm denial names its layer and retryability.
+- No test seam ships in production tool bytes; hermetic tests inject
+  a fixture `security` on PATH.
+
 ## Residual risks (live-acceptance, pilot retry)
 
 - **Prompt rendering fidelity**: the exact TUI rendering of the

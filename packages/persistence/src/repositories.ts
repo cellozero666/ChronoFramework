@@ -2044,6 +2044,22 @@ export class SecurityProfileRepository {
       : { id: row.id, version: row.version, contentHash: row.content_hash, approvedAt: row.approved_at };
   }
 
+  /**
+   * Record a governed revision of an existing profile (OC-P11 D2).
+   * The logical id is stable; the version increments monotonically and
+   * the content hash moves to the new revision. Single UPDATE inside
+   * the caller's transaction — no duplicate row, no partial persist,
+   * no manual intervention. History survives in the event log, which
+   * records every revision hash.
+   */
+  recordRevision(id: string, contentHash: string): SecurityProfileRecord {
+    const current = this.findById(id);
+    this.db.prepare(
+      "UPDATE security_profile SET version = ?, content_hash = ? WHERE id = ?"
+    ).run(current.version + 1, contentHash, id);
+    return this.findById(id);
+  }
+
   listAll(): SecurityProfileRecord[] {
     const rows = this.db
       .prepare("SELECT * FROM security_profile ORDER BY version")

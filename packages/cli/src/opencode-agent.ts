@@ -149,8 +149,10 @@ const ROLE_BODIES: Record<ChronoOpenCodeRole, string> = {
     "  `chrono approval-record`, never handle keys or session tokens,",
     "  never paste `--session-token` into model-visible text: signing",
     "  happens in the runtime host after the human answers, never in",
-    "  your context. Only a Core-recorded approval counts. Never sign,",
-    "  proxy, or claim PO authority.",
+    "  your context. Only a Core-recorded approval counts. Retire",
+    "  replaced drafts with `chrono_artifact_supersede` (never delete",
+    "  files or edit the database). Never sign, proxy, or claim PO",
+    "  authority.",
     "- Apply the Karpathy Guidelines skill throughout (think before coding,",
     `  simplicity first, surgical changes, goal-driven verified execution; pinned ${SKILL_RELEASE.pinnedCommit})`,
     "  without ever simplifying away security, traceability, evidence,",
@@ -278,7 +280,7 @@ export function buildOpenCodeAgentDefinition(role: ChronoOpenCodeRole): string {
   // precedence; the in-execute ask() remains the backstop.
   const permission =
     role === "gaspar"
-      ? "permission:\n  chrono_artifact_status: allow\n  chrono_artifact_propose: allow\n  chrono_artifact_revise: allow\n  chrono_approval_request: allow\n  chrono_approval_status: allow\n  chrono_approval_confirm: ask\n"
+      ? "permission:\n  chrono_artifact_status: allow\n  chrono_artifact_propose: allow\n  chrono_artifact_revise: allow\n  chrono_artifact_supersede: allow\n  chrono_approval_request: allow\n  chrono_approval_status: allow\n  chrono_approval_confirm: ask\n"
       : "";
   return `---\ndescription: ${ROLE_DESCRIPTIONS[role]}\nmode: ${mode}\n${permission}---\n\n${ROLE_BODIES[role]}\n`;
 }

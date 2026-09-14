@@ -31,7 +31,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import {
@@ -213,7 +213,7 @@ describe("OC-P11 native planning tools", () => {
     writeFileSync(join(root, OPENCODE_TOOLS_PACKAGE_RELATIVE), buildPlanningToolsPackage(), "utf8");
     tools = (await import(pathToFileURL(join(root, OPENCODE_TOOLS_FILE_RELATIVE)).href)) as Record<string, unknown>;
     savedEnv = { ...process.env };
-    for (const key of ["CHRONO_BIN", "CHRONO_KEY_HELPER", "CHRONO_SESSION_TOKEN"]) {
+    for (const key of ["CHRONO_BIN", "CHRONO_SESSION_TOKEN"]) {
       delete process.env[key];
     }
     // Real CLI shape behind a node shim (same boundary OpenCode uses).
@@ -236,12 +236,16 @@ describe("OC-P11 native planning tools", () => {
     );
     expect(core.enrollPo({ publicKeyPem: pair.publicKeyPem, nonce, timestamp, rationale: "test", confirmation, signature }).ok).toBe(true);
     signingKey = pair.privateKeyPem;
+    // Fixture `security` on PATH printing the enrolled key (no test
+    // seam in production bytes; PATH injection is the hermetic
+    // boundary, mirroring the macOS helper contract).
     const keyFile = join(root, "po-key.pem");
     writeFileSync(keyFile, signingKey, { mode: 0o600 });
-    const helper = join(root, "key-helper.sh");
-    writeFileSync(helper, `#!/bin/sh\ncat "${keyFile}"\n`, "utf8");
-    chmodSync(helper, 0o755);
-    process.env["CHRONO_KEY_HELPER"] = helper;
+    const fixtureBin = join(root, "fixture-bin");
+    mkdirSync(fixtureBin, { recursive: true });
+    writeFileSync(join(fixtureBin, "security"), `#!/bin/sh\ncat "${keyFile}"\n`, "utf8");
+    chmodSync(join(fixtureBin, "security"), 0o755);
+    process.env["PATH"] = `${fixtureBin}${delimiter}${process.env["PATH"] ?? ""}`;
     const sessionNonce = randomBytes(16).toString("hex");
     const sessionTimestamp = "2026-09-11T00:00:00.000Z";
     const sessionSig = signApprovalPayload(
@@ -269,7 +273,7 @@ describe("OC-P11 native planning tools", () => {
       if (savedEnv[key] === undefined) delete process.env[key];
       else process.env[key] = savedEnv[key];
     }
-    for (const key of ["CHRONO_BIN", "CHRONO_KEY_HELPER", "CHRONO_SESSION_TOKEN"]) {
+    for (const key of ["CHRONO_BIN", "CHRONO_SESSION_TOKEN"]) {
       if (!(key in savedEnv)) delete process.env[key];
     }
     try {
@@ -284,10 +288,11 @@ describe("OC-P11 native planning tools", () => {
 
   it("registers exactly the six governed tools with stable schemas", () => {
     // OpenCode resolves tool names as <filename>_<export>; the module
-    // file is `chrono`, so these exports become chrono_artifact_* and
-    // chrono_approval_* in the runtime.
-    const exports = ["artifact_status", "artifact_propose", "artifact_revise", "approval_request", "approval_status", "approval_confirm"];
-    expect(Object.keys(tools).sort()).toEqual(exports.sort());
+    // file is `chrono`, so tool exports become chrono_artifact_* and
+    // chrono_approval_* in the runtime. Key helpers are exported for
+    // parity tests (never model tools: they take no project action).
+    const exports = ["artifact_status", "artifact_propose", "artifact_revise", "artifact_supersede", "approval_request", "approval_status", "approval_confirm"];
+    expect(Object.keys(tools).sort()).toEqual([...exports, "normalizeKeyMaterial", "parsePoKey"].sort());
     expect(exports.map((e) => `chrono_${e}`).sort()).toEqual([...CHRONO_NATIVE_TOOLS].sort());
     for (const name of exports) {
       const def = tools[name] as { description: string; args: unknown; execute: unknown };
@@ -295,9 +300,10 @@ describe("OC-P11 native planning tools", () => {
       expect(def.description.length).toBeGreaterThan(20);
       expect(typeof def.execute).toBe("function");
     }
-    // No product-code, shell, hook, or credential surface exists here.
+    // No product-code, shell, hook, or credential surface exists here
+    // (key helpers are pure validators, not credential accessors).
     for (const name of Object.keys(tools)) {
-      expect(name).not.toMatch(/write|edit|bash|shell|hook|token|key|secret|db/i);
+      expect(name).not.toMatch(/write|edit|bash|shell|hook|token|secret|db/i);
     }
     // Schemas carry the contract Gaspar programs against.
     const propose = tools["artifact_propose"] as { args: Record<string, { parse: (v: unknown) => unknown }> };
@@ -626,6 +632,169 @@ describe("OC-P11 setup repair for native tools", () => {
     writeFileSync(join(tempDir, OPENCODE_TOOLS_FILE_RELATIVE), "// hand-edited drift\n", "utf8");
     expect(runSetup(tempDir, { adapter: "fixture", rtkBinary, json: true }).exitCode).toBe(0);
     expect(readFileSync(join(tempDir, OPENCODE_TOOLS_FILE_RELATIVE), "utf8")).toBe(buildPlanningToolsFile());
+  });
+});
+
+describe("OC-P11 native supersede, heal, and retry semantics (D3/D4)", () => {
+  let tempDir: string;
+  let root: string;
+  let core: ChronoCore;
+  let gasparSession = { id: "", token: "" };
+  let restoreTty: () => void;
+  let savedEnv: Record<string, string | undefined>;
+  const openSessionId = "native-d3-1";
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let tools: Record<string, any>;
+  let askMode: "allow" | "deny" = "allow";
+
+  function toolContext(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      sessionID: openSessionId,
+      messageID: "m1",
+      agent: "gaspar",
+      directory: root,
+      worktree: root,
+      abort: new AbortController().signal,
+      metadata: () => undefined,
+      ask: async () => {
+        if (askMode === "deny") {
+          throw new Error("human declined");
+        }
+      },
+      ...overrides,
+    };
+  }
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-native-d3-"));
+    root = realpathSync(tempDir);
+    const fixtureModules = join(root, "node_modules");
+    mkdirSync(join(fixtureModules, "@opencode-ai"), { recursive: true });
+    symlinkSync(join(REPO_ROOT, "node_modules", "@opencode-ai", "plugin"), join(fixtureModules, "@opencode-ai", "plugin"), "dir");
+    symlinkSync(join(REPO_ROOT, "node_modules", "zod"), join(fixtureModules, "zod"), "dir");
+    mkdirSync(join(root, ".opencode", "tools"), { recursive: true });
+    writeFileSync(join(root, OPENCODE_TOOLS_FILE_RELATIVE), buildPlanningToolsFile(), "utf8");
+    tools = (await import(pathToFileURL(join(root, OPENCODE_TOOLS_FILE_RELATIVE)).href)) as Record<string, unknown>;
+    savedEnv = { ...process.env };
+    for (const key of ["CHRONO_BIN", "CHRONO_SESSION_TOKEN"]) {
+      delete process.env[key];
+    }
+    const shim = join(root, "chrono-shim.sh");
+    writeFileSync(shim, `#!/bin/sh\nexec node ${join(REPO_ROOT, "packages", "cli", "dist", "bin.js")} "$@"\n`, "utf8");
+    chmodSync(shim, 0o755);
+    process.env["CHRONO_BIN"] = shim;
+    core = new ChronoCore({ projectPath: root, runtime: "opencode" });
+    expect(core.init().ok).toBe(true);
+    const pair = generateApprovalKeyPair();
+    restoreTty = fakeTty();
+    const nonce = randomBytes(16).toString("hex");
+    const fingerprint = fingerprintPublicKey(pair.publicKeyPem);
+    const confirmation = buildEnrollmentChallenge("default", fingerprint, nonce);
+    const timestamp = new Date().toISOString();
+    const signature = signApprovalPayload(
+      buildEnrollmentPayload({ projectId: "default", fingerprint, timestamp, nonce, authority: "PO", rationale: "test", confirmation }),
+      pair.privateKeyPem
+    );
+    expect(core.enrollPo({ publicKeyPem: pair.publicKeyPem, nonce, timestamp, rationale: "test", confirmation, signature }).ok).toBe(true);
+    const keyFile = join(root, "po-key.pem");
+    writeFileSync(keyFile, pair.privateKeyPem, { mode: 0o600 });
+    const fixtureBin = join(root, "fixture-bin");
+    mkdirSync(fixtureBin, { recursive: true });
+    writeFileSync(join(fixtureBin, "security"), `#!/bin/sh\ncat "${keyFile}"\n`, "utf8");
+    chmodSync(join(fixtureBin, "security"), 0o755);
+    process.env["PATH"] = `${fixtureBin}${delimiter}${process.env["PATH"] ?? ""}`;
+    const sessionNonce = randomBytes(16).toString("hex");
+    const sessionTimestamp = "2026-09-11T00:00:00.000Z";
+    const sessionSig = signApprovalPayload(
+      buildSessionAuthorizationPayload({
+        sessionRole: "gaspar", adapter: "test-adapter", runtime: "opencode",
+        scopeModule: null, scopeWp: null, ttlSeconds: 3600, nonce: sessionNonce,
+        authority: "PO", rationale: "test", timestamp: sessionTimestamp,
+      }),
+      pair.privateKeyPem
+    );
+    const opened = core.openSession(
+      { role: "gaspar", adapter: "test-adapter", runtime: "opencode", ttlSeconds: 3600 },
+      { poAuthorization: { nonce: sessionNonce, authority: "PO", rationale: "test", timestamp: sessionTimestamp, signature: sessionSig } }
+    );
+    expect(opened.ok).toBe(true);
+    gasparSession = { id: opened.value!.id, token: opened.value!.token };
+    writeFileSync(
+      join(tmpdir(), `chrono-gaspar-host-${createHash("sha256").update(`${root}|${openSessionId}`, "utf8").digest("hex").slice(0, 16)}.token`),
+      `${gasparSession.id}/${gasparSession.token}`,
+      { mode: 0o600 }
+    );
+    askMode = "allow";
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(savedEnv)) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+    restoreTty();
+    core.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("supersedes through the native tool with coherent registry/file/status", async () => {
+    const call = async (name: string, args: Record<string, unknown>): Promise<string> => {
+      const fn = tools[name] as { execute: (a: unknown, c: unknown) => Promise<string> };
+      return fn.execute(args, toolContext());
+    };
+    await call("artifact_propose", { kind: "spec", id: "SP-0003", title: "Old", body: "Old contract." });
+    await call("artifact_propose", { kind: "spec", id: "SP-0004", title: "New", body: "New contract." });
+    const done = JSON.parse(await call("artifact_supersede", { id: "SP-0003", supersededBy: "SP-0004" })) as {
+      ok: boolean;
+      supersededBy: string;
+    };
+    expect(done).toMatchObject({ ok: true, supersededBy: "SP-0004" });
+    const status = JSON.parse(await call("artifact_status", {})) as {
+      items: Array<{ id: string; lifecycle: string; supersededBy: string | null; filePresent: boolean }>;
+    };
+    expect(status.items.find((i) => i.id === "SP-0003")).toMatchObject({ lifecycle: "superseded", supersededBy: "SP-0004", filePresent: true });
+    expect(status.items.find((i) => i.id === "SP-0004")).toMatchObject({ lifecycle: "active" });
+    // Unknown replacement and double supersede deny.
+    await expect(call("artifact_supersede", { id: "SP-0003", supersededBy: "SP-0004" })).rejects.toThrow();
+    await expect(call("artifact_supersede", { id: "SP-0004", supersededBy: "SP-9999" })).rejects.toThrow(/REFERENCE_UNRESOLVABLE/);
+  });
+
+  it("heals a missing file through the native revise path", async () => {
+    const call = async (name: string, args: Record<string, unknown>): Promise<string> => {
+      const fn = tools[name] as { execute: (a: unknown, c: unknown) => Promise<string> };
+      return fn.execute(args, toolContext());
+    };
+    await call("artifact_propose", { kind: "spec", id: "SP-0001", title: "S", body: "Body." });
+    rmSync(join(root, ".chrono", "specs", "SP-0001.md"));
+    const healed = JSON.parse(await call("artifact_revise", { id: "SP-0001", title: "S", body: "Body." })) as {
+      ok: boolean;
+      healed: boolean;
+      revision: string;
+    };
+    expect(healed).toMatchObject({ ok: true, healed: true });
+    expect(existsSync(join(root, ".chrono", "specs", "SP-0001.md"))).toBe(true);
+  });
+
+  it("denials name their layer and same-ticket retryability (D4)", async () => {
+    const call = async (name: string, args: Record<string, unknown>): Promise<string> => {
+      const fn = tools[name] as { execute: (a: unknown, c: unknown) => Promise<string> };
+      return fn.execute(args, toolContext());
+    };
+    await call("artifact_propose", { kind: "spec", id: "SP-0001", title: "S", body: "Body." });
+    const specRev = core.getArtifact("SP-0001").revision;
+    const requested = JSON.parse(await call("approval_request", {
+      action: "planning-approval", scope: "SP-0001", revision: specRev, rationale: "r", securityImplications: "s",
+    })) as { ticketId: string };
+    // Host-boundary denial (declined human answer): layer=host, same ticket retryable.
+    askMode = "deny";
+    await expect(call("approval_confirm", { ticket: requested.ticketId })).rejects.toThrow(/layer=host retryable=yes/);
+    askMode = "allow";
+    // Malformed ticket: host denial, not retryable.
+    await expect(call("approval_confirm", { ticket: "bogus" })).rejects.toThrow(/layer=host retryable=no/);
+    // Genuine confirmation succeeds; replay then needs a fresh ticket.
+    const receipt = JSON.parse(await call("approval_confirm", { ticket: requested.ticketId })) as { ok: boolean };
+    expect(receipt.ok).toBe(true);
+    await expect(call("approval_confirm", { ticket: requested.ticketId })).rejects.toThrow(/layer=core retryable=no/);
   });
 });
 

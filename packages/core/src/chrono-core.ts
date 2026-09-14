@@ -7013,6 +7013,7 @@ export class ChronoCore {
     readonly seq: number;
     readonly eventType: string;
     readonly entityId: string;
+    readonly payload: string;
     readonly actor: string;
     readonly timestamp: string;
   }> {
@@ -7020,9 +7021,16 @@ export class ChronoCore {
       seq: e.seq,
       eventType: e.eventType,
       entityId: e.entityId,
+      payload: e.payload,
       actor: e.actor,
       timestamp: e.timestamp,
     }));
+  }
+
+  /** Versioned security-profile row (read-only, for status and tests). */
+  describeSecurityProfile(id: string): { id: string; version: number; contentHash: string } {
+    const row = this.db.securityProfiles().findById(id);
+    return { id: row.id, version: row.version, contentHash: row.contentHash };
   }
 
   /**
@@ -7239,6 +7247,11 @@ export class ChronoCore {
   /** Runtime-config key tracking the current revision of a file-tracked plan. */
   private planningRevisionKey(id: string): string {
     return `planning.revision.${id}`;
+  }
+
+  /** Runtime-config key recording which draft superseded this one (D3). */
+  private planningSupersededKey(id: string): string {
+    return `planning.superseded.${id}`;
   }
 
   /** Runtime-config key holding the JSON index of planning ids. */
@@ -7543,13 +7556,15 @@ export class ChronoCore {
    * Revise a planning draft (OC-P11 req 7,22). New file revision +
    * registry revision atomically; prior planning-approvals bound to the
    * old revision go stale deterministically (hasValidApproval compares
-   * against the current revision).
+   * against the current revision). A missing file with identical
+   * content heals in place (D3) instead of denying: same revision,
+   * rematerialized file, healed audit event.
    */
   revisePlanningArtifact(
     id: string,
     input: { title: string; body: string },
     auth: CallerAuth
-  ): CoreResult<{ id: string; revision: string; path: string; approvalCommand: string }> {
+  ): CoreResult<{ id: string; revision: string; path: string; approvalCommand: string; healed: boolean }> {
     try {
       const caller = this.requireCapability("planning.revise", this.resolveCaller(auth, "revise planning artifact"));
       const index = this.readPlanningIndex();
@@ -7561,6 +7576,16 @@ export class ChronoCore {
           invariantRef: "INV §10.2",
           affectedTarget: id,
           suggestedAction: "Propose the planning draft before revising it",
+        });
+      }
+      if (this.db.runtimeConfig().get(this.planningSupersededKey(id)) !== null) {
+        throw new ChronoError({
+          code: ErrorCode.INVALID_STATE,
+          severity: Severity.ERROR,
+          message: `Planning artifact '${id}' is superseded: revise the replacement draft instead`,
+          invariantRef: "INV §3.1",
+          affectedTarget: id,
+          suggestedAction: "Propose a new revision under the replacing draft's identifier",
         });
       }
       // Recover the kind from the identifier pattern (one id, one kind:
@@ -7588,7 +7613,8 @@ export class ChronoCore {
       const dest = this.planningDestination(resolvedKind, id);
       const revision = computeRevisionHash({ kind: resolvedKind, id, title: input.title, body: input.body });
       const current = this.db.runtimeConfig().get(this.planningRevisionKey(id));
-      if (current === revision) {
+      const fileMissing = !fsExistsSync(dest);
+      if (current === revision && !fileMissing) {
         throw new ChronoError({
           code: ErrorCode.DUPLICATE_IDENTITY,
           severity: Severity.ERROR,
@@ -7597,6 +7623,30 @@ export class ChronoCore {
           affectedTarget: id,
           suggestedAction: "Change the title or body to record a new revision",
         });
+      }
+      if (current === revision && fileMissing) {
+        // Heal (D3): identical content, absent file. Rematerialize the
+        // exact revision and audit the recovery; approvals stay valid
+        // because the content — and therefore the revision — is
+        // unchanged.
+        const file = this.renderPlanningFile(resolvedKind, id, input.title, input.body, revision);
+        fsMkdirSync(pathDirname(dest), { recursive: true });
+        fsWriteFileSync(`${dest}.chrono-tmp-${process.pid}`, file, "utf8");
+        fsRenameSync(`${dest}.chrono-tmp-${process.pid}`, dest);
+        this.events.append({
+          eventType: "PlanningFileHealed",
+          entityId: id,
+          payload: { type: "PLANNING_DRAFT", kind: resolvedKind, revision },
+          actor: caller.auditActor,
+          priorState: "DRAFT",
+          newState: "DRAFT",
+          reasoning: "Missing planning file rematerialized at the recorded revision",
+        });
+        this.syncProjectState();
+        const healApprovalCommand =
+          `chrono approve --action planning-approval --scope ${id} --revision ${revision} ` +
+          `--authority <PO> --rationale "<decision rationale>" --path <project>`;
+        return { ok: true, value: { id, revision, path: dest, approvalCommand: healApprovalCommand, healed: true } };
       }
       const file = this.renderPlanningFile(resolvedKind, id, input.title, input.body, revision);
       const family = PLANNING_KIND_FAMILY[resolvedKind];
@@ -7654,8 +7704,10 @@ export class ChronoCore {
             this.projects.setArchitecture("default", "ARCH", revision, "proposed");
           }
           if (resolvedKind === "security-profile") {
-            const version = this.db.securityProfiles().listAll().length + 1;
-            this.db.securityProfiles().create(id, version, revision);
+            // Governed revision, not a duplicate row (OC-P11 D2): the
+            // logical id stays stable while version and content hash
+            // advance inside this same transaction.
+            this.db.securityProfiles().recordRevision(id, revision);
           }
           this.events.append({
             eventType: "ArtifactRevised",
@@ -7686,7 +7738,161 @@ export class ChronoCore {
       const approvalCommand =
         `chrono approve --action planning-approval --scope ${id} --revision ${revision} ` +
         `--authority <PO> --rationale "<decision rationale>" --path <project>`;
-      return { ok: true, value: { id, revision, path: dest, approvalCommand } };
+      return { ok: true, value: { id, revision, path: dest, approvalCommand, healed: false } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Supersede one planning draft by another (OC-P11 D3).
+   *
+   * The planning layer retires the draft WITHOUT touching the
+   * normative Spec lifecycle (a DRAFT has no legal SUPERSEDED
+   * transition): the index records the replacement, the file keeps a
+   * supersession banner over its preserved body (auditable, never a
+   * missing file), and the status projection reports the superseded
+   * lifecycle with its pointer. References still resolve; execution
+   * stays impossible because a non-READY Spec never passes its gate.
+   * Gaspar/PO only (`planning.supersede`).
+   */
+  supersedePlanningArtifact(
+    id: string,
+    supersededBy: string,
+    auth: CallerAuth
+  ): CoreResult<{ id: string; revision: string; supersededBy: string; path: string }> {
+    try {
+      const caller = this.requireCapability("planning.supersede", this.resolveCaller(auth, "supersede planning artifact"));
+      const index = this.readPlanningIndex();
+      if (!index.includes(id)) {
+        throw new ChronoError({
+          code: ErrorCode.ENTITY_NOT_FOUND,
+          severity: Severity.ERROR,
+          message: `Planning artifact '${id}' not found: propose it first`,
+          invariantRef: "INV §10.2",
+          affectedTarget: id,
+          suggestedAction: "Propose the planning draft before superseding it",
+        });
+      }
+      if (this.db.runtimeConfig().get(this.planningSupersededKey(id)) !== null) {
+        throw new ChronoError({
+          code: ErrorCode.INVALID_STATE,
+          severity: Severity.ERROR,
+          message: `Planning artifact '${id}' is already superseded`,
+          invariantRef: "INV §3.1",
+          affectedTarget: id,
+          suggestedAction: "Follow the recorded replacement pointer",
+        });
+      }
+      if (supersededBy === id) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Planning artifact '${id}' cannot supersede itself`,
+          invariantRef: "INV §14.4",
+          affectedTarget: id,
+          suggestedAction: "Point at the replacing draft's identifier",
+        });
+      }
+      try {
+        this.artifacts.findById(supersededBy);
+      } catch {
+        if (this.db.runtimeConfig().get(this.planningRevisionKey(supersededBy)) === null) {
+          throw new ChronoError({
+            code: ErrorCode.REFERENCE_UNRESOLVABLE,
+            severity: Severity.ERROR,
+            message: `Superseding target '${supersededBy}' does not resolve: denied`,
+            invariantRef: "INV §10.2",
+            affectedTarget: id,
+            suggestedAction: "Propose the replacement draft first",
+          });
+        }
+      }
+      const resolvedKind = (Object.keys(PLANNING_KIND_DIR) as PlanningKind[]).find((k) => {
+        try {
+          assertPlanningId(k, id);
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      if (resolvedKind === undefined) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Planning artifact '${id}' has no resolvable kind: denied`,
+          invariantRef: "INV §14.4",
+          affectedTarget: id,
+          suggestedAction: "Propose the draft again with a canonical identifier",
+        });
+      }
+      const revision = this.db.runtimeConfig().get(this.planningRevisionKey(id));
+      const projectRevision = id === "ARCH" ? this.projects.findById("default").architectureRevision : null;
+      const boundRevision = projectRevision ?? revision;
+      if (boundRevision === null) {
+        throw new ChronoError({
+          code: ErrorCode.MISSING_REQUIRED_ARTIFACT,
+          severity: Severity.ERROR,
+          message: `Planning artifact '${id}' has no recorded revision: denied`,
+          invariantRef: "INV §14.4",
+          affectedTarget: id,
+          suggestedAction: "Propose the draft before superseding it",
+        });
+      }
+      const dest = this.planningDestination(resolvedKind, id);
+      // Banner over the preserved body (or an explicit marker when the
+      // file is already absent): the file never goes missing silently.
+      let body = "";
+      try {
+        const current = readFileSync(dest, "utf8");
+        const marker = "\n---\n";
+        const second = current.indexOf(marker, 3);
+        body = second === -1 ? current : current.slice(second + marker.length);
+      } catch {
+        body = `_Original content unavailable: superseded without a local file. See revision ${boundRevision} in the audit history._\n`;
+      }
+      const bannered = [
+        "---",
+        `id: ${id}`,
+        `kind: ${resolvedKind}`,
+        `revision: ${boundRevision}`,
+        `status: SUPERSEDED`,
+        `superseded_by: ${supersededBy}`,
+        `generated_by: chrono-planning`,
+        "---",
+        "",
+        `> Superseded by ${supersededBy}. This draft is retired: work continues under the replacement identifier.`,
+        "",
+        body.trim(),
+        "",
+      ].join("\n");
+      fsMkdirSync(pathDirname(dest), { recursive: true });
+      const tmp = `${dest}.chrono-tmp-${process.pid}`;
+      fsWriteFileSync(tmp, bannered, "utf8");
+      try {
+        fsRenameSync(tmp, dest);
+      } catch (e) {
+        try {
+          fsRmSync(tmp, { force: true });
+        } catch {
+          // Best-effort.
+        }
+        throw e;
+      }
+      this.db.transaction(() => {
+        this.db.runtimeConfig().set(this.planningSupersededKey(id), supersededBy);
+        this.events.append({
+          eventType: "PlanningSuperseded",
+          entityId: id,
+          payload: { type: "PLANNING_DRAFT", kind: resolvedKind, revision: boundRevision, supersededBy },
+          actor: caller.auditActor,
+          priorState: "DRAFT",
+          newState: "SUPERSEDED",
+          reasoning: "Planning draft superseded by a replacement draft",
+        });
+      });
+      this.syncProjectState();
+      return { ok: true, value: { id, revision: boundRevision, supersededBy, path: dest } };
     } catch (e) {
       return this.handleError(e);
     }
@@ -7705,6 +7911,8 @@ export class ChronoCore {
       revision: string;
       filePresent: boolean;
       approval: "approved" | "awaiting-signature" | "stale" | "rejected";
+      lifecycle: "active" | "superseded";
+      supersededBy: string | null;
       detail: string;
     }>;
   }> {
@@ -7717,6 +7925,8 @@ export class ChronoCore {
         revision: string;
         filePresent: boolean;
         approval: "approved" | "awaiting-signature" | "stale" | "rejected";
+        lifecycle: "active" | "superseded";
+        supersededBy: string | null;
         detail: string;
       }> = [];
       for (const id of this.readPlanningIndex()) {
@@ -7759,14 +7969,24 @@ export class ChronoCore {
         // Rejected = a revoked planning-approval with no current approval.
         const rejected = this.db.approvals().listAll().some((a) => a.scopeArtifactId === id && a.revoked) && !approved && !stale;
         const approval = approved ? "approved" : rejected ? "rejected" : stale ? "stale" : "awaiting-signature";
-        const detail = approved
-          ? `PO-signed planning-approval is current for ${revision.slice(0, 16)}…`
-          : stale
-            ? `Revision changed since the last PO signature: a new signed approval is required`
-            : rejected
-              ? `The PO approval was revoked: re-propose or revise, then request a new signature`
-              : `PO stated approval in chat is NOT registered: only a successful Core-signed approval counts; run the approval ceremony for this exact revision`;
-        items.push({ id, kind, revision, filePresent, approval, detail });
+        // Supersession lifecycle (D3): retired drafts point at their
+        // replacement instead of reading as active work. A missing file
+        // on an active draft is an explicit repair signal, not a silent
+        // gap: revise rematerializes it.
+        const supersededBy = this.db.runtimeConfig().get(this.planningSupersededKey(id));
+        const lifecycle = supersededBy === null ? "active" : "superseded";
+        const detail = supersededBy !== null
+          ? `Superseded by ${supersededBy}: retired draft, work continues under the replacement identifier`
+          : !filePresent
+            ? `File is missing for an active draft: revise with identical content to rematerialize it, or revise with new content`
+            : approved
+              ? `PO-signed planning-approval is current for ${revision.slice(0, 16)}…`
+              : stale
+                ? `Revision changed since the last PO signature: a new signed approval is required`
+                : rejected
+                  ? `The PO approval was revoked: re-propose or revise, then request a new signature`
+                  : `PO stated approval in chat is NOT registered: only a successful Core-signed approval counts; run the approval ceremony for this exact revision`;
+        items.push({ id, kind, revision, filePresent, approval, lifecycle, supersededBy, detail });
       }
       return { ok: true, value: { items } };
     } catch (e) {

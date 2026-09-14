@@ -227,7 +227,7 @@ Configuration-file presence (`rtk.yaml`) is NOT proof of routing `[P8.7]`.
 Adapters MUST distinguish four tool classes inside CHRONO projects:
 
 - **Governed planning mutation** — the NATIVE tools
-  (`chrono_artifact_status/propose/revise`,
+  (`chrono_artifact_status/propose/revise/supersede`,
   `chrono_approval_request/status/confirm` in
   `.opencode/tools/chrono.ts`): real model-callable tools with stable
   schemas, host-held sessions, stdin bodies, and Core validation of

@@ -48,7 +48,7 @@ import {
   entryCommanderOption,
 } from "./entry-contract.js";
 import { constructionFailure, openReadProject, resolveProjectDir } from "./project.js";
-import { runArtifactPropose, runArtifactRevise, runArtifactStatus } from "./artifact-cli.js";
+import { runArtifactPropose, runArtifactRevise, runArtifactStatus, runArtifactSupersede } from "./artifact-cli.js";
 import { runApprovalRecord, runApprovalRequest, runApprovalTicket } from "./approval-ceremony-cli.js";
 
 export { buildOpencodePlugin };
@@ -144,6 +144,7 @@ interface CommandOpts {
   readonly timestamp?: unknown;
   readonly signature?: unknown;
   readonly bodyStdin?: unknown;
+  readonly by?: unknown;
   readonly evidence?: unknown;
   readonly controls?: unknown;
   readonly followUp?: unknown;
@@ -3529,6 +3530,29 @@ export function createProgram(cwd: string): Command {
           title: String(opts.title ?? ""),
           ...(typeof opts.bodyFile === "string" && opts.bodyFile.length > 0 ? { bodyFile: opts.bodyFile } : {}),
           ...(stdinBody !== null ? { bodyText: stdinBody } : {}),
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  artifactCmd
+    .command("supersede")
+    .description("Retire a planning draft by its replacement (file keeps a banner; history preserved)")
+    .requiredOption("--id <id>", "planning artifact identifier to retire")
+    .requiredOption("--by <id>", "replacing draft identifier (must resolve)")
+    .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runArtifactSupersede(projectPath, {
+          id: String(opts.id ?? ""),
+          supersededBy: String(opts.by ?? ""),
           as: String(opts.as ?? ""),
           ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
           json: opts.json === true,

@@ -331,6 +331,124 @@ describe("OC-P11 planning authoring", () => {
     expect(core.getArtifact("SP-0001").status).toBe("DRAFT");
   });
 
+  it("security-profile revision advances the versioned row without collision (D2)", () => {
+    const first = core.proposePlanningArtifact({ kind: "security-profile", id: "SEC-0001", title: "Threats", body: "Boundaries v1." }, gaspar);
+    expect(first.ok).toBe(true);
+    // Initial proposal: version 1 bound to the file revision.
+    const row1 = core.describeSecurityProfile("SEC-0001");
+    expect(row1).toMatchObject({ version: 1, contentHash: first.value!.revision });
+    // Revision: same logical id, bumped version, moved hash, one row.
+    const second = core.revisePlanningArtifact("SEC-0001", { title: "Threats", body: "Boundaries v2 with abuse cases." }, gaspar);
+    expect(second.ok).toBe(true);
+    expect(second.value!.revision).not.toBe(first.value!.revision);
+    const row2 = core.describeSecurityProfile("SEC-0001");
+    expect(row2).toMatchObject({ version: 2, contentHash: second.value!.revision });
+    // Prior approval for rev1 is stale; the projection tracks current.
+    expect(core.hasValidApproval("SEC-0001", first.value!.revision, "planning-approval")).toBe(false);
+    const status = core.planningStatus(gaspar);
+    expect(status.value!.items.find((i) => i.id === "SEC-0001")?.revision).toBe(second.value!.revision);
+  });
+
+  it("security-profile survives restart and rolls back cleanly on failure (D2)", () => {
+    const first = core.proposePlanningArtifact({ kind: "security-profile", id: "SEC-0001", title: "Threats", body: "Boundaries v1." }, gaspar);
+    expect(first.ok).toBe(true);
+    const second = core.revisePlanningArtifact("SEC-0001", { title: "Threats", body: "Boundaries v2." }, gaspar);
+    expect(second.ok).toBe(true);
+    const reopened = new ChronoCore({ projectPath: tempDir, runtime: "test-runtime" });
+    try {
+      const again = { actor: "gaspar", session: bootstrapSession(reopened, "gaspar", privateKeyPem) };
+      expect(reopened.describeSecurityProfile("SEC-0001")).toMatchObject({ version: 2, contentHash: second.value!.revision });
+      const status = reopened.planningStatus(again);
+      expect(status.value!.items.find((i) => i.id === "SEC-0001")?.revision).toBe(second.value!.revision);
+      // Failed revise changes nothing: same version, hash, and file.
+      const bad = reopened.revisePlanningArtifact("SEC-0001", { title: "Threats", body: "x".repeat(70000) }, again);
+      expect(bad.ok).toBe(false);
+      expect(reopened.describeSecurityProfile("SEC-0001")).toMatchObject({ version: 2, contentHash: second.value!.revision });
+    } finally {
+      reopened.close();
+    }
+    // Original handle agrees after reopen (no divergence).
+    expect(core.describeSecurityProfile("SEC-0001")).toMatchObject({ version: 2, contentHash: second.value!.revision });
+  });
+
+  it("rapid sequential security-profile revisions stay coherent (D2)", () => {
+    const first = core.proposePlanningArtifact({ kind: "security-profile", id: "SEC-0001", title: "Threats", body: "v1." }, gaspar);
+    expect(first.ok).toBe(true);
+    const revisions = [first.value!.revision];
+    for (let n = 2; n <= 4; n++) {
+      const revised = core.revisePlanningArtifact("SEC-0001", { title: "Threats", body: `v${String(n)} with control ${String(n)}.` }, gaspar);
+      expect(revised.ok).toBe(true);
+      revisions.push(revised.value!.revision);
+    }
+    // Triple agreement: file revision, registry revision, profile hash.
+    const file = readFileSync(join(core.projectPath(), ".chrono/security/SEC-0001.md"), "utf8");
+    const row = core.describeSecurityProfile("SEC-0001");
+    expect(row.version).toBe(4);
+    expect(file).toContain(row.contentHash);
+    const status = core.planningStatus(gaspar);
+    expect(status.value!.items.find((i) => i.id === "SEC-0001")?.revision).toBe(row.contentHash);
+    // Every revision remains in audit history.
+    const seen = new Set(core.listEvents().filter((e) => e.entityId === "SEC-0001").map((e) => JSON.parse(e.payload as string).revision as string));
+    for (const revision of revisions) {
+      expect(seen.has(revision)).toBe(true);
+    }
+  });
+
+  it("superseded drafts stay coherent: registry, file, status, and references agree (D3)", () => {
+    const oldSpec = core.proposePlanningArtifact({ kind: "spec", id: "SP-0003", title: "Old", body: "Old contract." }, gaspar);
+    expect(oldSpec.ok).toBe(true);
+    const newSpec = core.proposePlanningArtifact({ kind: "spec", id: "SP-0004", title: "New", body: "New contract." }, gaspar);
+    expect(newSpec.ok).toBe(true);
+    const superseded = core.supersedePlanningArtifact("SP-0003", "SP-0004", gaspar);
+    expect(superseded.ok).toBe(true);
+    expect(superseded.value).toMatchObject({ id: "SP-0003", supersededBy: "SP-0004" });
+    // Registry, filesystem, and projection agree: no active artifact
+    // with a missing file.
+    const status = core.planningStatus(gaspar);
+    const item = status.value!.items.find((i) => i.id === "SP-0003");
+    expect(item).toMatchObject({ lifecycle: "superseded", supersededBy: "SP-0004", filePresent: true });
+    const text = readFileSync(join(core.projectPath(), ".chrono/specs/SP-0003.md"), "utf8");
+    expect(text).toContain("status: SUPERSEDED");
+    expect(text).toContain("SP-0004");
+    expect(text).toContain("Old contract.");
+    // References still resolve; execution stays impossible (DRAFT, never READY).
+    expect(core.getArtifact("SP-0003").status).toBe("DRAFT");
+    const mod = core.proposePlanningArtifact(
+      { kind: "module", id: "MOD-0001", title: "M", body: "Plan.", references: ["SP-0003", "SP-0004"] },
+      gaspar
+    );
+    expect(mod.ok).toBe(true);
+    expect(core.transitionState("MOD-0001", "ModulePlanned", { actor: "gaspar", session: gaspar.session }).ok).toBe(false);
+    // Supersede is terminal: double supersede and revise both deny.
+    expect(core.supersedePlanningArtifact("SP-0003", "SP-0004", gaspar).error?.code).toBe("INVALID_STATE");
+    expect(core.revisePlanningArtifact("SP-0003", { title: "Old", body: "Changed." }, gaspar).error?.code).toBe("INVALID_STATE");
+    expect(core.supersedePlanningArtifact("SP-0003", "SP-0003", gaspar).error?.code).toBe("INVALID_STATE");
+    expect(core.supersedePlanningArtifact("SP-0003", "SP-9999", gaspar).error?.code).toBe("INVALID_STATE");
+    expect(core.supersedePlanningArtifact("SP-9999", "SP-0004", gaspar).error?.code).toBe("ENTITY_NOT_FOUND");
+  });
+
+  it("missing planning files heal in place without losing approvals (D3)", () => {
+    const draft = core.proposePlanningArtifact({ kind: "requirement", id: "REQ-0001", title: "R", body: "Body." }, gaspar);
+    expect(draft.ok).toBe(true);
+    rmSync(join(core.projectPath(), ".chrono/context/requirements/REQ-0001.md"));
+    const status = core.planningStatus(gaspar);
+    expect(status.value!.items.find((i) => i.id === "REQ-0001")).toMatchObject({ filePresent: false });
+    // Identical content rematerializes the exact revision (healed).
+    const healed = core.revisePlanningArtifact("REQ-0001", { title: "R", body: "Body." }, gaspar);
+    expect(healed.ok).toBe(true);
+    expect(healed.value).toMatchObject({ revision: draft.value!.revision, healed: true });
+    expect(core.planningStatus(gaspar).value!.items.find((i) => i.id === "REQ-0001")).toMatchObject({ filePresent: true });
+    const events = core.listEvents().filter((e) => e.eventType === "PlanningFileHealed" && e.entityId === "REQ-0001");
+    expect(events).toHaveLength(1);
+  });
+
+  it("workers cannot supersede planning drafts (D3)", () => {
+    const draft = core.proposePlanningArtifact({ kind: "spec", id: "SP-0001", title: "S", body: "Body." }, gaspar);
+    expect(draft.ok).toBe(true);
+    const worker = { actor: "belthazar", session: openWorker(core, "belthazar") };
+    expect(core.supersedePlanningArtifact("SP-0001", "SP-0001", worker).error?.code).toBe("EXECUTION_DENIED");
+  });
+
   it("destinations never escape the project and never touch product code", () => {
     const res = core.proposePlanningArtifact({ kind: "spec", id: "SP-0001", title: "S", body: "Spec." }, gaspar);
     expect(res.ok).toBe(true);

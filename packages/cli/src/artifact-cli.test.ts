@@ -22,7 +22,7 @@ import {
   buildApprovalPayload,
 } from "@chrono/domain";
 import { ChronoCore } from "@chrono/core";
-import { runArtifactPropose, runArtifactRevise, runArtifactStatus } from "./artifact-cli.js";
+import { runArtifactPropose, runArtifactRevise, runArtifactStatus, runArtifactSupersede } from "./artifact-cli.js";
 
 function fakeTty(): () => void {
   const stdinDesc = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
@@ -174,6 +174,33 @@ describe("OC-P11 artifact CLI", () => {
     expect(status.exitCode).toBe(0);
     const items = (JSON.parse(status.stdout) as { items: Array<{ id: string; approval: string }> }).items;
     expect(items.find((i) => i.id === "REQ-0001")?.approval).toBe("awaiting-signature");
+  });
+
+  it("supersedes drafts and heals missing files through the CLI (D3)", () => {
+    const first = runArtifactPropose(tempDir, {
+      kind: "spec", id: "SP-0003", title: "Old", bodyFile: bodyFile("old", "Old contract."),
+      as: "gaspar", sessionToken: gasparToken, json: true,
+    });
+    expect(first.exitCode).toBe(0);
+    const second = runArtifactPropose(tempDir, {
+      kind: "spec", id: "SP-0004", title: "New", bodyFile: bodyFile("new", "New contract."),
+      as: "gaspar", sessionToken: gasparToken, json: true,
+    });
+    expect(second.exitCode).toBe(0);
+    const done = runArtifactSupersede(tempDir, { id: "SP-0003", supersededBy: "SP-0004", as: "gaspar", sessionToken: gasparToken, json: true });
+    expect(done.exitCode).toBe(0);
+    expect(JSON.parse(done.stdout)).toMatchObject({ ok: true, id: "SP-0003", supersededBy: "SP-0004" });
+    const status = runArtifactStatus(tempDir, { as: "gaspar", sessionToken: gasparToken, json: true });
+    const items = (JSON.parse(status.stdout) as { items: Array<{ id: string; lifecycle: string; supersededBy: string | null }> }).items;
+    expect(items.find((i) => i.id === "SP-0003")).toMatchObject({ lifecycle: "superseded", supersededBy: "SP-0004" });
+    // Missing file heals with identical content, same revision.
+    rmSync(join(tempDir, ".chrono/specs/SP-0004.md"));
+    const healed = runArtifactRevise(tempDir, {
+      id: "SP-0004", title: "New", bodyFile: bodyFile("new2", "New contract."),
+      as: "gaspar", sessionToken: gasparToken, json: true,
+    });
+    expect(healed.exitCode).toBe(0);
+    expect(JSON.parse(healed.stdout)).toMatchObject({ ok: true, healed: true });
   });
 
   it("status output carries no body content or secrets", () => {

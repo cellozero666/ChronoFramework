@@ -38,28 +38,13 @@ export class KeychainError extends Error {
 }
 
 /**
- * Normalize keychain-read material to its canonical PEM form without
- * ever weakening custody proof. CRLF becomes LF (CR is meaningless in
- * PEM armor and base64); ASCII whitespace is trimmed at the very
- * start/end; lowercase hex of even length that decodes to PEM-armored
- * bytes is decoded (macOS `security -w` hex transport for multiline
- * secrets). Interior bytes are never touched. Broker secrets (short
- * hex without PEM armor) pass through unchanged.
+ * Normalize keychain-read material to its canonical PEM form.
+ * Single-sourced in `./key-transport.js` (OC-P11 D1) so every PO
+ * signing path — CLI flows here and the embedded copy in generated
+ * native tools — shares one behavior, locked by parity tests.
  */
-export function normalizeKeyTransport(material: string): string {
-  const edge = material.replace(/\r\n/g, "\n").replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, "");
-  if (/^[0-9a-f]+$/i.test(edge) && edge.length % 2 === 0 && edge.length >= 2) {
-    try {
-      const decoded = Buffer.from(edge, "hex").toString("utf8");
-      if (decoded.startsWith("-----BEGIN")) {
-        return decoded;
-      }
-    } catch {
-      // Not decodable hex: fall through to the edge-trimmed form.
-    }
-  }
-  return edge;
-}
+export { normalizeKeyTransport } from "./key-transport.js";
+import { normalizeKeyTransport as normalizeTransport } from "./key-transport.js";
 
 /**
  * Read the PO private key in canonical, signable form, or null when no
@@ -79,7 +64,7 @@ export function readPoPrivateKey(store: KeyStore): string | null {
   if (raw === null || raw.length === 0) {
     return null;
   }
-  const normalized = normalizeKeyTransport(raw);
+  const normalized = normalizeTransport(raw);
   try {
     const key = createPrivateKey(normalized);
     if (key.asymmetricKeyType !== "ed25519") {

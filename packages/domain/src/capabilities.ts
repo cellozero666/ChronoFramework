@@ -20,7 +20,7 @@
 import type { AgentRole } from "./state.js";
 
 /** Version of this authority policy, persisted with authorization evidence. */
-export const AUTHORITY_POLICY_VERSION = "6";
+export const AUTHORITY_POLICY_VERSION = "7";
 
 /**
  * Version of the runtime tool-classification policy below. Bumped
@@ -37,6 +37,7 @@ export type CoreOperation =
   | "planning.propose"
   | "planning.revise"
   | "planning.status"
+  | "planning.supersede"
   | "approval.request"
   | "approval.finalize"
   | "architecture.propose"
@@ -71,6 +72,7 @@ export const ROLE_CAPABILITIES: Record<CoreOperation, readonly CapabilityHolder[
   "planning.propose": ["gaspar", "PO"],
   "planning.revise": ["gaspar", "PO"],
   "planning.status": ["gaspar", "PO"],
+  "planning.supersede": ["gaspar", "PO"],
   "approval.request": ["gaspar", "PO"],
   "approval.finalize": ["gaspar", "PO"],
   "architecture.propose": ["gaspar", "PO"],
@@ -192,6 +194,7 @@ export const OPENCODE_TOOL_POLICY: Record<string, ToolClassification> = {
   chrono_approval_request: "planning",
   chrono_approval_status: "planning",
   chrono_approval_confirm: "planning",
+  chrono_artifact_supersede: "planning",
 };
 
 /**
