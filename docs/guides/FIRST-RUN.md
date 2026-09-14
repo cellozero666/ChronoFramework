@@ -108,15 +108,15 @@ authorized implementation work).
 
 Each draft is approved **without leaving the runtime**: Gaspar opens
 a ticket, asks you through the native `question` UI showing the exact
-artifact, revision, and rationale, and — only after your explicit
-in-UI confirmation through the tool's native approval boundary — the
-runtime host signs with the OS-keychain PO key and records the
-approval. A chat "approved" alone starts this flow but records
+artifact, revision, and rationale, and — only on your explicit
+Approve answer — the runtime host signs with the OS-keychain PO key
+and records the approval. There is no approval-confirm tool and no
+permission setting that can substitute: execution permission, cached
+or wildcard allows, auto mode, and chat text can never produce a
+signature. A chat "approved" alone starts this flow but records
 nothing; status reports `awaiting-signature` until the Core records
 it. Revising a draft stales prior approvals; re-request and
-re-confirm the new revision. Retire replaced drafts with
-`chrono_artifact_supersede` (never delete files); a missing file
-heals through identical-content revise. Never run OpenCode with `--auto` for
+re-confirm the new revision. Never run OpenCode with `--auto` for
 approval sessions (auto mode cannot supply human confirmation and
 the ceremony refuses it); never paste session tokens anywhere. (The
 equivalent `chrono artifact --body-file/--body-stdin` and

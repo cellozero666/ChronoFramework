@@ -326,6 +326,42 @@ export function approvalAnswerMatches(questionText: string, answerText: string, 
 }
 
 /**
+ * Explicit human decision decoded from a runtime-delivered
+ * question/answer pair (fail-open fix: `ask()` success is tool
+ * permission, never approval).
+ *
+ * - `"approve"` only when BOTH halves carry the exact challenge AND
+ *   the answer reads as approval AND carries no deny/cancel signal;
+ * - `"decline"` when either half vetoes (deny/cancel wording) or the
+ *   answer lacks approval wording;
+ * - `"ignore"` when the challenge is absent from either half
+ *   (unrelated question traffic).
+ */
+export function approvalAnswerDecision(
+  questionText: string,
+  answerText: string,
+  challenge: string
+): "approve" | "decline" | "ignore" {
+  if (challenge.trim().length === 0) {
+    return "ignore";
+  }
+  const question = String(questionText ?? "");
+  const answer = String(answerText ?? "");
+  if (!question.includes(challenge) || !answer.includes(challenge)) {
+    return "ignore";
+  }
+  // Veto signals come from the HUMAN answer only: the question itself
+  // legitimately carries a Deny option for the human to pick.
+  if (/\bdeny\b/i.test(answer) || /\bcancel/i.test(answer)) {
+    return "decline";
+  }
+  if (/\bapprov/i.test(answer)) {
+    return "approve";
+  }
+  return "decline";
+}
+
+/**
  * Deterministic canonical JSON (lexicographically sorted keys, UTF-8).
  * Shared algorithm with the Core revision serializer, restricted to
  * plain JSON values: the plugin host uses it to sign approval payloads
@@ -356,6 +392,29 @@ export function canonicalizeJson(value: unknown): string {
     default:
       throw new Error(`canonicalizeJson: unsupported typeof '${typeof value}'`);
   }
+}
+
+/**
+ * Ceremony provenance judgment for one ApprovalGranted event payload
+ * (fail-open fix). Classic interactive approvals carry no ticket
+ * marker and are unaffected. Permission-bound approvals are
+ * authoritative only with the explicit-answer ceremony marker
+ * recorded at the current policy: anything older (including the
+ * vulnerable ask()-gated ceremony) fails closed in every gate,
+ * validator, and projection, while history stays append-only.
+ */
+export function permissionBoundApprovalAuthoritative(
+  eventPayload: Record<string, unknown>,
+  currentPolicyVersion: string
+): boolean {
+  const ticketId = eventPayload["ticketId"];
+  if (ticketId === undefined || ticketId === null) {
+    return true;
+  }
+  return (
+    eventPayload["ceremony"] === "question-answer-v1" &&
+    eventPayload["policyVersion"] === currentPolicyVersion
+  );
 }
 
 /**

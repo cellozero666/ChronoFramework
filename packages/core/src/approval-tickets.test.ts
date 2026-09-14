@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
+  AUTHORITY_POLICY_VERSION,
   approvalChallenge,
   buildApprovalPayload,
   buildEnrollmentChallenge,
@@ -20,6 +21,7 @@ import {
   buildSessionAuthorizationPayload,
   fingerprintPublicKey,
   generateApprovalKeyPair,
+  permissionBoundApprovalAuthoritative,
   signApprovalPayload,
 } from "@chrono/domain";
 import { ChronoCore, type CallerAuth } from "./chrono-core.js";
@@ -247,6 +249,57 @@ describe("OC-P11 approval tickets (ADR-007)", () => {
     const done = core.finalizeApprovalTicket({ ticketId, timestamp, signature, observation: OBSERVATION }, gaspar);
     expect(done.ok).toBe(true);
     expect(core.hasValidApproval("REQ-0001", draftRev, "planning-approval")).toBe(true);
+  });
+
+  it("expired tickets burn on finalize and need a fresh request", () => {
+    const { ticketId } = requestTicket();
+    const expired = new ChronoCore({
+      projectPath: tempDir,
+      runtime: "test-runtime",
+      clock: () => new Date(Date.now() + 20 * 60 * 1000).toISOString(),
+    });
+    try {
+      const { signature, timestamp } = hostSign(draftRev, "accept draft", "no new trust boundary");
+      const done = expired.finalizeApprovalTicket({ ticketId, timestamp, signature, observation: OBSERVATION }, gaspar);
+      expect(done.ok).toBe(false);
+      expect(core.describeApprovalTicket(ticketId, gaspar).value!.consumed).toBe(true);
+      expect(core.hasValidApproval("REQ-0001", draftRev, "planning-approval")).toBe(false);
+    } finally {
+      expired.close();
+    }
+  });
+
+  it("vulnerable permission-bound approvals are non-authoritative by provenance (fail-open fix)", () => {
+    // Classic interactive approvals carry no ticket marker: unaffected.
+    expect(permissionBoundApprovalAuthoritative({ action: "module-approval" }, AUTHORITY_POLICY_VERSION)).toBe(true);
+    // Current explicit-answer ceremony: authoritative.
+    expect(permissionBoundApprovalAuthoritative(
+      { ticketId: "TICKET-0001", ceremony: "question-answer-v1", policyVersion: AUTHORITY_POLICY_VERSION },
+      AUTHORITY_POLICY_VERSION
+    )).toBe(true);
+    // The vulnerable ask()-gated ceremony (ticket marker, no explicit-
+    // answer marker, older policy): rejected in every gate, including
+    // the real pilot's provenance shape.
+    expect(permissionBoundApprovalAuthoritative(
+      { ticketId: "TICKET-0002", policyVersion: "7", nativeObservation: {} },
+      AUTHORITY_POLICY_VERSION
+    )).toBe(false);
+    // Explicit-answer marker at a stale policy: rejected after upgrade.
+    expect(permissionBoundApprovalAuthoritative(
+      { ticketId: "TICKET-0003", ceremony: "question-answer-v1", policyVersion: "7" },
+      AUTHORITY_POLICY_VERSION
+    )).toBe(false);
+    // Unknown future ceremony: fail closed.
+    expect(permissionBoundApprovalAuthoritative(
+      { ticketId: "TICKET-0004", ceremony: "something-else", policyVersion: AUTHORITY_POLICY_VERSION },
+      AUTHORITY_POLICY_VERSION
+    )).toBe(false);
+    // A live explicit-answer approval still authorizes through the Core.
+    const { ticketId } = requestTicket();
+    const { signature, timestamp } = hostSign(draftRev, "accept draft", "no new trust boundary");
+    expect(core.finalizeApprovalTicket({ ticketId, timestamp, signature, observation: OBSERVATION }, gaspar).ok).toBe(true);
+    expect(core.hasValidApproval("REQ-0001", draftRev, "planning-approval")).toBe(true);
+    expect(core.approvalCeremonyAuthoritative(core.listApprovals()[0]?.id ?? "")).toBe(true);
   });
 
   it("no new ticket needed once approved; chat alone still approves nothing", () => {

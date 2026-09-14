@@ -30,7 +30,12 @@ export const OPENCODE_TOOLS_PACKAGE_RELATIVE = ".opencode/package.json";
 export const OPENCODE_PLUGIN_DEP = "@opencode-ai/plugin";
 export const OPENCODE_PLUGIN_PIN = "1.18.30";
 
-/** Native tool names exposed to the model (file `chrono`, export suffix). */
+/**
+ * Native tool names exposed to the model (file `chrono`, export suffix).
+ * There is deliberately NO approval-confirm tool: signing follows only
+ * an explicit human answer observed by the plugin host, never model
+ * tool invocation (fail-open fix).
+ */
 export const CHRONO_NATIVE_TOOLS = [
   "chrono_artifact_status",
   "chrono_artifact_propose",
@@ -38,7 +43,6 @@ export const CHRONO_NATIVE_TOOLS = [
   "chrono_artifact_supersede",
   "chrono_approval_request",
   "chrono_approval_status",
-  "chrono_approval_confirm",
 ] as const;
 
 export type ChronoNativeTool = (typeof CHRONO_NATIVE_TOOLS)[number];
@@ -84,13 +88,16 @@ export function buildPlanningToolsFile(): string {
  * \`chrono setup --adapter <id>\` / \`chrono init --runtime opencode\`
  * — do not hand-edit (drift fails closed; repair regenerates).
  *
- * Six model-callable tools (OpenCode names: chrono_<export>):
+ * Five model-callable tools (OpenCode names: chrono_<export>):
  * - artifact_status: Core-backed planning status projection (safe).
  * - artifact_propose: materialize one planning draft (inline body).
  * - artifact_revise: revise one planning draft (inline body).
+ * - artifact_supersede: retire one draft by its replacement.
  * - approval_request: open a single-use approval ticket.
  * - approval_status: safe ticket projection (live/consumed/stale).
- * - approval_confirm: native human confirmation + host signing.
+ * There is deliberately NO approval-confirm tool: signing follows
+ * only an explicit human answer observed by the plugin host, never
+ * model tool invocation (fail-open fix).
  *
  * Trust boundary (ADR-007):
  * - Everything here runs in the plugin host, never in model context.
@@ -98,8 +105,6 @@ export function buildPlanningToolsFile(): string {
  *   bound to the exact OpenCode session; it never enters arguments,
  *   results, logs, or prompts.
  * - Bodies travel on stdin to the CLI (argument arrays, no shell).
- * - approval_confirm additionally requires the native ask() human
- *   boundary inside execute; --auto mode refuses deterministically.
  * - Results carry ids, revisions, receipts, and denials only.
  */
 import { tool } from "@opencode-ai/plugin";
@@ -107,13 +112,10 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHash, createPrivateKey, createPublicKey, sign } from "node:crypto";
+import { createHash } from "node:crypto";
 
 const TOKEN_PREFIX = "chrono-gaspar-host-";
 const TOKEN_SUFFIX = ".token";
-const PO_KEY_SERVICE = "chrono-po-signing-key";
-const PO_KEY_ACCOUNT = "po";
-const TICKET_PATTERN = /TICKET-[0-9]{4}/;
 
 function sha16(text) {
   return createHash("sha256").update(text, "utf8").digest("hex").slice(0, 16);
@@ -181,114 +183,6 @@ function deny(result, fallback) {
   const code = result?.error?.code;
   const reason = result?.error?.message;
   fail(typeof code === "string" && typeof reason === "string" ? code + ": " + reason : fallback);
-}
-
-function canonicalize(value) {
-  if (value === null) {
-    return "null";
-  }
-  const kind = typeof value;
-  if (kind === "string" || kind === "boolean") {
-    return JSON.stringify(value);
-  }
-  if (kind === "number") {
-    if (!Number.isFinite(value)) {
-      fail("cannot sign non-finite number");
-    }
-    return JSON.stringify(value);
-  }
-  if (kind === "object") {
-    if (Array.isArray(value)) {
-      return "[" + value.map((item) => canonicalize(item)).join(",") + "]";
-    }
-    const record = value;
-    return "{" + Object.keys(record).sort().map((key) => JSON.stringify(key) + ":" + canonicalize(record[key])).join(",") + "}";
-  }
-  fail("cannot sign value");
-}
-
-export function normalizeKeyMaterial(material) {
-  // Byte-parity copy of the shared key-transport normalizer (OC-P11
-  // D1): CRLF to LF, edge whitespace trim, lower/UPPERCASE hex decode
-  // to PEM armor (macOS hex transport + trailing-newline variance).
-  // Interior bytes untouched. Parity-locked by key-transport tests.
-  const edge = String(material).replace(/\\r\\n/g, "\\n").replace(/^[ \\t\\n\\r\\f\\v]+|[ \\t\\n\\r\\f\\v]+$/g, "");
-  if (/^[0-9a-f]+$/i.test(edge) && edge.length % 2 === 0 && edge.length >= 2) {
-    try {
-      const decoded = Buffer.from(edge, "hex").toString("utf8");
-      if (decoded.startsWith("-----BEGIN")) {
-        return decoded;
-      }
-    } catch (err) {
-      // Not decodable hex: fall through to the edge-trimmed form.
-    }
-  }
-  return edge;
-}
-
-export function parsePoKey(raw) {
-  // Normalize, require a parseable Ed25519 private key, and bind the
-  // derived public-key fingerprint (non-secret; proves WHICH key the
-  // host holds so a foreign-but-valid key fails loudly at the Core
-  // instead of substituting silently). Returns { pem, fingerprint }
-  // or null. Secret-safe: no key text escapes.
-  if (typeof raw !== "string" || raw.length === 0) {
-    return null;
-  }
-  const normalized = normalizeKeyMaterial(raw);
-  if (normalized.length === 0) {
-    return null;
-  }
-  try {
-    const key = createPrivateKey(normalized);
-    if (key.asymmetricKeyType !== "ed25519") {
-      return null;
-    }
-    const publicPem = createPublicKey(key).export({ format: "pem", type: "spki" }).toString();
-    const fingerprint = createHash("sha256").update(publicPem, "utf8").digest("hex");
-    return { pem: normalized, fingerprint };
-  } catch (err) {
-    return null;
-  }
-}
-
-function readPoKeyRaw() {
-  // Host-only keychain read through the platform helpers (PATH
-  // resolution; hermetic tests inject a fixture security binary on
-  // PATH — there is no test seam in production bytes). macOS first,
-  // like the entry script. Returns raw material or null; callers
-  // normalize and validate through parsePoKey (D1 parity).
-  const mac = spawnSync("security", ["find-generic-password", "-s", PO_KEY_SERVICE, "-a", PO_KEY_ACCOUNT, "-w"], {
-    encoding: "utf8",
-    timeout: 15000,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const macOut = typeof mac.stdout === "string" ? mac.stdout : "";
-  if (mac.status === 0 && macOut.trim().length > 0) {
-    return macOut;
-  }
-  const linux = spawnSync("secret-tool", ["lookup", "service", PO_KEY_SERVICE, "account", PO_KEY_ACCOUNT], {
-    encoding: "utf8",
-    timeout: 15000,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const linuxOut = typeof linux.stdout === "string" ? linux.stdout : "";
-  if (linux.status === 0 && linuxOut.trim().length > 0) {
-    return linuxOut;
-  }
-  return null;
-}
-
-function autoModeRefused() {
-  return process.argv.includes("--auto");
-}
-
-// Denial taxonomy (D4): every confirm denial states WHERE it failed
-// and whether the SAME ticket can be retried. Host-boundary failures
-// happen before the Core ever sees a signed request (the ticket
-// survives unless noted); Core denials name the Core code.
-function tag(layer, retryable, ticket) {
-  return " [layer=" + layer + " retryable=" + (retryable ? "yes" : "no") + " ticket=" + ticket + "]";
 }
 
 const commonArgs = (root, token) => ["--as", "gaspar", "--session-token", token, "--path", root, "--json"];
@@ -409,94 +303,5 @@ export const approval_status = tool({
   },
 });
 
-export const approval_confirm = tool({
-  description: "CHRONO: confirm one approval ticket through the native human boundary and record the signed Core approval. Asks the human in the OpenCode UI with the exact ticket scope; denial or cancellation changes nothing.",
-  args: {
-    ticket: tool.schema.string().describe("single-use approval ticket id"),
-  },
-  async execute(args, context) {
-    if (!TICKET_PATTERN.test(args.ticket)) {
-      fail("malformed approval ticket id" + tag("host", false, args.ticket));
-    }
-    const root = projectRoot(context.directory);
-    const token = hostToken(root, context.sessionID);
-    // Re-validate liveness + revision currency before troubling the human.
-    const probed = runChrono(["approval-ticket", "--ticket", args.ticket, ...commonArgs(root, token)]);
-    if (probed.exit !== 0 || probed.json?.ok !== true || probed.json?.live !== true) {
-      deny(probed.json, "approval ticket is not live: re-request for the current revision" + tag("core", false, args.ticket));
-    }
-    const ticket = probed.json;
-    if (typeof context.ask !== "function") {
-      fail("native ask boundary is unavailable in this runtime: cannot confirm without it (draft stays unapproved)" + tag("host", false, args.ticket));
-    }
-    if (autoModeRefused()) {
-      fail("auto-approve mode refuses the ceremony: disable auto-approve for PO approvals (draft stays unapproved)" + tag("host", true, args.ticket));
-    }
-    try {
-      await context.ask({
-        permission: "chrono.approval",
-        patterns: [args.ticket],
-        always: [],
-        metadata: {
-          ticket: args.ticket,
-          action: ticket.action,
-          scope: ticket.scopeArtifactId,
-          revision: ticket.scopeRevision,
-          rationale: ticket.rationale,
-          securityImplications: ticket.securityImplications,
-        },
-      });
-    } catch {
-      fail("human confirmation declined or cancelled: no approval recorded (draft stays unapproved)" + tag("host", true, args.ticket));
-    }
-    if (autoModeRefused()) {
-      fail("auto-approve mode refuses the ceremony: disable auto-approve for PO approvals (draft stays unapproved)" + tag("host", true, args.ticket));
-    }
-    const live = runChrono(["approval-ticket", "--ticket", args.ticket, ...commonArgs(root, token)]);
-    if (live.exit !== 0 || live.json?.ok !== true || live.json?.live !== true) {
-      deny(live.json, "approval ticket lapsed during confirmation: re-request and confirm again" + tag("core", false, args.ticket));
-    }
-    // Host-side key custody with canonical transport parity (D1): the
-    // raw keychain output is normalized (hex/trim/CRLF), required to
-    // parse as Ed25519, and fingerprint-bound. Failures here happen in
-    // the native host boundary — before the Core ever sees a signed
-    // request — so the ticket survives and the same ticket is
-    // retryable once custody is repaired.
-    const parsed = parsePoKey(readPoKeyRaw());
-    if (parsed === null) {
-      fail("host: PO signing key unusable after canonical transport normalization (malformed, truncated, or non-Ed25519 keychain material)" + tag("host", true, args.ticket));
-    }
-    const observedAt = new Date().toISOString();
-    const payload = {
-      action: live.json.action,
-      scope_artifact_id: live.json.scopeArtifactId,
-      scope_revision: live.json.scopeRevision,
-      authority: "PO",
-      rationale: live.json.rationale,
-      timestamp: observedAt,
-      security_implications: live.json.securityImplications,
-    };
-    let signature;
-    try {
-      signature = sign(null, Buffer.from(canonicalize(payload), "utf8"), createPrivateKey(parsed.pem)).toString("base64");
-    } catch (err) {
-      fail("host: PO signing failed on validated key material" + tag("host", false, args.ticket));
-    }
-    const receipt = runChrono([
-      "approval-record", "--ticket", args.ticket, "--timestamp", observedAt,
-      "--signature", signature, "--permission-call-id", context.sessionID + ":" + args.ticket,
-      "--decided-at", observedAt, ...commonArgs(root, token),
-    ]);
-    if (receipt.exit !== 0 || receipt.json?.ok !== true) {
-      const code = receipt.json && receipt.json.error && receipt.json.error.code;
-      // Same-ticket retry is safe only when the Core left the ticket
-      // live (bad signature); consumed/stale/expired tickets need a
-      // fresh request. The code names the layer that denied.
-      const retryable = code === "SIGNATURE_INVALID" ? "yes" : "no";
-      deny(receipt.json, "approval recording denied by the Core [layer=core retryable=" + retryable + "]");
-    }
-    return JSON.stringify({ ok: true, approvalId: receipt.json.approvalId, ticket: args.ticket, keyFingerprint: parsed.fingerprint.slice(0, 16) });
-  },
-});
 `;
 }

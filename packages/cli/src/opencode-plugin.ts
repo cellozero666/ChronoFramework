@@ -64,7 +64,7 @@
  * directly importable in tests: enforcement logic runs for real, with
  * only the gate/entry binaries substituted by fixtures.
  *
- * Tool policy version: TOOL_POLICY_VERSION=3 (see @chrono/domain
+ * Tool policy version: TOOL_POLICY_VERSION=4 (see @chrono/domain
  * OPENCODE_TOOL_POLICY). The lists below are generated from that policy;
  * the Core remains the authority — the plugin only shapes the intake.
  *
@@ -81,13 +81,16 @@
  * files, internal hooks) are denied even though reads otherwise pass
  * without dispatch scope.
  *
- * OC-P11 integrated approval ceremony (ADR-007): the native `question`
- * tool carries human confirmation for display; `tool.execute.after`
- * audits runtime-delivered question traffic without acting. Signing
- * and recording belong to the native `chrono_approval_confirm` tool
- * (.opencode/tools/chrono.ts), which owns the ask() human boundary,
- * reads the OS-keychain PO key host-side (never to the model), and
- * records via `chrono approval-record`. The plugin uses only
+ * OC-P11 integrated approval ceremony (ADR-007, fail-open fix): the
+ * native `question` tool carries the human confirmation for display
+ * AND decision. `tool.execute.after` observes the runtime-delivered
+ * result and finalizes ONLY on explicit human Approve (exact ticket
+ * challenge, approval wording, no deny/cancel signal): it revalidates
+ * ticket liveness, revision currency, and session binding through the
+ * Core, refuses --auto, reads the OS-keychain PO key host-side (never
+ * to the model), signs, and records. There is deliberately NO
+ * approval-confirm tool: signing never follows model tool invocation
+ * or execution permission. The plugin uses only
  * `node:child_process` / `node:fs` / `node:path` / `node:crypto`, so
  * the generated file stays directly importable in tests with only
  * binaries substituted by fixtures.
@@ -137,18 +140,19 @@ export function buildOpencodePlugin(): string {
    *   verdict. Unknown tools are denied until classified (deny-by-default).
    *   While entry is unproven, EVERY tool (including reads) is denied.
    *   Anything missing or DENIED throws (fail-closed).
-   * - Integrated approval ceremony (ADR-007): the native \`question\`
-   *   tool carries the human confirmation. Its runtime-delivered result
-   *   is observed for audit only (never trusted from chat, never acted
-   *   on here). Signing and recording belong to the native
-   *   chrono_approval_confirm tool, which owns the ask() human boundary.
+   * - Integrated approval ceremony (ADR-007, fail-open fix): the native
+   *   \`question\` tool carries the human confirmation. Its
+   *   runtime-delivered result is observed here and finalizes ONLY on
+   *   explicit human Approve (exact challenge, approval wording, no
+   *   deny/cancel). There is deliberately NO approval-confirm tool:
+   *   signing never follows model invocation or execution permission.
    * - Runtime evidence lands in .chrono/runtime-activation.jsonl
    *   (non-secret metadata only). Session tokens are never held here,
    *   never logged, never modeled.
    */
 import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, sign } from "node:crypto";
 import { dirname, join, sep } from "node:path";
 
 const READ_TOOLS = new Set(${JSON.stringify(READ_TOOLS)});
@@ -166,20 +170,122 @@ const PLANNING_TOOLS = new Set([
   "chrono_artifact_supersede",
   "chrono_approval_request",
   "chrono_approval_status",
-  "chrono_approval_confirm",
 ]);
 const SKILL_PINNED_COMMIT = ${JSON.stringify(SKILL_RELEASE.pinnedCommit)};
 const SKILL_SOURCE_HASH = ${JSON.stringify(SKILL_RELEASE.sourceHash)};
 
-// Approval tickets referenced from runtime-delivered question payloads
-// (audit observation only; the native confirm tool owns signing).
+// Approval tickets referenced from runtime-delivered question payloads.
+// Only an explicit human Approve (exact challenge, approval wording,
+// no deny/cancel signal) may trigger host-side signing; everything
+// else is audited and left alone.
 const TICKET_PATTERN = /TICKET-[0-9]{4}/g;
 const CHALLENGE_PREFIX = "approve-";
+
+/**
+ * Deterministic canonical JSON (sorted keys). Byte-identical to the
+ * Core revision serializer for plain JSON values: the host signs
+ * approval payloads with exactly the bytes the Core verifies.
+ * Exported for hermetic contract tests.
+ */
+export function chronoCanonicalizeJson(value) {
+  if (value === null) {
+    return "null";
+  }
+  const kind = typeof value;
+  if (kind === "string" || kind === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (kind === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error("chronoCanonicalizeJson: non-finite number");
+    }
+    return JSON.stringify(value);
+  }
+  if (kind === "object") {
+    if (Array.isArray(value)) {
+      return "[" + value.map((item) => chronoCanonicalizeJson(item)).join(",") + "]";
+    }
+    const keys = Object.keys(value).sort();
+    return "{" + keys.map((key) => JSON.stringify(key) + ":" + chronoCanonicalizeJson(value[key])).join(",") + "}";
+  }
+  throw new Error("chronoCanonicalizeJson: unsupported value");
+}
+
+/**
+ * Explicit human decision decoded from a runtime-delivered
+ * question/answer pair. Approve requires the exact challenge in both
+ * halves plus approval wording with no deny/cancel signal; anything
+ * else declines or is ignored. Exported for hermetic contract tests.
+ */
+export function chronoApprovalDecision(questionText, answerText, challenge) {
+  if (typeof challenge !== "string" || challenge.trim().length === 0) {
+    return "ignore";
+  }
+  const question = String(questionText ?? "");
+  const answer = String(answerText ?? "");
+  if (question.indexOf(challenge) === -1 || answer.indexOf(challenge) === -1) {
+    return "ignore";
+  }
+  // Veto signals come from the HUMAN answer only: the question itself
+  // legitimately carries a Deny option for the human to pick.
+  if (/deny/i.test(answer) || /cancel/i.test(answer)) {
+    return "decline";
+  }
+  if (/approv/i.test(answer)) {
+    return "approve";
+  }
+  return "decline";
+}
 
 /** Extract ticket ids (TICKET-0001) from runtime-delivered text. */
 export function chronoExtractTicketIds(text) {
   const found = String(text ?? "").match(TICKET_PATTERN);
   return found === null ? [] : [...new Set(found)];
+}
+
+/**
+ * Byte-parity copy of the shared key-transport normalizer (D1):
+ * CRLF to LF, edge trim, lower/UPPERCASE hex decode to PEM armor.
+ * Parity-locked by key-transport tests; never logs key text.
+ */
+export function normalizeKeyMaterial(material) {
+  const edge = String(material).replace(/\\r\\n/g, "\\n").replace(/^[ \\t\\n\\r\\f\\v]+|[ \\t\\n\\r\\f\\v]+$/g, "");
+  if (/^[0-9a-f]+$/i.test(edge) && edge.length % 2 === 0 && edge.length >= 2) {
+    try {
+      const decoded = Buffer.from(edge, "hex").toString("utf8");
+      if (decoded.startsWith("-----BEGIN")) {
+        return decoded;
+      }
+    } catch {
+      // Not decodable hex: fall through to the edge-trimmed form.
+    }
+  }
+  return edge;
+}
+
+/**
+ * Normalize, require a parseable Ed25519 private key, and bind the
+ * derived public-key fingerprint (non-secret). Returns
+ * { pem, fingerprint } or null. Secret-safe: no key text escapes.
+ */
+export function parsePoKey(raw) {
+  if (typeof raw !== "string" || raw.length === 0) {
+    return null;
+  }
+  const normalized = normalizeKeyMaterial(raw);
+  if (normalized.length === 0) {
+    return null;
+  }
+  try {
+    const key = createPrivateKey(normalized);
+    if (key.asymmetricKeyType !== "ed25519") {
+      return null;
+    }
+    const publicPem = createPublicKey(key).export({ format: "pem", type: "spki" }).toString();
+    return { pem: normalized, fingerprint: createHash("sha256").update(publicPem, "utf8").digest("hex") };
+  } catch {
+    return null;
+  }
 }
 
 /** Exact challenge correlation between a question and its human answer. */
@@ -858,36 +964,181 @@ export const ChronoGatePlugin = async (ctx) => {
     }
   }
 
-  function auditApprovalQuestion(root, sessionKey, callID, questionText, answerText) {
-    // Audit-only observation of approval question traffic (OC-P11
-    // correction): the native chrono_approval_confirm tool owns
-    // signing and recording; this hook never acts, never signs, and
-    // never throws. It records which live-ticket challenges appeared
-    // in runtime-delivered question/answer pairs so pilot forensics
-    // can correlate human confirmations with Core receipts.
+  function readHostToken(root, sessionKey) {
+    // Host-held Gaspar session credential for ceremony Core calls.
+    // File only, 0600, never logged, never returned to model context.
+    // Returns "id/token" or null.
+    try {
+      const raw = readFileSync(hostTokenPath(canonicalRoot(root), sessionKey), "utf8").trim();
+      if (raw.length === 0 || raw.indexOf("/") <= 0) {
+        return null;
+      }
+      return raw;
+    } catch {
+      return null;
+    }
+  }
+
+  function runChronoJson(chronoBin, args, timeoutMs) {
+    // Synchronous host-side Core call (human-paced ceremony traffic
+    // only, never the hot path). Returns parsed stdout JSON or null.
+    try {
+      const out = execFileSync(chronoBin, args, { encoding: "utf8", timeout: timeoutMs, stdio: ["ignore", "pipe", "pipe"] });
+      return JSON.parse(String(out));
+    } catch (e) {
+      try {
+        const stdout = e && e.stdout ? String(e.stdout) : "";
+        if (stdout.trim().length > 0) {
+          return JSON.parse(stdout);
+        }
+      } catch {
+        // Fall through to null: unparseable is a denial signal.
+      }
+      return null;
+    }
+  }
+
+  function readHostPoKey() {
+    // OS keychain read, host only, through PATH-resolved platform
+    // helpers (no test seam in production bytes). Returns raw material
+    // or null; callers validate through parsePoKey (D1 parity).
+    try {
+      const out = execFileSync(
+        "security",
+        ["find-generic-password", "-s", "chrono-po-signing-key", "-a", "po", "-w"],
+        { encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"] }
+      );
+      if (String(out).trim().length > 0) {
+        return String(out);
+      }
+    } catch {
+      // Fall through to secret-tool.
+    }
+    try {
+      const out = execFileSync(
+        "secret-tool",
+        ["lookup", "service", "chrono-po-signing-key", "account", "po"],
+        { encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"] }
+      );
+      if (String(out).trim().length > 0) {
+        return String(out);
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
+  function signHostApprovalPayload(keyPem, payload) {
+    const key = createPrivateKey(String(keyPem));
+    const bytes = Buffer.from(chronoCanonicalizeJson(payload), "utf8");
+    return sign(null, bytes, key).toString("base64");
+  }
+
+  async function maybeFinalizeApproval(root, sessionKey, callID, questionText, answerText) {
+    // Explicit-answer ceremony (fail-open fix): ONLY an explicit human
+    // Approve in a runtime-delivered question result may trigger
+    // host-side signing. Permission to execute, chat text, cached or
+    // auto-resolved answers, and malformed output all end here as
+    // audits with no state change.
     const ticketIds = chronoExtractTicketIds(questionText + "\\n" + answerText);
     if (ticketIds.length === 0) {
       return;
     }
     const publicKey = typeof sessionKey === "string" && !sessionKey.startsWith("anonymous@") ? sessionKey : "anonymous";
+    if (process.argv.includes("--auto")) {
+      for (const ticketId of ticketIds) {
+        logEvidence(root, { kind: "approval-skipped-auto", session: publicKey, ticket: ticketId, call: callID });
+      }
+      return;
+    }
+    const token = readHostToken(root, sessionKey);
+    if (token === null) {
+      for (const ticketId of ticketIds) {
+        logEvidence(root, { kind: "approval-no-session", session: publicKey, ticket: ticketId, call: callID });
+      }
+      return;
+    }
+    const tokenId = token.slice(0, token.indexOf("/"));
+    const chronoBin = readEnv("CHRONO_BIN") ?? "chrono";
+    const observedAt = new Date().toISOString();
     for (const ticketId of ticketIds) {
       const challenge = CHALLENGE_PREFIX + ticketId;
-      logEvidence(root, {
-        kind: "approval-question-observed",
-        session: publicKey,
-        ticket: ticketId,
-        call: callID,
-        matched: chronoApprovalMatch(questionText, answerText, challenge),
-      });
+      const decision = chronoApprovalDecision(questionText, answerText, challenge);
+      if (decision !== "approve") {
+        logEvidence(root, {
+          kind: decision === "decline" ? "approval-answer-declined" : "approval-answer-no-match",
+          session: publicKey, ticket: ticketId, call: callID,
+        });
+        continue;
+      }
+      // Liveness, revision currency, AND session binding through the
+      // Core immediately before signing: a stale, consumed, foreign,
+      // or cross-session ticket can never authorize.
+      const ticket = runChronoJson(chronoBin, [
+        "approval-ticket", "--ticket", ticketId, "--as", "gaspar",
+        "--session-token", token, "--path", root, "--json",
+      ], 30000);
+      if (ticket === null || ticket.ok !== true || ticket.live !== true) {
+        logEvidence(root, { kind: "approval-ticket-not-live", session: publicKey, ticket: ticketId, call: callID });
+        continue;
+      }
+      if (typeof ticket.requesterSession === "string" && ticket.requesterSession.length > 0 && ticket.requesterSession !== tokenId) {
+        logEvidence(root, { kind: "approval-cross-session", session: publicKey, ticket: ticketId, call: callID });
+        continue;
+      }
+      const parsed = parsePoKey(readHostPoKey());
+      if (parsed === null) {
+        logEvidence(root, { kind: "approval-no-key", session: publicKey, ticket: ticketId, call: callID });
+        continue;
+      }
+      const payload = {
+        action: ticket.action,
+        scope_artifact_id: ticket.scopeArtifactId,
+        scope_revision: ticket.scopeRevision,
+        authority: "PO",
+        rationale: ticket.rationale,
+        timestamp: observedAt,
+        security_implications: ticket.securityImplications,
+      };
+      let signature;
+      try {
+        signature = signHostApprovalPayload(parsed.pem, payload);
+      } catch {
+        logEvidence(root, { kind: "approval-sign-failed", session: publicKey, ticket: ticketId, call: callID });
+        continue;
+      }
+      const receipt = runChronoJson(chronoBin, [
+        "approval-record", "--ticket", ticketId, "--timestamp", observedAt,
+        "--signature", signature, "--permission-call-id", callID,
+        "--decided-at", observedAt, "--as", "gaspar",
+        "--session-token", token, "--path", root, "--json",
+      ], 60000);
+      if (receipt !== null && receipt.ok === true && typeof receipt.approvalId === "string") {
+        logEvidence(root, {
+          kind: "approval-finalized", session: publicKey, ticket: ticketId,
+          approval: receipt.approvalId, scope: ticket.scopeArtifactId, call: callID,
+        });
+      } else {
+        const code = receipt !== null && typeof receipt.error === "object" && receipt.error !== null && typeof receipt.error.code === "string"
+          ? receipt.error.code
+          : "RECORD_DENIED";
+        logEvidence(root, { kind: "approval-record-denied", session: publicKey, ticket: ticketId, call: callID, code });
+      }
     }
   }
+
+  // auditApprovalQuestion was removed with the permission-gated
+  // confirm tool (fail-open fix): question traffic is handled by
+  // maybeFinalizeApproval below, which acts ONLY on explicit human
+  // Approve and audits every other outcome without state change.
 
   try {
     const loadRoot = (ctx && ctx.directory) || process.cwd();
     const loadProject = chronoProjectRoot(loadRoot);
     if (loadProject !== null && !pluginLoadLogged) {
       pluginLoadLogged = true;
-      logEvidence(loadProject, { kind: "plugin-load", toolPolicy: "v3" });
+      logEvidence(loadProject, { kind: "plugin-load", toolPolicy: "v4" });
     }
   } catch {
     // Load evidence is observability only; enforcement never depends on it.
@@ -1161,11 +1412,12 @@ export const ChronoGatePlugin = async (ctx) => {
       throw new Error(\`[chrono] \${code}: \${reason}\`);
     },
     "tool.execute.after": async (input, output) => {
-      // OC-P11 approval question audit (ADR-007). Fires on
+      // Explicit-answer ceremony (fail-open fix, ADR-007). Fires on
       // runtime-delivered tool results only — the model cannot
-      // fabricate these events. Observation only: the native
-      // chrono_approval_confirm tool owns signing and recording.
-      // This handler never acts and never throws into the runtime.
+      // fabricate these events. maybeFinalizeApproval signs and
+      // records ONLY on explicit human Approve; every other outcome
+      // is audited with no state change. This handler never throws
+      // into the runtime.
       try {
         const root = (ctx && ctx.directory) || process.cwd();
         if (chronoProjectRoot(root) === null) {
@@ -1184,7 +1436,7 @@ export const ChronoGatePlugin = async (ctx) => {
           input !== null && typeof input === "object" && typeof input.callID === "string" && input.callID.length > 0
             ? input.callID
             : "unknown-call";
-        auditApprovalQuestion(root, key, callID, questionText, answerText);
+        await maybeFinalizeApproval(root, key, callID, questionText, answerText);
       } catch {
         // Observation is advisory; enforcement lives in the Core.
       }

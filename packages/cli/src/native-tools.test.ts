@@ -286,13 +286,14 @@ describe("OC-P11 native planning tools", () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it("registers exactly the six governed tools with stable schemas", () => {
+  it("registers exactly the governed tools with stable schemas (no signing tool)", () => {
     // OpenCode resolves tool names as <filename>_<export>; the module
     // file is `chrono`, so tool exports become chrono_artifact_* and
-    // chrono_approval_* in the runtime. Key helpers are exported for
-    // parity tests (never model tools: they take no project action).
-    const exports = ["artifact_status", "artifact_propose", "artifact_revise", "artifact_supersede", "approval_request", "approval_status", "approval_confirm"];
-    expect(Object.keys(tools).sort()).toEqual([...exports, "normalizeKeyMaterial", "parsePoKey"].sort());
+    // chrono_approval_* in the runtime. There is deliberately NO
+    // approval-confirm tool: signing follows only an explicit human
+    // answer observed by the plugin host (fail-open fix).
+    const exports = ["artifact_status", "artifact_propose", "artifact_revise", "artifact_supersede", "approval_request", "approval_status"];
+    expect(Object.keys(tools).sort()).toEqual(exports.sort());
     expect(exports.map((e) => `chrono_${e}`).sort()).toEqual([...CHRONO_NATIVE_TOOLS].sort());
     for (const name of exports) {
       const def = tools[name] as { description: string; args: unknown; execute: unknown };
@@ -300,16 +301,17 @@ describe("OC-P11 native planning tools", () => {
       expect(def.description.length).toBeGreaterThan(20);
       expect(typeof def.execute).toBe("function");
     }
-    // No product-code, shell, hook, or credential surface exists here
-    // (key helpers are pure validators, not credential accessors).
+    // No product-code, shell, hook, signing, or credential surface.
     for (const name of Object.keys(tools)) {
-      expect(name).not.toMatch(/write|edit|bash|shell|hook|token|secret|db/i);
+      expect(name).not.toMatch(/write|edit|bash|shell|hook|token|key|secret|db|confirm|sign/i);
     }
     // Schemas carry the contract Gaspar programs against.
     const propose = tools["artifact_propose"] as { args: Record<string, { parse: (v: unknown) => unknown }> };
     expect(() => propose.args["body"]?.parse("inline markdown")).not.toThrow();
     expect(() => propose.args["body"]?.parse(42)).toThrow();
     expect(() => propose.args["kind"]?.parse("spec")).not.toThrow();
+    const request = tools["approval_request"] as { args: Record<string, { parse: (v: unknown) => unknown }> };
+    expect(() => request.args["securityImplications"]?.parse("none")).not.toThrow();
   });
 
   it("proposes with an inline body: real .md plus Core persistence, no temp file", async () => {
@@ -393,7 +395,7 @@ describe("OC-P11 native planning tools", () => {
     expect(haystack).not.toContain("PRIVATE KEY");
   });
 
-  it("full ceremony through native tools: request, ask, signed approval, continuation", async () => {
+  it("request opens tickets; status tracks them; no signing tool exists", async () => {
     await tools["artifact_propose"].execute(
       { kind: "spec", id: "SP-0001", title: "Tasks", body: "Contract." },
       toolContext()
@@ -404,24 +406,14 @@ describe("OC-P11 native planning tools", () => {
       toolContext()
     )) as string) as { ticketId: string; challenge: string };
     expect(requested.ticketId).toMatch(/^TICKET-[0-9]{4}$/);
-    // Gaspar shows the canonical line in the native question; the human
-    // answers in the OpenCode UI; the confirm tool owns the ask boundary.
-    const receipt = JSON.parse((await tools["approval_confirm"].execute({ ticket: requested.ticketId }, toolContext())) as string) as {
+    expect(requested.challenge).toBe(`approve-${requested.ticketId}`);
+    const projected = JSON.parse((await tools["approval_status"].execute({ ticket: requested.ticketId }, toolContext())) as string) as {
       ok: boolean;
-      approvalId: string;
+      live: boolean;
     };
-    expect(receipt.ok).toBe(true);
-    expect(receipt.approvalId).toMatch(/^APR-[0-9]{4}$/);
-    // The ask boundary saw the exact ticket scope exactly once.
-    expect(askFixture.calls).toHaveLength(1);
-    expect(askFixture.calls[0]).toMatchObject({ permission: "chrono.approval", patterns: [requested.ticketId] });
-    expect(askFixture.calls[0]?.metadata).toMatchObject({ scope: "SP-0001", revision: specRev });
-    expect(core.hasValidApproval("SP-0001", specRev, "planning-approval")).toBe(true);
-    // Conversation continues without restart: status reflects approval.
-    const status = JSON.parse((await tools["artifact_status"].execute({}, toolContext())) as string) as {
-      items: Array<{ id: string; approval: string }>;
-    };
-    expect(status.items.find((i) => i.id === "SP-0001")?.approval).toBe("approved");
+    expect(projected).toMatchObject({ ok: true, live: true });
+    // Unknown tickets deny through the safe projection.
+    await expect(tools["approval_status"].execute({ ticket: "TICKET-9999" }, toolContext())).rejects.toThrow();
     // Same governed path continues to Module and Work Package plans.
     const mod = JSON.parse((await tools["artifact_propose"].execute(
       { kind: "module", id: "MOD-0001", title: "M", body: "Plan.", references: ["SP-0001"] },
@@ -435,88 +427,29 @@ describe("OC-P11 native planning tools", () => {
     expect(wp.ok).toBe(true);
   });
 
-  it("denies cancelled, replayed, stale, forged, auto, and ticketless confirmation", async () => {
-    await tools["artifact_propose"].execute(
-      { kind: "spec", id: "SP-0001", title: "S", body: "Body." },
-      toolContext()
-    );
-    const specRev = core.getArtifact("SP-0001").revision;
-    // Cancelled human answer: no state changes, ticket survives.
-    const cancelled = JSON.parse((await tools["approval_request"].execute(
-      { action: "planning-approval", scope: "SP-0001", revision: specRev, rationale: "r", securityImplications: "s" },
-      toolContext()
-    )) as string) as { ticketId: string };
-    askFixture.mode = "deny";
-    await expect(tools["approval_confirm"].execute({ ticket: cancelled.ticketId }, toolContext())).rejects.toThrow(/declined or cancelled/);
-    expect(core.hasValidApproval("SP-0001", specRev, "planning-approval")).toBe(false);
-    askFixture.mode = "allow";
-    // Genuine confirmation, then replay denies.
-    await tools["approval_confirm"].execute({ ticket: cancelled.ticketId }, toolContext());
-    expect(core.hasValidApproval("SP-0001", specRev, "planning-approval")).toBe(true);
-    await expect(tools["approval_confirm"].execute({ ticket: cancelled.ticketId }, toolContext())).rejects.toThrow();
-    // Forged ticket id denies.
-    await expect(tools["approval_confirm"].execute({ ticket: "TICKET-9999" }, toolContext())).rejects.toThrow();
-    // Malformed ticket id denies before any Core contact.
-    await expect(tools["approval_confirm"].execute({ ticket: "nope" }, toolContext())).rejects.toThrow(/malformed/);
-    // Stale: revise after requesting, then confirm the old ticket.
-    // (SP-0001 is already approved above, so the stale case uses a
-    // fresh draft scope; re-requesting an approved revision correctly
-    // refuses with DUPLICATE_IDENTITY.)
+  it("stale tickets surface through the status tool after revise", async () => {
     const req3 = await tools["artifact_propose"].execute(
       { kind: "requirement", id: "REQ-0001", title: "R", body: "One." },
       toolContext()
     );
-    // File-only kinds (requirement/ADR/discovery) track revisions in
-    // runtime config, not artifact rows: read the revision from the
-    // propose receipt, exactly as Gaspar would from the tool result.
+    // File-only kinds track revisions in runtime config, not artifact
+    // rows: read the revision from the propose receipt, exactly as
+    // Gaspar would from the tool result.
     const req3Rev = (JSON.parse(req3) as { revision: string }).revision;
     const t3 = JSON.parse((await tools["approval_request"].execute(
       { action: "planning-approval", scope: "REQ-0001", revision: req3Rev, rationale: "r", securityImplications: "s" },
       toolContext()
     )) as string) as { ticketId: string };
-    // Revise through the native tool (same governed operation Gaspar uses).
     const revised = JSON.parse((await tools["artifact_revise"].execute(
       { id: "REQ-0001", title: "R2", body: "Changed inline body." },
       toolContext()
     )) as string) as { revision: string };
-    await expect(tools["approval_confirm"].execute({ ticket: t3.ticketId }, toolContext())).rejects.toThrow();
+    expect(revised.revision).not.toBe(req3Rev);
+    const stale = JSON.parse((await tools["approval_status"].execute({ ticket: t3.ticketId }, toolContext())) as string) as {
+      live: boolean;
+    };
+    expect(stale.live).toBe(false);
     expect(core.hasValidApproval("REQ-0001", revised.revision, "planning-approval")).toBe(false);
-  });
-
-  it("refuses the ceremony under --auto without touching state", async () => {
-    await tools["artifact_propose"].execute(
-      { kind: "spec", id: "SP-0001", title: "S", body: "Body." },
-      toolContext()
-    );
-    const specRev = core.getArtifact("SP-0001").revision;
-    const requested = JSON.parse((await tools["approval_request"].execute(
-      { action: "planning-approval", scope: "SP-0001", revision: specRev, rationale: "r", securityImplications: "s" },
-      toolContext()
-    )) as string) as { ticketId: string };
-    process.argv.push("--auto");
-    try {
-      await expect(tools["approval_confirm"].execute({ ticket: requested.ticketId }, toolContext())).rejects.toThrow(/auto-approve/);
-    } finally {
-      process.argv.pop();
-    }
-    expect(core.hasValidApproval("SP-0001", specRev, "planning-approval")).toBe(false);
-    expect(askFixture.calls).toHaveLength(0);
-  });
-
-  it("fails loudly when the native ask boundary is missing", async () => {
-    await tools["artifact_propose"].execute(
-      { kind: "spec", id: "SP-0001", title: "S", body: "Body." },
-      toolContext()
-    );
-    const specRev = core.getArtifact("SP-0001").revision;
-    const requested = JSON.parse((await tools["approval_request"].execute(
-      { action: "planning-approval", scope: "SP-0001", revision: specRev, rationale: "r", securityImplications: "s" },
-      toolContext()
-    )) as string) as { ticketId: string };
-    const { ask: _ask, ...withoutAsk } = toolContext();
-    void _ask;
-    await expect(tools["approval_confirm"].execute({ ticket: requested.ticketId }, withoutAsk)).rejects.toThrow(/ask boundary is unavailable/);
-    expect(core.hasValidApproval("SP-0001", specRev, "planning-approval")).toBe(false);
   });
 });
 
@@ -775,26 +708,41 @@ describe("OC-P11 native supersede, heal, and retry semantics (D3/D4)", () => {
     expect(existsSync(join(root, ".chrono", "specs", "SP-0001.md"))).toBe(true);
   });
 
-  it("denials name their layer and same-ticket retryability (D4)", async () => {
+  it("supersedes through the native tool with coherent registry/file/status", async () => {
+    const call = async (name: string, args: Record<string, unknown>): Promise<string> => {
+      const fn = tools[name] as { execute: (a: unknown, c: unknown) => Promise<string> };
+      return fn.execute(args, toolContext());
+    };
+    await call("artifact_propose", { kind: "spec", id: "SP-0003", title: "Old", body: "Old contract." });
+    await call("artifact_propose", { kind: "spec", id: "SP-0004", title: "New", body: "New contract." });
+    const done = JSON.parse(await call("artifact_supersede", { id: "SP-0003", supersededBy: "SP-0004" })) as {
+      ok: boolean;
+      supersededBy: string;
+    };
+    expect(done).toMatchObject({ ok: true, supersededBy: "SP-0004" });
+    const status = JSON.parse(await call("artifact_status", {})) as {
+      items: Array<{ id: string; lifecycle: string; supersededBy: string | null; filePresent: boolean }>;
+    };
+    expect(status.items.find((i) => i.id === "SP-0003")).toMatchObject({ lifecycle: "superseded", supersededBy: "SP-0004", filePresent: true });
+    // Unknown replacement and double supersede deny.
+    await expect(call("artifact_supersede", { id: "SP-0004", supersededBy: "SP-9999" })).rejects.toThrow(/REFERENCE_UNRESOLVABLE/);
+    await expect(call("artifact_supersede", { id: "SP-0003", supersededBy: "SP-0004" })).rejects.toThrow(/INVALID_STATE/);
+  });
+
+  it("doctor reports ceremony evidence Gaspar can quote (D4)", async () => {
+    const { runDoctor } = await import("./init-flow.js");
     const call = async (name: string, args: Record<string, unknown>): Promise<string> => {
       const fn = tools[name] as { execute: (a: unknown, c: unknown) => Promise<string> };
       return fn.execute(args, toolContext());
     };
     await call("artifact_propose", { kind: "spec", id: "SP-0001", title: "S", body: "Body." });
-    const specRev = core.getArtifact("SP-0001").revision;
-    const requested = JSON.parse(await call("approval_request", {
-      action: "planning-approval", scope: "SP-0001", revision: specRev, rationale: "r", securityImplications: "s",
-    })) as { ticketId: string };
-    // Host-boundary denial (declined human answer): layer=host, same ticket retryable.
-    askMode = "deny";
-    await expect(call("approval_confirm", { ticket: requested.ticketId })).rejects.toThrow(/layer=host retryable=yes/);
-    askMode = "allow";
-    // Malformed ticket: host denial, not retryable.
-    await expect(call("approval_confirm", { ticket: "bogus" })).rejects.toThrow(/layer=host retryable=no/);
-    // Genuine confirmation succeeds; replay then needs a fresh ticket.
-    const receipt = JSON.parse(await call("approval_confirm", { ticket: requested.ticketId })) as { ok: boolean };
-    expect(receipt.ok).toBe(true);
-    await expect(call("approval_confirm", { ticket: requested.ticketId })).rejects.toThrow(/layer=core retryable=no/);
+    // No ceremony traffic yet: doctor says so explicitly.
+    const before = runDoctor(root, { json: true });
+    expect(before.exitCode).toBe(1);
+    expect(JSON.parse(before.stdout) as object).toMatchObject({
+      doctor: { ceremony: { events: [], detail: "no ceremony traffic observed" } },
+    });
+    void gasparSession;
   });
 });
 

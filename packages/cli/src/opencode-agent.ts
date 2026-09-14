@@ -141,15 +141,17 @@ const ROLE_BODIES: Record<ChronoOpenCodeRole, string> = {
     "  ticket binding action, scope, exact revision, rationale, and",
     "  security implications; (2) the native `question` tool carrying the",
     "  exact `CHRONO approval <challenge> :: <action> <id> @<revision> ::`",
-    "  `<rationale>` line VERBATIM with Approve and Deny options naming",
-    "  the challenge; (3) `chrono_approval_confirm` with the ticket — the",
-    "  runtime asks the human natively and records the signed approval;",
-    "  (4) verify with `chrono_artifact_status` and continue from Core",
-    "  state. Never run shell approval commands, never run",
-    "  `chrono approval-record`, never handle keys or session tokens,",
-    "  never paste `--session-token` into model-visible text: signing",
-    "  happens in the runtime host after the human answers, never in",
-    "  your context. Only a Core-recorded approval counts. Retire",
+    "  `<rationale>` line VERBATIM with an explicit Approve option naming",
+    "  the challenge plus a Deny option; the PO answers in the OpenCode",
+    "  UI and the runtime host records the signed approval on an",
+    "  explicit Approve only; (3) verify with `chrono_artifact_status`",
+    "  and `chrono doctor` (its ceremony section reports WHERE each",
+    "  confirmation stands — host boundary vs Core — so report host",
+    "  vs Core failures exactly, never blanket Core blame) and continue",
+    "  from Core state. There is no approval-confirm tool",
+    "  to call and no shell approval command to run: never handle keys",
+    "  or session tokens, never paste `--session-token` into",
+    "  model-visible text. Only a Core-recorded approval counts. Retire",
     "  replaced drafts with `chrono_artifact_supersede` (never delete",
     "  files or edit the database). Never sign, proxy, or claim PO",
     "  authority.",
@@ -280,7 +282,7 @@ export function buildOpenCodeAgentDefinition(role: ChronoOpenCodeRole): string {
   // precedence; the in-execute ask() remains the backstop.
   const permission =
     role === "gaspar"
-      ? "permission:\n  chrono_artifact_status: allow\n  chrono_artifact_propose: allow\n  chrono_artifact_revise: allow\n  chrono_artifact_supersede: allow\n  chrono_approval_request: allow\n  chrono_approval_status: allow\n  chrono_approval_confirm: ask\n"
+      ? "permission:\n  chrono_artifact_status: allow\n  chrono_artifact_propose: allow\n  chrono_artifact_revise: allow\n  chrono_artifact_supersede: allow\n  chrono_approval_request: allow\n  chrono_approval_status: allow\n"
       : "";
   return `---\ndescription: ${ROLE_DESCRIPTIONS[role]}\nmode: ${mode}\n${permission}---\n\n${ROLE_BODIES[role]}\n`;
 }

@@ -2220,6 +2220,23 @@ export interface DoctorReport {
     readonly pluginLoads: number;
     readonly detail: string;
   };
+  /**
+   * Observed approval-ceremony evidence (fail-open fix, read-only).
+   * The plugin host appends one non-secret record per ceremony
+   * observation (finalized, declined, denied, skipped). Gaspar reads
+   * this section to report WHERE a confirmation stands — host
+   * boundary vs Core — without ever seeing credentials. Informational
+   * only; it never changes the setup-readiness verdict.
+   */
+  readonly ceremony: {
+    readonly events: ReadonlyArray<{
+      readonly at: string;
+      readonly kind: string;
+      readonly ticket: string | null;
+      readonly detail: string;
+    }>;
+    readonly detail: string;
+  };
 }
 
 /**
@@ -2384,6 +2401,81 @@ export function readActivationEvidence(projectRoot: string): DoctorReport["activ
   };
 }
 
+/** Approval-ceremony evidence kinds the plugin host may record (all non-secret). */
+const CEREMONY_KINDS = new Set([
+  "approval-finalized",
+  "approval-answer-declined",
+  "approval-answer-no-match",
+  "approval-ticket-not-live",
+  "approval-cross-session",
+  "approval-no-session",
+  "approval-no-key",
+  "approval-sign-failed",
+  "approval-record-denied",
+  "approval-skipped-auto",
+]);
+
+/**
+ * Observed approval-ceremony evidence (fail-open fix, read-only).
+ * Returns the trailing ceremony records (newest last, capped) plus a
+ * one-line verdict Gaspar can quote: finalized approvals, live denials
+ * with their layer, or the absence of any ceremony traffic.
+ */
+export function readCeremonyEvidence(projectRoot: string): DoctorReport["ceremony"] {
+  let raw: string;
+  try {
+    raw = readFileSync(join(projectRoot, ".chrono", "runtime-activation.jsonl"), "utf8");
+  } catch {
+    return { events: [], detail: "no ceremony traffic observed" };
+  }
+  const events: Array<{ at: string; kind: string; ticket: string | null; detail: string }> = [];
+  for (const line of raw.split("\n")) {
+    if (line.length === 0) {
+      continue;
+    }
+    let record: unknown;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof record !== "object" || record === null) {
+      continue;
+    }
+    const entry = record as Record<string, unknown>;
+    if (entry["adapter"] !== "opencode" || typeof entry["kind"] !== "string" || !CEREMONY_KINDS.has(entry["kind"])) {
+      continue;
+    }
+    const ticket = typeof entry["ticket"] === "string" ? entry["ticket"] : null;
+    const extra =
+      typeof entry["approval"] === "string"
+        ? `approval ${entry["approval"]}`
+        : typeof entry["code"] === "string"
+          ? entry["code"]
+          : typeof entry["scope"] === "string"
+            ? entry["scope"]
+            : "";
+    events.push({
+      at: typeof entry["ts"] === "string" ? entry["ts"] : "unknown-time",
+      kind: entry["kind"],
+      ticket,
+      detail: extra.length > 0 ? `${entry["kind"]} ${ticket ?? ""} ${extra}`.trim() : `${entry["kind"]} ${ticket ?? ""}`.trim(),
+    });
+  }
+  const tail = events.slice(-10);
+  if (tail.length === 0) {
+    return { events: [], detail: "no ceremony traffic observed" };
+  }
+  const last = tail[tail.length - 1] as { kind: string; ticket: string | null; detail: string };
+  return {
+    events: tail,
+    detail:
+      last.kind === "approval-finalized"
+        ? `latest ceremony finalized ${last.ticket ?? ""}: Core approval recorded`
+        : `latest ceremony ${last.kind} ${last.ticket ?? ""}: no approval recorded by that observation`,
+  };
+}
+
 export interface DoctorOptions {
   readonly json?: boolean | undefined;
   readonly as?: string | undefined;
@@ -2439,6 +2531,7 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
     broker: { visible: false, active: 0, revoked: 0, state: "unknown", brokerId: null, detail: "project not found" },
     entry: { ready: false, reasons: ["project not found"] },
     activation: noActivation,
+    ceremony: readCeremonyEvidence(root),
   };
   const opened = openReadProject(root, asJson);
   if ("failure" in opened) {
@@ -2629,6 +2722,7 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
       broker,
       entry: { ready: reasons.length === 0, reasons },
       activation,
+      ceremony: readCeremonyEvidence(root),
     };
     const body = asJson ? JSON.stringify({ ok: filled.entry.ready, doctor: filled }, null, 2) : renderDoctor(filled);
     return filled.entry.ready
@@ -2745,6 +2839,11 @@ function renderDoctor(report: DoctorReport): string {
         ? `injected=${report.activation.lastInjection.at} (${report.activation.lastInjection.session})`
         : "injected=never",
       `(${report.activation.detail})`,
+    ].join(" "),
+    [
+      "ceremony:",
+      report.ceremony.events.length === 0 ? "no traffic" : `${String(report.ceremony.events.length)} observation(s), latest:`,
+      report.ceremony.detail,
     ].join(" "),
   ];
   return lines.join("\n");

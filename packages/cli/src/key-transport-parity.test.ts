@@ -16,12 +16,12 @@
  * skipped tests — both branches are passing assertions).
  */
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateKeyPairSync, sign, verify, createPrivateKey, createPublicKey } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { pathToFileURL, fileURLToPath } from "node:url";
+import { pathToFileURL } from "node:url";
 import {
   fingerprintKeyMaterial,
   isUsableEd25519Key,
@@ -29,9 +29,8 @@ import {
   readKeyMaterial,
 } from "./key-transport.js";
 import { fingerprintPublicKey } from "@chrono/domain";
-import { buildPlanningToolsFile } from "./opencode-planning-tools.js";
+import { buildOpencodePlugin } from "./opencode-plugin.js";
 
-const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 
 function ed25519Pair(): { publicKeyPem: string; privateKeyPem: string } {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -45,19 +44,18 @@ async function toolKeyFns(): Promise<{
   normalizeKeyMaterial: (material: string) => string;
   parsePoKey: (raw: string) => { pem: string; fingerprint: string } | null;
 }> {
+  // The parity copies live in the GENERATED PLUGIN bytes (the host
+  // signing path): import them for real. The plugin file is plain JS
+  // with node builtins only — no fixture node_modules needed.
   const dir = mkdtempSync(join(tmpdir(), "chrono-key-parity-"));
   try {
-    const fixtureModules = join(dir, "node_modules");
-    mkdirSync(join(fixtureModules, "@opencode-ai"), { recursive: true });
-    symlinkSync(join(REPO_ROOT, "node_modules", "@opencode-ai", "plugin"), join(fixtureModules, "@opencode-ai", "plugin"), "dir");
-    symlinkSync(join(REPO_ROOT, "node_modules", "zod"), join(fixtureModules, "zod"), "dir");
-    mkdirSync(join(dir, ".opencode", "tools"), { recursive: true });
-    writeFileSync(join(dir, ".opencode", "tools", "chrono.ts"), buildPlanningToolsFile(), "utf8");
-    const module = (await import(pathToFileURL(join(dir, ".opencode", "tools", "chrono.ts")).href)) as Record<string, unknown>;
+    const pluginFile = join(dir, "chrono-gate.js");
+    writeFileSync(pluginFile, buildOpencodePlugin(), "utf8");
+    const module = (await import(pathToFileURL(pluginFile).href)) as Record<string, unknown>;
     const normalizeKeyMaterial = module["normalizeKeyMaterial"];
     const parsePoKey = module["parsePoKey"];
     if (typeof normalizeKeyMaterial !== "function" || typeof parsePoKey !== "function") {
-      throw new Error("Generated tool module must export normalizeKeyMaterial and parsePoKey for parity tests");
+      throw new Error("Generated plugin must export normalizeKeyMaterial and parsePoKey for parity tests");
     }
     return {
       normalizeKeyMaterial: normalizeKeyMaterial as (material: string) => string,

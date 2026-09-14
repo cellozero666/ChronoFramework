@@ -20,14 +20,14 @@
 import type { AgentRole } from "./state.js";
 
 /** Version of this authority policy, persisted with authorization evidence. */
-export const AUTHORITY_POLICY_VERSION = "7";
+export const AUTHORITY_POLICY_VERSION = "8";
 
 /**
  * Version of the runtime tool-classification policy below. Bumped
  * independently from the authority matrix: tool classification affects
  * pre-tool gate decisions, never grant semantics.
  */
-export const TOOL_POLICY_VERSION = "3";
+export const TOOL_POLICY_VERSION = "4";
 
 export type CapabilityHolder = AgentRole | "PO";
 
@@ -193,8 +193,6 @@ export const OPENCODE_TOOL_POLICY: Record<string, ToolClassification> = {
   chrono_artifact_revise: "planning",
   chrono_approval_request: "planning",
   chrono_approval_status: "planning",
-  chrono_approval_confirm: "planning",
-  chrono_artifact_supersede: "planning",
 };
 
 /**

@@ -1,6 +1,6 @@
-# ADR-007: Permission-Bound PO Approvals for In-Runtime Ceremonies
+# ADR-007: Explicit-Answer PO Approvals for In-Runtime Ceremonies
 
-**Status:** Proposed (requires PO ratification at pilot acceptance)
+**Status:** Proposed, ceremony BLOCKED (requires PO ratification at pilot acceptance; `ask()`-as-evidence was a fail-open defect, corrected below)
 **Date:** 2026-09-14
 **Authority:** PO decision required (security ceremony equivalence)
 **Decides:** OC-P11 integrated approval ceremony mechanics
@@ -36,26 +36,34 @@ and the published docs:
    `question` tool carrying the exact canonical line
    `CHRONO approval <challenge> :: <action> <scope> @<revision> ::
    <rationale>`. Chat text alone never authorizes.
-3. **Native confirmation tool** (`chrono_approval_confirm` in
-   `.opencode/tools/chrono.ts`, registered in the generated plugin's
-   `Hooks.tool` collection): Gaspar invokes it with the ticket id; it
-   re-validates liveness, requires the native `ask()` human boundary
-   (exact ticket scope in patterns/metadata, empty `always` so nothing
-   broadens silently), refuses `--auto` mode, reads the OS-keychain PO
-   key host-side, signs the canonical payload (byte-identical
-   serializer, contract-tested), and records through
-   `finalizeApprovalTicket`. Denial/cancellation changes nothing.
+3. **Host-finalized explicit answer (fail-open correction)**:
+   `ToolContext.ask()` is tool-execution permission, NOT product
+   approval — a confirm tool signing on `ask()` success recorded a
+   real approval with no human UI, and has been DELETED (unknown
+   `chrono_approval_confirm` is deny-by-default). Instead, the
+   generated plugin observes the runtime-delivered `question` result
+   and finalizes ONLY on explicit human Approve (exact challenge,
+   approval wording, no deny/cancel): it re-validates ticket
+   liveness, revision currency, and session binding, refuses `--auto`,
+   reads the OS-keychain PO key host-side, signs the canonical
+   payload (byte-identical serializer, contract-tested), and records
+   through `finalizeApprovalTicket`. Denial/cancellation/malformed/
+   missing/timeout answers change nothing.
 4. **Core verification** (`finalizeApprovalTicket`): Ed25519 under the
    registered PO key (same crypto!), single-use atomic ticket
    consumption, scope-revision currency (drift burns the ticket),
-   expiry, and a recorded native observation
-   (permission/question call id, decision time). No TTY is required on
-   this path: human presence is proven by the ticket plus the recorded
-   native observation instead of a terminal check.
+   expiry, explicit-answer ceremony marker, and a recorded native
+   observation (question call id, decision time). No TTY is required
+   on this path: human presence is proven by the ticket plus the
+   observed explicit answer instead of a terminal check.
 5. **Classic path unchanged**: `recordApproval` keeps the TTY rule;
    `planning-approval` joins the canonical action set; signatures with
    `security_implications` verify alongside legacy ones (absent field
    serializes as absent).
+6. **Vulnerable-approval invalidation**: permission-bound grants
+   without the explicit-answer marker at the current policy are
+   non-authoritative in every gate, validator, and projection, with
+   history preserved append-only.
 
 ## Why this preserves ADR-003 intent
 
@@ -73,18 +81,19 @@ and the published docs:
 
 - Keychain reads normalize through one shared algorithm
   (lower/UPPERCASE hex, trim, CRLF) with Ed25519 validation and
-  fingerprint binding, in CLI flows and in generated native tools
+  fingerprint binding, in CLI flows and in generated plugin bytes
   (parity-locked copies). Failures are secret-safe denials; the
   ticket survives host-boundary failures and the same ticket is
   retryable, while consumed/stale/expired tickets require a fresh
-  request. Every confirm denial names its layer and retryability.
-- No test seam ships in production tool bytes; hermetic tests inject
-  a fixture `security` on PATH.
+  request. The doctor ceremony section names the failing layer so
+  Gaspar reports host vs Core exactly.
+- No test seam ships in production bytes; hermetic tests inject a
+  fixture `security` on PATH.
 
 ## Residual risks (live-acceptance, pilot retry)
 
 - **Prompt rendering fidelity**: the exact TUI rendering of the
-  question/ask UI is unverified without a paid-model session; the
+  question UI is unverified without a paid-model session; the
   retry must observe it.
 - **Mid-session auto-approve toggling** (palette): launch-time `--auto`
   is refused deterministically, but a palette toggle afterwards has no

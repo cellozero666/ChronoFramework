@@ -912,12 +912,30 @@ separate PO authorization for provider spend:
   body, and project `lifecycle: superseded`; missing files heal in
   place via identical-content revise; revise-after-supersede denies.
 - **D4 — approval retry semantics.** Deterministic and reported:
-  host-boundary failures (no session/key, declined ask, `--auto`,
-  malformed ticket) never consume the ticket — the same ticket is
-  retryable; Core stale/expired/consumed tickets burn and need a
-  fresh request; bad signatures leave the ticket live. Every confirm
-  denial names `[layer=host|core retryable=yes|no]`, and Gaspar's
-  instructions distinguish the two layers.
+  host-boundary failures (no session/key, non-Approve answer,
+  `--auto`, malformed ticket) never consume the ticket — the same
+  ticket is retryable; Core stale/expired/consumed tickets burn and
+  need a fresh request; bad signatures leave the ticket live. The
+  doctor ceremony section names the failing layer so Gaspar reports
+  host vs Core exactly, never blanket Core blame.
+- **Fail-open fix — `ask()` is permission, not approval.** The pilot
+  recorded `APR-0002` with no human UI because a confirm tool signed
+  on execution permission. Corrected: the `chrono_approval_confirm`
+  tool is DELETED (unknown `chrono_approval_confirm` is
+  deny-by-default); signing lives only in generated plugin bytes and
+  fires only on an explicit human Approve observed in a
+  runtime-delivered `question` result (exact challenge, approval
+  wording, no deny/cancel). Permission `allow`/`always`, wildcards,
+  cached grants, auto mode, chat text, and missing/timeout responses
+  can never produce a signature.
+- **Vulnerable-approval invalidation.** Permission-bound approvals
+  recorded without the explicit-answer ceremony marker at the
+  current policy (including the pilot's `APR-0002`, identified by
+  ceremony/policy provenance, never by hardcoded ID) are
+  non-authoritative: every gate, validator, and status projection
+  rejects them while audit history stays append-only. Repair is one
+  `chrono init --runtime opencode` (code upgrade activates the rule;
+  no database surgery, no DRAFT deletion).
 
 ### The single repair command for the existing pilot
 
@@ -954,7 +972,7 @@ integration where available);
 Packed: isolated tarball install, `init --dry-run` with zero writes,
 ceremony command surface (`--body-stdin`, `--security-implications`),
 dist tool-runtime presence. Full `test:clean` PASS (48 files /
-594 tests on Node 22.21.1 and Node 24.20.0 clean exports — `npm ci`,
+595 tests on Node 22.21.1 and Node 24.20.0 clean exports — `npm ci`,
 lint, typecheck, build, suite each green from clean checkouts),
 `lint` exit 0, `git diff --check` clean. Real-runtime evidence: NONE
 YET — the retry below must produce it.
@@ -976,28 +994,31 @@ conversational flow is:
    @sha256:… :: <rationale>`, with Approve / Deny options.
 3. The PO answers **in the OpenCode UI**. A chat "approved" alone only
    makes Gaspar start this flow — it never records anything.
-4. Gaspar calls `chrono_approval_confirm`: the tool re-validates the
-   ticket, requires the native `ask()` human boundary (exact ticket
-   scope in metadata), refuses `--auto` mode, reads the OS-keychain
-   PO key host-side, signs, and records. The model sees the receipt
-   and continues — no restart, no shell, no token handling.
-5. On Deny (or any non-confirming path), nothing changes: the model
-   continues from Core status, which still reads
-   `awaiting-signature`.
+4. On an explicit Approve (exact challenge, approval wording, no
+   deny/cancel), the plugin host — never the model — re-validates
+   ticket liveness, revision currency, and session binding, refuses
+   `--auto` mode, reads the OS-keychain PO key host-side, signs, and
+   records. There is no approval-confirm tool to call and no
+   permission that can substitute: execution permission, cached or
+   wildcard allows, and auto behavior can never produce a signature.
+   The model sees the Core status update and continues — no restart,
+   no shell, no token handling.
+5. On Deny, cancel, malformed, or missing answers, nothing changes:
+   the model continues from Core status, which still reads
+   `awaiting-signature`, and `chrono doctor` names the failing layer.
 6. `chrono_artifact_status` proves every state (proposed, awaiting PO
-   signature, approved, rejected, stale) from Core-signed rows only.
+   signature, approved, rejected, stale, superseded) from Core-signed
+   rows only.
 
 Key/trust facts for the retry: signatures are Ed25519 under the
 enrolled PO key (same cryptography as the classic ceremony);
 tickets are single-use and revision-bound (drift burns them);
 `--auto` launch refuses deterministically; question traffic is
-audited without secrets. Three items stay explicitly
+audited without secrets. Two items stay explicitly
 live-acceptance (unverifiable without a paid-model TUI session): the
-exact TUI rendering of the question and ask() prompts, mid-session
+exact TUI rendering of the question prompt, and mid-session
 auto-approve palette toggling (launch-time `--auto` is covered;
-never enable auto-approve in approval sessions), and the observed
-prompt count for one confirmation (permission ask + in-execute ask
-may each prompt).
+never enable auto-approve in approval sessions).
 
 ### Pilot retry procedure (governed artifact flow)
 
@@ -1017,10 +1038,10 @@ gate passes):
    `chrono_artifact_propose` tool (inline body; no temp files, no
    shell, no tokens).
 4. For each draft: native `chrono_approval_request`, then the native
-   `question` with the exact challenge line, then native
-   `chrono_approval_confirm`; the PO confirms in the OpenCode UI.
-   Chat acceptance is reported only as "PO stated approval in chat"
-   until the Core records the approval.
+   `question` with the exact challenge line; the PO confirms with an
+   explicit Approve in the OpenCode UI and the host records the
+   signed approval. Chat acceptance is reported only as "PO stated
+   approval in chat" until the Core records the approval.
 5. Native `chrono_artifact_status` shows approved for every draft;
    stale drafts require re-request and re-confirmation after revise.
 6. Harness, Module/WP plans, module approval (same ceremony), then

@@ -35,6 +35,7 @@ import {
   isStaleReference,
   parseArtifactId,
   approvalChallenge,
+  permissionBoundApprovalAuthoritative,
   APPROVAL_TICKET_TTL_SECONDS,
   assertBlockerType,
   assertRequiredFields,
@@ -4705,6 +4706,14 @@ export class ChronoCore {
    * The approval must be bound to the scope's exact current revision;
    * material change invalidates it. Every stored approval was
    * cryptographically verified at record time [DOM §3.16, INV §5.4].
+   *
+   * Fail-open invalidation (blocking defect): approvals recorded
+   * through the vulnerable permission-based ceremony — a
+   * permission-bound grant event without the explicit-answer ceremony
+   * marker at the current policy — are non-authoritative. They stay
+   * in history (forward-only, never deleted) but every gate rejects
+   * them until a fresh ticket plus an explicit human decision
+   * re-authorizes the scope.
    */
   hasValidApproval(artifactId: string, revision: string, action: string): boolean {
     const approval = this.approvals.findByScope(artifactId, revision, action);
@@ -4717,7 +4726,39 @@ export class ChronoCore {
       return false;
     }
 
+    if (!this.approvalCeremonyAuthoritative(approval.id)) {
+      return false;
+    }
+
     return true;
+  }
+
+  /**
+   * Ceremony provenance check for one approval row. Classic
+   * interactive approvals carry no ticket marker and are unaffected.
+   * Permission-bound approvals are authoritative only with the
+   * explicit-answer ceremony marker recorded at the current policy:
+   * anything older (including the vulnerable ask()-gated ceremony)
+   * fails closed here, in `validate`, and in status projections.
+   */
+  approvalCeremonyAuthoritative(approvalId: string): boolean {
+    let grantEvent: { payload: string } | null = null;
+    for (const event of this.events.listByEntity(approvalId)) {
+      if (event.eventType === "ApprovalGranted") {
+        grantEvent = { payload: event.payload };
+        break;
+      }
+    }
+    if (grantEvent === null) {
+      return false;
+    }
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(grantEvent.payload) as Record<string, unknown>;
+    } catch {
+      return false;
+    }
+    return permissionBoundApprovalAuthoritative(payload, AUTHORITY_POLICY_VERSION);
   }
 
   /**
@@ -8108,6 +8149,7 @@ export class ChronoCore {
     rationale: string;
     securityImplications: string;
     challenge: string;
+    requesterSession: string;
     expiresAt: string;
     consumed: boolean;
     live: boolean;
@@ -8133,6 +8175,7 @@ export class ChronoCore {
           rationale: ticket.rationale,
           securityImplications: ticket.securityImplications,
           challenge: approvalChallenge(ticket.id),
+          requesterSession: ticket.requesterSession,
           expiresAt: ticket.expiresAt,
           consumed: ticket.consumed,
           live,
@@ -8263,13 +8306,18 @@ export class ChronoCore {
             rationale: ticket.rationale,
             securityImplications: ticket.securityImplications,
             ticketId: ticket.id,
+            // Explicit-answer ceremony marker (fail-open fix): only
+            // question-answer-v1 grants recorded at the current policy
+            // are authoritative. Older permission-bound grants stay in
+            // history but every gate rejects them.
+            ceremony: "question-answer-v1",
             nativeObservation: input.observation,
             policyVersion: AUTHORITY_POLICY_VERSION,
           },
           actor: "PO",
           priorState: "granted",
           newState: "granted",
-          reasoning: "PO approval recorded through the native permission-bound ceremony",
+          reasoning: "PO approval recorded through the native explicit-answer ceremony",
         });
       });
       this.syncProjectState();
