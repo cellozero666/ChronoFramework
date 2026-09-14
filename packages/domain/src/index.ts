@@ -82,6 +82,7 @@ export {
 
 // Planning/artifact-authoring path (OC-P11): Gaspar bootstrap without dispatch
 export {
+  APPROVAL_TICKET_TTL_SECONDS,
   FORBIDDEN_READ_SUBSTRINGS,
   PLANNING_ALLOC_FAMILY,
   PLANNING_BASH_PREFIXES,
@@ -90,10 +91,14 @@ export {
   PLANNING_KIND_FAMILY,
   PLANNING_MAX_BYTES,
   PLANNING_MIN_BYTES,
+  approvalAnswerMatches,
+  approvalChallenge,
+  approvalQuestionLine,
   assertNoSecrets,
   assertPlanningContent,
   assertPlanningId,
   assertPlanningKind,
+  canonicalizeJson,
   extractBashCommand,
   isPlanningBashCommand,
   isPlanningKind,
@@ -106,6 +111,9 @@ export {
 export {
   ENTRY_SESSION_SCRIPT_ASSET,
   LEGACY_MANAGED_ASSETS,
+  OPENCODE_AGENT_ASSETS,
+  OPENCODE_TOOL_ASSETS,
+  OPENCODE_TOOLS_PACKAGE_MARKER,
   RUNTIME_MANAGED_ASSETS,
   claudeEntryAsset,
   kiroEntryAsset,
@@ -119,13 +127,17 @@ export {
   AUTHORITY_POLICY_VERSION,
   EVENT_ROLE_ALLOWLIST,
   KNOWN_RUNTIME_IDS,
+  OPENCODE_TOOL_POLICY,
   ROLE_CAPABILITIES,
+  TOOL_POLICY_VERSION,
+  classifyOpencodeTool,
   isCapable,
   isKnownRuntimeId,
   mayEnactEvent,
   type CapabilityHolder,
   type CoreOperation,
   type KnownRuntimeId,
+  type ToolClassification,
 } from "./capabilities.js";
 
 // Registration rules (entry states, required fields)

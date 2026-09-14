@@ -900,5 +900,53 @@ The Core exposes deterministic functions. Adapters MAY call them but MUST NOT re
 | `chrono_approve(action, scope, rev, rationale)` | approval_id or `APPROVAL_REQUIRED` | Interactive PO approval |
 | `verify_and_record_rtk()` | `current` attestation or `BLOCKED_RTK` | RTK verification |
 | `verify_and_record_skill()` | `current` attestation or `BLOCKED_PROCESS_SKILL` | Skill verification |
+| `propose_planning_artifact(kind, id?, title, body, refs?)` | `{id, revision, path, approvalCommand}` or error | Governed planning draft (Gaspar/PO) |
+| `revise_planning_artifact(id, title, body)` | `{id, revision, path, approvalCommand}` or error | New planning revision; stales approvals |
+| `planning_status()` | proposed/awaiting/approved/rejected/stale list | Safe status projection, no secrets |
 
 Reference: `[DOM §6]`, `[FW §13]`, `[REF §24]`.
+
+---
+
+## 17. Planning-Artifact Authoring (OC-P11)
+
+The bootstrap deadlock (no Module/WP dispatch before Specs exist, no
+Specs without file writes) is closed by a Core-governed planning path
+distinct from implementation execution.
+
+### 17.1 Permitted kinds and destinations
+
+Kinds: `discovery`, `requirement`, `architecture`, `adr`, `spec`,
+`harness-draft`, `security-profile`, `roadmap`, `module`,
+`workpackage`. Destinations derive deterministically from (kind, id)
+under `.chrono/context`, `.chrono/architecture`,
+`.chrono/architecture/adr`, `.chrono/specs`, `.chrono/harness`,
+`.chrono/security`, `.chrono/roadmap`. There is no caller-supplied
+path. Product-code paths, `.chrono/chrono.db`, broker accounts, token
+files, and internal hooks are unreachable through this path.
+
+### 17.2 Capability and validation
+
+`planning.propose`, `planning.revise`, `planning.status` admit Gaspar
+and the PO only (authority policy v5; tool policy v2). Validation
+covers kind, exact identifier, lifecycle entry state
+(DRAFT/PLANNED/proposed), resolvable references, schema, secrets, and
+size (1 byte to 64 KiB). `module` plans require at least one Spec
+reference; `workpackage` plans require their owning Module reference.
+
+### 17.3 Atomicity and revision binding
+
+Files materialize first (tmp + rename), so a filesystem failure denies
+with nothing persisted; SQLite registry/event changes commit second,
+removing the created file when the transaction fails. `revise` keeps
+a backup and restores the last good draft on registry failure — no
+half-materialized draft reads as ready. The file revision IS the
+registry revision: SP/MOD/WP drafts
+create DRAFT/PLANNED rows, `ARCH` moves the project architecture row,
+security proposals append profile versions, and all other kinds track
+revisions in runtime config. `revise` appends history and moves the
+current pointer, so `planning-approval` rows bound to older revisions
+go stale deterministically. The `planning-approval` action joins the
+canonical approval set alongside `module-approval`,
+`architecture-security`, `implementation-security`, and
+`adapter-registration`.

@@ -123,19 +123,34 @@ const ROLE_BODIES: Record<ChronoOpenCodeRole, string> = {
     "  artifacts, ADRs, Specs, and the repository before interrupting the",
     "  Product Owner. Persist every decision, requirement, and open question",
     "  as structured project knowledge — conversation is not storage.",
-    "- Materialize planning artifacts ONLY through the Core-governed path:",
-    "  `chrono artifact propose|revise|status` (never generic write/edit).",
-    "  Discovery answers, requirements, architecture/ADR proposals, Spec",
-    "  drafts, harness drafts, security-profile proposals, and roadmap or",
-    "  Module/Work Package plans are DRAFT material until validated. Never",
-    "  use `chrono run`: execution grants are reserved for authorized",
-    "  implementation work and cannot exist before Module approval.",
+    "- Materialize planning artifacts ONLY through the native governed",
+    "  planning tools: `chrono_artifact_propose`, `chrono_artifact_revise`,",
+    "  `chrono_artifact_status`. Discovery answers, requirements,",
+    "  architecture/ADR proposals, Spec drafts, harness drafts,",
+    "  security-profile proposals, and roadmap or Module/Work Package",
+    "  plans are DRAFT material until validated. Pass the Markdown body",
+    "  inline to the tool (never temp files). Never use generic",
+    "  write/edit/bash for planning, and never use `chrono run`:",
+    "  execution grants are reserved for authorized implementation work",
+    "  and cannot exist before Module approval.",
     "- Request Product Owner approval at required gates through CHRONO; never",
     "  synthesize, preapprove, or bypass authority. A PO statement in chat",
     "  such as \"approved\" is NOT a registered approval: report it only as",
-    "  \"PO stated approval in chat\" and present the exact `chrono approve`",
-    "  ceremony. Only a successful Core-signed approval may be reported as",
-    "  registered. Never sign, proxy, or claim PO authority.",
+    "  \"PO stated approval in chat\", then confirm for real, all inside",
+    "  this session: (1) `chrono_approval_request` for a single-use",
+    "  ticket binding action, scope, exact revision, rationale, and",
+    "  security implications; (2) the native `question` tool carrying the",
+    "  exact `CHRONO approval <challenge> :: <action> <id> @<revision> ::`",
+    "  `<rationale>` line VERBATIM with Approve and Deny options naming",
+    "  the challenge; (3) `chrono_approval_confirm` with the ticket — the",
+    "  runtime asks the human natively and records the signed approval;",
+    "  (4) verify with `chrono_artifact_status` and continue from Core",
+    "  state. Never run shell approval commands, never run",
+    "  `chrono approval-record`, never handle keys or session tokens,",
+    "  never paste `--session-token` into model-visible text: signing",
+    "  happens in the runtime host after the human answers, never in",
+    "  your context. Only a Core-recorded approval counts. Never sign,",
+    "  proxy, or claim PO authority.",
     "- Apply the Karpathy Guidelines skill throughout (think before coding,",
     `  simplicity first, surgical changes, goal-driven verified execution; pinned ${SKILL_RELEASE.pinnedCommit})`,
     "  without ever simplifying away security, traceability, evidence,",
@@ -256,7 +271,16 @@ const ROLE_BODIES: Record<ChronoOpenCodeRole, string> = {
  */
 export function buildOpenCodeAgentDefinition(role: ChronoOpenCodeRole): string {
   const mode = role === "gaspar" ? "primary" : "subagent";
-  return `---\ndescription: ${ROLE_DESCRIPTIONS[role]}\nmode: ${mode}\n---\n\n${ROLE_BODIES[role]}\n`;
+  // Gaspar alone receives the governed planning tool policy (OC-P11
+  // correction): planning/request/status tools run freely under Core
+  // governance, while approval confirmation always asks the human
+  // natively. Agent rules merge over global config and take
+  // precedence; the in-execute ask() remains the backstop.
+  const permission =
+    role === "gaspar"
+      ? "permission:\n  chrono_artifact_status: allow\n  chrono_artifact_propose: allow\n  chrono_artifact_revise: allow\n  chrono_approval_request: allow\n  chrono_approval_status: allow\n  chrono_approval_confirm: ask\n"
+      : "";
+  return `---\ndescription: ${ROLE_DESCRIPTIONS[role]}\nmode: ${mode}\n${permission}---\n\n${ROLE_BODIES[role]}\n`;
 }
 
 /** Parse one agent file frontmatter (description/mode); null when malformed. */
@@ -388,7 +412,7 @@ function findTopLevelDefaultAgentKeys(raw: string): KeySpan[] {
   const spans: KeySpan[] = [];
   let i = 0;
   let depth = 0;
-  let inString = false;
+  const inString = false;
   let stringStart = -1;
   const n = raw.length;
   const skipString = (from: number): number => {
@@ -685,7 +709,7 @@ export function removeDefaultAgentKey(existing: string): { content: string } {
     }
     return { content: `${existing.slice(0, span.start)}${existing.slice(end)}` };
   }
-  let start = span.start;
+  const start = span.start;
   let p = start - 1;
   while (p >= 0 && /[ \t\n\r]/.test(existing[p] as string)) {
     p -= 1;

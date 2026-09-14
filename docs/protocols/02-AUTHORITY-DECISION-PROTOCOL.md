@@ -77,3 +77,16 @@ The Core MUST persist approvals and decisions, validate authority and freshness,
 ## 10. Approval authenticity
 
 PO approval, waiver, and risk acceptance MUST be issued only through an interactive human terminal using `chrono approve`, `chrono waive`, or the corresponding risk command. A signing key outside the project and agent context, preferably in the operating-system keychain, MUST sign the exact action, scope, artifact identity, revision/hash, signer, and timestamp. Events are append-only in SQLite and material changes invalidate affected signatures. Missing interactivity, verified identity, key access, or signature validity MUST produce `APPROVAL_REQUIRED`. Agents and adapters MUST be unable to impersonate or automate PO authority.
+
+## 11. Permission-bound approvals inside agent runtimes (OC-P11, ADR-007)
+
+Where no line terminal exists for the agent runtime (OpenCode TUI),
+the equivalent ceremony is: a single-use Core ticket binding action,
+scope, exact revision, rationale, and security implications; a native
+runtime confirmation (human answer to a `question` carrying the exact
+ticket challenge); host-observed finalize with OS-keychain signing;
+Core verification of the Ed25519 signature, ticket single-use, and
+revision currency. Chat text alone never authorizes; the model cannot
+confirm, forge, replay, or auto-accept; denial changes nothing; no key
+or credential reaches the model. `--auto` mode refuses the ceremony.
+This path is Proposed until PO ratification at pilot acceptance.

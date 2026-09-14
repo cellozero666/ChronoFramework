@@ -40,6 +40,20 @@ export const ENTRY_SESSION_SCRIPT_ASSET: ManagedAssetSpec = {
  * the matching runtime. Each set is self-sufficient together with the
  * shared entry script.
  */
+/** Marker substring proving the managed tool runtime dependency. */
+export const OPENCODE_TOOLS_PACKAGE_MARKER = "@opencode-ai/plugin";
+
+/**
+ * Native governed planning tools for OpenCode (OC-P11 correction).
+ * The tool module is byte-exact; the runtime manifest carries the pinned
+ * dependency marker (user-owned resolvers must tolerate registry metadata around
+ * the pinned entry without false drift).
+ */
+export const OPENCODE_TOOL_ASSETS: readonly ManagedAssetSpec[] = [
+  { path: ".opencode/tools/chrono.ts", kind: "exact" },
+  { path: ".opencode/package.json", kind: "marker", marker: OPENCODE_TOOLS_PACKAGE_MARKER },
+];
+
 /** Canonical CHRONO role agent definitions for OpenCode (OC-P10). */
 export const OPENCODE_AGENT_ASSETS: readonly ManagedAssetSpec[] = [
   { path: ".opencode/agents/gaspar.md", kind: "exact" },
@@ -52,7 +66,11 @@ export const OPENCODE_AGENT_ASSETS: readonly ManagedAssetSpec[] = [
 ];
 
 export const RUNTIME_MANAGED_ASSETS: Record<KnownRuntimeId, readonly ManagedAssetSpec[]> = {
-  opencode: [{ path: ".opencode/plugins/chrono-gate.js", kind: "exact" }, ...OPENCODE_AGENT_ASSETS],
+  opencode: [
+    { path: ".opencode/plugins/chrono-gate.js", kind: "exact" },
+    ...OPENCODE_AGENT_ASSETS,
+    ...OPENCODE_TOOL_ASSETS,
+  ],
   "claude-code": [
     { path: ".chrono/hooks/chrono-claude-gate.js", kind: "exact" },
     { path: ".claude/settings.json", kind: "marker", marker: "chrono-claude-gate.js" },

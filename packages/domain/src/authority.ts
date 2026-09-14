@@ -34,7 +34,15 @@ export const APPROVAL_ACTIONS = [
 
 export type ApprovalAction = (typeof APPROVAL_ACTIONS)[number];
 
-/** Canonical approval payload [ADR-003 §3]. */
+/**
+ * Canonical approval payload [ADR-003 §3, ADR-007 §3].
+ *
+ * `security_implications` is optional and signed when present: classic
+ * interactive approvals omit it (identical bytes as before), while
+ * permission-bound approvals bind the ticket's recorded security
+ * implications into the signature. Absent serializes as absent —
+ * existing signatures verify unchanged.
+ */
 export interface ApprovalPayload {
   readonly action: string;
   readonly scope_artifact_id: string;
@@ -42,6 +50,7 @@ export interface ApprovalPayload {
   readonly authority: string;
   readonly rationale: string;
   readonly timestamp: string;
+  readonly security_implications?: string;
 }
 
 /** Canonical privileged-session bootstrap payload [Remediation §3A]. */
@@ -182,7 +191,7 @@ export function verifyApprovalSignature(
   }
 }
 
-/** Build the canonical approval payload from its fields [ADR-003 §3]. */
+/** Build the canonical approval payload from its fields [ADR-003 §3, ADR-007 §3]. */
 export function buildApprovalPayload(fields: {
   action: string;
   scopeArtifactId: string;
@@ -190,6 +199,7 @@ export function buildApprovalPayload(fields: {
   authority: string;
   rationale: string;
   timestamp: string;
+  securityImplications?: string;
 }): ApprovalPayload {
   return {
     action: fields.action,
@@ -198,6 +208,9 @@ export function buildApprovalPayload(fields: {
     authority: fields.authority,
     rationale: fields.rationale,
     timestamp: fields.timestamp,
+    ...(fields.securityImplications !== undefined && fields.securityImplications.length > 0
+      ? { security_implications: fields.securityImplications }
+      : {}),
   };
 }
 

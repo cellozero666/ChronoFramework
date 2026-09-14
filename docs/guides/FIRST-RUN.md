@@ -96,6 +96,31 @@ selection, no exported tokens, no repeated questions.
 > model execution, provider login) awaits explicit PO authorization
 > and is reported as open, not passed.
 
+## 3.1 Propose drafts and collect approvals (before any implementation)
+
+Gaspar works through its NATIVE governed tools (no shell, no temp
+files, no tokens): `chrono_artifact_propose` / `chrono_artifact_revise`
+with inline Markdown bodies, `chrono_artifact_status` for the safe
+projection, `chrono_approval_request` for single-use tickets, and
+`chrono_approval_confirm` for the human confirmation. Never generic
+file writes, never `chrono run` (execution grants are reserved for
+authorized implementation work).
+
+Each draft is approved **without leaving the runtime**: Gaspar opens
+a ticket, asks you through the native `question` UI showing the exact
+artifact, revision, and rationale, and — only after your explicit
+in-UI confirmation through the tool's native approval boundary — the
+runtime host signs with the OS-keychain PO key and records the
+approval. A chat "approved" alone starts this flow but records
+nothing; status reports `awaiting-signature` until the Core records
+it. Revising a draft stales prior approvals; re-request and
+re-confirm the new revision. Never run OpenCode with `--auto` for
+approval sessions (auto mode cannot supply human confirmation and
+the ceremony refuses it); never paste session tokens anywhere. (The
+equivalent `chrono artifact --body-file/--body-stdin` and
+`chrono approval-request` shell commands exist for operators with an
+exported session; Gaspar must use the native tools.)
+
 ## 4. Re-run, repair, and diagnose
 
 ```sh

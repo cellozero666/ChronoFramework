@@ -2583,4 +2583,154 @@ export class BrokerRepository {
   }
 }
 
+/** Native approval ticket record (OC-P11 integrated ceremony). */
+export interface ApprovalTicketRecord {
+  id: string;
+  action: string;
+  scopeArtifactId: string;
+  scopeRevision: string;
+  authority: string;
+  rationale: string;
+  securityImplications: string;
+  requesterSession: string;
+  createdAt: string;
+  expiresAt: string;
+  consumed: boolean;
+}
+
+interface ApprovalTicketRow {
+  id: unknown;
+  action: unknown;
+  scope_artifact_id: unknown;
+  scope_revision: unknown;
+  authority: unknown;
+  rationale: unknown;
+  security_implications: unknown;
+  requester_session: unknown;
+  created_at: unknown;
+  expires_at: unknown;
+  consumed: unknown;
+}
+
+/**
+ * Repository for single-use approval tickets. Tickets are created by
+ * approval-request and consumed by exactly one permission-bound
+ * finalize: consumption is one conditional UPDATE (`WHERE consumed = 0`)
+ * so concurrent finalizers cannot double-spend. Rows are never deleted.
+ */
+export class ApprovalTicketRepository {
+  constructor(private readonly db: Database) {}
+
+  create(ticket: {
+    id: string;
+    action: string;
+    scopeArtifactId: string;
+    scopeRevision: string;
+    authority: string;
+    rationale: string;
+    securityImplications: string;
+    requesterSession: string;
+    createdAt: string;
+    expiresAt: string;
+  }): ApprovalTicketRecord {
+    try {
+      this.db.prepare(
+        `INSERT INTO approval_ticket (id, action, scope_artifact_id, scope_revision, authority,
+           rationale, security_implications, requester_session, created_at, expires_at, consumed)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+      ).run(
+        ticket.id, ticket.action, ticket.scopeArtifactId, ticket.scopeRevision,
+        ticket.authority, ticket.rationale, ticket.securityImplications,
+        ticket.requesterSession, ticket.createdAt, ticket.expiresAt
+      );
+    } catch {
+      throw new ChronoError({
+        code: ErrorCode.DUPLICATE_IDENTITY,
+        severity: Severity.ERROR,
+        message: `Approval ticket '${ticket.id}' already exists`,
+        invariantRef: "INV §10.1",
+        affectedTarget: ticket.id,
+        suggestedAction: "Request a fresh ticket for the current revision",
+      });
+    }
+    return this.findById(ticket.id);
+  }
+
+  findById(id: string): ApprovalTicketRecord {
+    const row = this.db
+      .prepare("SELECT * FROM approval_ticket WHERE id = ?")
+      .get(id) as ApprovalTicketRow | undefined;
+    if (row === undefined) {
+      throw new ChronoError({
+        code: ErrorCode.ENTITY_NOT_FOUND,
+        severity: Severity.ERROR,
+        message: `Approval ticket '${id}' not found`,
+        invariantRef: "INV §10.2",
+        affectedTarget: id,
+        suggestedAction: "Request an approval ticket for the current revision first",
+      });
+    }
+    return this.mapRow(row);
+  }
+
+  /** Live (unconsumed) tickets for one scope, newest first. */
+  findLiveForScope(scopeArtifactId: string): ApprovalTicketRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM approval_ticket WHERE scope_artifact_id = ? AND consumed = 0 ORDER BY created_at DESC")
+      .all(scopeArtifactId) as ApprovalTicketRow[];
+    return rows.map((r) => this.mapRow(r));
+  }
+
+  /**
+   * Consume a ticket atomically: exactly one row must flip from
+   * unconsumed, otherwise the ticket is missing, already consumed, or
+   * raced — all fail closed.
+   */
+  consume(id: string): ApprovalTicketRecord {
+    const info = this.db
+      .prepare("UPDATE approval_ticket SET consumed = 1 WHERE id = ? AND consumed = 0")
+      .run(id);
+    if (info.changes !== 1) {
+      const row = this.db
+        .prepare("SELECT consumed FROM approval_ticket WHERE id = ?")
+        .get(id) as { consumed: number } | undefined;
+      if (row === undefined) {
+        throw new ChronoError({
+          code: ErrorCode.ENTITY_NOT_FOUND,
+          severity: Severity.ERROR,
+          message: `Approval ticket '${id}' not found: replay denied`,
+          invariantRef: "INV §10.2",
+          affectedTarget: id,
+          suggestedAction: "Request a fresh ticket for the current revision",
+        });
+      }
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Approval ticket '${id}' was already consumed: replay denied`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Request a fresh ticket for the current revision",
+      });
+    }
+    return this.findById(id);
+  }
+
+  private mapRow(row: ApprovalTicketRow): ApprovalTicketRecord {
+    return {
+      id: row.id as string,
+      action: row.action as string,
+      scopeArtifactId: row.scope_artifact_id as string,
+      scopeRevision: row.scope_revision as string,
+      authority: row.authority as string,
+      rationale: row.rationale as string,
+      securityImplications: row.security_implications as string,
+      requesterSession: row.requester_session as string,
+      createdAt: row.created_at as string,
+      expiresAt: row.expires_at as string,
+      consumed: Boolean(row.consumed),
+    };
+  }
+}
+
 export { type Database };

@@ -755,11 +755,240 @@ On the existing pilot project (untouched by this session):
    Gaspar. Any paid step needs fresh PO authorization immediately
    beforehand.
 
+## Finding OC-P11 — CHRONO cannot materialize its initial governed artifacts
+
+**Status:** IMPLEMENTED — NOT VERIFIED (blocking live acceptance; the
+defect below is blocking, this label must not be read as completion)
+
+Real Phase 6A workflow observation (provider-backed OpenCode run,
+`/Volumes/Studio/HOSTS/CHRONOTESTAPP`, initialized READY, Gaspar
+genuinely selected, session closed with no chat approval accepted):
+
+1. Gaspar completed product discovery.
+2. Gaspar attempted `chrono artifact status` through OpenCode's bash tool.
+3. CHRONO denied it as generic implementation mutation:
+   `[chrono] CHRONO project without dispatch context: export
+   CHRONO_GATE_MODULE ... or dispatch via 'chrono run'.`
+4. Gaspar created no Markdown documents and no Core artifact records.
+5. Gaspar created no approval ticket.
+6. OpenCode displayed no native approval UI.
+7. Gaspar fell back to a chat-only Approve/Deny proposal, correctly
+   admitting that it could not register it.
+
+The governed artifact flow is therefore NOT functional in the real
+OpenCode runtime. The pilot did not advance beyond the planning
+deadlock. Chat text was reported as registered authority, and the
+only offered recovery required the very authorization the flow could
+not yet produce.
+
+### Proven code-level root causes (C1–C6)
+
+- **C1 — `tool.execute.before` reads the wrong argument.** The hook
+  declared `(input)` and read the command from the first argument,
+  but OpenCode 1.18.30 passes `(input { tool, sessionID, callID },
+  output { args })` (verified in the installed SDK
+  `@opencode-ai/plugin` and corroborated by the installed official
+  RTK plugin, which reads `output?.args.command`). The hook never saw
+  the real command, classified bash as generic mutation, and demanded
+  implementation dispatch.
+- **C2 — tests encoded a fictional hook payload** (`command` in the
+  first argument) in `planning-tools.test.ts` and
+  `approval-ceremony.test.ts`. They passed without proving runtime
+  conformance. Corrected to the exact two-argument SDK shape, plus a
+  regression test proving the old shape alone authorizes nothing.
+- **C3 — no authenticated session reached the CLI process.** Planning
+  CLI requires `--session-token`/`CHRONO_SESSION_TOKEN`, correctly
+  hidden from Gaspar, with no host binding for shell-spawned
+  commands. Corrected by preferring native tools (below): the token
+  never enters a generic shell environment.
+- **C4 — `--body-file` was a second deadlock.** Gaspar cannot create
+  the temp file blocked tools would require. Corrected: bodies travel
+  inline (`--body-stdin`, native tool `body` argument); the flag
+  remains for operator use only and Gaspar is never instructed to use
+  it.
+- **C5 — no native planning tools were registered.** Comments claimed
+  "narrow native tools" while only bash strings were allowlisted.
+  Corrected: real model-callable tools in the generated plugin's
+  `Hooks.tool` collection (`.opencode/tools/chrono.ts`, six tools),
+  with stable Zod schemas, host-held sessions, and Core validation.
+- **C6 — the claimed E2E did not execute the claimed flow** (hook
+  permitted, then direct Core helpers). Corrected: E2E tests cross
+  the plugin/tool/CLI/Core/filesystem boundary OpenCode uses; the
+  prior claim is withdrawn below.
+
+### Evidence taxonomy (binding for this finding)
+
+- **Generated-byte tests**: byte-exact assertions on emitted files,
+  never runtime proof.
+- **Direct-Core tests**: Core semantics without runtime traversal.
+- **Packed tests**: isolated tarball install plus CLI behavior.
+- **Real-runtime evidence**: observed TUI behavior with a paid model.
+  Only the last closes OC-P11. Unit, byte, and packed evidence are
+  necessary but insufficient, and must be labeled as such wherever
+  OC-P11 completion is discussed.
+
+### Required correction (corrected implementation)
+
+A Core-governed planning/artifact-authoring path distinct from
+implementation execution, exposed as REAL native OpenCode tools
+(C1–C6 corrected; unauthorized claims withdrawn):
+
+- Gaspar proposes and materializes permitted planning artifacts
+  (discovery, requirements, architecture proposals, ADRs, Specs,
+  harness drafts, security-profile proposals, roadmap/Module/Work
+  Package plans) before any implementation Module/WP exists — with no
+  arbitrary filesystem, shell, or implementation authority.
+- `chrono run` execution grants stay reserved for authorized
+  implementation work.
+- Runtime-neutral Core operations (`proposePlanningArtifact`,
+  `revisePlanningArtifact`, `planningStatus`) plus CLI tools
+  (`chrono artifact propose|revise|status`) create or revise the
+  planning set. Every operation enforces the Gaspar capability matrix
+  (`planning.propose`, `planning.revise`, `planning.status` — Gaspar
+  and PO only; workers denied).
+- Validation covers artifact type, identifier, lifecycle entry state,
+  revision, references, allowed destination, schema, and content size
+  (1 byte to 64 KiB; secrets denied without persisting).
+- Authoritative Markdown and SQLite registry/event changes land
+  atomically or recoverably (file first via tmp + rename, so a
+  filesystem failure denies with nothing persisted; registry second,
+  removing the created file when the transaction fails; revise keeps a
+  backup and restores the last good draft — no half-materialized draft
+  is ever presented as ready).
+- Writes reach only canonical managed artifact locations derived from
+  (kind, id) — there is no caller-supplied path, so traversal,
+  symlinks, product-code writes, and escapes are structurally denied.
+- Model content enters as untrusted DRAFT/PROPOSED material.
+- Chat text never becomes PO authority: `planning-approval` (plus the
+  existing `architecture-security` / `module-approval` actions) binds
+  artifact ID, exact revision/hash, decision type, timestamp,
+  rationale, and security implications through the existing signed,
+  interactive ceremony. Revision changes stale prior approvals
+  deterministically. Gaspar presents the exact ceremony and reports
+  chat acceptance only as "PO stated approval in chat".
+- OpenCode exposes REAL native tools (`.opencode/tools/chrono.ts`,
+  six tools: `chrono_artifact_status/propose/revise`,
+  `chrono_approval_request/status/confirm`) with stable Zod schemas,
+  host-held sessions, stdin bodies, and Core validation of role,
+  session, project, kind, destination, size, secrets, revision, and
+  lifecycle. Bash compatibility uses the real two-argument
+  `(input, output)` contract but is NOT a substitute for native tools;
+  gaspar.md names the native tools (shell planning instructions
+  removed). Claude/Kiro keep hook-level planning classification.
+- Safe Core projections (`chrono_artifact_status`: proposed, awaiting
+  PO signature, approved, rejected, stale) replace direct reads of
+  internal state. Discovery persists incrementally, so restart resumes
+  accepted answers without chat history.
+- The circular dependency is closed ONLY through the native tools
+  (hermetic + packed evidence below); the prior bash-only claim is
+  withdrawn pending the live pilot in the retry procedure.
+- The sample tasks-app fixture separates administrative database
+  bootstrap (`admin-bootstrap.sql`, superuser: roles, database,
+  grants) from the application schema (`app-schema.sql`, schema
+  owner: tables plus DML-only grants). The runtime `tasks_app`
+  account never receives CREATE DATABASE/TABLE privileges.
+
+### Evidence (labeled per the taxonomy above)
+
+Hermetic suites: `planning.test.ts` (direct-Core adversarial);
+`artifact-cli.test.ts` + `approval-commands.test.ts` (CLI surface);
+`planning-tools.test.ts` (generated-byte classification with the
+exact two-argument SDK shape, plus the C2 regression);
+`native-tools.test.ts` (EXACT generated tool bytes executed for real
+against a REAL Core project and the REAL built CLI: registration,
+schemas, inline propose/revise, status, tickets, ask()-gated
+confirmation, signed approval, cancel/replay/stale/forge/auto/
+ticketless/cross-session/cross-project denial, setup repair);
+`approval-ceremony.test.ts` (conversational orchestration across
+plugin gate, native tools, question audit, Core, and filesystem);
+`approval-tickets.test.ts` (Core ticket adversarial);
+`planning-blackbox.test.ts` (hermetic discovery-to-grant flow).
+Packed: isolated tarball install, `init --dry-run` with zero writes,
+ceremony command surface (`--body-stdin`, `--security-implications`),
+dist tool-runtime presence. Full `test:clean` PASS (47 files /
+581 tests on Node 22.21.1 and Node 24.20.0 clean exports — `npm ci`,
+lint, typecheck, build, suite each green from clean checkouts),
+`lint` exit 0, `git diff --check` clean. Real-runtime evidence: NONE
+YET — the retry below must produce it.
+
+### Integrated approval UX (in-OpenCode, no external command)
+
+The PO never leaves OpenCode, copies a CLI command, exports a token,
+obtains an internal ID, or runs `chrono run` to approve planning
+artifacts. Gaspar uses the NATIVE tools (`.opencode/tools/chrono.ts`);
+shell planning instructions were removed from its definition. The
+conversational flow is:
+
+1. Gaspar materializes a draft (`chrono_artifact_propose`, inline
+   body) and opens a ticket (`chrono_approval_request`), receiving a
+   challenge such as `approve-TICKET-0001`.
+2. Gaspar asks the PO through the **native `question` tool**, showing
+   the exact canonical line, e.g.
+   `CHRONO approval approve-TICKET-0001 :: planning-approval REQ-0001
+   @sha256:… :: <rationale>`, with Approve / Deny options.
+3. The PO answers **in the OpenCode UI**. A chat "approved" alone only
+   makes Gaspar start this flow — it never records anything.
+4. Gaspar calls `chrono_approval_confirm`: the tool re-validates the
+   ticket, requires the native `ask()` human boundary (exact ticket
+   scope in metadata), refuses `--auto` mode, reads the OS-keychain
+   PO key host-side, signs, and records. The model sees the receipt
+   and continues — no restart, no shell, no token handling.
+5. On Deny (or any non-confirming path), nothing changes: the model
+   continues from Core status, which still reads
+   `awaiting-signature`.
+6. `chrono_artifact_status` proves every state (proposed, awaiting PO
+   signature, approved, rejected, stale) from Core-signed rows only.
+
+Key/trust facts for the retry: signatures are Ed25519 under the
+enrolled PO key (same cryptography as the classic ceremony);
+tickets are single-use and revision-bound (drift burns them);
+`--auto` launch refuses deterministically; question traffic is
+audited without secrets. Three items stay explicitly
+live-acceptance (unverifiable without a paid-model TUI session): the
+exact TUI rendering of the question and ask() prompts, mid-session
+auto-approve palette toggling (launch-time `--auto` is covered;
+never enable auto-approve in approval sessions), and the observed
+prompt count for one confirmation (permission ask + in-execute ask
+may each prompt).
+
+### Pilot retry procedure (governed artifact flow)
+
+STOP before any paid step and request PO authorization (provider
+spend, provider login, and any global/runtime change each need
+explicit applicable authorization immediately beforehand).
+
+On a disposable project (never the live pilot project until this
+gate passes):
+
+1. `chrono init --runtime opencode` to READY (existing machinery;
+   repairs/upgrades regenerate plugin, agents, native tools,
+   permission policy, manifest, and managed assets).
+2. Open OpenCode normally (never with `--auto` for approval
+   sessions); Gaspar begins discovery from the entry projection.
+3. Gaspar materializes each draft with the NATIVE
+   `chrono_artifact_propose` tool (inline body; no temp files, no
+   shell, no tokens).
+4. For each draft: native `chrono_approval_request`, then the native
+   `question` with the exact challenge line, then native
+   `chrono_approval_confirm`; the PO confirms in the OpenCode UI.
+   Chat acceptance is reported only as "PO stated approval in chat"
+   until the Core records the approval.
+5. Native `chrono_artifact_status` shows approved for every draft;
+   stale drafts require re-request and re-confirmation after revise.
+6. Harness, Module/WP plans, module approval (same ceremony), then
+   dispatch — exactly the proven black-box order.
+7. Observe and record: Gaspar's actual native tool invocations; the
+   created `.md` files at Core-derived paths; same artifact+revision
+   from a separate process; the native PO interaction rendering;
+   the signed Core approval; continuation without shell/token/run
+   requests; no product writes pre-dispatch; generic mutation still
+   denied; redacted transcript with approval/ticket/grant ids.
+
 ## OpenCode pilot entry criteria
 
 The real test may start only when:
 
-1. OC-P1, OC-P2, OC-P8, OC-P9, and OC-P10 are fixed and their adversarial tests pass;
+1. OC-P1, OC-P2, OC-P8, OC-P9, OC-P10, and OC-P11 are fixed and their adversarial tests pass;
 2. the generated plugin imports and registers through the installed OpenCode
    version without experimental-hook errors;
 3. a packed, isolated CHRONO installation passes `chrono init --dry-run` and

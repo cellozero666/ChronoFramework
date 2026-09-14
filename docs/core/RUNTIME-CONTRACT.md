@@ -60,6 +60,9 @@ Reference: `[FW §194-255]`, `[DOM §2.2]`.
 | `chrono rtk verify` | Any | Re-verify and re-record RTK attestation |
 | `chrono skill status` | Any | Check skill attestation |
 | `chrono skill verify` | Any | Re-verify and re-record skill attestation |
+| `chrono artifact propose` | Gaspar/PO session | Propose and materialize a planning draft (DRAFT, untrusted) |
+| `chrono artifact revise` | Gaspar/PO session | Revise a planning draft (stales prior approvals) |
+| `chrono artifact status` | Gaspar/PO session | Safe planning status projection (no secrets) |
 
 ### 3.2 `chrono gate` interface
 
@@ -218,6 +221,32 @@ and snapshots the registration and asset hashes; dispatch re-validates
 all of them per use, so drift invalidates without further ceremony.
 
 Configuration-file presence (`rtk.yaml`) is NOT proof of routing `[P8.7]`.
+
+### 6.4 Planning-vs-implementation tool distinction (OC-P11 correction)
+
+Adapters MUST distinguish four tool classes inside CHRONO projects:
+
+- **Governed planning mutation** — the NATIVE tools
+  (`chrono_artifact_status/propose/revise`,
+  `chrono_approval_request/status/confirm` in
+  `.opencode/tools/chrono.ts`): real model-callable tools with stable
+  schemas, host-held sessions, stdin bodies, and Core validation of
+  every call. Planning-governed, not generic shell mutation and not
+  implementation dispatch; the pre-tool gate requires proven entry,
+  nothing more. Bash compatibility (`chrono artifact ...`,
+  `chrono approval-request/ticket`, read-only
+  `chrono doctor/status/validate`) uses the real two-argument
+  `(input, output)` contract but is NOT a substitute for native tools.
+  Chained, piped, or substituted commands stay on the dispatch path.
+- **Implementation mutation** — generic write/edit/bash and every other
+  mutable tool: requires Module dispatch context and a live execution
+  gate verdict, as before.
+- **Read-only operations** — pass without dispatch scope, except reads
+  referencing internal/security state.
+- **Forbidden internal/security-state access** — reads of
+  `.chrono/chrono.db`, broker account files, token files, and internal
+  hooks deny with a safe-projection pointer (`chrono doctor`,
+  `chrono artifact status`). Gaspar MUST use Core projections instead.
 
 ---
 

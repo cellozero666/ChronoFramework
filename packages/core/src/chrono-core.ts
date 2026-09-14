@@ -34,6 +34,8 @@ import {
   isRevisionHash,
   isStaleReference,
   parseArtifactId,
+  approvalChallenge,
+  APPROVAL_TICKET_TTL_SECONDS,
   assertBlockerType,
   assertRequiredFields,
   assertValidInitialState,
@@ -7043,6 +7045,27 @@ export class ChronoCore {
     return this.blockers.findActive().map((b) => ({ id: b.id, type: b.type, reason: b.reason }));
   }
 
+  /** Every approval row including revoked ones (read-only, for tests and audit). */
+  listApprovals(): ReadonlyArray<{
+    readonly id: string;
+    readonly action: string;
+    readonly scopeArtifactId: string;
+    readonly scopeRevision: string;
+    readonly authority: string;
+    readonly signature: string;
+    readonly revoked: boolean;
+  }> {
+    return this.db.approvals().listAll().map((a) => ({
+      id: a.id,
+      action: a.action,
+      scopeArtifactId: a.scopeArtifactId,
+      scopeRevision: a.scopeRevision,
+      authority: a.authority,
+      signature: a.signature,
+      revoked: a.revoked,
+    }));
+  }
+
   /** QA reports recorded for a module, oldest first. */
   listQaReports(moduleId: string): ReadonlyArray<{ id: string; verdict: string; reviewer: string }> {
     return this.qa.listByModule(moduleId).map((r) => ({ id: r.id, verdict: r.verdict, reviewer: r.reviewer }));
@@ -7321,8 +7344,17 @@ export class ChronoCore {
       const caller = this.requireCapability("planning.propose", this.resolveCaller(auth, "propose planning artifact"));
       assertPlanningKind(input.kind);
       const kind = input.kind;
-      // Allocate or validate the identifier (exact, never normalized).
+      // Fixed singleton identities resolve before allocation (exact,
+      // never normalized).
       let id = input.id?.trim() ?? "";
+      if (kind === "architecture") {
+        id = "ARCH";
+      } else if (kind === "roadmap" && (id.length === 0 || (id !== "ROADMAP" && !/^MOD-[0-9]{4}$/.test(id)))) {
+        id = "ROADMAP";
+      } else if (kind === "discovery" && (id.length === 0 || id === "OPEN" || id === "DISCOVERY")) {
+        id = id.length === 0 ? this.sequences.allocate("OPEN") : "DISCOVERY";
+      }
+      // Allocate or validate the identifier.
       if (id.length === 0) {
         const family = PLANNING_ALLOC_FAMILY[kind];
         if (family === null) {
@@ -7336,25 +7368,6 @@ export class ChronoCore {
           });
         }
         id = this.sequences.allocate(family);
-        if (kind === "discovery" && id.startsWith("OPEN-") === false) {
-          throw new ChronoError({
-            code: ErrorCode.VALIDATION_ERROR,
-            severity: Severity.ERROR,
-            message: `Internal sequence mismatch for discovery: denied`,
-            invariantRef: "INV §10.1",
-            affectedTarget: kind,
-            suggestedAction: "Retry the planning proposal",
-          });
-        }
-      }
-      if (kind === "architecture") {
-        id = "ARCH";
-      }
-      if (kind === "roadmap" && id !== "ROADMAP" && !/^MOD-[0-9]{4}$/.test(id)) {
-        id = "ROADMAP";
-      }
-      if (kind === "discovery" && id === "OPEN") {
-        id = "DISCOVERY";
       }
       assertPlanningId(kind, id);
       assertPlanningContent(kind, input.title, input.body, id);
@@ -7393,7 +7406,18 @@ export class ChronoCore {
       const structured = family === "SP" || family === "MOD" || family === "WP";
       const structuredContent =
         family === "SP"
-          ? { id, title: input.title, purpose: input.title, body: input.body, planningDraft: true, dependencies: input.references ?? [] }
+          ? {
+              id,
+              title: input.title,
+              purpose: input.title,
+              body: input.body,
+              planningDraft: true,
+              dependencies: input.references ?? [],
+              // Draft-level executable contract (refined through review):
+              // the READY guard requires scope and acceptance criteria.
+              inScope: [input.title],
+              acceptanceCriteria: [`${id} draft acceptance: ${input.title}`],
+            }
           : family === "MOD"
             ? { id, name: input.title, purpose: input.title, body: input.body, specs: input.references ?? [] }
             : family === "WP"
@@ -7431,12 +7455,24 @@ export class ChronoCore {
       }
       const revision = computeRevisionHash({ kind, id, title: input.title, body: input.body });
       const file = this.renderPlanningFile(kind, id, input.title, input.body, revision);
-      // File first to tmp, then DB transaction, then atomic rename. A
-      // rename failure after commit compensates with tombstone + event.
+      // File first, registry second: a filesystem failure denies with
+      // nothing persisted (no compensation needed); a later DB failure
+      // removes the file this call created, so no half-materialized
+      // draft is ever presented as ready.
       fsMkdirSync(pathDirname(dest), { recursive: true });
+      const existedBefore = fsExistsSync(dest);
       const tmp = `${dest}.chrono-tmp-${process.pid}`;
       fsWriteFileSync(tmp, file, "utf8");
-      let committed = false;
+      try {
+        fsRenameSync(tmp, dest);
+      } catch (e) {
+        try {
+          fsRmSync(tmp, { force: true });
+        } catch {
+          // Best-effort; the rename error below is authoritative.
+        }
+        throw e;
+      }
       try {
         this.db.transaction(() => {
           if (structured && structuredContent !== null) {
@@ -7480,33 +7516,15 @@ export class ChronoCore {
             reasoning: `Planning draft proposed (${kind})`,
           });
         });
-        committed = true;
-        fsRenameSync(tmp, dest);
       } catch (e) {
-        try {
-          fsRmSync(tmp, { force: true });
-        } catch {
-          // Tmp cleanup is best-effort.
-        }
-        if (committed) {
-          // DB committed but the file did not land: tombstone the
-          // registry row (structured kinds) so no half-materialized
-          // draft is ever presented as ready, and audit the failure.
+        // Registry failed after the file landed: remove the file this
+        // call created (best-effort) so the draft can be re-proposed
+        // cleanly; audit history is untouched.
+        if (!existedBefore) {
           try {
-            if (structured) {
-              this.artifacts.softDelete(id);
-            }
-            this.events.append({
-              eventType: "ArtifactCreated",
-              entityId: id,
-              payload: { type: "PLANNING_COMPENSATED", kind, revision },
-              actor: caller.auditActor,
-              priorState: "DRAFT",
-              newState: "compensated",
-              reasoning: "Planning file materialization failed after commit: registry compensated",
-            });
+            fsRmSync(dest, { force: true });
           } catch {
-            // Compensation is best-effort; the original error stands.
+            // Best-effort; the original error stands.
           }
         }
         throw e;
@@ -7583,17 +7601,45 @@ export class ChronoCore {
       const file = this.renderPlanningFile(resolvedKind, id, input.title, input.body, revision);
       const family = PLANNING_KIND_FAMILY[resolvedKind];
       const structured = family === "SP" || family === "MOD" || family === "WP";
+      // File first with backup: the previous draft is restorable when
+      // the registry transaction fails, so a failed revise never loses
+      // the last good revision.
       fsMkdirSync(pathDirname(dest), { recursive: true });
+      let backup: string | null = null;
+      try {
+        backup = fsExistsSync(dest) ? readFileSync(dest, "utf8") : null;
+      } catch {
+        backup = null;
+      }
       const tmp = `${dest}.chrono-tmp-${process.pid}`;
       fsWriteFileSync(tmp, file, "utf8");
-      let committed = false;
+      try {
+        fsRenameSync(tmp, dest);
+      } catch (e) {
+        try {
+          fsRmSync(tmp, { force: true });
+        } catch {
+          // Best-effort; the rename error below is authoritative.
+        }
+        throw e;
+      }
       try {
         this.db.transaction(() => {
           if (structured) {
             const artifact = this.artifacts.findById(id);
+            const prior = this.registrationContent(id);
             const nextContent =
               family === "SP"
-                ? { id, title: input.title, purpose: input.title, body: input.body, planningDraft: true }
+                ? {
+                    id,
+                    title: input.title,
+                    purpose: input.title,
+                    body: input.body,
+                    planningDraft: true,
+                    dependencies: (prior["dependencies"] as string[] | undefined) ?? [],
+                    inScope: (prior["inScope"] as string[] | undefined) ?? [input.title],
+                    acceptanceCriteria: (prior["acceptanceCriteria"] as string[] | undefined) ?? [`${id} draft acceptance: ${input.title}`],
+                  }
                 : family === "MOD"
                   ? { id, name: input.title, purpose: input.title, body: input.body, specs: this.registrationContent(id)["specs"] ?? [] }
                   : { id, name: input.title, module: this.registrationContent(id)["module"] ?? id, body: input.body, dependsOn: this.registrationContent(id)["dependsOn"] ?? [] };
@@ -7621,28 +7667,18 @@ export class ChronoCore {
             reasoning: "Planning draft revised: prior approvals are stale",
           });
         });
-        committed = true;
-        fsRenameSync(tmp, dest);
       } catch (e) {
+        // Registry failed after the file moved: restore the previous
+        // draft (best-effort) so the last good revision survives and a
+        // retry starts from a coherent state.
         try {
-          fsRmSync(tmp, { force: true });
-        } catch {
-          // Best-effort.
-        }
-        if (committed) {
-          try {
-            this.events.append({
-              eventType: "ArtifactRevised",
-              entityId: id,
-              payload: { type: "PLANNING_COMPENSATED", kind: resolvedKind, revision },
-              actor: caller.auditActor,
-              priorState: "DRAFT",
-              newState: "compensated",
-              reasoning: "Planning file rewrite failed after commit: re-run revise to recover",
-            });
-          } catch {
-            // Best-effort.
+          if (backup !== null) {
+            fsWriteFileSync(dest, backup, "utf8");
+          } else {
+            fsRmSync(dest, { force: true });
           }
+        } catch {
+          // Best-effort; the original error stands.
         }
         throw e;
       }
@@ -7733,6 +7769,291 @@ export class ChronoCore {
         items.push({ id, kind, revision, filePresent, approval, detail });
       }
       return { ok: true, value: { items } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // OC-P11 integrated approval ceremony (ADR-007).
+  //
+  // The classic ceremony stays interactive-TTY human-only
+  // (`recordApproval`). The integrated path serves OpenCode sessions
+  // where no line terminal exists for the agent runtime: Gaspar
+  // requests a single-use ticket, the human confirms through the
+  // runtime-native boundary (the plugin host observes the allow and
+  // signs with the keychain key — never the model), and the Core
+  // records the Ed25519-signed approval. Chat text alone never
+  // authorizes: without a live ticket plus a valid PO signature,
+  // finalize denies. The TTY rule is replaced here by the ticket's
+  // single-use scope/revision binding plus the recorded native
+  // observation — never by a prompt claim.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Request a single-use approval ticket (OC-P11 req 5).
+   * Gaspar/PO only (`approval.request`). Binds action, scope, exact
+   * current revision, rationale, and security implications. The ticket
+   * authorizes NOTHING by itself: only a permission-bound finalize
+   * carrying a valid PO signature can consume it.
+   */
+  requestApprovalTicket(
+    input: {
+      action: string;
+      scopeArtifactId: string;
+      scopeRevision: string;
+      rationale: string;
+      securityImplications: string;
+    },
+    auth: CallerAuth
+  ): CoreResult<{ ticketId: string; challenge: string; expiresAt: string }> {
+    try {
+      const caller = this.requireCapability("approval.request", this.resolveCaller(auth, "request approval ticket"));
+      if (!(APPROVAL_ACTIONS as readonly string[]).includes(input.action)) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Unknown approval action '${input.action}': ticket ceremony covers ${APPROVAL_ACTIONS.join(", ")}`,
+          invariantRef: "INV §14.4",
+          affectedTarget: input.scopeArtifactId,
+          suggestedAction: "Request a ticket for a canonical approval action",
+        });
+      }
+      if (input.rationale.trim().length === 0 || input.securityImplications.trim().length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Approval tickets require a rationale and explicit security implications",
+          invariantRef: "INV §14.4",
+          affectedTarget: input.scopeArtifactId,
+          suggestedAction: "State the decision rationale and its security implications",
+        });
+      }
+      // Tickets bind the CURRENT revision only: a stale scope cannot
+      // enter the ceremony.
+      const liveRevision = this.assertLiveScopeRevision(input.scopeArtifactId, input.scopeRevision, input.action);
+      if (this.hasValidApproval(input.scopeArtifactId, liveRevision, input.action)) {
+        throw new ChronoError({
+          code: ErrorCode.DUPLICATE_IDENTITY,
+          severity: Severity.ERROR,
+          message: `'${input.scopeArtifactId}' already carries a current '${input.action}' approval: no ticket needed`,
+          invariantRef: "INV §10.1",
+          affectedTarget: input.scopeArtifactId,
+          suggestedAction: "Proceed with the approved revision",
+        });
+      }
+      const id = this.sequences.allocate("TICKET");
+      const createdAt = this.now();
+      const expiresAt = new Date(Date.parse(createdAt) + APPROVAL_TICKET_TTL_SECONDS * 1000).toISOString();
+      this.db.approvalTickets().create({
+        id,
+        action: input.action,
+        scopeArtifactId: input.scopeArtifactId,
+        scopeRevision: liveRevision,
+        authority: "PO",
+        rationale: input.rationale.trim(),
+        securityImplications: input.securityImplications.trim(),
+        requesterSession: caller.session.id,
+        createdAt,
+        expiresAt,
+      });
+      this.events.append({
+        eventType: "ApprovalTicketIssued",
+        entityId: id,
+        payload: { action: input.action, scopeArtifactId: input.scopeArtifactId, scopeRevision: liveRevision },
+        actor: caller.auditActor,
+        priorState: undefined,
+        newState: "issued",
+        reasoning: "Approval ticket issued for native human confirmation",
+      });
+      return { ok: true, value: { ticketId: id, challenge: approvalChallenge(id), expiresAt } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Describe a ticket without secrets (host re-validation before
+   * signing). Gaspar/PO session required. Tickets carry no key
+   * material, so this projection is safe to log.
+   */
+  describeApprovalTicket(
+    ticketId: string,
+    auth: CallerAuth
+  ): CoreResult<{
+    id: string;
+    action: string;
+    scopeArtifactId: string;
+    scopeRevision: string;
+    rationale: string;
+    securityImplications: string;
+    challenge: string;
+    expiresAt: string;
+    consumed: boolean;
+    live: boolean;
+  }> {
+    try {
+      const caller = this.requireCapability("approval.request", this.resolveCaller(auth, "describe approval ticket"));
+      void caller;
+      const ticket = this.db.approvalTickets().findById(ticketId);
+      const current = this.currentRevisionOf(ticket.scopeArtifactId);
+      const live =
+        !ticket.consumed &&
+        !Number.isNaN(Date.parse(ticket.expiresAt)) &&
+        Date.parse(ticket.expiresAt) > Date.parse(this.now()) &&
+        current !== null &&
+        !isStaleReference(ticket.scopeRevision, current);
+      return {
+        ok: true,
+        value: {
+          id: ticket.id,
+          action: ticket.action,
+          scopeArtifactId: ticket.scopeArtifactId,
+          scopeRevision: ticket.scopeRevision,
+          rationale: ticket.rationale,
+          securityImplications: ticket.securityImplications,
+          challenge: approvalChallenge(ticket.id),
+          expiresAt: ticket.expiresAt,
+          consumed: ticket.consumed,
+          live,
+        },
+      };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Record a permission-bound approval (OC-P11 req 5, ADR-007).
+   *
+   * Consumes one live ticket and records the Ed25519-signed approval.
+   * The signature is verified cryptographically under the registered PO
+   * key — a model-forged confirmation fails here even with a live
+   * ticket. No TTY is required: human presence is proven by the
+   * single-use ticket plus the recorded native observation (which the
+   * plugin host supplies from runtime-delivered events the model
+   * cannot fabricate). Denial consumes nothing except on stale scope,
+   * where the ticket is burned so it can never authorize a moved
+   * revision.
+   */
+  finalizeApprovalTicket(
+    input: {
+      ticketId: string;
+      timestamp: string;
+      signature: string;
+      observation: { permissionCallId: string; decidedAt: string; autoModeProbed: boolean };
+    },
+    auth: CallerAuth
+  ): CoreResult<{ approvalId: string }> {
+    try {
+      const caller = this.requireCapability("approval.finalize", this.resolveCaller(auth, "finalize approval ticket"));
+      void caller;
+      if (input.observation.permissionCallId.trim().length === 0 || input.observation.decidedAt.trim().length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Permission-bound finalize requires the native observation (permission call id and decision time)",
+          invariantRef: "INV §14.4",
+          affectedTarget: input.ticketId,
+          suggestedAction: "Finalize only from an observed native human confirmation",
+        });
+      }
+      this.assertFreshTimestamp(input.timestamp, input.ticketId);
+      const ticket = this.db.approvalTickets().findById(input.ticketId);
+      if (ticket.consumed) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Approval ticket '${ticket.id}' was already consumed: replay denied`,
+          invariantRef: "INV §5.1",
+          affectedTarget: ticket.id,
+          suggestedAction: "Request a fresh ticket for the current revision",
+        });
+      }
+      if (Date.parse(ticket.expiresAt) <= Date.parse(this.now())) {
+        this.db.approvalTickets().consume(ticket.id);
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Approval ticket '${ticket.id}' expired at ${ticket.expiresAt}: re-request for the current revision`,
+          invariantRef: "INV §5.1",
+          affectedTarget: ticket.id,
+          suggestedAction: "Request a fresh ticket for the current revision",
+        });
+      }
+      // Scope must STILL be current: a revision that moved after the
+      // human confirmed burns the ticket instead of authorizing drift.
+      const current = this.currentRevisionOf(ticket.scopeArtifactId);
+      if (current === null || isStaleReference(ticket.scopeRevision, current)) {
+        this.db.approvalTickets().consume(ticket.id);
+        throw new ChronoError({
+          code: ErrorCode.STALE_REVISION,
+          severity: Severity.ERROR,
+          message: `Approval ticket '${ticket.id}' no longer matches '${ticket.scopeArtifactId}' (now at ${current ?? "unknown"}): re-request and re-confirm`,
+          invariantRef: "INV §4.4",
+          affectedTarget: ticket.scopeArtifactId,
+          suggestedAction: "Request a fresh ticket for the current revision and confirm again",
+        });
+      }
+      const unsigned = buildApprovalPayload({
+        action: ticket.action,
+        scopeArtifactId: ticket.scopeArtifactId,
+        scopeRevision: ticket.scopeRevision,
+        authority: ticket.authority,
+        rationale: ticket.rationale,
+        timestamp: input.timestamp,
+        securityImplications: ticket.securityImplications,
+      });
+      this.verifySignatureOrThrow(unsigned, input.signature, ticket.scopeArtifactId);
+      // Idempotent when the approval already landed (same ticket,
+      // same signature): consume and return the existing row instead
+      // of colliding.
+      const existing = this.approvals.findByScope(ticket.scopeArtifactId, ticket.scopeRevision, ticket.action);
+      let approvalId: string;
+      this.db.transaction(() => {
+        this.db.approvalTickets().consume(ticket.id);
+        if (existing !== null && !existing.revoked) {
+          approvalId = existing.id;
+        } else {
+          approvalId = this.sequences.allocate("APR");
+          try {
+            this.approvals.create({
+              id: approvalId,
+              action: ticket.action,
+              scopeArtifactId: ticket.scopeArtifactId,
+              scopeRevision: ticket.scopeRevision,
+              authority: ticket.authority,
+              signer: ticket.authority,
+              signature: input.signature,
+              rationale: ticket.rationale,
+              timestamp: input.timestamp,
+            });
+          } catch (e) {
+            throw this.mapConstraintToDuplicate(e, approvalId);
+          }
+        }
+        this.events.append({
+          eventType: "ApprovalGranted",
+          entityId: approvalId,
+          payload: {
+            action: ticket.action,
+            scopeArtifactId: ticket.scopeArtifactId,
+            scopeRevision: ticket.scopeRevision,
+            authority: ticket.authority,
+            rationale: ticket.rationale,
+            securityImplications: ticket.securityImplications,
+            ticketId: ticket.id,
+            nativeObservation: input.observation,
+            policyVersion: AUTHORITY_POLICY_VERSION,
+          },
+          actor: "PO",
+          priorState: "granted",
+          newState: "granted",
+          reasoning: "PO approval recorded through the native permission-bound ceremony",
+        });
+      });
+      this.syncProjectState();
+      return { ok: true, value: { approvalId: approvalId! } };
     } catch (e) {
       return this.handleError(e);
     }

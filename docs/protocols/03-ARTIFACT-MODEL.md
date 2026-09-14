@@ -76,6 +76,19 @@ The Domain Model SHOULD derive stable families such as `REQ`, `BR`, `CON`, `DEC`
 
 The Core MUST be able to detect duplicate identities, missing/incompatible references, orphan work, stale revisions, invalid authority, illegal transitions, missing required artifacts, invalid DAG edges/cycles, and broken traceability.
 
+## 8.1 Planning drafts (OC-P11)
+
+Before any Module/WP exists, Gaspar materializes planning drafts of
+kind `discovery`, `requirement`, `architecture`, `adr`, `spec`,
+`harness-draft`, `security-profile`, `roadmap`, `module`, or
+`workpackage` through Core-governed operations only. Drafts are
+untrusted DRAFT/PROPOSED material in canonical managed locations;
+destinations derive from (kind, id) with no caller-supplied path.
+`planning-approval` binds draft ID to exact revision under the same
+authenticity rules as all PO decisions; revision changes stale prior
+approvals deterministically. Creating the artifacts that define a
+Module MUST NOT require an approved Module.
+
 ## 9. Normative state and storage ownership
 
 - Project uses `UNINITIALIZED | ANALYZING | ARCHITECTING | SPECIFYING | PLANNING | EXECUTING | VERIFYING | COMPLETE | BLOCKED` and is a deterministic projection that cannot hide child state.

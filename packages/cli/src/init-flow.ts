@@ -35,6 +35,7 @@ import { tmpdir, homedir as osHomedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { ChronoCore } from "@chrono/core";
 import {
+  OPENCODE_TOOLS_PACKAGE_MARKER,
   SKILL_RELEASE,
   buildSessionAuthorizationPayload,
   computeRevisionHash,
@@ -70,6 +71,11 @@ import {
   entrySessionCommand,
   kiroEntryRegistrationPath,
 } from "./gaspar-entry.js";
+import {
+  OPENCODE_TOOLS_FILE_RELATIVE,
+  OPENCODE_TOOLS_PACKAGE_RELATIVE,
+  buildPlanningToolsFile,
+} from "./opencode-planning-tools.js";
 import {
   CHRONO_OPENCODE_ROLES,
   OPENCODE_CONFIG_SIDECAR_RELATIVE,
@@ -377,7 +383,13 @@ export function detectInit(
     ".chrono/hooks/chrono-entry-session.sh",
     ".chrono/broker-account",
     ...(selectedIds.includes("opencode")
-      ? [".opencode/plugins/chrono-gate.js", ...CHRONO_OPENCODE_ROLES.map((role) => openCodeAgentPath(role)), ...opencodeConfigProbe.create]
+      ? [
+          ".opencode/plugins/chrono-gate.js",
+          ...CHRONO_OPENCODE_ROLES.map((role) => openCodeAgentPath(role)),
+          ...opencodeConfigProbe.create,
+          OPENCODE_TOOLS_FILE_RELATIVE,
+          OPENCODE_TOOLS_PACKAGE_RELATIVE,
+        ]
       : []),
     ...(selectedIds.includes("claude-code")
       ? [".chrono/hooks/chrono-claude-gate.js", ".claude/agents/gaspar.md"]
@@ -2679,6 +2691,14 @@ export function checkManagedHooks(
       checks[relative] = checkBytes(relative, buildOpenCodeAgentDefinition(role));
     }
     checks["opencode.json:default_agent"] = checkOpenCodeDefaultAgent(projectRoot, "gaspar").state === "ok";
+    // Native governed planning tools (OC-P11 correction, C5): the tool
+    // module is byte-exact; the runtime manifest carries the pinned
+    // dependency marker (user resolvers may add metadata around it).
+    checks[OPENCODE_TOOLS_FILE_RELATIVE] = checkBytes(OPENCODE_TOOLS_FILE_RELATIVE, buildPlanningToolsFile());
+    checks[`${OPENCODE_TOOLS_PACKAGE_RELATIVE}:runtime`] = checkContains(
+      OPENCODE_TOOLS_PACKAGE_RELATIVE,
+      OPENCODE_TOOLS_PACKAGE_MARKER
+    );
   }
   if (runtimes.includes("claude-code") || unknownAdapters.length > 0) {
     checks[".chrono/hooks/chrono-claude-gate.js"] = checkBytes(".chrono/hooks/chrono-claude-gate.js", buildClaudeHook());
@@ -2987,6 +3007,7 @@ export interface UninstallOptions {
 /** Project-local managed files owned by setup (never user data). */
 const MANAGED_ASSET_PATTERNS: ReadonlyArray<{ dir: string; prefix: string; suffix: string }> = [
   { dir: ".opencode/plugins", prefix: "chrono-gate.", suffix: ".js" },
+  { dir: ".opencode/tools", prefix: "chrono.", suffix: ".ts" },
   { dir: ".chrono/hooks", prefix: "chrono-", suffix: ".js" },
   { dir: ".chrono/hooks", prefix: "chrono-", suffix: ".sh" },
   { dir: ".kiro/hooks", prefix: "chrono-", suffix: ".json" },

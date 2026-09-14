@@ -283,7 +283,7 @@ async function main() {
   // planning operation (no chaining/substitution) needs no dispatch
   // scope; the planning CLI enforces the Gaspar/PO session itself.
   if (tool === "shell" || tool === "execute_bash" || tool === "execute_cmd") {
-    const PLANNING = ["chrono artifact propose", "chrono artifact revise", "chrono artifact status", "chrono discovery record", "chrono plan status", "chrono status", "chrono validate", "chrono doctor"];
+    const PLANNING = ["chrono artifact propose", "chrono artifact revise", "chrono artifact status", "chrono approval-request", "chrono approval-ticket", "chrono discovery record", "chrono plan status", "chrono status", "chrono validate", "chrono doctor"];
     let command = null;
     try {
       const parsed = JSON.parse(raw);

@@ -64,7 +64,10 @@ export interface ArtifactProposeOptions {
   readonly kind: string;
   readonly id?: string | undefined;
   readonly title: string;
-  readonly bodyFile: string;
+  /** Markdown body source: exactly one of bodyFile or bodyText is required. */
+  readonly bodyFile?: string | undefined;
+  /** Inline body (native tools pass Markdown directly; no temp file). */
+  readonly bodyText?: string | undefined;
   readonly references?: string[] | undefined;
   readonly as: string;
   readonly sessionToken?: string | undefined;
@@ -74,7 +77,10 @@ export interface ArtifactProposeOptions {
 export interface ArtifactReviseOptions {
   readonly id: string;
   readonly title: string;
-  readonly bodyFile: string;
+  /** Markdown body source: exactly one of bodyFile or bodyText is required. */
+  readonly bodyFile?: string | undefined;
+  /** Inline body (native tools pass Markdown directly; no temp file). */
+  readonly bodyText?: string | undefined;
   readonly as: string;
   readonly sessionToken?: string | undefined;
   readonly json?: boolean | undefined;
@@ -95,6 +101,27 @@ function readBodyFile(path: string): { ok: true; body: string } | { ok: false; e
 }
 
 /**
+ * Resolve the Markdown body from exactly one source. Native OpenCode
+ * tools pass the body inline (C4: Gaspar cannot create temp files
+ * before dispatch); operators may keep using files. Both paths face
+ * identical Core validation downstream.
+ */
+function resolveBody(
+  bodyFile: string | undefined,
+  bodyText: string | undefined
+): { ok: true; body: string } | { ok: false; error: string } {
+  const hasFile = bodyFile !== undefined && bodyFile.length > 0;
+  const hasText = bodyText !== undefined;
+  if (hasFile === hasText) {
+    return { ok: false, error: "provide exactly one of --body-file or --body-stdin" };
+  }
+  if (hasFile) {
+    return readBodyFile(bodyFile as string);
+  }
+  return { ok: true, body: bodyText as string };
+}
+
+/**
  * Propose and materialize a planning draft through the Core.
  * Gaspar/PO session required; workers denied by the capability matrix.
  */
@@ -102,7 +129,7 @@ export function runArtifactPropose(projectPath: string, options: ArtifactPropose
   const asJson = options.json === true;
   if (options.kind.trim().length === 0 || options.title.trim().length === 0) {
     return coreError(
-      { code: "VALIDATION_ERROR", severity: "ERROR", message: "artifact propose requires --kind, --title, and --body-file" },
+      { code: "VALIDATION_ERROR", severity: "ERROR", message: "artifact propose requires --kind, --title, and --body-file or --body-stdin" },
       asJson
     );
   }
@@ -119,7 +146,7 @@ export function runArtifactPropose(projectPath: string, options: ArtifactPropose
       asJson
     );
   }
-  const body = readBodyFile(options.bodyFile);
+  const body = resolveBody(options.bodyFile, options.bodyText);
   if (body.ok === false) {
     return coreError(
       { code: "VALIDATION_ERROR", severity: "ERROR", message: `artifact body unreadable: ${body.error}` },
@@ -179,7 +206,7 @@ export function runArtifactRevise(projectPath: string, options: ArtifactReviseOp
   const asJson = options.json === true;
   if (options.id.length === 0 || options.title.trim().length === 0) {
     return coreError(
-      { code: "VALIDATION_ERROR", severity: "ERROR", message: "artifact revise requires --id, --title, and --body-file" },
+      { code: "VALIDATION_ERROR", severity: "ERROR", message: "artifact revise requires --id, --title, and --body-file or --body-stdin" },
       asJson
     );
   }
@@ -196,7 +223,7 @@ export function runArtifactRevise(projectPath: string, options: ArtifactReviseOp
       asJson
     );
   }
-  const body = readBodyFile(options.bodyFile);
+  const body = resolveBody(options.bodyFile, options.bodyText);
   if (body.ok === false) {
     return coreError(
       { code: "VALIDATION_ERROR", severity: "ERROR", message: `artifact body unreadable: ${body.error}` },

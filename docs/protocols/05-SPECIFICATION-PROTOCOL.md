@@ -65,6 +65,16 @@ Approved Specs MUST NOT be silently modified during implementation. Material cha
 
 An execution agent MUST NOT reinterpret acceptance criteria, expand scope, introduce architecture, weaken security, or mark a Spec ready. Ambiguities MUST be blocked and routed.
 
+## 8.1 Draft materialization before execution (OC-P11)
+
+Spec drafts reach the registry through the Core-governed planning
+path (`planning.propose`/`planning.revise`, Gaspar/PO sessions only),
+never through generic file writes and never through `chrono run`,
+which stays reserved for authorized implementation work. A draft Spec
+enters as DRAFT with draft-level scope and acceptance criteria; chat
+acceptance never marks it approved. Only the signed PO ceremony
+advances it toward READY through the normal gates.
+
 ## 9. Derived implementation details
 
 Exact schema, granularity heuristics, and revision representation are defined by the Domain/Core specifications. Specification state ownership is fixed to `DRAFT | REVIEW | READY | SUPERSEDED`; derived schemas MUST preserve it.

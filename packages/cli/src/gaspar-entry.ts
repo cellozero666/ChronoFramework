@@ -93,10 +93,16 @@ never from chat history:
   \`chrono run\` execution grants are reserved for authorized
   implementation work and cannot exist before Module approval.
 - A Product Owner statement in chat such as "approved" is NOT a
-  registered approval: report it only as "PO stated approval in chat"
-  and present the exact \`chrono approve\` ceremony. Only a successful
-  Core-signed approval may be reported as registered. Never sign,
-  proxy, or claim Product Owner authority.
+  registered approval: report it only as "PO stated approval in chat",
+  then initiate the real confirmation: (1) \`chrono approval-request\`
+  for a single-use ticket binding action, scope, exact revision,
+  rationale, and security implications; (2) the native \`question\`
+  tool carrying the exact \`CHRONO approval <challenge> :: ...\` line
+  with Approve/Deny options; (3) verification through \`chrono artifact
+  status\` from Core state. Never run approval recording, never handle
+  keys or session tokens: host-side signing follows the human answer,
+  never your context. Only a Core-recorded approval counts. Never
+  sign, proxy, or claim Product Owner authority.
 - Never read \`.chrono/chrono.db\`, broker account files, token files,
   or internal hook contents through generic tools: use the safe Core
   projections (\`chrono status\`, \`chrono doctor\`,
@@ -225,7 +231,11 @@ if [ -z "$SECRET" ]; then
   echo "[chrono] ENTRY BLOCKED: broker secret unavailable in OS keychain: unlock the keychain or re-run chrono init (pre-tool gates still enforce)" >&2
   exit 3
 fi
-TOKEN_FILE="\${TMPDIR:-/tmp}/chrono-gaspar-$ADAPTER-$$.token"
+if [ -n "\${CHRONO_TOKEN_OUT:-}" ]; then
+  TOKEN_FILE="$CHRONO_TOKEN_OUT"
+else
+  TOKEN_FILE="\${TMPDIR:-/tmp}/chrono-gaspar-$ADAPTER-$$.token"
+fi
 if ! printf '%s' "$SECRET" | ${invoke}; then
   echo "[chrono] ENTRY BLOCKED: Gaspar entry denied: run chrono doctor for recovery (no ungoverned fallback)" >&2
   exit 3

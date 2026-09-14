@@ -77,6 +77,17 @@ The Core MAY authorize parallel Work Packages only when dependencies, shared-res
 
 Code generation or agent success is not completion. Outputs MUST enter test, security, and independent verification under the Verification & Correction Protocol.
 
+## 10.1 Planning precedes dispatch without circularity (OC-P11)
+
+Module and Work Package plans are authored through the planning path
+before any dispatch exists: plan creation MUST NOT require an
+authorized Module. Execution authorization (`chrono run` grants)
+begins only after Specs, Harnesses, plans, both PO security
+decisions, and the Module approval are persisted and current.
+Adapters enforce the distinction natively: exact planning
+invocations pass with entry only, while generic mutation requires
+dispatch context.
+
 ## 11. Derived implementation details
 
 The Domain/Core specification MUST define scheduler behavior, bounded concurrency, SQLite locking/transaction strategy, process transport, retry limits, and the exact runtime API before implementation. These details MUST preserve fail-closed bidirectional enforcement and the approved state model.

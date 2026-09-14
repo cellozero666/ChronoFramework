@@ -12,6 +12,7 @@ import { SCHEMA_VERSION, MIGRATIONS } from "./schema.js";
 import {
   AdapterRepository,
   ApprovalRepository,
+  ApprovalTicketRepository,
   ArtifactRepository,
   BlockerRepository,
   DefectRepository,
@@ -233,6 +234,10 @@ export class ChronoDatabase {
 
   brokerCredentials(): BrokerRepository {
     return new BrokerRepository(this.db);
+  }
+
+  approvalTickets(): ApprovalTicketRepository {
+    return new ApprovalTicketRepository(this.db);
   }
 
   /**

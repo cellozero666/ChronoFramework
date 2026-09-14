@@ -64,21 +64,33 @@
  * directly importable in tests: enforcement logic runs for real, with
  * only the gate/entry binaries substituted by fixtures.
  *
- * Tool policy version: TOOL_POLICY_VERSION=2 (see @chrono/domain
+ * Tool policy version: TOOL_POLICY_VERSION=3 (see @chrono/domain
  * OPENCODE_TOOL_POLICY). The lists below are generated from that policy;
  * the Core remains the authority — the plugin only shapes the intake.
  *
  * OC-P11 planning distinction: `bash` invocations that are EXACTLY a
  * governed planning operation (`chrono artifact propose|revise|status`,
- * `chrono discovery record`, `chrono plan status`, `chrono status`,
- * `chrono validate`, `chrono doctor` — no chaining, no substitution)
- * follow the planning path (entry proven; session enforced by the CLI
- * through the host session environment, never through model-visible
- * arguments). Every other mutable tool — including generic
- * write/edit/bash — still requires Module dispatch context. Reads that
- * reference internal/security state (.chrono/chrono.db, broker-account,
- * token files, internal hooks) are denied even though reads otherwise
- * pass without dispatch scope.
+ * `chrono approval-request|approval-ticket`, `chrono discovery record`,
+ * `chrono plan status`, `chrono status`, `chrono validate`,
+ * `chrono doctor` — no chaining, no substitution) follow the planning
+ * path (entry proven; session enforced by the CLI through the host
+ * session environment, never through model-visible arguments). Every
+ * other mutable tool — including generic write/edit/bash — still
+ * requires Module dispatch context. Reads that reference
+ * internal/security state (.chrono/chrono.db, broker-account, token
+ * files, internal hooks) are denied even though reads otherwise pass
+ * without dispatch scope.
+ *
+ * OC-P11 integrated approval ceremony (ADR-007): the native `question`
+ * tool carries human confirmation for display; `tool.execute.after`
+ * audits runtime-delivered question traffic without acting. Signing
+ * and recording belong to the native `chrono_approval_confirm` tool
+ * (.opencode/tools/chrono.ts), which owns the ask() human boundary,
+ * reads the OS-keychain PO key host-side (never to the model), and
+ * records via `chrono approval-record`. The plugin uses only
+ * `node:child_process` / `node:fs` / `node:path` / `node:crypto`, so
+ * the generated file stays directly importable in tests with only
+ * binaries substituted by fixtures.
  */
 
 import { SKILL_RELEASE } from "@chrono/domain";
@@ -112,20 +124,28 @@ export function buildOpencodePlugin(): string {
    * - Read-only tools pass without dispatch scope once entry is proven,
    *   except reads referencing internal/security state (denied: use
    *   projections instead);
-   *   \`bash\` invocations that are EXACTLY a governed planning operation
-   *   (\`chrono artifact propose|revise|status\`, \`chrono doctor\`,
+   *   \`bash\` invocations that are EXACTLY a governed planning or
+   *   approval-request operation (\`chrono artifact propose|revise|status\`,
+   *   \`chrono approval-request|approval-ticket\`, \`chrono doctor\`,
    *   \`chrono status|validate\`) pass with entry only — the planning CLI
-   *   enforces the Gaspar/PO session itself;
+   *   enforces the Gaspar/PO session itself (\`chrono approval-record\`
+   *   is deliberately NOT on this path: recording needs a host-made PO
+   *   signature that model text can never supply);
    *   every other mutable tool requires CHRONO_GATE_MODULE (+ optional
    *   CHRONO_GATE_WP), CHRONO_GATE_AS, CHRONO_GATE_ROLE, and
    *   CHRONO_SESSION_TOKEN and a live \`chrono gate execution\` AUTHORIZED
    *   verdict. Unknown tools are denied until classified (deny-by-default).
    *   While entry is unproven, EVERY tool (including reads) is denied.
    *   Anything missing or DENIED throws (fail-closed).
-  * - Runtime evidence lands in .chrono/runtime-activation.jsonl
-  *   (non-secret metadata only). Session tokens are never held here,
-  *   never logged, never modeled.
-  */
+   * - Integrated approval ceremony (ADR-007): the native \`question\`
+   *   tool carries the human confirmation. Its runtime-delivered result
+   *   is observed for audit only (never trusted from chat, never acted
+   *   on here). Signing and recording belong to the native
+   *   chrono_approval_confirm tool, which owns the ask() human boundary.
+   * - Runtime evidence lands in .chrono/runtime-activation.jsonl
+   *   (non-secret metadata only). Session tokens are never held here,
+   *   never logged, never modeled.
+   */
 import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -133,8 +153,41 @@ import { dirname, join, sep } from "node:path";
 
 const READ_TOOLS = new Set(${JSON.stringify(READ_TOOLS)});
 const MUTATE_TOOLS = new Set(${JSON.stringify(MUTATE_TOOLS)});
+// Native governed planning tools (OC-P11 correction, C5): real
+// model-callable tools registered by this same setup
+// (.opencode/tools/chrono.ts). Planning-governed, not generic shell
+// mutation and not implementation dispatch: each enforces its Gaspar
+// session itself and the Core validates every call. The gate requires
+// proven entry, nothing more.
+const PLANNING_TOOLS = new Set([
+  "chrono_artifact_status",
+  "chrono_artifact_propose",
+  "chrono_artifact_revise",
+  "chrono_approval_request",
+  "chrono_approval_status",
+  "chrono_approval_confirm",
+]);
 const SKILL_PINNED_COMMIT = ${JSON.stringify(SKILL_RELEASE.pinnedCommit)};
 const SKILL_SOURCE_HASH = ${JSON.stringify(SKILL_RELEASE.sourceHash)};
+
+// Approval tickets referenced from runtime-delivered question payloads
+// (audit observation only; the native confirm tool owns signing).
+const TICKET_PATTERN = /TICKET-[0-9]{4}/g;
+const CHALLENGE_PREFIX = "approve-";
+
+/** Extract ticket ids (TICKET-0001) from runtime-delivered text. */
+export function chronoExtractTicketIds(text) {
+  const found = String(text ?? "").match(TICKET_PATTERN);
+  return found === null ? [] : [...new Set(found)];
+}
+
+/** Exact challenge correlation between a question and its human answer. */
+export function chronoApprovalMatch(questionText, answerText, challenge) {
+  if (typeof challenge !== "string" || challenge.trim().length === 0) {
+    return false;
+  }
+  return String(questionText ?? "").includes(challenge) && String(answerText ?? "").includes(challenge);
+}
 
 // Fail-closed entry bounds (documented, deterministic).
 // CHRONO_ENTRY_TIMEOUT_MS overrides the entry execution timeout per
@@ -306,11 +359,15 @@ function doctorHint(root) {
   // A bash command qualifies ONLY when it is exactly one of these
   // operations with no shell chaining or substitution: anything else —
   // including a planning-looking string embedded in a larger script —
-  // stays on the implementation-dispatch path.
+  // stays on the implementation-dispatch path. approval-record is
+  // deliberately absent: recording needs a host-made PO signature that
+  // model text can never supply.
   const PLANNING_BASH_PREFIXES = [
     "chrono artifact propose",
     "chrono artifact revise",
     "chrono artifact status",
+    "chrono approval-request",
+    "chrono approval-ticket",
     "chrono discovery record",
     "chrono plan status",
     "chrono status",
@@ -335,27 +392,30 @@ function doctorHint(root) {
     return FORBIDDEN_READ_SUBSTRINGS.some((needle) => haystack.includes(needle));
   }
 
-  function extractBashCommand(toolInput) {
-    if (typeof toolInput === "string") {
-      return toolInput;
-    }
-    if (toolInput === null || typeof toolInput !== "object") {
+  function toolArgs(output) {
+    // Real OpenCode 1.18.30 contract (C1): tool.execute.before receives
+    // (input { tool, sessionID, callID }, output { args }). The command
+    // lives in output.args — never in the first argument. Anything else
+    // is not a classifiable invocation.
+    if (output === null || typeof output !== "object") {
       return null;
     }
-    const record = toolInput;
+    const args = output.args;
+    if (args === null || typeof args !== "object") {
+      return null;
+    }
+    return args;
+  }
+
+  function extractBashCommand(output) {
+    const args = toolArgs(output);
+    if (args === null) {
+      return null;
+    }
     for (const key of ["command", "cmd", "input", "script"]) {
-      const value = record[key];
+      const value = args[key];
       if (typeof value === "string" && value.trim().length > 0) {
         return value;
-      }
-    }
-    // Fallback: some runtimes nest arguments one level deeper.
-    for (const value of Object.values(record)) {
-      if (value !== null && typeof value === "object") {
-        const nested = extractBashCommand(value);
-        if (nested !== null) {
-          return nested;
-        }
       }
     }
     return null;
@@ -530,12 +590,36 @@ export const ChronoGatePlugin = async (ctx) => {
       "Project state: " + projection.projectState + ". Required next action: " + projection.nextAction.key + " — " + projection.nextAction.summary,
       "Mandatory process skill — activate BEFORE any analysis, planning, implementation, testing, security review, or verification: karpathy-guidelines, pinned commit " + SKILL_PINNED_COMMIT + " (source " + SKILL_SOURCE_HASH + "). " + skillState + " Behaviors: think before coding; simplicity first (never simplify away security, traceability, evidence, gates, error handling, or approved scope); surgical changes; goal-driven verified execution. Precedence: Product Owner, then CHRONO protocols and Core, then approved artifacts and Harness, then role rules, then Karpathy Guidelines.",
       "Authority: act only inside the Gaspar role. Obey Core approvals, gates, blockers, waivers, and escalation paths. Do not claim Spekkio verification authority, Product Owner authority, or completion powers beyond Gaspar.",
-      "Planning bootstrap (OC-P11): materialize analysis, requirements, architecture/ADRs, Specs, harness drafts, security proposals, and roadmap or Module/Work Package plans ONLY through the Core-governed chrono artifact propose|revise|status path (never generic write/edit/bash). Chrono run execution grants are reserved for authorized implementation work. A Product Owner statement in chat such as approved is NOT a registered approval: report it only as PO stated approval in chat and present the exact chrono approve ceremony. Only a successful Core-signed approval may be reported as registered. Never read internal database, broker account files, token files, or internal hook contents through generic tools: use the safe Core projections instead.",
+      "Planning bootstrap (OC-P11): materialize analysis, requirements, architecture/ADRs, Specs, harness drafts, security proposals, and roadmap or Module/Work Package plans ONLY through the Core-governed chrono artifact propose|revise|status path (never generic write/edit/bash). Chrono run execution grants are reserved for authorized implementation work. A Product Owner statement in chat such as approved is NOT a registered approval: report it only as PO stated approval in chat, then confirm for real — chrono approval-request for a single-use ticket, then the native question tool carrying the exact CHRONO approval challenge line with Approve and Deny options, then verify through chrono artifact status. Never run approval recording, never handle keys or tokens: host-side signing follows the human answer, never your context. Only a Core-recorded approval counts. Never read internal database, broker account files, token files, or internal hook contents through generic tools: use the safe Core projections instead.",
       "</chrono-gaspar-entry>",
     ].join("\\n");
   }
 
-  function runEntryChild(root, adapter, chronoBin, timeoutMs) {
+  function hostTokenPath(root, sessionKey) {
+    // Deterministic host-only session token path (OC-P11 ceremony):
+    // the plugin tells the entry script exactly where to confine the
+    // token (CHRONO_TOKEN_OUT override) so later host-side Core calls
+    // (ticket query, approval record) authenticate without ever
+    // exposing the credential to model context. Same naming family as
+    // the default, so the stale sweep covers it; 0600 enforced by the
+    // entry script.
+    return join(tmpDir(), TOKEN_FILE_PREFIX + "host-" + sha256hex(root + "|" + sessionKey).slice(0, 16) + TOKEN_FILE_SUFFIX);
+  }
+
+  function canonicalRoot(root) {
+    // Single normalization for every host-side path derivation (C-fix:
+    // the token file hash must agree between the entry flow here and
+    // the native tool modules, which canonicalize ToolContext paths;
+    // a raw-vs-canonical skew (/var vs /private/var) would orphan the
+    // credential and silently break the ceremony).
+    try {
+      return realpathSync(root);
+    } catch {
+      return root;
+    }
+  }
+
+  function runEntryChild(root, adapter, chronoBin, timeoutMs, sessionKeyForToken) {
     // Asynchronous entry execution with a hard timeout kill so the
     // awaiting hooks stay responsive and concurrent callers share one
     // per-session promise instead of spawning duplicate entries.
@@ -572,15 +656,18 @@ export const ChronoGatePlugin = async (ctx) => {
         }
         finish({ error: { code: "ENTRY_TIMEOUT", reason: "entry execution timed out after " + timeoutMs + "ms" } });
       }, timeoutMs);
+      const tokenOut = hostTokenPath(canonicalRoot(root), typeof sessionKeyForToken === "string" ? sessionKeyForToken : "anonymous");
       try {
         // cwd is the validated project root (OC-P9 black-box finding):
         // the entry script resolves its project from its own working
         // directory, so inheriting an unrelated host cwd would redeem
         // (or silently skip) the wrong project. The plugin already
         // proved the root; the child starts exactly there.
+        // CHRONO_TOKEN_OUT pins the 0600 token to a plugin-known path
+        // (host only, never model-visible) for later ceremony calls.
         child = spawn("sh", [script, adapter], {
           cwd: root,
-          env: { ...process.env, CHRONO_BIN: chronoBin },
+          env: { ...process.env, CHRONO_BIN: chronoBin, CHRONO_TOKEN_OUT: tokenOut },
           stdio: ["ignore", "pipe", "pipe"],
         });
       } catch (e) {
@@ -657,7 +744,7 @@ export const ChronoGatePlugin = async (ctx) => {
     const adapter = readEnv("CHRONO_ENTRY_ADAPTER") ?? "opencode";
     const chronoBin = readEnv("CHRONO_BIN") ?? "chrono";
     const timeoutMs = entryTimeoutMs();
-    const promise = runEntryChild(root, adapter, chronoBin, timeoutMs).then(
+    const promise = runEntryChild(root, adapter, chronoBin, timeoutMs, sessionKey).then(
       (result) => {
         if (result.payload !== undefined) {
           const payloadHash = sha256hex(result.payload);
@@ -770,12 +857,36 @@ export const ChronoGatePlugin = async (ctx) => {
     }
   }
 
+  function auditApprovalQuestion(root, sessionKey, callID, questionText, answerText) {
+    // Audit-only observation of approval question traffic (OC-P11
+    // correction): the native chrono_approval_confirm tool owns
+    // signing and recording; this hook never acts, never signs, and
+    // never throws. It records which live-ticket challenges appeared
+    // in runtime-delivered question/answer pairs so pilot forensics
+    // can correlate human confirmations with Core receipts.
+    const ticketIds = chronoExtractTicketIds(questionText + "\\n" + answerText);
+    if (ticketIds.length === 0) {
+      return;
+    }
+    const publicKey = typeof sessionKey === "string" && !sessionKey.startsWith("anonymous@") ? sessionKey : "anonymous";
+    for (const ticketId of ticketIds) {
+      const challenge = CHALLENGE_PREFIX + ticketId;
+      logEvidence(root, {
+        kind: "approval-question-observed",
+        session: publicKey,
+        ticket: ticketId,
+        call: callID,
+        matched: chronoApprovalMatch(questionText, answerText, challenge),
+      });
+    }
+  }
+
   try {
     const loadRoot = (ctx && ctx.directory) || process.cwd();
     const loadProject = chronoProjectRoot(loadRoot);
     if (loadProject !== null && !pluginLoadLogged) {
       pluginLoadLogged = true;
-      logEvidence(loadProject, { kind: "plugin-load", toolPolicy: "v1" });
+      logEvidence(loadProject, { kind: "plugin-load", toolPolicy: "v3" });
     }
   } catch {
     // Load evidence is observability only; enforcement never depends on it.
@@ -914,8 +1025,13 @@ export const ChronoGatePlugin = async (ctx) => {
         bytes: contract.length,
       });
     },
-    "tool.execute.before": async (input) => {
-      const tool = input && typeof input.tool === "string" ? input.tool : "";
+    "tool.execute.before": async (input, output) => {
+      // Real OpenCode 1.18.30 contract (C1): (input { tool, sessionID,
+      // callID }, output { args }). Tool identity comes from the first
+      // argument; tool arguments — including any shell command — come
+      // from the second. Shapes that do not match are not classifiable
+      // and stay on the deny-by-default path.
+      const tool = input !== null && typeof input === "object" && typeof input.tool === "string" ? input.tool : "";
       const root = (ctx && ctx.directory) || process.cwd();
       if (chronoProjectRoot(root) === null) {
         return;
@@ -938,32 +1054,44 @@ export const ChronoGatePlugin = async (ctx) => {
         // OC-P11 req 16: generic reads never serve internal/security
         // state (.chrono/chrono.db, broker accounts, token files,
         // internal hooks). Safe Core projections are the only channel.
+        // Probed on the real second-argument payload (C1).
         let probe = "";
         try {
-          probe = JSON.stringify(input ?? "");
+          probe = JSON.stringify(output !== undefined ? output : "");
         } catch {
           probe = "";
         }
         if (referencesForbiddenState(probe)) {
           throw new Error(
-            "[chrono] SECRET_DETECTED: this read references CHRONO internal or security state: use chrono doctor or chrono artifact status projections instead; direct access is denied."
+            "[chrono] SECRET_DETECTED: this read references CHRONO internal or security state: use chrono doctor or the chrono_artifact_status native tool instead; direct access is denied."
           );
         }
         return;
       }
+      if (kind === "planning" || PLANNING_TOOLS.has(tool)) {
+        // Native governed planning tools (OC-P11 correction, C5): real
+        // model-callable tools registered by this same setup
+        // (.opencode/tools/chrono.ts). Planning-governed, not generic
+        // shell mutation and not implementation dispatch: each enforces
+        // its Gaspar session itself and the Core validates every call.
+        // The gate requires proven entry, nothing more.
+        return;
+      }
       if (kind === "unknown") {
         throw new Error(
-          \`[chrono] TOOL_DENIED: tool '\${tool}' is not classified by CHRONO tool policy v2: deny-by-default until reviewed.\`
+          \`[chrono] TOOL_DENIED: tool '\${tool}' is not classified by CHRONO tool policy v3: deny-by-default until reviewed.\`
         );
       }
-      // OC-P11 planning path: a bash invocation that is EXACTLY a
-      // governed planning operation needs entry only — never Module
-      // dispatch. The chrono artifact CLI enforces the Gaspar/PO
-      // session and capability matrix through the host session
+      // Bash compatibility: a bash invocation that is EXACTLY a governed
+      // planning or approval-request operation (read from the real
+      // second-argument payload, C1) needs entry only — never Module
+      // dispatch. Operator sessions supply the session through the host
       // environment; never pass --session-token in model-visible text.
-      // Generic write/edit/bash stays on the dispatch path below.
+      // Generic write/edit/bash stays on the dispatch path below. Bash
+      // compatibility is NOT a substitute for the native planning tools
+      // Gaspar must use.
       if (tool === "bash") {
-        const command = extractBashCommand(input);
+        const command = extractBashCommand(output);
         if (command !== null && isPlanningBashCommand(command)) {
           return;
         }
@@ -1030,6 +1158,35 @@ export const ChronoGatePlugin = async (ctx) => {
       const code = verdict && typeof verdict.code === "string" ? verdict.code : "DENIED";
       const reason = verdict && typeof verdict.reason === "string" ? verdict.reason : "denied";
       throw new Error(\`[chrono] \${code}: \${reason}\`);
+    },
+    "tool.execute.after": async (input, output) => {
+      // OC-P11 approval question audit (ADR-007). Fires on
+      // runtime-delivered tool results only — the model cannot
+      // fabricate these events. Observation only: the native
+      // chrono_approval_confirm tool owns signing and recording.
+      // This handler never acts and never throws into the runtime.
+      try {
+        const root = (ctx && ctx.directory) || process.cwd();
+        if (chronoProjectRoot(root) === null) {
+          return;
+        }
+        const toolName = input !== null && typeof input === "object" && typeof input.tool === "string" ? input.tool : "";
+        if (toolName !== "question") {
+          return;
+        }
+        const key = resolveSessionKey(input, root);
+        const questionText = JSON.stringify(input !== null && typeof input === "object" && input.args !== undefined ? input.args : "");
+        const answerText = JSON.stringify(
+          output !== null && typeof output === "object" && output.output !== undefined ? output.output : output
+        );
+        const callID =
+          input !== null && typeof input === "object" && typeof input.callID === "string" && input.callID.length > 0
+            ? input.callID
+            : "unknown-call";
+        auditApprovalQuestion(root, key, callID, questionText, answerText);
+      } catch {
+        // Observation is advisory; enforcement lives in the Core.
+      }
     },
     dispose: async () => {
       // Best-effort stale-token sweep on unload (runtime close/restart).

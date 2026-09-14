@@ -1936,7 +1936,7 @@ describe.each([11, 12])("Routing proof migration (v%i → current)", (baseline) 
 
   it("preserves vintage rows as non-authoritative candidates", () => {
     const { applied } = seedVintageDb();
-    expect(applied[applied.length - 1]).toBe(14);
+    expect(applied[applied.length - 1]).toBe(15);
     const db = new ChronoDatabase({ path: dbPath() });
     try {
       const row = db.routingProofs().findById("RTE-0001");

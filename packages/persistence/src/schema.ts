@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -650,5 +650,27 @@ export const MIGRATIONS: Record<number, string> = {
     BEGIN
       SELECT RAISE(ABORT, 'routing_proof: proof rows are append-only and cannot be deleted');
     END;
+  `,
+  15: `
+    -- Native approval tickets (OC-P11 integrated ceremony): single-use,
+    -- short-lived, scope- and revision-bound authorizations created
+    -- through approval-request and consumed by exactly one successful
+    -- permission-bound finalize. Rows are never updated except the
+    -- consumed 0 → 1 flip, and never deleted: replay collides or finds
+    -- a consumed ticket, both fail-closed.
+    CREATE TABLE approval_ticket (
+      id                    TEXT PRIMARY KEY,
+      action                TEXT NOT NULL,
+      scope_artifact_id     TEXT NOT NULL,
+      scope_revision        TEXT NOT NULL,
+      authority             TEXT NOT NULL,
+      rationale             TEXT NOT NULL,
+      security_implications TEXT NOT NULL,
+      requester_session     TEXT NOT NULL,
+      created_at            TEXT NOT NULL,
+      expires_at            TEXT NOT NULL,
+      consumed              INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX idx_ticket_scope ON approval_ticket(scope_artifact_id, scope_revision);
   `,
 };

@@ -20,14 +20,14 @@
 import type { AgentRole } from "./state.js";
 
 /** Version of this authority policy, persisted with authorization evidence. */
-export const AUTHORITY_POLICY_VERSION = "4";
+export const AUTHORITY_POLICY_VERSION = "6";
 
 /**
  * Version of the runtime tool-classification policy below. Bumped
  * independently from the authority matrix: tool classification affects
  * pre-tool gate decisions, never grant semantics.
  */
-export const TOOL_POLICY_VERSION = "2";
+export const TOOL_POLICY_VERSION = "3";
 
 export type CapabilityHolder = AgentRole | "PO";
 
@@ -37,6 +37,8 @@ export type CoreOperation =
   | "planning.propose"
   | "planning.revise"
   | "planning.status"
+  | "approval.request"
+  | "approval.finalize"
   | "architecture.propose"
   | "architecture.enact"
   | "harness.record"
@@ -69,6 +71,8 @@ export const ROLE_CAPABILITIES: Record<CoreOperation, readonly CapabilityHolder[
   "planning.propose": ["gaspar", "PO"],
   "planning.revise": ["gaspar", "PO"],
   "planning.status": ["gaspar", "PO"],
+  "approval.request": ["gaspar", "PO"],
+  "approval.finalize": ["gaspar", "PO"],
   "architecture.propose": ["gaspar", "PO"],
   "architecture.enact": ["gaspar", "PO"],
   "harness.record": ["gaspar", "PO"],
@@ -161,7 +165,7 @@ export function isCapable(
  * MCP tools (`mcp_*`), and custom tools — is DENIED until classified in a
  * reviewed policy release. Tool names are adapter data, never authority.
  */
-export type ToolClassification = "read" | "mutate";
+export type ToolClassification = "read" | "mutate" | "planning";
 
 export const OPENCODE_TOOL_POLICY: Record<string, ToolClassification> = {
   read: "read",
@@ -177,6 +181,17 @@ export const OPENCODE_TOOL_POLICY: Record<string, ToolClassification> = {
   apply_patch: "mutate",
   webfetch: "mutate",
   websearch: "mutate",
+  // Native governed planning tools (OC-P11 correction): real
+  // model-callable tools registered by the generated plugin. They are
+  // neither generic shell mutation nor implementation dispatch: each
+  // enforces its Gaspar session itself and the Core validates every
+  // call. The gate requires proven entry, nothing more.
+  chrono_artifact_status: "planning",
+  chrono_artifact_propose: "planning",
+  chrono_artifact_revise: "planning",
+  chrono_approval_request: "planning",
+  chrono_approval_status: "planning",
+  chrono_approval_confirm: "planning",
 };
 
 /**

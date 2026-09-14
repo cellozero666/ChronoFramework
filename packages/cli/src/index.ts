@@ -16,6 +16,14 @@ import { ChronoCore } from "@chrono/core";
 import { RTK_UPSTREAM, SKILL_RELEASE, SKILL_RUNTIME_PATHS, buildApprovalPayload, buildEnrollmentChallenge, buildEnrollmentPayload, buildSessionAuthorizationPayload, buildWaiverPayload, computeRevisionHash, convertSkillSource, fingerprintPublicKey, generateApprovalKeyPair, parseSkillFrontmatter, signApprovalPayload, skillGeneratedHashes, skillRawSourceUrl, skillVendorPath, verifySkillRelease, type SkillRuntime } from "@chrono/domain";
 import { CHRONO_VERSION } from "./version.js";
 import { buildOpencodePlugin } from "./opencode-plugin.js";
+import {
+  OPENCODE_PLUGIN_DEP,
+  OPENCODE_PLUGIN_PIN,
+  OPENCODE_TOOLS_FILE_RELATIVE,
+  OPENCODE_TOOLS_PACKAGE_RELATIVE,
+  buildPlanningToolsFile,
+  buildPlanningToolsPackage,
+} from "./opencode-planning-tools.js";
 import { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook, mergeClaudeHookGroup, mergeClaudeSettings } from "./claude-hook.js";
 import { KIRO_HOOK_REGISTRATION_RELATIVE_PATH, KIRO_HOOK_RELATIVE_PATH, buildKiroHook, buildKiroHookRegistration } from "./kiro-hook.js";
 import {
@@ -41,6 +49,7 @@ import {
 } from "./entry-contract.js";
 import { constructionFailure, openReadProject, resolveProjectDir } from "./project.js";
 import { runArtifactPropose, runArtifactRevise, runArtifactStatus } from "./artifact-cli.js";
+import { runApprovalRecord, runApprovalRequest, runApprovalTicket } from "./approval-ceremony-cli.js";
 
 export { buildOpencodePlugin };
 export { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook, mergeClaudeHookGroup, mergeClaudeSettings };
@@ -128,6 +137,13 @@ interface CommandOpts {
   readonly rationale?: unknown;
   readonly issue?: unknown;
   readonly expiry?: unknown;
+  readonly securityImplications?: unknown;
+  readonly permissionCallId?: unknown;
+  readonly decidedAt?: unknown;
+  readonly ticket?: unknown;
+  readonly timestamp?: unknown;
+  readonly signature?: unknown;
+  readonly bodyStdin?: unknown;
   readonly evidence?: unknown;
   readonly controls?: unknown;
   readonly followUp?: unknown;
@@ -2308,6 +2324,75 @@ export interface SetupExecResult {
 }
 
 /**
+ * Install the managed planning-tool runtime manifest
+ * (`.opencode/package.json`, OC-P11 correction C5).
+ *
+ * Fail-closed dependency ownership: an absent file is created with the
+ * pinned runtime; an existing file keeps every user-owned entry and
+ * gains (or verifies) exactly the pinned CHRONO entry. A conflicting
+ * pin for the same dependency refuses with remediation instead of
+ * overwriting — dependency resolution is never guessed.
+ */
+export function installPlanningToolsPackage(projectPath: string): void {
+  const full = join(projectPath, OPENCODE_TOOLS_PACKAGE_RELATIVE);
+  const wanted = buildPlanningToolsPackage();
+  let existing: string | null = null;
+  try {
+    existing = readFileSync(full, "utf8");
+  } catch (e) {
+    if ((e as { code?: string }).code !== "ENOENT") {
+      throw e;
+    }
+  }
+  if (existing === null) {
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, wanted, "utf8");
+    return;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(existing);
+  } catch {
+    throw new Error(
+      `Project planning-tool manifest '${OPENCODE_TOOLS_PACKAGE_RELATIVE}' is not parseable JSON: fix it or remove it, then re-run`
+    );
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(
+      `Project planning-tool manifest '${OPENCODE_TOOLS_PACKAGE_RELATIVE}' must be a JSON object: fix it or remove it, then re-run`
+    );
+  }
+  const doc = parsed as Record<string, unknown>;
+  const deps = doc["dependencies"];
+  if (deps === undefined) {
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, JSON.stringify({ ...doc, dependencies: { [OPENCODE_PLUGIN_DEP]: OPENCODE_PLUGIN_PIN } }, null, 2) + "\n", "utf8");
+    return;
+  }
+  if (typeof deps !== "object" || deps === null || Array.isArray(deps)) {
+    throw new Error(
+      `Project planning-tool manifest '${OPENCODE_TOOLS_PACKAGE_RELATIVE}' has a non-object dependencies table: fix it or remove it, then re-run`
+    );
+  }
+  const table = deps as Record<string, unknown>;
+  const current = table[OPENCODE_PLUGIN_DEP];
+  if (current === undefined) {
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(
+      full,
+      JSON.stringify({ ...doc, dependencies: { ...table, [OPENCODE_PLUGIN_DEP]: OPENCODE_PLUGIN_PIN } }, null, 2) + "\n",
+      "utf8"
+    );
+    return;
+  }
+  if (current !== OPENCODE_PLUGIN_PIN) {
+    throw new Error(
+      `Project planning-tool manifest pins '${OPENCODE_PLUGIN_DEP}' at '${String(current)}' (CHRONO requires '${OPENCODE_PLUGIN_PIN}'): align the pin or remove the file, then re-run`
+    );
+  }
+}
+
+/**
  * Minimal quotes-aware command-line splitter for registered proof
  * commands (single/double quotes, backslash escapes). Returns null on
  * unbalanced quotes instead of guessing.
@@ -2493,6 +2578,12 @@ export function runSetup(
         } catch (e) {
           return fail(2, "VALIDATION_ERROR", e instanceof Error ? e.message : "OpenCode default_agent merge refused");
         }
+        // Native governed planning tools (OC-P11 correction, C5): the
+        // model-callable tool module plus its pinned runtime manifest.
+        // The package file is user-owned dependency metadata: refuse to
+        // overwrite clashing requirements instead of guessing.
+        writeBytes(join(projectPath, OPENCODE_TOOLS_FILE_RELATIVE), buildPlanningToolsFile());
+        installPlanningToolsPackage(projectPath);
       }
       if (writesClaude) {
         writeBytes(claudeHookPath, buildClaudeHook());
@@ -2562,7 +2653,13 @@ export function runSetup(
     const managedHooks = [
       ENTRY_SESSION_SCRIPT_RELATIVE_PATH,
       ...(writesOpencode
-        ? [".opencode/plugins/chrono-gate.js", ...CHRONO_OPENCODE_ROLES.map((role) => openCodeAgentPath(role)), OPENCODE_CONFIG_SIDECAR_RELATIVE]
+        ? [
+            ".opencode/plugins/chrono-gate.js",
+            ...CHRONO_OPENCODE_ROLES.map((role) => openCodeAgentPath(role)),
+            OPENCODE_CONFIG_SIDECAR_RELATIVE,
+            OPENCODE_TOOLS_FILE_RELATIVE,
+            OPENCODE_TOOLS_PACKAGE_RELATIVE,
+          ]
         : []),
       ...(writesClaude ? [CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH] : []),
       ...(writesKiro ? [KIRO_HOOK_RELATIVE_PATH, KIRO_HOOK_REGISTRATION_RELATIVE_PATH] : []),
@@ -2597,6 +2694,7 @@ export function runSetup(
             ? [
                 "  agents: .opencode/agents/{gaspar,belthazar,melchior,prometheus,lucca,glenn,spekkio}.md (gaspar is the primary; no model is written)",
                 "  default_agent: gaspar (project config merged, backup preserved; close OpenCode and open a fresh session afterwards)",
+                "  tools: .opencode/tools/chrono.ts (native governed planning tools) + .opencode/package.json (pinned runtime)",
               ]
             : []),
           `  hooks: ${managedHooks.join(", ")}`,
@@ -2615,6 +2713,54 @@ export function runSetup(
 /** Commander collector for repeatable flags (e.g. --runtime). */
 function collectStrings(value: string, previous: string[]): string[] {
   return [...previous, value];
+}
+
+/** Maximum inline body accepted on stdin (256 KiB; the Core enforces the 64 KiB content bound). */
+const INLINE_BODY_CAP_BYTES = 256 * 1024;
+
+/**
+ * Read an inline Markdown body from stdin for --body-stdin (C4: native
+ * tools pass the body directly so Gaspar never needs a temp file).
+ * Returns null after emitting the failure envelope (caller must stop).
+ */
+function readInlineBody(asJson: boolean): string | null {
+  if (process.stdin.isTTY === true) {
+    const body = asJson
+      ? JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: "--body-stdin requires piped stdin" } }, null, 2)
+      : "Error [VALIDATION_ERROR]: --body-stdin requires piped stdin";
+    if (asJson) {
+      console.log(body);
+    } else {
+      console.error(body);
+    }
+    throw programFailureExit(2);
+  }
+  let text = "";
+  try {
+    text = readFileSync(0, "utf8");
+  } catch (e) {
+    const body = asJson
+      ? JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: `cannot read stdin: ${e instanceof Error ? e.message : String(e)}` } }, null, 2)
+      : `Error [VALIDATION_ERROR]: cannot read stdin`;
+    if (asJson) {
+      console.log(body);
+    } else {
+      console.error(body);
+    }
+    throw programFailureExit(2);
+  }
+  if (Buffer.byteLength(text, "utf8") > INLINE_BODY_CAP_BYTES) {
+    const body = asJson
+      ? JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: "inline body exceeds the 256 KiB stdin cap" } }, null, 2)
+      : "Error [VALIDATION_ERROR]: inline body exceeds the 256 KiB stdin cap";
+    if (asJson) {
+      console.log(body);
+    } else {
+      console.error(body);
+    }
+    throw programFailureExit(2);
+  }
+  return text;
 }
 
 export function createProgram(cwd: string): Command {
@@ -3329,7 +3475,8 @@ export function createProgram(cwd: string): Command {
     .requiredOption("--kind <kind>", "planning kind (discovery, requirement, architecture, adr, spec, harness-draft, security-profile, roadmap, module, workpackage)")
     .option("--id <id>", "canonical identifier (allocated by the Core when omitted)")
     .requiredOption("--title <text>", "draft title")
-    .requiredOption("--body-file <path>", "markdown body file")
+    .option("--body-file <path>", "markdown body file (exactly one of --body-file or --body-stdin)")
+    .option("--body-stdin", "read the markdown body from stdin (native tools use this; no temp file)")
     .option("--ref <id>", "reference an existing artifact or draft (repeatable)", collectStrings, [])
     .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
     .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
@@ -3338,13 +3485,18 @@ export function createProgram(cwd: string): Command {
     .action((opts: CommandOpts) => {
       const projectPath = resolveProjectDir(cwd, opts.path);
       const refs = Array.isArray(opts.ref) ? opts.ref.filter((r): r is string => typeof r === "string") : [];
+      const stdinBody = opts.bodyStdin === true ? readInlineBody(opts.json === true) : null;
+      if (stdinBody === null && opts.bodyStdin === true) {
+        return;
+      }
       emitProgramResult(
         program,
         runArtifactPropose(projectPath, {
           kind: String(opts.kind ?? ""),
           ...(typeof opts.id === "string" && opts.id.length > 0 ? { id: opts.id } : {}),
           title: String(opts.title ?? ""),
-          bodyFile: String(opts.bodyFile ?? ""),
+          ...(typeof opts.bodyFile === "string" && opts.bodyFile.length > 0 ? { bodyFile: opts.bodyFile } : {}),
+          ...(stdinBody !== null ? { bodyText: stdinBody } : {}),
           ...(refs.length > 0 ? { references: refs } : {}),
           as: String(opts.as ?? ""),
           ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
@@ -3358,19 +3510,25 @@ export function createProgram(cwd: string): Command {
     .description("Revise a planning draft to a new revision (prior approvals go stale)")
     .requiredOption("--id <id>", "planning artifact identifier")
     .requiredOption("--title <text>", "revised title")
-    .requiredOption("--body-file <path>", "revised markdown body file")
+    .option("--body-file <path>", "revised markdown body file (exactly one of --body-file or --body-stdin)")
+    .option("--body-stdin", "read the revised markdown body from stdin (native tools use this; no temp file)")
     .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
     .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--json", "machine-readable JSON output")
     .action((opts: CommandOpts) => {
       const projectPath = resolveProjectDir(cwd, opts.path);
+      const stdinBody = opts.bodyStdin === true ? readInlineBody(opts.json === true) : null;
+      if (stdinBody === null && opts.bodyStdin === true) {
+        return;
+      }
       emitProgramResult(
         program,
         runArtifactRevise(projectPath, {
           id: String(opts.id ?? ""),
           title: String(opts.title ?? ""),
-          bodyFile: String(opts.bodyFile ?? ""),
+          ...(typeof opts.bodyFile === "string" && opts.bodyFile.length > 0 ? { bodyFile: opts.bodyFile } : {}),
+          ...(stdinBody !== null ? { bodyText: stdinBody } : {}),
           as: String(opts.as ?? ""),
           ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
           json: opts.json === true,
@@ -3390,6 +3548,91 @@ export function createProgram(cwd: string): Command {
       emitProgramResult(
         program,
         runArtifactStatus(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  // OC-P11 integrated approval ceremony (ADR-007): single-use tickets
+  // plus host-observed native confirmation. approval-request creates
+  // the ticket (planning path); approval-record consumes it with a
+  // host-made PO signature (model invocation without a valid signature
+  // denies); approval-ticket is the safe re-validation projection.
+  // Key material never travels through these commands.
+  program
+    .command("approval-request")
+    .description("Request a single-use approval ticket binding action, scope, exact revision, rationale, and security implications")
+    .requiredOption("--action <action>", "approval action (module-approval, planning-approval, architecture-security, implementation-security)")
+    .requiredOption("--scope <id>", "artifact scope identifier")
+    .requiredOption("--revision <rev>", "exact scope revision hash")
+    .requiredOption("--rationale <text>", "decision rationale")
+    .requiredOption("--security-implications <text>", "explicit security implications")
+    .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runApprovalRequest(projectPath, {
+          action: String(opts.action ?? ""),
+          scope: String(opts.scope ?? ""),
+          revision: String(opts.revision ?? ""),
+          rationale: String(opts.rationale ?? ""),
+          securityImplications: String(opts.securityImplications ?? ""),
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("approval-record")
+    .description("Record a permission-bound approval from a host-made PO signature (denies without one)")
+    .requiredOption("--ticket <id>", "single-use approval ticket id")
+    .requiredOption("--timestamp <ts>", "ISO-8601 UTC timestamp bound in the signature")
+    .requiredOption("--signature <base64>", "Ed25519 signature over the canonical ticket payload")
+    .requiredOption("--permission-call-id <id>", "native observation: permission/question call id")
+    .requiredOption("--decided-at <ts>", "native observation: human decision time")
+    .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runApprovalRecord(projectPath, {
+          ticket: String(opts.ticket ?? ""),
+          timestamp: String(opts.timestamp ?? ""),
+          signature: String(opts.signature ?? ""),
+          permissionCallId: String(opts.permissionCallId ?? ""),
+          decidedAt: String(opts.decidedAt ?? ""),
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("approval-ticket")
+    .description("Safe approval-ticket projection for host re-validation (no secrets)")
+    .requiredOption("--ticket <id>", "approval ticket id")
+    .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runApprovalTicket(projectPath, {
+          ticket: String(opts.ticket ?? ""),
           as: String(opts.as ?? ""),
           ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
           json: opts.json === true,

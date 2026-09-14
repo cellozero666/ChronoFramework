@@ -662,6 +662,34 @@ PRODUCT_AMBIGUITY     → Product Owner
 - SkillAttestation is mandatory for every agent execution `[P6.6, P3.6]`; its absence is `BLOCKED_PROCESS_SKILL`.
 - RTK is external to domain ownership; it does not define CHRONO state/governance/lifecycle `[REF §13, P6.5]`.
 
+### 4.8 Planning-authoring path (OC-P11)
+
+Gaspar must be able to propose and materialize planning artifacts
+(discovery, requirements, architecture proposals, ADRs, Specs, harness
+drafts, security-profile proposals, roadmap/Module/Work Package plans)
+BEFORE any implementation Module/WP exists, without arbitrary
+filesystem, shell, or implementation authority. `chrono run` execution
+grants stay reserved for authorized implementation work.
+
+- Operations `planning.propose`, `planning.revise`, and
+  `planning.status` are Core-owned and capability-gated to Gaspar and
+  the PO only; workers are denied by the matrix.
+- Every operation validates kind, identifier, lifecycle entry state,
+  revision, references, allowed destination, schema, and content size.
+- Destinations derive deterministically from (kind, id) under
+  canonical managed locations; there is no caller-supplied path.
+- Writes land atomically or compensatably (Markdown/YAML plus SQLite
+  registry/event changes); no half-materialized draft reads as ready.
+- Model content enters as untrusted DRAFT/PROPOSED material. Chat text
+  never becomes PO authority: only Core-signed approvals
+  (`planning-approval`, plus `architecture-security` /
+  `module-approval` where applicable) bind artifact ID, exact
+  revision/hash, decision type, timestamp, rationale, and security
+  implications. Revision changes stale prior approvals
+  deterministically.
+- No circular dependency: creating the artifacts that define a Module
+  never requires an approved Module.
+
 ---
 
 ## 5. Core Events

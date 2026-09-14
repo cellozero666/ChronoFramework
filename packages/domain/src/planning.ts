@@ -196,6 +196,16 @@ export function assertPlanningContent(kind: PlanningKind, title: string, body: s
       suggestedAction: "Provide a title describing the proposed artifact",
     });
   }
+  if (body.trim().length === 0) {
+    throw new ChronoError({
+      code: ErrorCode.VALIDATION_ERROR,
+      severity: Severity.ERROR,
+      message: `Planning ${kind} '${target}' requires a non-blank body`,
+      invariantRef: "INV §14.4",
+      affectedTarget: target,
+      suggestedAction: "Provide the draft content as Markdown",
+    });
+  }
   const bytes = Buffer.byteLength(body, "utf8");
   if (bytes < PLANNING_MIN_BYTES || bytes > PLANNING_MAX_BYTES) {
     throw new ChronoError({
@@ -241,6 +251,8 @@ export const PLANNING_BASH_PREFIXES: readonly string[] = [
   "chrono artifact propose",
   "chrono artifact revise",
   "chrono artifact status",
+  "chrono approval-request",
+  "chrono approval-ticket",
   "chrono discovery record",
   "chrono plan status",
   "chrono status",
@@ -248,12 +260,102 @@ export const PLANNING_BASH_PREFIXES: readonly string[] = [
   "chrono doctor",
 ];
 
-/** True when a bash command string is a governed planning operation. */
+/**
+ * True when a bash command string is EXACTLY a governed planning
+ * operation. Strict: no chaining, piping, substitution, or
+ * backgrounding — a planning operation is exactly one chrono
+ * invocation. Anything else stays on the implementation-dispatch path.
+ */
 export function isPlanningBashCommand(command: string): boolean {
   const normalized = command.trim().replace(/\s+/g, " ");
+  if (/[;|&$`\\]/.test(normalized)) {
+    return false;
+  }
+  // A binary path prefix (./bin, absolute) still names the same governed
+  // surface: accept a trailing path segment before `chrono`.
+  const withoutBinary = normalized.replace(/^([\w\-./\\:]+\/)?chrono(\.exe|\.cmd|\.bat)? /, "chrono ");
+  if (withoutBinary === normalized && !normalized.startsWith("chrono ")) {
+    return false;
+  }
   return PLANNING_BASH_PREFIXES.some(
-    (prefix) => normalized === prefix || normalized.startsWith(`${prefix} `) || normalized.startsWith(`${prefix} --`),
+    (prefix) => withoutBinary === prefix || withoutBinary.startsWith(`${prefix} `),
   );
+}
+
+/**
+ * Approval-ticket lifetime in seconds (OC-P11 ceremony). A ticket that
+ * outlives its window can never authorize signing: finalize denies and
+ * Gaspar requests a fresh ticket for the current revision.
+ */
+export const APPROVAL_TICKET_TTL_SECONDS = 900;
+
+/** Correlation challenge for one approval ticket (not a secret). */
+export function approvalChallenge(ticketId: string): string {
+  return `approve-${ticketId}`;
+}
+
+/**
+ * Canonical human-confirmation line Gaspar must include verbatim in the
+ * native `question` call for one approval ticket (OC-P11 ceremony).
+ * The plugin host acts only when the runtime-delivered question AND its
+ * human answer both carry this line's challenge for a live ticket.
+ */
+export function approvalQuestionLine(input: {
+  challenge: string;
+  action: string;
+  scopeId: string;
+  revision: string;
+  rationale: string;
+}): string {
+  return (
+    `CHRONO approval ${input.challenge} :: ${input.action} ${input.scopeId} ` +
+    `@${input.revision} :: ${input.rationale}`
+  );
+}
+
+/**
+ * True when a runtime-delivered question/answer pair carries the same
+ * live challenge in both halves. Matching is exact and case-sensitive;
+ * chat text never reaches this check (only tool runtime payloads do).
+ */
+export function approvalAnswerMatches(questionText: string, answerText: string, challenge: string): boolean {
+  if (challenge.trim().length === 0) {
+    return false;
+  }
+  return questionText.includes(challenge) && answerText.includes(challenge);
+}
+
+/**
+ * Deterministic canonical JSON (lexicographically sorted keys, UTF-8).
+ * Shared algorithm with the Core revision serializer, restricted to
+ * plain JSON values: the plugin host uses it to sign approval payloads
+ * byte-identically without importing domain code.
+ */
+export function canonicalizeJson(value: unknown): string {
+  if (value === null) {
+    return "null";
+  }
+  switch (typeof value) {
+    case "string":
+      return JSON.stringify(value);
+    case "number":
+      if (!Number.isFinite(value)) {
+        throw new Error("canonicalizeJson: non-finite number");
+      }
+      return JSON.stringify(value);
+    case "boolean":
+      return value ? "true" : "false";
+    case "object": {
+      if (Array.isArray(value)) {
+        return `[${value.map((item) => canonicalizeJson(item)).join(",")}]`;
+      }
+      const record = value as Record<string, unknown>;
+      const keys = Object.keys(record).sort();
+      return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalizeJson(record[key])}`).join(",")}}`;
+    }
+    default:
+      throw new Error(`canonicalizeJson: unsupported typeof '${typeof value}'`);
+  }
 }
 
 /**

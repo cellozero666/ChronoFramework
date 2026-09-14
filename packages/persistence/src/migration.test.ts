@@ -58,6 +58,43 @@ describe("Schema migrations", () => {
     expect(db.schemaVersion()).toBe(SCHEMA_VERSION);
   });
 
+  it("creates the approval_ticket table at v15 on every upgrade path", () => {
+    for (const baseline of [1, 14]) {
+      const dir = mkdtempSync(join(tmpdir(), "chrono-ticket-mig-test-"));
+      try {
+        const first = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          first.migrate(baseline);
+        } finally {
+          first.close();
+        }
+        const second = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          second.migrate();
+          expect(second.schemaVersion()).toBe(SCHEMA_VERSION);
+          const created = second.approvalTickets().create({
+            id: "TICKET-0001",
+            action: "planning-approval",
+            scopeArtifactId: "REQ-0001",
+            scopeRevision: `sha256:${"a".repeat(64)}`,
+            authority: "PO",
+            rationale: "test",
+            securityImplications: "none",
+            requesterSession: "SES-0001",
+            createdAt: "2026-09-14T00:00:00.000Z",
+            expiresAt: "2026-09-14T00:15:00.000Z",
+          });
+          expect(created.consumed).toBe(false);
+          expect(second.approvalTickets().consume("TICKET-0001").consumed).toBe(true);
+        } finally {
+          second.close();
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("rewrites the legacy luca identity to lucca with an audit trail", () => {
     db = new ChronoDatabase({ path: join(tempDir, "chrono.db") });
     db.migrate(4);
@@ -158,7 +195,7 @@ describe("Routing-proof promotion guard (OC-P2)", () => {
         try {
           const applied = second.migrate().map((m) => m.version);
           expect(applied[applied.length - 1]).toBe(SCHEMA_VERSION);
-          expect(second.schemaVersion()).toBe(14);
+          expect(second.schemaVersion()).toBe(SCHEMA_VERSION);
           const raw = new Database(join(dir, "chrono.db"));
           try {
             const triggers = raw

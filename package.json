@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "license": "Apache-2.0",
-  "description": "CHRONO Framework \u2014 Spec-Driven Development orchestration for AI-assisted software engineering",
+  "description": "CHRONO Framework — Spec-Driven Development orchestration for AI-assisted software engineering",
   "workspaces": [
     "packages/*"
   ],
@@ -15,15 +15,17 @@
     "test:clean": "node scripts/verify-test-clean.mjs",
     "test:watch": "vitest",
     "clean": "rimraf packages/*/dist packages/*/tsconfig.tsbuildinfo tsconfig.tsbuildinfo",
-    "test:blackbox": "CHRONO_BLACKBOX=1 vitest run packages/cli/src/entry-blackbox.test.ts packages/cli/src/opencode-plugin-blackbox.test.ts"
+    "test:blackbox": "CHRONO_BLACKBOX=1 vitest run packages/cli/src/entry-blackbox.test.ts packages/cli/src/opencode-plugin-blackbox.test.ts packages/cli/src/planning-blackbox.test.ts"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.30",
     "@types/node": "^22.0.0",
     "eslint": "^9.10.0",
     "rimraf": "^6.0.0",
     "typescript": "^5.6.0",
     "typescript-eslint": "^8.0.0",
-    "vitest": "^2.1.0"
+    "vitest": "^2.1.0",
+    "zod": "^4.1.8"
   },
   "engines": {
     "node": "^22.12.0 || ^24.0.0"
