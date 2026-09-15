@@ -50,6 +50,30 @@ import {
 import { constructionFailure, openReadProject, resolveProjectDir } from "./project.js";
 import { runArtifactPropose, runArtifactRevise, runArtifactStatus, runArtifactSupersede } from "./artifact-cli.js";
 import { runApprovalRecord, runApprovalRequest, runApprovalTicket } from "./approval-ceremony-cli.js";
+import { runDispatchClaim, runDispatchRequest, runDispatchTaskCheck } from "./dispatch-cli.js";
+import {
+  runCompleteModule,
+  runCorrectionComplete,
+  runCorrectionOpen,
+  runDeepCheck,
+  runDefectRecord,
+  runDefectResolve,
+  runDispatchConfirm,
+  runDispatchReconcile,
+  runDispatchRelease,
+  runDispatchRevoke,
+  runEvidenceRecord,
+  runEvidenceStatus,
+  runExecutionStatus,
+  runNextAction,
+  runPolicySet,
+  runPolicyStatus,
+  runReviewAssign,
+  runReviewComplete,
+  runScopeAdvance,
+  runVerifyRecord,
+  runWpAuthorize,
+} from "./lifecycle-cli.js";
 
 export { buildOpencodePlugin };
 export { CLAUDE_HOOK_RELATIVE_PATH, CLAUDE_SETTINGS_RELATIVE_PATH, buildClaudeHook, mergeClaudeHookGroup, mergeClaudeSettings };
@@ -140,6 +164,33 @@ interface CommandOpts {
   readonly securityImplications?: unknown;
   readonly permissionCallId?: unknown;
   readonly decidedAt?: unknown;
+  readonly dispatch?: unknown;
+  readonly deep?: unknown;
+  readonly event?: unknown;
+  readonly check?: unknown;
+  readonly result?: unknown;
+  readonly diagnostics?: unknown;
+  readonly classification?: unknown;
+  readonly severity?: unknown;
+  readonly criteria?: unknown;
+  readonly artifact?: unknown;
+  readonly blockingScope?: unknown;
+  readonly repro?: unknown;
+  readonly verdict?: unknown;
+  readonly reviewer?: unknown;
+  readonly defects?: unknown;
+  readonly waivers?: unknown;
+  readonly proposedProfile?: unknown;
+  readonly profile?: unknown;
+  readonly review?: unknown;
+  readonly defect?: unknown;
+  readonly loop?: unknown;
+  readonly reason?: unknown;
+  readonly agent?: unknown;
+  readonly session?: unknown;
+  readonly taskId?: unknown;
+  readonly workerSession?: unknown;
+  readonly opencodeSession?: unknown;
   readonly ceremonyKey?: unknown;
   readonly ceremonySession?: unknown;
   readonly ceremonyRequest?: unknown;
@@ -1003,32 +1054,60 @@ export function runGate(projectPath: string, options: GateOptions): CliOutput {
       );
     }
     if (options.gate === "execution") {
+      // Per-tool binding validation (CF-1): the caller session must
+      // hold a live ACTIVE dispatch covering the scope. No grant is
+      // minted here — claim mints and consumes the single grant with
+      // enactment; every later tool call validates that binding and
+      // its freshness. --role/--requester-token stay accepted for
+      // compatibility: --role must equal --as, and any --requester
+      // credential is ignored (the binding names its own requester).
       if (options.module === undefined || options.module.length === 0) {
         return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "execution gate requires --module" }, "Error [VALIDATION_ERROR]: execution gate requires --module");
-      }
-      if (options.role === undefined || options.role.length === 0) {
-        return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "execution gate requires --role (assigned implementation role)" }, "Error [VALIDATION_ERROR]: execution gate requires --role (assigned implementation role)");
       }
       const session = resolveSessionToken(options.sessionToken);
       if (session === null) {
         return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "execution gate requires --session-token (or CHRONO_SESSION_TOKEN)" }, "Error [VALIDATION_ERROR]: execution gate requires --session-token (or CHRONO_SESSION_TOKEN)");
       }
-      const requesterSession = parseSessionToken(options.requesterToken);
-      if (options.requesterToken !== undefined && requesterSession === null) {
-        return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "execution gate requires --requester-token <id/token>" }, "Error [VALIDATION_ERROR]: execution gate requires --requester-token <id/token>");
+      if (options.role !== undefined && options.role.length > 0 && options.role !== options.as) {
+        // A gate answers AUTHORIZED/DENIED, never usage errors, for
+        // inconsistent credentials: claiming another role's binding
+        // through this session is impersonation, denied fail-closed.
+        return respond(
+          1,
+          { result: "DENIED", code: "EXECUTION_DENIED", reason: "execution gate --role must equal --as (the session's own bound role)" },
+          "DENIED [EXECUTION_DENIED]: execution gate --role must equal --as"
+        );
       }
-      if (requesterSession === null && options.as !== options.role) {
-        return respond(2, { result: "ERROR", code: "VALIDATION_ERROR", reason: "orchestrated execution requests require --requester-token for the requesting session" }, "Error [VALIDATION_ERROR]: orchestrated execution requests require --requester-token for the requesting session");
+      // Unknown scopes deny as unresolvable before binding checks.
+      try {
+        core.getArtifact(options.module);
+        if (typeof options.wp === "string" && options.wp.length > 0) {
+          core.getArtifact(options.wp);
+        }
+      } catch (e) {
+        const code = typeof e === "object" && e !== null && "code" in e && typeof e.code === "string" ? e.code : "ENTITY_NOT_FOUND";
+        const message = e instanceof Error ? e.message : "unknown scope";
+        return respond(1, { result: "DENIED", code, reason: message }, `DENIED [${code}]: ${message}`);
       }
-      const result = core.authorizeExecution(options.module, {
-        ...(options.wp !== undefined ? { workPackageId: options.wp } : {}),
-        actor: options.as,
-        role: options.role,
-        session,
-        ...(requesterSession === null ? {} : { requesterSession }),
-      });
+      const result = core.authorizeDispatchedTool(
+        { actor: options.as, session },
+        {
+          moduleId: options.module,
+          workPackageId: typeof options.wp === "string" && options.wp.length > 0 ? options.wp : null,
+        }
+      );
       if (result.ok) {
-        return respond(0, { result: "AUTHORIZED", grantId: result.value?.grantId }, "AUTHORIZED");
+        return respond(
+          0,
+          {
+            result: "AUTHORIZED",
+            dispatchId: result.value?.dispatchId,
+            moduleId: result.value?.moduleId,
+            workPackageId: result.value?.workPackageId,
+            role: result.value?.role,
+          },
+          "AUTHORIZED"
+        );
       }
       return respond(
         1,
@@ -3310,9 +3389,21 @@ export function createProgram(cwd: string): Command {
     .option("--path <dir>", "project directory (default: current directory)")
     .option("--as <actor>", "accepted for compatibility; broker inspection is public and needs no session")
     .option("--session-token <id/token>", "accepted for compatibility; the doctor never uses privileged sessions")
+    .option("--deep", "lifecycle integrity: cross-record consistency, backlog, stale citations, loop bounds, reachability (gaspar/PO session)")
     .option("--json", "machine-readable JSON output")
     .action(async (opts: CommandOpts) => {
       const projectPath = resolveProjectDir(cwd, opts.path);
+      if (opts.deep === true) {
+        emitProgramResult(
+          program,
+          runDeepCheck(projectPath, {
+            as: String(opts.as ?? ""),
+            ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+            json: opts.json === true,
+          })
+        );
+        return;
+      }
       const { runDoctor } = await import("./init-flow.js");
       const token =
         typeof opts.sessionToken === "string" && opts.sessionToken.length > 0
@@ -3671,6 +3762,568 @@ export function createProgram(cwd: string): Command {
           ticket: String(opts.ticket ?? ""),
           as: String(opts.as ?? ""),
           ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("dispatch-request")
+    .description("Validate every dispatch gate for a module/WP and record a native dispatch intent (Gaspar/PO session; no tokens in output)")
+    .requiredOption("--module <id>", "module scope identifier")
+    .option("--wp <id>", "work-package scope identifier")
+    .option("--kind <kind>", "dispatch kind: implementation, test, security-review, verification, correction (default: implementation)")
+    .option("--proposed-profile <profile>", "proposed rigor profile: lean, standard, critical (can only raise, never lower)")
+    .requiredOption("--rationale <text>", "why this dispatch starts now (1-500 chars)")
+    .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--adapter <id>", "runtime adapter the worker will run under")
+    .option("--opencode-session <id>", "requesting OpenCode session key for task-delegation binding (native tool passes ToolContext.sessionID)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runDispatchRequest(projectPath, {
+          module: String(opts.module ?? ""),
+          ...(typeof opts.wp === "string" && opts.wp.length > 0 ? { wp: opts.wp } : {}),
+          ...(typeof opts.kind === "string" && opts.kind.length > 0 ? { kind: opts.kind } : {}),
+          ...(typeof opts.proposedProfile === "string" && opts.proposedProfile.length > 0
+            ? { proposedProfile: opts.proposedProfile }
+            : {}),
+          rationale: String(opts.rationale ?? ""),
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          ...(typeof opts.adapter === "string" && opts.adapter.length > 0 ? { adapter: opts.adapter } : {}),
+          ...(typeof opts.opencodeSession === "string" && opts.opencodeSession.length > 0
+            ? { opencodeSession: opts.opencodeSession }
+            : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("dispatch-claim")
+    .description("Bind one worker subagent session to a dispatch intent (host-resolved credentials; model supplies only the dispatch id)")
+    .requiredOption("--dispatch <id>", "dispatch intent id from dispatch-request")
+    .requiredOption("--agent <role>", "claiming worker role (must match the task delegation)")
+    .requiredOption("--worker-session <id>", "claiming worker OpenCode session id (host-supplied, never model text)")
+    .option("--adapter <id>", "runtime adapter the worker runs under")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runDispatchClaim(projectPath, {
+          dispatch: String(opts.dispatch ?? ""),
+          agent: String(opts.agent ?? ""),
+          workerSessionKey: String(opts.workerSession ?? ""),
+          ...(typeof opts.adapter === "string" && opts.adapter.length > 0 ? { adapter: opts.adapter } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("dispatch-task-check")
+    .description("Decide one native task delegation against the dispatch ledger (plugin-enforced; denies unknown or ungated delegation)")
+    .requiredOption("--session <id>", "calling OpenCode session key (host-supplied)")
+    .requiredOption("--agent <role>", "requested subagent role")
+    .option("--task-id <id>", "resume an existing worker session instead of delegating fresh")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runDispatchTaskCheck(projectPath, {
+          session: String(opts.session ?? ""),
+          agent: String(opts.agent ?? ""),
+          ...(typeof opts.taskId === "string" && opts.taskId.length > 0 ? { taskId: opts.taskId } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("next-action")
+    .description("Highest-precedence next action for a scope, derived from Core records (any bound session; workers see their own scope)")
+    .option("--module <id>", "module scope identifier")
+    .option("--wp <id>", "work-package scope identifier (takes precedence over --module)")
+    .requiredOption("--as <actor>", "calling identity (must match the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runNextAction(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          ...(typeof opts.module === "string" && opts.module.length > 0 ? { module: opts.module } : {}),
+          ...(typeof opts.wp === "string" && opts.wp.length > 0 ? { wp: opts.wp } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("execution-status")
+    .description("Worker execution projection: own binding, scope states, revision currency (no secrets)")
+    .option("--module <id>", "module scope identifier")
+    .option("--wp <id>", "work-package scope identifier (takes precedence over --module)")
+    .requiredOption("--as <actor>", "calling identity (must match the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runExecutionStatus(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          ...(typeof opts.module === "string" && opts.module.length > 0 ? { module: opts.module } : {}),
+          ...(typeof opts.wp === "string" && opts.wp.length > 0 ? { wp: opts.wp } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("evidence-status")
+    .description("Evidence projection for one content revision: current rows only, no diagnostics")
+    .requiredOption("--revision <hash>", "content revision hash to project")
+    .requiredOption("--as <actor>", "calling identity (must match the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runEvidenceStatus(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          revision: String(opts.revision ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("deep-check")
+    .description("Deep integrity check: cross-record consistency gaspar/PO run before completion (versions, backlog, stale citations, loop bounds)")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runDeepCheck(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("review-assign")
+    .description("Assign a Glenn security review or Spekkio verification (gaspar/PO)")
+    .requiredOption("--kind <kind>", "review kind: security-review or verification")
+    .requiredOption("--module <id>", "module scope identifier")
+    .option("--wp <id>", "work-package scope identifier")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runReviewAssign(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          kind: String(opts.kind ?? ""),
+          module: String(opts.module ?? ""),
+          ...(typeof opts.wp === "string" && opts.wp.length > 0 ? { wp: opts.wp } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("review-complete")
+    .description("Submit an assigned review from the reviewer session (glenn or spekkio)")
+    .requiredOption("--review <id>", "review assignment id")
+    .requiredOption("--as <actor>", "calling identity: the assigned reviewer")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runReviewComplete(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          review: String(opts.review ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("correction-open")
+    .description("Open a bounded correction loop for a defect (gaspar, spekkio, or PO)")
+    .requiredOption("--defect <id>", "defect identifier")
+    .requiredOption("--as <actor>", "calling identity (must match the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runCorrectionOpen(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          defect: String(opts.defect ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("correction-complete")
+    .description("Complete a correction loop with evidenced fix (owning role)")
+    .requiredOption("--loop <id>", "correction loop id")
+    .requiredOption("--as <actor>", "calling identity: the loop owner")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runCorrectionComplete(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          loop: String(opts.loop ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("evidence-record")
+    .description("Record evidence bound to an exact content revision (producer must equal the caller role)")
+    .requiredOption("--revision <hash>", "exact content revision hash the evidence proves")
+    .requiredOption("--check <name>", "check name (what was run)")
+    .requiredOption("--result <result>", "check result (pass)")
+    .option("--diagnostics <text>", "short failure/output excerpt (scanned for secrets)")
+    .requiredOption("--as <actor>", "calling identity: the producing role")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runEvidenceRecord(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          revision: String(opts.revision ?? ""),
+          check: String(opts.check ?? ""),
+          result: String(opts.result ?? ""),
+          ...(typeof opts.diagnostics === "string" ? { diagnostics: opts.diagnostics } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("defect-record")
+    .description("Record a defect against concrete artifacts (Spekkio authority; routes to the responsible owner)")
+    .requiredOption("--classification <class>", "defect classification")
+    .requiredOption("--severity <level>", "defect severity")
+    .option("--evidence <csv>", "comma-separated evidence ids")
+    .option("--criteria <csv>", "comma-separated affected criteria")
+    .option("--artifact <csv>", "comma-separated affected artifact ids")
+    .option("--blocking-scope <id>", "scope the defect blocks")
+    .option("--repro <text>", "reproduction info")
+    .requiredOption("--as <actor>", "calling identity: spekkio")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runDefectRecord(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          classification: String(opts.classification ?? ""),
+          severity: String(opts.severity ?? ""),
+          ...(typeof opts.evidence === "string" ? { evidence: opts.evidence } : {}),
+          ...(typeof opts.criteria === "string" ? { criteria: opts.criteria } : {}),
+          ...(typeof opts.artifact === "string" ? { artifact: opts.artifact } : {}),
+          ...(typeof opts.blockingScope === "string" ? { blockingScope: opts.blockingScope } : {}),
+          ...(typeof opts.repro === "string" ? { repro: opts.repro } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("verify-record")
+    .description("Record a Spekkio verification verdict (independent authority; nobody else, not even PO)")
+    .requiredOption("--module <id>", "module identifier")
+    .requiredOption("--verdict <verdict>", "PASS, FAILED, or WAIVED")
+    .requiredOption("--reviewer <role>", "reviewing role (spekkio)")
+    .option("--defects <csv>", "comma-separated defect ids (FAILED)")
+    .option("--waivers <csv>", "comma-separated waiver ids (WAIVED)")
+    .option("--evidence <csv>", "comma-separated evidence ids reviewed")
+    .option("--wp <id>", "work-package scope identifier")
+    .requiredOption("--as <actor>", "calling identity: spekkio")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runVerifyRecord(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          module: String(opts.module ?? ""),
+          verdict: String(opts.verdict ?? ""),
+          reviewer: String(opts.reviewer ?? ""),
+          ...(typeof opts.defects === "string" ? { defects: opts.defects } : {}),
+          ...(typeof opts.waivers === "string" ? { waivers: opts.waivers } : {}),
+          ...(typeof opts.evidence === "string" ? { evidence: opts.evidence } : {}),
+          ...(typeof opts.wp === "string" && opts.wp.length > 0 ? { wp: opts.wp } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("wp-authorize")
+    .description("Authorize one Work Package for execution (gaspar/PO planning authority)")
+    .requiredOption("--wp <id>", "work-package identifier")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runWpAuthorize(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          wp: String(opts.wp ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("scope-advance")
+    .description("Advance a bound scope one legal forward step (bound worker session; event kind-gated)")
+    .requiredOption("--module <id>", "module identifier")
+    .option("--wp <id>", "work-package identifier")
+    .requiredOption("--event <event>", "forward event: ImplementationDone, VerificationReady, SpekkioPassed, SpekkioFailed, CorrectionComplete (modules: ImplementationComplete instead of Done)")
+    .requiredOption("--as <actor>", "calling identity: the bound worker role")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runScopeAdvance(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          module: String(opts.module ?? ""),
+          ...(typeof opts.wp === "string" && opts.wp.length > 0 ? { wp: opts.wp } : {}),
+          event: String(opts.event ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("defect-resolve")
+    .description("Resolve a defect after its correction loop closed on re-verification (owner or PO)")
+    .requiredOption("--defect <id>", "defect identifier")
+    .requiredOption("--as <actor>", "calling identity: the defect owner or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runDefectResolve(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          defect: String(opts.defect ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("policy-set")
+    .description("Calibrate the project rigor profile (gaspar/PO; lowering rigor needs a PO signature)")
+    .requiredOption("--profile <profile>", "rigor profile: lean, standard, critical")
+    .requiredOption("--rationale <text>", "why this profile fits the project (1-500 chars)")
+    .option("--signature <hex>", "PO signature over the canonical policy payload (required for downgrades)")
+    .option("--timestamp <iso>", "signature timestamp, newer than the stored policy (required for downgrades)")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runPolicySet(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          profile: String(opts.profile ?? ""),
+          rationale: String(opts.rationale ?? ""),
+          ...(typeof opts.signature === "string" && opts.signature.length > 0 ? { signature: opts.signature } : {}),
+          ...(typeof opts.timestamp === "string" && opts.timestamp.length > 0 ? { timestamp: opts.timestamp } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("policy-status")
+    .description("Show the calibrated rigor profile (public projection)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runPolicyStatus(projectPath, {
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("dispatch-confirm")
+    .description("Confirm credential confinement for an enacted dispatch (requester or worker session)")
+    .requiredOption("--dispatch <id>", "dispatch id")
+    .requiredOption("--as <actor>", "calling identity (must match the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runDispatchConfirm(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          dispatch: String(opts.dispatch ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("dispatch-release")
+    .description("Release an evidenced binding to COMPLETED: the bound worker, or gaspar/PO oversight")
+    .requiredOption("--dispatch <id>", "dispatch id")
+    .requiredOption("--as <actor>", "calling identity (must match the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runDispatchRelease(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          dispatch: String(opts.dispatch ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("dispatch-revoke")
+    .description("Compensating revocation for a failed or abandoned claim (gaspar/PO)")
+    .requiredOption("--dispatch <id>", "dispatch id")
+    .option("--reason <text>", "why the binding is revoked")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runDispatchRevoke(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          dispatch: String(opts.dispatch ?? ""),
+          ...(typeof opts.reason === "string" && opts.reason.length > 0 ? { reason: opts.reason } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("dispatch-reconcile")
+    .description("Crash-safety sweep: expire stale intents, revoke stale enactments (gaspar/PO)")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runDispatchReconcile(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("complete-module")
+    .description("Complete a module through its completion authorization (idempotent; gaspar, spekkio, or PO)")
+    .requiredOption("--module <id>", "module identifier")
+    .requiredOption("--as <actor>", "calling identity (must match the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runCompleteModule(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          module: String(opts.module ?? ""),
           json: opts.json === true,
         })
       );

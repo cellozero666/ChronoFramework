@@ -224,30 +224,52 @@ Configuration-file presence (`rtk.yaml`) is NOT proof of routing `[P8.7]`.
 
 ### 6.4 Planning-vs-implementation tool distinction (OC-P11 correction)
 
-Adapters MUST distinguish four tool classes inside CHRONO projects:
+Adapters MUST distinguish five tool classes inside CHRONO projects:
 
 - **Governed planning mutation** — the NATIVE tools
   (`chrono_artifact_status/propose/revise/supersede`,
-  `chrono_approval_request/status` in
-  `.opencode/tools/chrono.ts`; there is deliberately NO
-  approval-confirm tool): real model-callable tools with stable
-  schemas, host-held sessions, stdin bodies, and Core validation of
-  every call. Human confirmation travels only through the native
-  `question` tool, which the Gaspar agent policy MUST explicitly
-  allow (`question: allow` — OpenCode denies tools by default), and
-  the ticket request refuses (`--require-question`, always passed
-  by the native tool) unless that surface is available. Exactly-once
-  authority invariant (ADR-007 Addendum E1): the `question.replied`
-  event is the SINGLE authoritative finalization path for exactly
-  one bound ticket; `tool.execute.after` on question results is
-  observation-only and MUST never finalize, deny, or consume. The
-  Core claims the recomputed ceremony key (canonical project,
-  session, request, ticket, scope, action, revision) atomically
-  with ticket consumption and approval registration — one human
-  Approve authorizes at most one ceremony claim and at most one
-  approval row. Planning-governed, not generic shell mutation and
-  not implementation dispatch; the pre-tool gate requires proven
-  entry, nothing more.
+  `chrono_approval_request/status`,
+  `chrono_dispatch/dispatch_claim`, plus the lifecycle set
+  `chrono_next/execution_status/evidence_record/evidence_status/complete_request/review_request/review_complete/defect_record/defect_resolve/verify_record/correction_open/correction_complete/module_complete/wp_authorize/deep_check/policy_set/policy_status/dispatch_confirm/dispatch_release/dispatch_revoke/dispatch_reconcile/scope_advance` in
+  `.opencode/tools/chrono.ts`, canonical list `CHRONO_NATIVE_TOOLS`;
+  there is deliberately NO approval-confirm tool): real model-callable
+  tools with stable schemas, host-held sessions, stdin bodies, and
+  Core validation of every call. Human confirmation travels only
+  through the native `question` tool, which the Gaspar agent policy
+  MUST explicitly allow (`question: allow` — OpenCode denies tools by
+  default), and the ticket request refuses (`--require-question`,
+  always passed by the native tool) unless that surface is
+  available. Exactly-once authority invariant (ADR-007 Addendum E1):
+  the `question.replied` event is the SINGLE authoritative
+  finalization path for exactly one bound ticket;
+  `tool.execute.after` on question results is observation-only and
+  MUST never finalize, deny, or consume. The Core claims the
+  recomputed ceremony key (canonical project, session, request,
+  ticket, scope, action, revision) atomically with ticket consumption
+  and approval registration — one human Approve authorizes at most
+  one ceremony claim and at most one approval row. Post-planning
+  dispatch runs entirely inside the runtime: `chrono_dispatch`
+  (module/WP ids, kind, bounded rationale; every gate validated,
+  Core-owned intent recorded) then exactly one worker subagent via
+  the delegation class below, whose first action is
+  `chrono_dispatch_claim` (host-confined credentials, atomic claim
+  with enactment, immediate confirmation to `ACTIVE`). Per-tool
+  checks validate the committed binding without minting grants
+  (`authorize_dispatched_tool`). Gaspar MUST never ask the PO to run
+  shell commands, export tokens, or operate CHRONO internals.
+  Planning-governed, not generic shell mutation and not
+  implementation dispatch; the pre-tool gate requires proven entry,
+  nothing more.
+- **Governed delegation** — OpenCode's real subagent tool (`task`:
+  description/prompt/subagent_type, child sessions with parentID).
+  NEVER broadly allowed: one call passes only when bound to a live
+  dispatch intent for a kind-fitting role, decided host-side, never
+  from model text. Implementation/test work admits belthazar,
+  melchior, prometheus, lucca; security-review admits Glenn;
+  verification admits Spekkio; correction admits the defect owner.
+  Unknown, builtin, authority (gaspar/PO), worker-side, ambiguous,
+  expired, or ungated delegation stays denied, as does any resumed
+  session that is not the caller's own claimed worker.
   Bash compatibility (`chrono artifact ...`,
   `chrono approval-request/ticket`, read-only
   `chrono doctor/status/validate`) uses the real two-argument

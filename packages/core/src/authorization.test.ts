@@ -599,11 +599,16 @@ describe("Execution authorization", () => {
     const { gaspar } = approvedModule(core, sign, privateKeyPem);
     recordAttestations(core, gaspar, privateKeyPem);
     const worker = openTestSession(core, "belthazar", "MOD-0001");
-    for (const role of ["gaspar", "glenn", "PO", "mallory"]) {
+    for (const role of ["gaspar", "PO", "mallory"]) {
       const res = core.authorizeExecution("MOD-0001", { actor: "gaspar", role, session: worker });
       expect(res.ok).toBe(false);
       expect(res.error?.code).toBe("VALIDATION_ERROR");
     }
+    // Glenn is assignable (security-review only) but not through
+    // another role's session: the executor binding check denies.
+    const glenn = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "glenn", session: worker });
+    expect(glenn.ok).toBe(false);
+    expect(["INCONSISTENT_REFERENCE", "EXECUTION_DENIED"]).toContain(glenn.error?.code);
   });
 
   it("denies without a configured runtime (CONFIG_ERROR)", () => {
@@ -1221,6 +1226,12 @@ describe("Completion authorization", () => {
     expect(done.value?.state).toBe("COMPLETE");
     expect(core.getArtifact("MOD-0001").status).toBe("COMPLETE");
 
+    // Completion is idempotent: repeating it re-reports COMPLETE
+    // without minting grants or re-running transitions.
+    const again = core.completeModule("MOD-0001", fx.gaspar);
+    expect(again.ok).toBe(true);
+    expect(again.value?.state).toBe("COMPLETE");
+
     const status = core.status();
     expect(status.value?.state).toBe("COMPLETE");
     expect(core.validate().value?.valid).toBe(true);
@@ -1253,12 +1264,42 @@ describe("Completion authorization", () => {
     // FAILED modules cannot complete.
     expect(core.authorizeCompletion("MOD-0001", fx.gaspar).ok).toBe(false);
 
-    // Correct, re-verify, and complete (each forward step re-authorizes).
-    expect(core.resolveDefect(defect.value!.id, fx.belthazar).ok).toBe(true);
-    const correctGrant = authorizeWorkerStep(fx);
+    // Resolving around the open correction loop denies: the loop owns
+    // the defect until its fix is evidenced and re-verified.
+    expect(core.resolveDefect(defect.value!.id, fx.belthazar).ok).toBe(false);
+
+    // Governed correction: dispatch the correction through the loop
+    // (claim enacts CorrectionComplete and binds the loop), evidence
+    // the fix, complete the loop, then re-verify and resolve.
+    const correction = core.requestDispatch(
+      { moduleId: "MOD-0001", kind: "correction", rationale: "fix the implementation defect", adapterId: undefined },
+      fx.gaspar
+    );
+    expect(correction.ok).toBe(true);
     expect(
-      core.transitionState("MOD-0001", "CorrectionComplete", { actor: "belthazar", session: fx.belthazar.session, grantId: correctGrant }).ok
+      core.recordTaskDelegation({ agent: "belthazar", parentRuntimeSession: "opencode-parent-1" }, fx.gaspar).ok
     ).toBe(true);
+    const claimed = core.claimDispatch(
+      { dispatchId: correction.value!.dispatchId, childRuntimeSession: "opencode-child-1" },
+      fx.gaspar
+    );
+    expect(claimed.ok).toBe(true);
+    const looped = core.openCorrectionLoop(defect.value!.id, fx.gaspar);
+    expect(looped.ok).toBe(false);
+    expect(looped.error?.code).toBe("DUPLICATE_IDENTITY");
+    const loops = core.nextAction({ moduleId: "MOD-0001" }, fx.gaspar);
+    expect(loops.ok).toBe(true);
+    expect(loops.value!.action).toBe("correct-defect");
+    const fixEvidence = testEvidence(core, fx.belthazar, fx.revision, "fix");
+    expect(fixEvidence.length).toBeGreaterThan(0);
+    const openLoop = core.nextAction({ moduleId: "MOD-0001" }, fx.gaspar).value!.summary;
+    const loopMatch = /'(COR-[0-9]+)'/.exec(openLoop);
+    expect(loopMatch).not.toBe(null);
+    expect(core.completeCorrectionLoop(loopMatch![1]!, fx.belthazar).ok).toBe(true);
+    // Pre-correction proof went stale with the loop: re-record the
+    // completion evidence the profile requires, then re-verify.
+    testEvidence(core, fx.lucca, fx.revision, "unit");
+    testEvidence(core, fx.glenn, fx.revision, "review");
     const progressGrant = authorizeWorkerStep(fx);
     expect(
       core.transitionState("MOD-0001", "ImplementationComplete", { actor: "belthazar", session: fx.belthazar.session, grantId: progressGrant }).ok
@@ -1268,6 +1309,7 @@ describe("Completion authorization", () => {
     expect(
       core.transitionState("MOD-0001", "SpekkioPassed", { actor: "spekkio", session: fx.spekkio.session, grantId: passGrant }).ok
     ).toBe(true);
+    expect(core.resolveDefect(defect.value!.id, fx.belthazar).ok).toBe(true);
     expect(core.authorizeCompletion("MOD-0001", fx.gaspar).ok).toBe(true);
   });
 

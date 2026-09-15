@@ -386,8 +386,11 @@ describe("OC-P11 integrated approval ceremony", () => {
     expect(gaspar).toContain("There is no approval-confirm tool");
     expect(gaspar).not.toContain("--body-file");
     expect(gaspar).toContain("never use `chrono run`");
-    // Contract proof: the definition never instructs a signing tool.
-    expect(Object.keys(tools).join(" ")).not.toMatch(/confirm/);
+    // Contract proof: the only confirmation tool is claim
+    // confirmation (worker credential confinement), never PO approval
+    // signing — there is no approval-confirm tool by any spelling.
+    const confirmTools = Object.keys(tools).filter((name) => /confirm/i.test(name));
+    expect(confirmTools).toEqual(["dispatch_confirm"]);
   });
 
   it("full conversational flow: native tools, explicit Approve, signed approval, plan, no restart", async () => {

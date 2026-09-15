@@ -12,10 +12,11 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:host": "CHRONO_HOST_TESTS=1 vitest run host.test",
     "test:clean": "node scripts/verify-test-clean.mjs",
     "test:watch": "vitest",
     "clean": "rimraf packages/*/dist packages/*/tsconfig.tsbuildinfo tsconfig.tsbuildinfo",
-    "test:blackbox": "CHRONO_BLACKBOX=1 vitest run packages/cli/src/entry-blackbox.test.ts packages/cli/src/opencode-plugin-blackbox.test.ts packages/cli/src/planning-blackbox.test.ts"
+    "test:blackbox": "CHRONO_BLACKBOX=1 vitest run packages/cli/src/entry-blackbox.test.ts packages/cli/src/opencode-plugin-blackbox.test.ts packages/cli/src/planning-blackbox.test.ts packages/cli/src/lifecycle-blackbox.test.ts"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.30",

@@ -6,10 +6,10 @@
  * the private key pairing with the expected public key — never by raw
  * PEM string equality.
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
 import { generateApprovalKeyPair, fingerprintPublicKey } from "@chrono/domain";
-import { OsKeychainStore, sanitizeKeychainDetail, verifyKeyCustody } from "./keychain.js";
+import { sanitizeKeychainDetail, verifyKeyCustody } from "./keychain.js";
 describe("verifyKeyCustody (canonical rule)", () => {
   const pair = generateApprovalKeyPair();
   const other = generateApprovalKeyPair();
@@ -116,33 +116,5 @@ describe("keychain error sanitization (no secret material in messages)", () => {
     expect(sanitizeKeychainDetail("")).toBe("no tool output");
     expect(sanitizeKeychainDetail("   \n  ")).toBe("no tool output");
     expect(sanitizeKeychainDetail("x".repeat(500)).length).toBe(300);
-  });
-});
-
-describe("macOS keychain round-trip (real `security` executable)", () => {
-  // Disposable credential: a unique service/account pair created here
-  // and deleted in cleanup. Nothing else is touched.
-  const service = `chrono-test-${process.pid}`;
-  const account = "custody-probe";
-  const store = new OsKeychainStore();
-
-  afterEach(() => {
-    try {
-      store.deleteKey(account, service);
-    } catch {
-      // Cleanup is best-effort; the assertion below proves deletion.
-    }
-  });
-
-  it.runIf(process.platform === "darwin")("writes and reads back provable custody", () => {
-    const pair = generateApprovalKeyPair();
-    store.writeKey(account, pair.privateKeyPem, service);
-    const retrieved = store.readKey(account, service);
-    expect(retrieved).not.toBeNull();
-    // The round-trip may differ textually (trailing newline); custody
-    // must still prove cryptographically.
-    expect(verifyKeyCustody(retrieved, pair.publicKeyPem)).toBe(true);
-    store.deleteKey(account, service);
-    expect(store.readKey(account, service)).toBeNull();
   });
 });

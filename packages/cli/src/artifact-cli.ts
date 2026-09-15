@@ -258,10 +258,20 @@ export function runArtifactRevise(projectPath: string, options: ArtifactReviseOp
       return {
         exitCode: 0,
         stdout: JSON.stringify(
-          { ok: true, id: v.id, revision: v.revision, path: v.path, approvalCommand: v.approvalCommand, healed: v.healed },
+          { ok: true, id: v.id, revision: v.revision, path: v.path, approvalCommand: v.approvalCommand, healed: v.healed, recovered: v.recovered },
           null,
           2
         ),
+        stderr: "",
+      };
+    }
+    if (v.recovered) {
+      return {
+        exitCode: 0,
+        stdout: [
+          `Planning registry row rematerialized: ${v.id} @ ${v.revision.slice(0, 16)}… (governed recovery, audited; approvals stand only when the revision is unchanged)`,
+          `  file: ${v.path}`,
+        ].join("\n"),
         stderr: "",
       };
     }

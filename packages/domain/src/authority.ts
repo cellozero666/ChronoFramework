@@ -21,6 +21,7 @@ import {
   type KeyObject,
 } from "node:crypto";
 import { ChronoError, ErrorCode, Severity } from "./errors.js";
+import type { PolicyPayload } from "./policy.js";
 import { canonicalize } from "./revision.js";
 
 /** Approval actions (module/security decisions). Waivers use action "waiver". */
@@ -148,7 +149,7 @@ export function parseApprovalPublicKey(publicKeyPem: string): KeyObject {
 }
 
 /** Sign a canonical payload with an Ed25519 private key (PKCS8 PEM). Returns base64. */
-export function signApprovalPayload(payload: ApprovalPayload | WaiverPayload | SessionAuthorizationPayload | EnrollmentPayload, privateKeyPem: string): string {
+export function signApprovalPayload(payload: ApprovalPayload | WaiverPayload | SessionAuthorizationPayload | EnrollmentPayload | PolicyPayload, privateKeyPem: string): string {
   let key: KeyObject;
   try {
     key = createPrivateKey(privateKeyPem);
@@ -171,7 +172,7 @@ export function signApprovalPayload(payload: ApprovalPayload | WaiverPayload | S
  * false to SIGNATURE_INVALID / APPROVAL_REQUIRED.
  */
 export function verifyApprovalSignature(
-  payload: ApprovalPayload | WaiverPayload | SessionAuthorizationPayload | EnrollmentPayload,
+  payload: ApprovalPayload | WaiverPayload | SessionAuthorizationPayload | EnrollmentPayload | PolicyPayload,
   signatureBase64: string,
   publicKey: KeyObject
 ): boolean {

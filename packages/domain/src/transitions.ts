@@ -40,6 +40,14 @@ export const MODULE_TRANSITIONS: readonly LegalTransition[] = [
   { fromState: "EXECUTING", toState: "VERIFYING", eventType: "ImplementationComplete" },
   { fromState: "VERIFYING", toState: "PASSED", eventType: "SpekkioPassed" },
   { fromState: "PASSED", toState: "COMPLETE", eventType: "DefinitionOfDoneSatisfied" },
+  // Aggregate completion (CORE_FIX CF-7): a module whose Work Packages
+  // are all COMPLETE completes through its packages, each proven by
+  // its own Spekkio PASS verdict chain. The module carries no separate
+  // verdict; the Core authorizes the aggregate prerequisites instead.
+  { fromState: "APPROVED", toState: "COMPLETE", eventType: "AllPackagesComplete" },
+  { fromState: "EXECUTING", toState: "COMPLETE", eventType: "AllPackagesComplete" },
+  { fromState: "VERIFYING", toState: "COMPLETE", eventType: "AllPackagesComplete" },
+  { fromState: "PASSED", toState: "COMPLETE", eventType: "AllPackagesComplete" },
   { fromState: "VERIFYING", toState: "FAILED", eventType: "SpekkioFailed" },
   { fromState: "FAILED", toState: "EXECUTING", eventType: "CorrectionComplete" },
   { fromState: "EXECUTING", toState: "BLOCKED", eventType: "BlockerRaised" },

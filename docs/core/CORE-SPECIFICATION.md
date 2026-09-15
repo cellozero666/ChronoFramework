@@ -486,6 +486,19 @@ FUNCTION gate_execution(module_id, wp_id, spec_revision):
     RETURN AUTHORIZED
 ```
 
+#### 7.4.1 Native in-runtime dispatch (no PO terminal action)
+
+After approvals are current, Gaspar initiates dispatch without
+leaving the runtime: `request_dispatch` validates §7.4 gates
+without an executor and returns the revision snapshot;
+`claim_dispatch` (worker subagent session, delegated from the
+Gaspar/PO parent) re-validates everything with the worker as
+executor and issues the single-use grant bound to session, role,
+module, WP, and revisions. One human Approve authorizes at most
+one dispatch; one dispatch binds at most one worker session; the
+worker acts only inside its bound scope. Shell, exported tokens,
+and PO-operated commands are never part of this flow.
+
 ### 7.5 Verification gate `[P9.3]`
 
 ```
@@ -901,7 +914,26 @@ The Core exposes deterministic functions. Adapters MAY call them but MUST NOT re
 | `verify_and_record_rtk()` | `current` attestation or `BLOCKED_RTK` | RTK verification |
 | `verify_and_record_skill()` | `current` attestation or `BLOCKED_PROCESS_SKILL` | Skill verification |
 | `propose_planning_artifact(kind, id?, title, body, refs?)` | `{id, revision, path, approvalCommand}` or error | Governed planning draft (Gaspar/PO) |
-| `revise_planning_artifact(id, title, body)` | `{id, revision, path, approvalCommand}` or error | New planning revision; stales approvals |
+| `revise_planning_artifact(id, title, body)` | `{id, revision, path, approvalCommand, healed, recovered}` or error | New planning revision; stales approvals; rematerializes a lost file (`healed`) or a lost structured registry row for Specs (`recovered`, audited) |
+| `request_dispatch(module, wp?, kind?, rationale, proposed_profile?)` | `{dispatchId, kind, revisions, dispatchableRoles, effectiveProfile, riskTriggers}` or exact gate error | Native dispatch phase 1: every dispatch gate validated without an executor; Core-owned intent row (kind, revisions, requester, policy, expiry); read-only except audit (Gaspar/PO) |
+| `record_task_delegation(agent, parent_session)` | `{dispatchId, agent, resume}` or `TASK_DENIED` | Binds exactly one native `task` delegation to one live dispatch of a fitting kind; idempotent for the same parent/agent (Gaspar-side session) |
+| `claim_dispatch(dispatch_id, child_session)` | `{dispatchId, grantId, session, role, revisions}` or exact gate error | Native dispatch phase 2: delegated worker session minted from the Gaspar/PO parent, full gates re-validated, single-use grant issued and consumed with the enactment transition atomically; review kinds and second bindings bind without re-enacting |
+| `confirm_claim(dispatch_id)` | `{dispatchId, status}` | Confirms host-side credential confinement: `ENACTED → ACTIVE` (requester or worker session; idempotent) |
+| `release_dispatch(dispatch_id)` | `{dispatchId, status}` | Releases an evidenced binding to `COMPLETED` and retires its worker session (bound worker with proof, or Gaspar/PO oversight) |
+| `revoke_dispatch(dispatch_id, reason?)` | `{dispatchId, status}` | Compensating revocation for failed/abandoned claims; revokes the worker session (Gaspar/PO) |
+| `reconcile_stale_claims()` | `{expired[], revoked[]}` | Crash-safety sweep: expire stale intents, revoke stale enactments (Gaspar/PO) |
+| `authorize_dispatched_tool()` | binding projection or exact gate error | Per-tool authorization against the committed `ACTIVE` binding with fresh revisions — mints no grant |
+| `advance_scope(module, wp?, event)` | `{scope, fromState, toState}` or exact gate error | One legal forward step for the bound scope (kind-gated; terminal `SpekkioPassed` enforces profile-proportional readiness) |
+| `next_action(module?, wp?)` | `{action, target, summary, reason, policyRule, alsoReady?, escalation?}` | Deterministic highest-precedence next action from Core records only (open loops, stale dispatches, open reviews, readiness, batching) |
+| `execution_status(module?, wp?)` | own binding, scope states, revision currency | Worker execution projection without secrets; workers confined to their scope |
+| `evidence_status(revision)` | current rows by id plus stale count | Evidence projection for one revision: no diagnostics, stale rows excluded |
+| `deep_integrity_check()` | `{blockers, warnings, findings[]}` | Cross-record consistency: versions, dispatch backlog, stale citations, loop bounds, orphan sessions, dangling index, scope reachability, full validation fold (Gaspar/PO) |
+| `assign_review(kind, module, wp?)` | `{reviewId, kind, reviewerRole}` | Assign a Glenn security review or Spekkio verification at the current revision (Gaspar/PO; at most one open per kind/scope/revision) |
+| `complete_review(review_id)` | `{reviewId, status}` | Submit the assigned review from the reviewer session with bound evidence/verdict and independence (Glenn/Spekkio) |
+| `open_correction_loop(defect_id)` | `{loopId, owner, attempt, maxAttempts, escalated}` | Open one bounded correction loop per defect with profile attempt bounds and terminal escalation |
+| `complete_correction_loop(loop_id)` | `{loopId, status, invalidatedEvidence}` | Complete with owner fix evidence; invalidates pre-correction proof; requires re-verification (owner) |
+| `set_policy_profile(profile, rationale, signature?, timestamp?)` | `{profile, downgraded}` | Calibrate `lean`/`standard`/`critical` (Gaspar/PO; lowering needs a fresh PO signature; default `standard`) |
+| `complete_module(module_id)` | `{state}` | Terminal completion: package-less modules through their verdict chain, WP modules by aggregate (`AllPackagesComplete`); idempotent |
 | `planning_status()` | proposed/awaiting/approved/rejected/stale list | Safe status projection, no secrets |
 
 Reference: `[DOM §6]`, `[FW §13]`, `[REF §24]`.
@@ -928,7 +960,7 @@ files, and internal hooks are unreachable through this path.
 ### 17.2 Capability and validation
 
 `planning.propose`, `planning.revise`, `planning.status` admit Gaspar
-and the PO only (authority policy v5; tool policy v2). Validation
+and the PO only (authority policy v9; tool policy v6). Validation
 covers kind, exact identifier, lifecycle entry state
 (DRAFT/PLANNED/proposed), resolvable references, schema, secrets, and
 size (1 byte to 64 KiB). `module` plans require at least one Spec

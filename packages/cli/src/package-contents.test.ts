@@ -11,7 +11,9 @@
  */
 import { describe, it, expect } from "vitest";
 import { spawnSync } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -51,11 +53,17 @@ function isBannedEntry(entry: string): boolean {
 }
 
 function packFileList(workspace: string): string[] {
-  const ran = spawnSync("npm", ["pack", "--dry-run", `--workspace=${workspace}`], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-    timeout: 120000,
-  });
+  // Hermetic npm: a disposable cache per call, so the developer's
+  // cache ownership, content, or network state never affects the
+  // default battery (CORE_FIX CF-10). --dry-run publishes nothing.
+  const cacheDir = mkdtempSync(join(tmpdir(), "chrono-npm-cache-"));
+  try {
+    const ran = spawnSync("npm", ["pack", "--dry-run", `--workspace=${workspace}`], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      timeout: 120000,
+      env: { ...process.env, npm_config_cache: cacheDir, npm_config_update_notifier: "false" },
+    });
   if (ran.status !== 0) {
     throw new Error(`npm pack --dry-run failed for ${workspace}: ${ran.stderr}`);
   }
@@ -83,6 +91,9 @@ function packFileList(workspace: string): string[] {
     throw new Error(`no tarball entries parsed for ${workspace}; npm output format may have changed`);
   }
   return files;
+  } finally {
+    rmSync(cacheDir, { recursive: true, force: true });
+  }
 }
 
 describe("public tarball contents", () => {

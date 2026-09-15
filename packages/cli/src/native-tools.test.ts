@@ -299,7 +299,7 @@ describe("OC-P11 native planning tools", () => {
     // chrono_approval_* in the runtime. There is deliberately NO
     // approval-confirm tool: signing follows only an explicit human
     // answer observed by the plugin host (fail-open fix).
-    const exports = ["artifact_status", "artifact_propose", "artifact_revise", "artifact_supersede", "approval_request", "approval_status"];
+    const exports = [...CHRONO_NATIVE_TOOLS].map((name) => name.replace(/^chrono_/, ""));
     expect(Object.keys(tools).sort()).toEqual(exports.sort());
     expect(exports.map((e) => `chrono_${e}`).sort()).toEqual([...CHRONO_NATIVE_TOOLS].sort());
     for (const name of exports) {
@@ -308,9 +308,12 @@ describe("OC-P11 native planning tools", () => {
       expect(def.description.length).toBeGreaterThan(20);
       expect(typeof def.execute).toBe("function");
     }
-    // No product-code, shell, hook, signing, or credential surface.
+    // No product-code, shell, hook, approval-confirmation, or
+    // credential surface. Dispatch claim confirmation
+    // (dispatch_confirm) is explicitly allowed: it confines a worker
+    // credential, it never signs a PO approval.
     for (const name of Object.keys(tools)) {
-      expect(name).not.toMatch(/write|edit|bash|shell|hook|token|key|secret|db|confirm|sign/i);
+      expect(name).not.toMatch(/write|edit|bash|shell|hook|token|key|secret|db|approval.?confirm|sign/i);
     }
     // Schemas carry the contract Gaspar programs against.
     const propose = tools["artifact_propose"] as { args: Record<string, { parse: (v: unknown) => unknown }> };

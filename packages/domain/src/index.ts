@@ -132,6 +132,7 @@ export {
 // Authority/capability matrix [DOM §2.2, Remediation §3A]
 export {
   AUTHORITY_POLICY_VERSION,
+  DISPATCHABLE_WORKER_ROLES,
   EVENT_ROLE_ALLOWLIST,
   KNOWN_RUNTIME_IDS,
   OPENCODE_TOOL_POLICY,
@@ -139,13 +140,38 @@ export {
   TOOL_POLICY_VERSION,
   classifyOpencodeTool,
   isCapable,
+  isDispatchableWorkerRole,
   isKnownRuntimeId,
   mayEnactEvent,
   type CapabilityHolder,
   type CoreOperation,
+  type DispatchableWorkerRole,
   type KnownRuntimeId,
   type ToolClassification,
 } from "./capabilities.js";
+
+// Proportional workflow policy (CORE_FIX CF-11): profiles, risk
+// triggers, dispatch kinds, bounded correction, signed downgrades.
+export {
+  BATCH_CAP,
+  CORRECTION_MAX_ATTEMPTS,
+  DISPATCH_KINDS,
+  DISPATCH_KIND_ROLES,
+  ENACTMENT_ROLES,
+  POLICY_PROFILES,
+  buildPolicyPayload,
+  classifyContentRisk,
+  isEnactmentRole,
+  isProfileDowngrade,
+  isRoleForDispatchKind,
+  maxProfile,
+  profileRank,
+  type DispatchKind,
+  type EnactmentRole,
+  type PolicyPayload,
+  type PolicyProfile,
+  type RiskTrigger,
+} from "./policy.js";
 
 // Registration rules (entry states, required fields)
 export {

@@ -1078,6 +1078,21 @@ determinism/binding + multi-grant authority matrix);
 `migration.test.ts` (v16 ledger on v1/v15 upgrade paths +
 fan-out revocation precision + idempotence + v17 rebuild
 without data loss, guard survival, and active-only uniqueness);
+`dispatch.test.ts` (Core request/claim: snapshots, delegation,
+denials for stale approvals, missing/stale Harnesses, wrong
+roles/scopes, forged parents, post-request drift);
+`dispatch-cli.test.ts` (intent ledger, single-claim binding,
+replay/hijack/expiry denial, task-check allow/deny/resume);
+`native-dispatch.test.ts` (real plugin + tools + CLI: full
+dispatch→delegate→claim→bound-work flow, Gaspar still denied,
+direct/unknown/authority/worker task denial, claim replay,
+forgery, session mismatch, revoked approval, transform scoping,
+resume-only-own-worker);
+`artifact-cli.test.ts` (SP registry-row recovery on proven
+envelope equivalence, changed-content denial toward supersede,
+MOD/WP guided supersede denial);
+`tool-policy.test.ts` (v6 delegate class with lifecycle tools,
+dispatch natives, deny-by-default, enactment roles);
 `key-transport-parity.test.ts` (D1 vectors + disposable-keychain
 integration where available);
 `planning-blackbox.test.ts` (hermetic discovery-to-grant flow).
@@ -1085,9 +1100,9 @@ Packed: isolated tarball install, `init --dry-run` with zero writes,
 ceremony command surface (`--body-stdin`, `--security-implications`,
 `--require-question`, `--ceremony-key/session/request`), dist
 tool-runtime presence. Full
-`test:clean` PASS (49 files / 628 tests on Node 22.21.1 and Node
+`test:clean` PASS (57 files / 688 tests on Node 22.21.1 and Node
 24.20.0 clean exports — `npm ci`, lint, typecheck, build, suite
-each green from clean checkouts), `test:blackbox` 13/13,
+each green from clean checkouts), `test:blackbox` 17/17,
 package-contents green, `lint` 0 errors,
 `git diff --check` clean. Real-runtime evidence: NONE YET — the
 retry below must produce it.
@@ -1175,6 +1190,52 @@ gate passes):
    the signed Core approval; continuation without shell/token/run
    requests; no product writes pre-dispatch; generic mutation still
    denied; redacted transcript with approval/ticket/grant ids.
+9. Dispatch entirely inside OpenCode: `chrono_dispatch` for each
+   approved Work Package, one `task` delegation per dispatch to the
+   authorized worker role, worker `chrono_dispatch_claim`, then
+   implementation inside the bound scope. Gaspar never asks the PO
+   to run shell commands or export tokens.
+
+## Finding OC-P12 — Post-planning dispatch deadlock (provider-backed)
+
+After all planning artifacts and MOD-0002/WP-0001..WP-0004 stood
+approved and current, Gaspar could not continue: native `task` was
+denied as unclassified (tool policy v4), shell needs dispatch
+context, `chrono run` is reachable only through the blocked shell,
+and Gaspar wrongly asked the PO to execute an internal dispatch
+command externally. Framework integration defect, not a PO
+decision.
+
+Root causes: no native governed dispatch tool existed; OpenCode's
+real delegation surface (`task`: description/prompt/subagent_type,
+child sessions with parentID/agent, verified against the published
+runtime source) was never classified, so deny-by-default blocked
+it with no bound path; worker sessions had no host-side credential
+or scope binding; and the planning registry could claim active
+drafts (SP-0003/SP-0004) whose canonical files were missing while
+revise demanded byte-identical reproduction that no longer
+existed (`ENTITY_NOT_FOUND`).
+
+Correction (shipped, pilot untouched): `chrono_dispatch` (module/WP
+ids plus bounded rationale; every Core gate validated; intent
+recorded) and `chrono_dispatch_claim` (worker binds its own
+subagent session first; credentials confined host-side); `task`
+classified as `delegate` (tool policy v6) and allowed only bound
+to one live dispatch of a kind-fitting role (belthazar, melchior,
+prometheus, lucca; Glenn through security-review; Spekkio through
+verification; the defect owner through correction), decided
+host-side — unknown, builtin, authority, worker-side, ambiguous,
+expired, or ungated delegation stays denied; claimed workers act
+only inside their binding (per-tool binding validation without
+grant minting; review bindings are read-only), unbound children
+read and claim but never mutate, delegate, or plan; the Gaspar
+contract is never injected into worker sessions; and `revise`
+rematerializes a Spec whose registry row was lost only on proven
+byte-equivalence against the canonical recovery envelope
+(approvals stand only then), while anything else — like
+Module/Work Package rows that cannot be rebuilt — fails toward
+formal supersede with harness history preserved. Agent
+definitions carry the dispatch flow and the never-ask-PO rule.
 
 ## OpenCode pilot entry criteria
 

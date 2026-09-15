@@ -22,9 +22,13 @@ import {
   HarnessRepository,
   BrokerRepository,
   CeremonyClaimRepository,
+  CorrectionRepository,
+  DispatchRepository,
+  PolicyRepository,
   ProjectRepository,
   QaRepository,
   RtkRepository,
+  ReviewRepository,
   RoutingProofRepository,
   RuntimeConfigRepository,
   SecurityProfileRepository,
@@ -243,6 +247,22 @@ export class ChronoDatabase {
 
   ceremonyClaims(): CeremonyClaimRepository {
     return new CeremonyClaimRepository(this.db);
+  }
+
+  dispatches(): DispatchRepository {
+    return new DispatchRepository(this.db);
+  }
+
+  reviewAssignments(): ReviewRepository {
+    return new ReviewRepository(this.db);
+  }
+
+  correctionLoops(): CorrectionRepository {
+    return new CorrectionRepository(this.db);
+  }
+
+  projectPolicy(): PolicyRepository {
+    return new PolicyRepository(this.db);
   }
 
   /**

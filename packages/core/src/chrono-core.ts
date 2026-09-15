@@ -9,6 +9,7 @@ import { accessSync, constants as fsConstants, existsSync as fsExistsSync, lstat
 import { dirname as pathDirname, join as joinPath, resolve as pathResolve, sep as pathSep } from "node:path";
 import {
   ChronoDatabase,
+  SCHEMA_VERSION,
   type AdapterRecord,
   type ProjectRepository,
   type ArtifactRepository,
@@ -21,6 +22,7 @@ import {
   type QaRepository,
   type HarnessRepository,
   type AgentSessionRecord,
+  type CorrectionRecord,
   type RtkAttestationDetail,
   type SkillAttestationDetail,
 } from "@chrono/persistence";
@@ -37,7 +39,21 @@ import {
   approvalChallenge,
   approvalGrantsAuthoritative,
   buildCeremonyKey,
+  buildPolicyPayload,
+  BATCH_CAP,
   CEREMONY_MARKER_CURRENT,
+  ENACTMENT_ROLES,
+  CORRECTION_MAX_ATTEMPTS,
+  DISPATCH_KINDS,
+  DISPATCH_KIND_ROLES,
+  classifyContentRisk,
+  isProfileDowngrade,
+  isRoleForDispatchKind,
+  maxProfile,
+  profileRank,
+  type DispatchKind,
+  type PolicyProfile,
+  type RiskTrigger,
   APPROVAL_TICKET_TTL_SECONDS,
   assertBlockerType,
   assertRequiredFields,
@@ -83,7 +99,7 @@ import {
   type CoreOperation,
   type PlanningKind,
 } from "@chrono/domain";
-import type { ProjectState, EntityType, ApprovalPayload, WaiverPayload, AgentRole, SetupStep, GasparEntryProjection } from "@chrono/domain";
+import type { ProjectState, EntityType, ApprovalPayload, WaiverPayload, AgentRole, SetupStep, GasparEntryProjection, PolicyPayload } from "@chrono/domain";
 
 /**
  * Caller authentication bundle for every protected Core operation.
@@ -105,6 +121,74 @@ export interface CallerAuth {
 interface UnresolvedCaller {
   readonly actor: unknown;
   readonly session: unknown;
+}
+
+/**
+ * Single highest-precedence next action for a scope (CF-6), derived
+ * from Core records only. `policyRule` cites the effective profile
+ * (and attempt counters where relevant) so a model can explain why
+ * this action — and not a cheaper one — is required. `alsoReady`
+ * lists batchable same-kind siblings within the profile batch cap;
+ * `escalation` carries a terminal-escalation notice when present.
+ */
+export interface NextAction {
+  readonly action: string;
+  readonly targetKind: "module" | "work-package";
+  readonly targetId: string;
+  readonly summary: string;
+  readonly reason: string;
+  readonly policyRule: string;
+  readonly alsoReady?: string[];
+  readonly escalation?: string;
+}
+
+/** Worker execution projection: own binding, scope states, revision currency (CF-8). No secrets, ever. */
+export interface ExecutionStatus {
+  readonly moduleId: string;
+  readonly moduleStatus: string;
+  readonly moduleRevision: string;
+  readonly workPackageId: string | null;
+  readonly packages: ReadonlyArray<{ workPackageId: string; status: string; revision: string }>;
+  readonly ownDispatch: {
+    readonly dispatchId: string;
+    readonly kind: string;
+    readonly role: string;
+    readonly status: string;
+    readonly grantId: string | null;
+    readonly attempt: number;
+    readonly expiresAt: string;
+  } | null;
+  readonly openDispatches: ReadonlyArray<{ dispatchId: string; kind: string; role: string; status: string; attempt: number }>;
+  readonly profile: PolicyProfile;
+}
+
+/** Evidence projection for one content revision (CF-8): current rows only, no diagnostics. */
+export interface EvidenceStatus {
+  readonly targetRevision: string;
+  readonly artifactId: string | null;
+  readonly current: ReadonlyArray<{
+    readonly evidenceId: string;
+    readonly producer: string;
+    readonly check: string;
+    readonly result: string;
+    readonly recordedAt: string;
+  }>;
+  readonly staleSuperseded: number;
+}
+
+/** One deep-integrity finding (CF-8): advisory record, repair stays explicit and PO-owned. */
+export interface DeepIntegrityFinding {
+  readonly severity: "blocker" | "warning";
+  readonly check: string;
+  readonly detail: string;
+}
+
+/** Deep integrity report: cross-record consistency gaspar/PO can run before completion. */
+export interface DeepIntegrityReport {
+  readonly checkedAt: string;
+  readonly blockerCount: number;
+  readonly warningCount: number;
+  readonly findings: DeepIntegrityFinding[];
 }
 
 /**
@@ -1052,6 +1136,7 @@ export class ChronoCore {
       const contentHash = computeRevisionHash({ specId, content });
 
       this.artifacts.create(specId, "SP", revision, status, contentHash, canonical);
+      this.writeEnvelope(specId, canonical);
 
       this.events.append({
         eventType: "ArtifactCreated",
@@ -1097,6 +1182,7 @@ export class ChronoCore {
       const contentHash = computeRevisionHash({ moduleId, content });
 
       this.artifacts.create(moduleId, "MOD", revision, status, contentHash, canonical);
+      this.writeEnvelope(moduleId, canonical);
 
       this.events.append({
         eventType: "ArtifactCreated",
@@ -1156,6 +1242,7 @@ export class ChronoCore {
       const contentHash = computeRevisionHash({ wpId, content });
 
       this.artifacts.create(wpId, "WP", revision, status, contentHash, canonical);
+      this.writeEnvelope(wpId, canonical);
 
       this.events.append({
         eventType: "ArtifactCreated",
@@ -1514,10 +1601,15 @@ export class ChronoCore {
           const blocker = this.activeBlockerOrThrow(guardContext, artifactId);
           this.db.blockers().setPriorState(blocker.id, fromState);
         }
-        if (eventType === "ExecutionStarted" || eventType === "ExecutionAssigned") {
-          // Single-use grant consumed atomically with the dispatch it opens.
-          const grantId = guardContext?.["grantId"] as string;
-          this.db.grants().consume(grantId);
+        {
+          // Single-use grants consume atomically with the transition
+          // they authorize — every step, not just enactment (CF-1,
+          // CF-9): an unconsumed grant after its transition is orphan
+          // authority. Binding-authorized transitions carry no grant.
+          const grantId = guardContext?.["grantId"];
+          if (typeof grantId === "string" && grantId.length > 0) {
+            this.db.grants().consume(grantId);
+          }
         }
         this.events.append({
           eventType: "StateTransition",
@@ -1563,6 +1655,7 @@ export class ChronoCore {
       ImplementationComplete: "VERIFYING",
       SpekkioPassed: "PASSED",
       DefinitionOfDoneSatisfied: "COMPLETE",
+      AllPackagesComplete: "COMPLETE",
       SpekkioFailed: "FAILED",
       CorrectionComplete: "EXECUTING",
       ChangeControlInitiated: "DRAFT",
@@ -3430,11 +3523,11 @@ export class ChronoCore {
         break;
       case "MOD:ImplementationComplete":
         this.denyIfBlocked(artifactId);
-        this.validateExecutionGrant(artifactId, null, guardContext, caller);
+        this.validateGrantOrBinding(artifactId, null, guardContext, caller);
         break;
       case "MOD:SpekkioPassed":
         this.requireQaVerdict(artifactId, revision, null, "PASS");
-        this.validateExecutionGrant(artifactId, null, guardContext, caller);
+        this.validateGrantOrBinding(artifactId, null, guardContext, caller);
         break;
       case "MOD:DefinitionOfDoneSatisfied":
         this.propagateAuthorization(
@@ -3448,12 +3541,12 @@ export class ChronoCore {
         break;
       case "MOD:SpekkioFailed":
         this.requireQaVerdict(artifactId, revision, null, "FAILED");
-        this.validateExecutionGrant(artifactId, null, guardContext, caller);
+        this.validateGrantOrBinding(artifactId, null, guardContext, caller);
         break;
       case "MOD:CorrectionComplete":
         this.denyIfBlocked(artifactId);
         this.requireValidApproval(artifactId, revision, "module-approval");
-        this.validateExecutionGrant(artifactId, null, guardContext, caller);
+        this.validateGrantOrBinding(artifactId, null, guardContext, caller);
         break;
       case "WP:WorkPackageAuthorized":
         this.guardWorkPackageAuthorized(artifactId);
@@ -3466,15 +3559,15 @@ export class ChronoCore {
       case "WP:VerificationReady":
       case "WP:CorrectionComplete":
         this.denyIfBlocked(artifactId);
-        this.validateExecutionGrant(this.workPackageModule(artifactId), artifactId, guardContext, caller);
+        this.validateGrantOrBinding(this.workPackageModule(artifactId), artifactId, guardContext, caller);
         break;
       case "WP:SpekkioPassed":
         this.requireQaVerdict(artifactId, revision, artifactId, "PASS");
-        this.validateExecutionGrant(this.workPackageModule(artifactId), artifactId, guardContext, caller);
+        this.validateGrantOrBinding(this.workPackageModule(artifactId), artifactId, guardContext, caller);
         break;
       case "WP:SpekkioFailed":
         this.requireQaVerdict(artifactId, revision, artifactId, "FAILED");
-        this.validateExecutionGrant(this.workPackageModule(artifactId), artifactId, guardContext, caller);
+        this.validateGrantOrBinding(this.workPackageModule(artifactId), artifactId, guardContext, caller);
         break;
       default:
         // BlockerRaised / BlockerResolved linkage is enforced by
@@ -4661,7 +4754,7 @@ export class ChronoCore {
    * There is no fallback path [ADR-003, INV §4.6].
    */
   private verifySignatureOrThrow(
-    payload: ApprovalPayload | WaiverPayload,
+    payload: ApprovalPayload | WaiverPayload | PolicyPayload,
     signature: string,
     scopeId: string
   ): void {
@@ -4912,9 +5005,20 @@ export class ChronoCore {
       }
       for (const target of data.affectedArtifacts) {
         this.requireReference(target, this.artifactTypeOf(target), "defect");
+        // Scope follows the artifact: a WP defect is WP-scoped (a
+        // WP-bound reviewer records for its own package, never a
+        // sibling's), module/spec defects are module-scoped.
+        let targetWp: string | null = null;
+        try {
+          if (this.artifacts.findById(target).type === "WP") {
+            targetWp = target;
+          }
+        } catch {
+          targetWp = null;
+        }
         this.assertSessionScope(
           caller,
-          { moduleId: this.artifactScopeModule(target), workPackageId: null },
+          { moduleId: this.artifactScopeModule(target), workPackageId: targetWp },
           "record defect"
         );
       }
@@ -4974,6 +5078,20 @@ export class ChronoCore {
           invariantRef: "INV §5.1",
           affectedTarget: id,
           suggestedAction: "Route correction to the responsible owner",
+        });
+      }
+      // An open correction loop owns the defect until its fix is
+      // evidenced and re-verified: resolving around the loop would
+      // orphan the bounded retry it governs.
+      const open = this.db.correctionLoops().findOpenByDefect(id);
+      if (open.some((loop) => loop.status === "OPEN" || loop.status === "CORRECTING")) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Defect '${id}' has an open correction loop: complete correction and re-verify first`,
+          invariantRef: "INV §5.1",
+          affectedTarget: id,
+          suggestedAction: "Evidence the fix, complete the loop, and record a new verdict",
         });
       }
       this.defects.setStatus(id, "resolved", true);
@@ -5053,11 +5171,24 @@ export class ChronoCore {
         toToolIdentity(data.tool);
       }
       const evidenceTarget = this.artifacts.findArtifactIdByRevision(data.targetRevision);
+      // Scope follows the revision's owner: a Work Package revision is
+      // WP-scoped (a WP-bound worker records for its own package, never
+      // a sibling's), module/spec revisions are module-scoped.
+      let targetWp: string | null = null;
+      if (evidenceTarget !== null) {
+        try {
+          if (this.artifacts.findById(evidenceTarget).type === "WP") {
+            targetWp = evidenceTarget;
+          }
+        } catch {
+          targetWp = null;
+        }
+      }
       this.assertSessionScope(
         caller,
         {
           moduleId: evidenceTarget === null ? null : this.artifactScopeModule(evidenceTarget),
-          workPackageId: null,
+          workPackageId: targetWp,
         },
         "record evidence"
       );
@@ -5715,6 +5846,7 @@ export class ChronoCore {
       session: { id: string; token: string };
       requesterSession?: { id: string; token: string } | undefined;
       adapterId?: string | undefined;
+      kind?: string | undefined;
     }
   ): CoreResult<{ authorized: boolean; grantId: string }> {
     const actor = options.actor;
@@ -5774,150 +5906,15 @@ export class ChronoCore {
         "authorize execution"
       );
       this.assertSessionScope(requester, { moduleId, workPackageId: options.workPackageId ?? null }, "authorize execution");
-      const moduleArtifact = this.artifacts.findById(moduleId);
-      // Re-authorization states: APPROVED/EXECUTING for dispatch, and
-      // VERIFYING/PASSED/FAILED for step-scoped re-authorization (every
-      // forward lifecycle step presents a fresh grant). The transition
-      // tables still govern which step each state may enact, so a grant
-      // issued here cannot reopen unrelated transitions. DRAFT,
-      // AWAITING_APPROVAL, COMPLETE, and BLOCKED never authorize.
-      if (!["APPROVED", "EXECUTING", "VERIFYING", "PASSED", "FAILED"].includes(moduleArtifact.status)) {
-        throw new ChronoError({
-          code: ErrorCode.EXECUTION_DENIED,
-          severity: Severity.BLOCKER,
-          message: `Module ${moduleId} is in state ${moduleArtifact.status}: no dispatch authorized`,
-          invariantRef: "INV §5.3, DOM §6.4",
-          affectedTarget: moduleId,
-          suggestedAction: "Promote the module through its lifecycle first",
-        });
-      }
-
-      const project = this.projects.findById("default");
-      if (project.runtime === null || project.runtime.trim().length === 0) {
-        throw new ChronoError({
-          code: ErrorCode.CONFIG_ERROR,
-          severity: Severity.BLOCKER,
-          message: `Module ${moduleId}: no PO-selected runtime configured`,
-          invariantRef: "INV §14.4",
-          affectedTarget: moduleId,
-          suggestedAction: "Select a runtime in the project configuration first",
-        });
-      }
-
-      this.requireCurrentRtk(moduleId, { id: executor.id, adapter: executor.adapter, runtime: executor.runtime }, options.adapterId ?? null);
-      this.requireCurrentSkill(moduleId);
-
-      const approval = this.approvals.findByScope(moduleId, moduleArtifact.revision, "module-approval");
-      if (approval === null || approval.revoked) {
-        throw new ChronoError({
-          code: ErrorCode.APPROVAL_REQUIRED,
-          severity: Severity.BLOCKER,
-          message: `Module ${moduleId} lacks required PO approval`,
-          invariantRef: "INV §5.4, DOM §6.4",
-          affectedTarget: moduleId,
-          suggestedAction: "Record a signed module-approval binding this exact revision",
-        });
-      }
-      if (isStaleReference(approval.scopeRevision, moduleArtifact.revision)) {
-        throw new ChronoError({
-          code: ErrorCode.APPROVAL_REQUIRED,
-          severity: Severity.BLOCKER,
-          message: `Module ${moduleId} approval is stale after material change`,
-          invariantRef: "INV §4.4",
-          affectedTarget: moduleId,
-          suggestedAction: "Re-approve the current revision",
-        });
-      }
-
-      const archRev = project.architectureRevision;
-      if (project.architectureState !== "approved" || archRev === null) {
-        throw new ChronoError({
-          code: ErrorCode.APPROVAL_REQUIRED,
-          severity: Severity.BLOCKER,
-          message: `Module ${moduleId}: architecture is not approved`,
-          invariantRef: "INV §5.5",
-          affectedTarget: moduleId,
-          suggestedAction: "Approve the architecture with its security approval first",
-        });
-      }
-      if (!this.hasValidApproval("ARCH", archRev, "architecture-security")) {
-        throw new ChronoError({
-          code: ErrorCode.APPROVAL_REQUIRED,
-          severity: Severity.BLOCKER,
-          message: `Module ${moduleId}: Architecture Security Approval is not current`,
-          invariantRef: "INV §5.5",
-          affectedTarget: moduleId,
-          suggestedAction: "Record a current signed architecture-security approval",
-        });
-      }
-
-      const specIds = this.moduleSpecIds(moduleId);
-      for (const specId of specIds) {
-        const spec = this.artifacts.findById(specId);
-        if (spec.status !== "READY") {
-          throw new ChronoError({
-            code: ErrorCode.EXECUTION_DENIED,
-            severity: Severity.BLOCKER,
-            message: `Module ${moduleId}: Spec '${specId}' is ${spec.status}, not READY`,
-            invariantRef: "INV §5.3, DOM §6.4",
-            affectedTarget: specId,
-            suggestedAction: "Release every module Spec to READY first",
-          });
-        }
-        let harness: { stale: boolean };
-        try {
-          harness = this.harnesses.findBySpecRevision(spec.revision);
-        } catch {
-          throw new ChronoError({
-            code: ErrorCode.MISSING_REQUIRED_ARTIFACT,
-            severity: Severity.BLOCKER,
-            message: `Module ${moduleId}: no Harness for Spec '${specId}@${spec.revision}'`,
-            invariantRef: "INV §14.4",
-            affectedTarget: specId,
-            suggestedAction: "Record the authoritative Harness for this Spec revision",
-          });
-        }
-        if (harness.stale) {
-          throw new ChronoError({
-            code: ErrorCode.STALE_REVISION,
-            severity: Severity.BLOCKER,
-            message: `Module ${moduleId}: Harness for Spec '${specId}@${spec.revision}' is stale`,
-            invariantRef: "INV §10.3",
-            affectedTarget: specId,
-            suggestedAction: "Regenerate the Harness after the material change",
-          });
-        }
-      }
-
-      this.denyOnPostApprovalChange(moduleId, specIds, approval.timestamp);
-
-      if (options.workPackageId !== undefined) {
-        this.authorizeWorkPackageScope(moduleId, options.workPackageId);
-      } else if (this.moduleWorkPackages(moduleId).length > 0) {
-        throw new ChronoError({
-          code: ErrorCode.EXECUTION_DENIED,
-          severity: Severity.BLOCKER,
-          message: `Module ${moduleId} has Work Packages: execution requires an explicit work-package scope`,
-          invariantRef: "INV §5.1",
-          affectedTarget: moduleId,
-          suggestedAction: "Authorize a specific Work Package of this Module",
-        });
-      }
-
-      this.denyIfBlocked(moduleId);
-
-      if (moduleArtifact.status === "EXECUTING" && this.evidence.hasCurrentEvidence(moduleArtifact.revision)) {
-        if (!this.hasValidApproval(moduleId, moduleArtifact.revision, "implementation-security")) {
-          throw new ChronoError({
-            code: ErrorCode.APPROVAL_REQUIRED,
-            severity: Severity.BLOCKER,
-            message: `Module ${moduleId}: resuming execution with implementation evidence requires a current Implementation Security Acceptance`,
-            invariantRef: "INV §7.2",
-            affectedTarget: moduleId,
-          suggestedAction: "Record the implementation-security decision for this revision",
-          });
-        }
-      }
+      // All gate prerequisites (shared with requestDispatch below: the
+      // same deterministic checks, no executor binding yet there).
+      const prereqs = this.assertDispatchPrerequisites(
+        moduleId,
+        options.workPackageId,
+        { id: executor.id, adapter: executor.adapter, runtime: executor.runtime },
+        options.adapterId ?? null,
+        options.kind ?? undefined
+      );
 
       // All prerequisites hold: issue the single-use dispatch grant bound
       // to the project, exact module/work-package/spec revisions, Harness
@@ -5927,9 +5924,9 @@ export class ChronoCore {
       const grantId = this.issueBoundGrant({
         moduleId,
         workPackageId: options.workPackageId ?? null,
-        moduleRevision: moduleArtifact.revision,
-        specIds,
-        archRevision: archRev,
+        moduleRevision: prereqs.moduleRevision,
+        specIds: prereqs.specIds,
+        archRevision: prereqs.archRevision,
         role: assignedRole,
         sessionId: executor.id,
         requestedBy: requester.role,
@@ -5941,6 +5938,1361 @@ export class ChronoCore {
       this.auditDenial(moduleId, "ExecutionAuthorization", e, actor);
       return this.handleError(e);
     }
+  }
+
+  /**
+   * Shared dispatch gate prerequisites (native dispatch repair): every
+   * deterministic check `authorizeExecution` performs that does not
+   * require an executor session — module state, runtime, RTK/skill,
+   * module approval currency, architecture approvals, Spec readiness
+   * with fresh Harnesses, post-approval change, Work Package scope,
+   * blockers, and implementation-security resumption. Session-scoped
+   * checks and grant issuance stay with the caller. Throws the exact
+   * unmet prerequisite; identical errors from both entry points.
+   */
+  private assertDispatchPrerequisites(
+    moduleId: string,
+    workPackageId: string | undefined,
+    sessionInfo: { id: string; adapter: string; runtime: string },
+    adapterId: string | null,
+    kind?: string
+  ): { moduleRevision: string; archRevision: string; specIds: string[] } {
+    const moduleArtifact = this.artifacts.findById(moduleId);
+    // Re-authorization states: APPROVED/EXECUTING for dispatch, and
+    // VERIFYING/PASSED/FAILED for step-scoped re-authorization (every
+    // forward lifecycle step presents a fresh grant). The transition
+    // tables still govern which step each state may enact, so a grant
+    // issued here cannot reopen unrelated transitions. DRAFT,
+    // AWAITING_APPROVAL, COMPLETE, and BLOCKED never authorize.
+    if (!["APPROVED", "EXECUTING", "VERIFYING", "PASSED", "FAILED"].includes(moduleArtifact.status)) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Module ${moduleId} is in state ${moduleArtifact.status}: no dispatch authorized`,
+        invariantRef: "INV §5.3, DOM §6.4",
+        affectedTarget: moduleId,
+        suggestedAction: "Promote the module through its lifecycle first",
+      });
+    }
+
+    const project = this.projects.findById("default");
+    if (project.runtime === null || project.runtime.trim().length === 0) {
+      throw new ChronoError({
+        code: ErrorCode.CONFIG_ERROR,
+        severity: Severity.BLOCKER,
+        message: `Module ${moduleId}: no PO-selected runtime configured`,
+        invariantRef: "INV §14.4",
+        affectedTarget: moduleId,
+        suggestedAction: "Select a runtime in the project configuration first",
+      });
+    }
+
+    this.requireCurrentRtk(moduleId, sessionInfo, adapterId);
+    this.requireCurrentSkill(moduleId);
+
+    const approval = this.approvals.findByScope(moduleId, moduleArtifact.revision, "module-approval");
+    if (approval === null || approval.revoked) {
+      throw new ChronoError({
+        code: ErrorCode.APPROVAL_REQUIRED,
+        severity: Severity.BLOCKER,
+        message: `Module ${moduleId} lacks required PO approval`,
+        invariantRef: "INV §5.4, DOM §6.4",
+        affectedTarget: moduleId,
+        suggestedAction: "Record a signed module-approval binding this exact revision",
+      });
+    }
+    if (isStaleReference(approval.scopeRevision, moduleArtifact.revision)) {
+      throw new ChronoError({
+        code: ErrorCode.APPROVAL_REQUIRED,
+        severity: Severity.BLOCKER,
+        message: `Module ${moduleId} approval is stale after material change`,
+        invariantRef: "INV §4.4",
+        affectedTarget: moduleId,
+        suggestedAction: "Re-approve the current revision",
+      });
+    }
+
+    const archRev = project.architectureRevision;
+    if (project.architectureState !== "approved" || archRev === null) {
+      throw new ChronoError({
+        code: ErrorCode.APPROVAL_REQUIRED,
+        severity: Severity.BLOCKER,
+        message: `Module ${moduleId}: architecture is not approved`,
+        invariantRef: "INV §5.5",
+        affectedTarget: moduleId,
+        suggestedAction: "Approve the architecture with its security approval first",
+      });
+    }
+    if (!this.hasValidApproval("ARCH", archRev, "architecture-security")) {
+      throw new ChronoError({
+        code: ErrorCode.APPROVAL_REQUIRED,
+        severity: Severity.BLOCKER,
+        message: `Module ${moduleId}: Architecture Security Approval is not current`,
+        invariantRef: "INV §5.5",
+        affectedTarget: moduleId,
+        suggestedAction: "Record a current signed architecture-security approval",
+      });
+    }
+
+    const specIds = this.moduleSpecIds(moduleId);
+    for (const specId of specIds) {
+      const spec = this.artifacts.findById(specId);
+      if (spec.status !== "READY") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Module ${moduleId}: Spec '${specId}' is ${spec.status}, not READY`,
+          invariantRef: "INV §5.3, DOM §6.4",
+          affectedTarget: specId,
+          suggestedAction: "Release every module Spec to READY first",
+        });
+      }
+      let harness: { stale: boolean };
+      try {
+        harness = this.harnesses.findBySpecRevision(spec.revision);
+      } catch {
+        throw new ChronoError({
+          code: ErrorCode.MISSING_REQUIRED_ARTIFACT,
+          severity: Severity.BLOCKER,
+          message: `Module ${moduleId}: no Harness for Spec '${specId}@${spec.revision}'`,
+          invariantRef: "INV §14.4",
+          affectedTarget: specId,
+          suggestedAction: "Record the authoritative Harness for this Spec revision",
+        });
+      }
+      if (harness.stale) {
+        throw new ChronoError({
+          code: ErrorCode.STALE_REVISION,
+          severity: Severity.BLOCKER,
+          message: `Module ${moduleId}: Harness for Spec '${specId}@${spec.revision}' is stale`,
+          invariantRef: "INV §10.3",
+          affectedTarget: specId,
+          suggestedAction: "Regenerate the Harness after the material change",
+        });
+      }
+    }
+
+    this.denyOnPostApprovalChange(moduleId, specIds, approval.timestamp);
+
+    if (workPackageId !== undefined) {
+      this.authorizeWorkPackageScope(moduleId, workPackageId, kind);
+    } else if (this.moduleWorkPackages(moduleId).length > 0) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Module ${moduleId} has Work Packages: execution requires an explicit work-package scope`,
+        invariantRef: "INV §5.1",
+        affectedTarget: moduleId,
+        suggestedAction: "Authorize a specific Work Package of this Module",
+      });
+    }
+
+    this.denyIfBlocked(moduleId);
+
+    if (moduleArtifact.status === "EXECUTING" && this.evidence.hasCurrentEvidence(moduleArtifact.revision)) {
+      if (!this.hasValidApproval(moduleId, moduleArtifact.revision, "implementation-security")) {
+        throw new ChronoError({
+          code: ErrorCode.APPROVAL_REQUIRED,
+          severity: Severity.BLOCKER,
+          message: `Module ${moduleId}: resuming execution with implementation evidence requires a current Implementation Security Acceptance`,
+          invariantRef: "INV §7.2",
+          affectedTarget: moduleId,
+        suggestedAction: "Record the implementation-security decision for this revision",
+        });
+      }
+    }
+    return { moduleRevision: moduleArtifact.revision, archRevision: archRev, specIds };
+  }
+
+  /**
+   * Native dispatch phase 1 (post-planning deadlock repair): validate
+   * every dispatch gate for a module (optionally one Work Package)
+   * WITHOUT an executor session, so Gaspar can initiate
+   * Core-authorized dispatch entirely inside OpenCode. Returns the
+   * validated revision snapshot the claim phase re-validates when it
+   * binds the worker session and issues the grant. Read-only except
+   * the audit trail: no grant, no session, no lifecycle change.
+   * Gaspar/PO only (`execution.request`).
+   */
+  requestDispatch(
+    input: {
+      moduleId: string;
+      workPackageId?: string | undefined;
+      kind?: string | undefined;
+      rationale: string;
+      adapterId?: string | undefined;
+      proposedProfile?: string | undefined;
+    },
+    auth: CallerAuth
+  ): CoreResult<{
+    dispatchId: string;
+    kind: string;
+    moduleId: string;
+    moduleRevision: string;
+    workPackageId: string | null;
+    workPackageRevision: string | null;
+    specRevisions: Record<string, string>;
+    dispatchableRoles: readonly string[];
+    requestedBy: string;
+    effectiveProfile: PolicyProfile;
+    riskTriggers: string[];
+    expiresAt: string;
+  }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const requester = this.resolveCaller(auth, "request dispatch");
+      this.requireCapability("execution.request", requester);
+      const kind: DispatchKind = input.kind === undefined ? "implementation" : input.kind as DispatchKind;
+      if (!(DISPATCH_KINDS as readonly string[]).includes(kind)) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Unknown dispatch kind '${input.kind ?? ""}': use implementation, test, security-review, verification, or correction`,
+          invariantRef: "INV §14.4",
+          affectedTarget: input.moduleId,
+          suggestedAction: "Request the dispatch kind matching the work (reviews and verification are distinct kinds)",
+        });
+      }
+      const rationale = input.rationale.trim();
+      if (rationale.length === 0 || rationale.length > 500) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Dispatch request requires a rationale of 1 to 500 characters",
+          invariantRef: "INV §14.4",
+          affectedTarget: input.moduleId,
+          suggestedAction: "State why this dispatch starts now, briefly",
+        });
+      }
+      this.assertSessionScope(requester, { moduleId: input.moduleId, workPackageId: input.workPackageId ?? null }, "request dispatch");
+      const prereqs = this.assertDispatchPrerequisites(
+        input.moduleId,
+        input.workPackageId,
+        { id: requester.session.id, adapter: requester.session.adapter, runtime: requester.session.runtime },
+        input.adapterId ?? null,
+        kind
+      );
+      let workPackageRevision: string | null = null;
+      if (input.workPackageId !== undefined) {
+        workPackageRevision = this.artifacts.findById(input.workPackageId).revision;
+      }
+      const specRevisions: Record<string, string> = {};
+      for (const specId of prereqs.specIds) {
+        specRevisions[specId] = this.artifacts.findById(specId).revision;
+      }
+      // Correction dispatches bind their defect's owner and open loop
+      // up front: the role is derived, never chosen, and a missing
+      // open loop denies here rather than mid-claim.
+      let role: string | null = null;
+      let correctionOf: string | null = null;
+      if (kind === "correction") {
+        const loop = this.requireOpenCorrectionLoop(input.moduleId, input.workPackageId ?? null, null);
+        const owner = loop.ownerRole;
+        if (!isRoleForDispatchKind(kind, owner)) {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Correction owner '${owner}' cannot be subagent-dispatched: Gaspar or the PO correct directly`,
+            invariantRef: "INV §5.1",
+            affectedTarget: input.moduleId,
+            suggestedAction: "Correct architecture, specification, or product scope as Gaspar or PO",
+          });
+        }
+        role = owner;
+        correctionOf = loop.defectId;
+      }
+      // Effective rigor: project policy, content risk, and any agent
+      // proposal compete by maximum — proposals can only raise.
+      const { triggers, requiredProfile } = this.contentRiskFor(input.moduleId, prereqs.specIds);
+      const proposed = input.proposedProfile !== undefined ? this.parseProfile(input.proposedProfile, input.moduleId) : "lean" as PolicyProfile;
+      const effectiveProfile = maxProfile(this.projectProfile(), requiredProfile, proposed);
+      const now = this.now();
+      const ttlSeconds = this.config.grantTtlSeconds ?? 3600;
+      const dispatchId = this.sequences.allocate("DSP");
+      this.db.dispatches().create({
+        id: dispatchId,
+        kind,
+        moduleId: input.moduleId,
+        workPackageId: input.workPackageId ?? null,
+        moduleRevision: prereqs.moduleRevision,
+        workPackageRevision,
+        specRevisions,
+        role: role ?? "",
+        requesterSession: requester.session.id,
+        adapterId: input.adapterId ?? null,
+        correctionOf,
+        attempt: 1,
+        policyProfile: effectiveProfile,
+        riskTriggers: triggers.map((t) => t.key),
+        rationale,
+        expiresAt: new Date(Date.parse(now) + ttlSeconds * 1000).toISOString(),
+        createdAt: now,
+      });
+      this.events.append({
+        eventType: "DispatchRequested",
+        entityId: input.workPackageId ?? input.moduleId,
+        payload: {
+          dispatchId,
+          kind,
+          moduleId: input.moduleId,
+          moduleRevision: prereqs.moduleRevision,
+          workPackageId: input.workPackageId ?? null,
+          workPackageRevision,
+          specRevisions,
+          rationale,
+          effectiveProfile,
+          riskTriggers: triggers.map((t) => t.key),
+        },
+        actor: requester.auditActor,
+        priorState: undefined,
+        newState: undefined,
+        reasoning: "Native dispatch intent validated: all dispatch gates hold",
+      });
+      return {
+        ok: true,
+        value: {
+          dispatchId,
+          kind,
+          moduleId: input.moduleId,
+          moduleRevision: prereqs.moduleRevision,
+          workPackageId: input.workPackageId ?? null,
+          workPackageRevision,
+          specRevisions,
+          dispatchableRoles: (DISPATCH_KIND_ROLES as Record<string, readonly string[]>)[kind] ?? [],
+          requestedBy: requester.role,
+          effectiveProfile,
+          riskTriggers: triggers.map((t) => t.key),
+          expiresAt: new Date(Date.parse(now) + ttlSeconds * 1000).toISOString(),
+        },
+      };
+    } catch (e) {
+      this.auditDenial(input.moduleId, "DispatchRequest", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Record one task delegation against a live dispatch (CORE_FIX
+   * CF-2): the single durable source the later claim binds to.
+   * Allows exactly one delegation per dispatch: the first matching
+   * call wins; anything later denies. Resume re-enters the caller's
+   * own claimed worker session without new state.
+   */
+  recordTaskDelegation(
+    input: {
+      agent: string;
+      parentRuntimeSession: string;
+      taskCallId?: string | undefined;
+      taskId?: string | undefined;
+    },
+    auth: CallerAuth
+  ): CoreResult<{ dispatchId: string; agent: string; resume: boolean }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const caller = this.resolveCaller(auth, "record task delegation");
+      this.requireCapability("execution.request", caller);
+      if (input.parentRuntimeSession.length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Task delegation requires the calling runtime session",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Delegate from the session holding the live dispatch",
+        });
+      }
+      // Resume path: re-entering the caller's own claimed worker
+      // session. No new state; hijack of another session denies.
+      if (input.taskId !== undefined && input.taskId.length > 0) {
+        const claimed = this.db.dispatches().findByChildRuntimeSession(input.taskId);
+        if (
+          claimed !== null &&
+          claimed.parentRuntimeSession === input.parentRuntimeSession &&
+          claimed.delegatedAgent === input.agent &&
+          claimed.status === "ACTIVE" &&
+          !Number.isNaN(Date.parse(claimed.expiresAt)) &&
+          Date.parse(claimed.expiresAt) > Date.parse(this.now())
+        ) {
+          return { ok: true, value: { dispatchId: claimed.id, agent: input.agent, resume: true } };
+        }
+        throw new ChronoError({
+          code: ErrorCode.TASK_DENIED,
+          severity: Severity.BLOCKER,
+          message: "Resuming that task is denied: it is not the caller's own live dispatched worker session",
+          invariantRef: "INV §5.1",
+          affectedTarget: input.taskId,
+          suggestedAction: "Resume only worker sessions this session delegated and claimed",
+        });
+      }
+      // Fresh delegation: exactly one live PENDING dispatch requested
+      // by this Core session that fits the agent's kind roles.
+      const nowMs = Date.parse(this.now());
+      const live = this.db.dispatches().listByRequester(caller.session.id).filter((d) => {
+        if (d.status !== "PENDING") {
+          return false;
+        }
+        if (Number.isNaN(Date.parse(d.expiresAt)) || Date.parse(d.expiresAt) <= nowMs) {
+          return false;
+        }
+        return isRoleForDispatchKind(d.kind, input.agent);
+      });
+      // Idempotent retry: the same parent session re-delegating the
+      // same agent to the same dispatch re-reports success without
+      // touching the single-delegation guard.
+      if (
+        live.length === 1 &&
+        live[0]!.delegatedAgent === input.agent &&
+        live[0]!.parentRuntimeSession === input.parentRuntimeSession
+      ) {
+        return { ok: true, value: { dispatchId: live[0]!.id, agent: input.agent, resume: false } };
+      }
+      const candidates = live.filter((d) => d.delegatedAgent === null);
+      if (candidates.length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.TASK_DENIED,
+          severity: Severity.BLOCKER,
+          message: `No live dispatch intent fits '${input.agent || "(unnamed)"}': validate one first with chrono_dispatch, then delegate exactly one worker`,
+          invariantRef: "INV §5.1",
+          affectedTarget: input.agent,
+          suggestedAction: "Request a dispatch whose kind authorizes this role",
+        });
+      }
+      if (candidates.length > 1) {
+        throw new ChronoError({
+          code: ErrorCode.TASK_DENIED,
+          severity: Severity.BLOCKER,
+          message: "Several live dispatch intents fit this delegation: delegation cannot choose between them — claim or revoke until one remains",
+          invariantRef: "INV §5.1",
+          affectedTarget: input.agent,
+          suggestedAction: "Resolve to a single live dispatch before delegating",
+        });
+      }
+      const dispatch = candidates[0]!;
+      this.db.dispatches().recordDelegation(dispatch.id, input.parentRuntimeSession, input.agent, input.taskCallId ?? null);
+      this.events.append({
+        eventType: "TaskDelegated",
+        entityId: dispatch.id,
+        payload: { agent: input.agent, parentRuntimeSession: input.parentRuntimeSession, taskCallId: input.taskCallId ?? null },
+        actor: caller.auditActor,
+        priorState: "PENDING",
+        newState: "PENDING",
+        reasoning: "Native task delegation bound to one live dispatch",
+      });
+      return { ok: true, value: { dispatchId: dispatch.id, agent: input.agent, resume: false } };
+    } catch (e) {
+      this.auditDenial(input.agent || "task", "TaskDelegation", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Native dispatch phase 2 (claim): bind one worker subagent session
+   * to a validated dispatch, atomically. In ONE transaction the Core
+   * mints the delegated worker session, runs the FULL
+   * `authorizeExecution` gates, issues the single-use grant, consumes
+   * it while enacting the legal execution transition, and moves the
+   * dispatch PENDING -> ENACTED. The worker credential returns to the
+   * HOST ONLY (never model-visible): the CLI confines it to a 0600
+   * file keyed by the worker's OpenCode session, then confirms. Any
+   * failure rolls back session, grant, transition, and dispatch row
+   * together — no orphan authority survives a failed claim.
+   */
+  claimDispatch(
+    input: {
+      dispatchId: string;
+      childRuntimeSession: string;
+    },
+    parentAuth: CallerAuth
+  ): CoreResult<{
+    dispatchId: string;
+    grantId: string;
+    session: { id: string; token: string; expiresAt: string };
+    role: string;
+    moduleId: string;
+    moduleRevision: string;
+    workPackageId: string | null;
+    workPackageRevision: string | null;
+    specRevisions: Record<string, string>;
+  }> {
+    const actor = typeof parentAuth.actor === "string" ? parentAuth.actor : "unknown";
+    try {
+      const parent = this.resolveCaller(parentAuth, "claim dispatch");
+      this.requireCapability("execution.request", parent);
+      if (input.dispatchId.length === 0 || input.childRuntimeSession.length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Dispatch claim requires a dispatch id and the claiming worker runtime session",
+          invariantRef: "INV §14.4",
+          suggestedAction: "Claim from the worker subagent session created by the bound task call",
+        });
+      }
+      const dispatch = this.db.dispatches().findById(input.dispatchId);
+      if (dispatch.status !== "PENDING") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Dispatch '${input.dispatchId}' is '${dispatch.status}', not PENDING: replay denied`,
+          invariantRef: "INV §5.1",
+          affectedTarget: input.dispatchId,
+          suggestedAction: "Claim each dispatch exactly once",
+        });
+      }
+      if (dispatch.requesterSession !== parent.session.id) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Dispatch '${input.dispatchId}' was requested by another session: session hijack denied`,
+          invariantRef: "INV §5.1",
+          affectedTarget: input.dispatchId,
+          suggestedAction: "Claim only dispatches requested by this session",
+        });
+      }
+      if (Number.isNaN(Date.parse(dispatch.expiresAt)) || Date.parse(dispatch.expiresAt) <= Date.parse(this.now())) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Dispatch '${input.dispatchId}' expired at ${dispatch.expiresAt}: dispatch again`,
+          invariantRef: "INV §5.1",
+          affectedTarget: input.dispatchId,
+          suggestedAction: "Request a fresh dispatch intent",
+        });
+      }
+      if (dispatch.delegatedAgent === null) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Dispatch '${input.dispatchId}' has no recorded task delegation: delegate first with the task tool`,
+          invariantRef: "INV §5.1",
+          affectedTarget: input.dispatchId,
+          suggestedAction: "Bind the dispatch to exactly one worker through task delegation",
+        });
+      }
+      const role = dispatch.delegatedAgent;
+      if (!isRoleForDispatchKind(dispatch.kind, role)) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Role '${role}' cannot enact '${dispatch.kind}' dispatch '${input.dispatchId}': kinds are not interchangeable`,
+          invariantRef: "INV §5.1",
+          affectedTarget: input.dispatchId,
+          suggestedAction: "Delegate each dispatch kind to its own worker role",
+        });
+      }
+      // Correction dispatches additionally require their open loop:
+      // the owner was resolved at request time and re-checked here.
+      if (dispatch.kind === "correction") {
+        this.requireOpenCorrectionLoop(dispatch.moduleId, dispatch.workPackageId, dispatch.correctionOf);
+      }
+      const grantTtl = this.config.grantTtlSeconds ?? 3600;
+      // Raw parent credential comes from the caller's presented
+      // session object (records never carry bearer tokens).
+      const parentCredential = { id: parent.session.id, token: parentAuth.session.token };
+      const claimed = this.db.transaction(() => {
+        const opened = this.openSession(
+          {
+            role,
+            adapter: parent.session.adapter,
+            runtime: parent.session.runtime,
+            scopeModule: dispatch.moduleId,
+            ...(dispatch.workPackageId !== null ? { scopeWp: dispatch.workPackageId } : {}),
+            ttlSeconds: grantTtl,
+          },
+          { parentSession: parentCredential }
+        );
+        if (!opened.ok) {
+          throw new ChronoError({
+            code: (opened.error?.code ?? ErrorCode.EXECUTION_DENIED) as (typeof ErrorCode)[keyof typeof ErrorCode],
+            severity: Severity.BLOCKER,
+            message: opened.error?.message ?? `Worker session minting failed for dispatch '${input.dispatchId}'`,
+            invariantRef: opened.error?.invariantRef ?? "INV §5.1",
+            affectedTarget: input.dispatchId,
+            suggestedAction: "Inspect the session cause, then dispatch again",
+          });
+        }
+        const worker = opened.value!;
+        const authorized = this.authorizeExecution(dispatch.moduleId, {
+          ...(dispatch.workPackageId !== null ? { workPackageId: dispatch.workPackageId } : {}),
+          actor: parent.role,
+          role,
+          session: { id: worker.id, token: worker.token },
+          requesterSession: parentCredential,
+          ...(dispatch.adapterId !== null ? { adapterId: dispatch.adapterId } : {}),
+          kind: dispatch.kind,
+        });
+        if (!authorized.ok) {
+          throw new ChronoError({
+            code: (authorized.error?.code ?? ErrorCode.EXECUTION_DENIED) as (typeof ErrorCode)[keyof typeof ErrorCode],
+            severity: Severity.BLOCKER,
+            message: authorized.error?.message ?? `Execution gates failed for dispatch '${input.dispatchId}'`,
+            invariantRef: authorized.error?.invariantRef ?? "INV §5.1",
+            affectedTarget: input.dispatchId,
+            suggestedAction: "Fix the failing gate, then dispatch again",
+          });
+        }
+        // Enact the execution transition with the fresh grant: issue
+        // and consumption commit together, so a claimed dispatch always
+        // has its lifecycle state behind it. Correction claims always
+        // enact the correction event (the only legal exit from FAILED).
+        // Review claims bind only: the scope is already positioned (the
+        // review assignment names its revision). A second worker on an
+        // already-positioned scope (Lucca alongside implementation)
+        // likewise binds only: re-enacting the start event would be an
+        // illegal transition. Anything else denies through the table.
+        const target = dispatch.workPackageId ?? dispatch.moduleId;
+        const scopeStatus = dispatch.workPackageId !== null
+          ? this.artifacts.findById(dispatch.workPackageId).status
+          : this.artifacts.findById(dispatch.moduleId).status;
+        const alreadyPositioned = dispatch.workPackageId !== null
+          ? scopeStatus !== "AUTHORIZED"
+          : scopeStatus !== "APPROVED";
+        if (dispatch.kind === "security-review" || dispatch.kind === "verification" || (alreadyPositioned && dispatch.kind !== "correction")) {
+          this.db.grants().consume(authorized.value!.grantId);
+        } else {
+          const startEvent = dispatch.kind === "correction"
+            ? "CorrectionComplete"
+            : dispatch.workPackageId !== null ? "ExecutionAssigned" : "ExecutionStarted";
+          const started = this.transitionState(target, startEvent, {
+            actor: role,
+            session: { id: worker.id, token: worker.token },
+            grantId: authorized.value!.grantId,
+          });
+          if (!started.ok) {
+            throw new ChronoError({
+              code: (started.error?.code ?? ErrorCode.EXECUTION_DENIED) as (typeof ErrorCode)[keyof typeof ErrorCode],
+              severity: Severity.BLOCKER,
+              message: started.error?.message ?? `Enactment failed for dispatch '${input.dispatchId}'`,
+              invariantRef: started.error?.invariantRef ?? "INV §5.1",
+              affectedTarget: target,
+              suggestedAction: "Inspect the transition cause, then dispatch again",
+            });
+          }
+        }
+        // Correction claims bind the dispatch to its open loop inside
+        // the same transaction: the loop moves OPEN -> CORRECTING so
+        // the fix, its evidence, and re-verification stay governed.
+        if (dispatch.kind === "correction" && dispatch.correctionOf !== null) {
+          const loop = this.requireOpenCorrectionLoop(dispatch.moduleId, dispatch.workPackageId, dispatch.correctionOf);
+          this.db.correctionLoops().bindDispatch(loop.id, input.dispatchId);
+        }
+        // Single-use claim flip inside the same transaction: a lost
+        // race rolls back session, grant, and transition together.
+        if (!this.db.dispatches().claim(input.dispatchId, worker.id, authorized.value!.grantId, input.childRuntimeSession)) {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Dispatch '${input.dispatchId}' was claimed concurrently: replay denied`,
+            invariantRef: "INV §5.1",
+            affectedTarget: input.dispatchId,
+            suggestedAction: "Proceed in the winning worker session",
+          });
+        }
+        return { worker, grantId: authorized.value!.grantId };
+      });
+      this.events.append({
+        eventType: "DispatchClaimed",
+        entityId: input.dispatchId,
+        payload: { workerSession: claimed.worker.id, grantId: claimed.grantId, role },
+        actor: parent.auditActor,
+        priorState: "PENDING",
+        newState: "ENACTED",
+        reasoning: "Worker session bound, grant issued and consumed with enactment, atomically",
+      });
+      const moduleRevision = this.artifacts.findById(dispatch.moduleId).revision;
+      const workPackageRevision =
+        dispatch.workPackageId !== null ? this.artifacts.findById(dispatch.workPackageId).revision : null;
+      const specRevisions: Record<string, string> = {};
+      for (const specId of this.moduleSpecIds(dispatch.moduleId)) {
+        specRevisions[specId] = this.artifacts.findById(specId).revision;
+      }
+      return {
+        ok: true,
+        value: {
+          dispatchId: input.dispatchId,
+          grantId: claimed.grantId,
+          session: { id: claimed.worker.id, token: claimed.worker.token, expiresAt: claimed.worker.expiresAt },
+          role,
+          moduleId: dispatch.moduleId,
+          moduleRevision,
+          workPackageId: dispatch.workPackageId,
+          workPackageRevision,
+          specRevisions,
+        },
+      };
+    } catch (e) {
+      this.auditDenial(input.dispatchId || "dispatch", "DispatchClaim", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Confirm credential confinement after a claim (CF-3 recoverable
+   * claim protocol). Moves ENACTED -> ACTIVE once the host proves the
+   * worker credential is confined. Idempotent on ACTIVE: confirmation
+   * retries after a crash resume instead of duplicating authority.
+   */
+  confirmClaim(
+    dispatchId: string,
+    auth: CallerAuth
+  ): CoreResult<{ dispatchId: string; status: string }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const caller = this.resolveCaller(auth, "confirm claim");
+      const dispatch = this.db.dispatches().findById(dispatchId);
+      const allowed =
+        caller.session.id === dispatch.requesterSession ||
+        (dispatch.workerSession !== null && caller.session.id === dispatch.workerSession);
+      if (!allowed) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Dispatch '${dispatchId}' confirmation requires its requester or worker session`,
+          invariantRef: "INV §5.1",
+          affectedTarget: dispatchId,
+          suggestedAction: "Confirm from the dispatch requester or the claimed worker session",
+        });
+      }
+      const confirmed = this.db.dispatches().confirm(dispatchId);
+      this.events.append({
+        eventType: "DispatchConfirmed",
+        entityId: dispatchId,
+        payload: { workerSession: confirmed.workerSession },
+        actor: caller.auditActor,
+        priorState: "ENACTED",
+        newState: confirmed.status,
+        reasoning: "Worker credential confined host-side; binding is live",
+      });
+      return { ok: true, value: { dispatchId, status: confirmed.status } };
+    } catch (e) {
+      this.auditDenial(dispatchId || "dispatch", "DispatchConfirm", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Compensating revocation for a failed or abandoned claim (CF-3).
+   * Revokes the worker session when one was minted and moves the
+   * dispatch to REVOKED with an audit event. Terminal dispatches are
+   * left untouched (idempotent). No error path may leave usable
+   * orphan authority.
+   */
+  revokeDispatch(dispatchId: string, auth: CallerAuth, reason?: string): CoreResult<{ dispatchId: string; status: string }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const caller = this.resolveCaller(auth, "revoke dispatch");
+      if (caller.role !== "gaspar" && caller.role !== "PO") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Dispatch revocation requires a gaspar or PO session, not '${caller.role}'`,
+          invariantRef: "INV §5.1",
+          affectedTarget: dispatchId,
+          suggestedAction: "Escalate revocation to the orchestrator",
+        });
+      }
+      const dispatch = this.db.dispatches().findById(dispatchId);
+      if (dispatch.status === "COMPLETED" || dispatch.status === "REVOKED" || dispatch.status === "EXPIRED") {
+        return { ok: true, value: { dispatchId, status: dispatch.status } };
+      }
+      if (dispatch.workerSession !== null) {
+        try {
+          this.db.sessions().revoke(dispatch.workerSession);
+        } catch {
+          // Best-effort: already revoked or concurrently revoked still
+          // converges on unusable; the denial below never stands on it.
+        }
+      }
+      const revoked = this.db.dispatches().revoke(dispatchId);
+      this.events.append({
+        eventType: "DispatchRevoked",
+        entityId: dispatchId,
+        payload: { reason: reason ?? "compensating revocation", workerSession: dispatch.workerSession },
+        actor: caller.auditActor,
+        priorState: dispatch.status,
+        newState: "REVOKED",
+        reasoning: "Incomplete or abandoned claim revoked: no orphan authority survives",
+      });
+      return { ok: true, value: { dispatchId, status: revoked.status } };
+    } catch (e) {
+      this.auditDenial(dispatchId || "dispatch", "DispatchRevoke", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Startup/crash sweep over incomplete claims (CF-3). PENDING rows
+   * past expiry become EXPIRED; ENACTED rows past expiry lose their
+   * worker session and become REVOKED. Deterministic from stored
+   * timestamps: restart recovery never replays authority.
+   */
+  reconcileStaleClaims(auth: CallerAuth): CoreResult<{ expired: string[]; revoked: string[] }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const caller = this.resolveCaller(auth, "reconcile dispatches");
+      this.requireCapability("dispatch.reconcile", caller);
+      const nowIso = this.now();
+      const expired: string[] = [];
+      for (const stale of this.db.dispatches().listStalePending(nowIso)) {
+        this.db.dispatches().expire(stale.id);
+        this.events.append({
+          eventType: "DispatchExpired",
+          entityId: stale.id,
+          payload: {},
+          actor: caller.auditActor,
+          priorState: "PENDING",
+          newState: "EXPIRED",
+          reasoning: "Unclaimed intent passed its bounded lifetime",
+        });
+        expired.push(stale.id);
+      }
+      const revoked: string[] = [];
+      for (const stale of this.db.dispatches().listStaleEnacted(nowIso)) {
+        if (stale.workerSession !== null) {
+          try {
+            this.db.sessions().revoke(stale.workerSession);
+          } catch {
+            // Best-effort (see revokeDispatch).
+          }
+        }
+        this.db.dispatches().revoke(stale.id);
+        this.events.append({
+          eventType: "DispatchRevoked",
+          entityId: stale.id,
+          payload: { reason: "stale unconfirmed enactment", workerSession: stale.workerSession },
+          actor: caller.auditActor,
+          priorState: "ENACTED",
+          newState: "REVOKED",
+          reasoning: "Crash-safety sweep: unconfirmed enactment cannot become usable authority",
+        });
+        revoked.push(stale.id);
+      }
+      return { ok: true, value: { expired, revoked } };
+    } catch (e) {
+      this.auditDenial("dispatch", "DispatchReconcile", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Release a live binding to COMPLETED (CF-2 terminal state). The
+   * bound worker releases its own binding only with its work
+   * evidenced: passing evidence it produced for implementation,
+   * test, or correction scopes, or its submitted review for review
+   * scopes. Gaspar/PO may release any binding as oversight (audited,
+   * no evidence required). Releasing an already-COMPLETED binding
+   * re-reports success so retries converge.
+   */
+  releaseDispatch(dispatchId: string, auth: CallerAuth): CoreResult<{ dispatchId: string; status: string }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const caller = this.resolveCaller(auth, "release dispatch");
+      this.requireCapability("dispatch.release", caller);
+      const dispatch = this.db.dispatches().findById(dispatchId);
+      if (dispatch.status === "COMPLETED") {
+        return { ok: true, value: { dispatchId, status: dispatch.status } };
+      }
+      if (dispatch.status !== "ACTIVE") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Dispatch '${dispatchId}' is '${dispatch.status}', not ACTIVE: confirm the claim before releasing`,
+          invariantRef: "INV §5.1",
+          affectedTarget: dispatchId,
+          suggestedAction: "Claim and confirm the dispatch, evidence the work, then release",
+        });
+      }
+      const isOwner = dispatch.workerSession !== null && caller.session.id === dispatch.workerSession;
+      const isOverseer = caller.role === "gaspar" || caller.role === "PO";
+      if (!isOwner && !isOverseer) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Dispatch '${dispatchId}' belongs to another session: release requires its worker or Gaspar/PO oversight`,
+          invariantRef: "INV §5.1",
+          affectedTarget: dispatchId,
+          suggestedAction: "Release from the bound worker session",
+        });
+      }
+      const workerRole = this.dispatchWorkerRole(dispatch);
+      const scopeId = dispatch.workPackageId ?? dispatch.moduleId;
+      const scopeRevision = dispatch.workPackageId !== null
+        ? dispatch.workPackageRevision
+        : dispatch.moduleRevision;
+      if (!isOverseer) {
+        if (dispatch.kind === "security-review" || dispatch.kind === "verification") {
+          const submitted = this.db.reviewAssignments().listByScope(dispatch.moduleId, dispatch.workPackageId)
+            .some((r) => r.kind === dispatch.kind && r.status === "SUBMITTED" && r.reviewerSession === caller.session.id);
+          if (!submitted) {
+            throw new ChronoError({
+              code: ErrorCode.EVIDENCE_MISSING,
+              severity: Severity.BLOCKER,
+              message: `Dispatch '${dispatchId}': no submitted ${dispatch.kind} review by this session — submit before releasing`,
+              invariantRef: "INV §11.3",
+              affectedTarget: dispatchId,
+              suggestedAction: "Submit the assigned review, then release the binding",
+            });
+          }
+        } else {
+          const evidenced = scopeRevision !== null && this.db.evidence().findCurrentByTargetRevision(scopeRevision)
+            .some((e) => e.producer === workerRole && e.result === "pass");
+          if (!evidenced) {
+            throw new ChronoError({
+              code: ErrorCode.EVIDENCE_MISSING,
+              severity: Severity.BLOCKER,
+              message: `Dispatch '${dispatchId}': no current passing evidence by '${workerRole ?? "unknown"}' for this scope — record before releasing`,
+              invariantRef: "INV §11.3",
+              affectedTarget: dispatchId,
+              suggestedAction: "Record evidence of the work, then release the binding",
+            });
+          }
+        }
+      }
+      // The binding owns its worker session cradle-to-grave: release
+      // retires the session with the binding, so no usable authority
+      // outlives a completed dispatch (CF-3). Revocation precedes the
+      // terminal flip, so a failure leaves the binding ACTIVE and
+      // retryable instead of half-released.
+      if (dispatch.workerSession !== null) {
+        this.db.sessions().revoke(dispatch.workerSession);
+      }
+      const completed = this.db.dispatches().complete(dispatchId, this.now());
+      this.events.append({
+        eventType: "DispatchCompleted",
+        entityId: dispatchId,
+        payload: { scope: scopeId, overseer: isOverseer && !isOwner },
+        actor: caller.auditActor,
+        priorState: "ACTIVE",
+        newState: "COMPLETED",
+        reasoning: isOverseer && !isOwner ? "Oversight release of a live binding" : "Worker released its evidenced binding",
+      });
+      return { ok: true, value: { dispatchId, status: completed.status } };
+    } catch (e) {
+      this.auditDenial(dispatchId || "dispatch", "DispatchRelease", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Advance a bound scope one legal forward step (CF-4, CF-7): the
+   * worker holding the ACTIVE binding for a Work Package (or a
+   * package-less module) enacts exactly the next lifecycle event for
+   * its kind — implementation/test/correction advance work,
+   * verification advances verdicts. The Core issues one single-use
+   * grant bound to the exact revisions and consumes it with the
+   * transition atomically: no grant ever crosses to the model, and no
+   * step is enactable without the binding.
+   */
+  advanceScope(
+    input: { moduleId: string; workPackageId?: string | undefined; event: string },
+    auth: CallerAuth
+  ): CoreResult<{ scope: string; fromState: string; toState: string }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const caller = this.resolveCaller(auth, "advance scope");
+      this.requireCapability("scope.advance", caller);
+      const moduleId = input.moduleId;
+      const wpId = input.workPackageId ?? null;
+      const scopeId = wpId ?? moduleId;
+      const scope = this.artifacts.findById(scopeId);
+      if (wpId !== null) {
+        if (scope.type !== "WP" || this.workPackageModule(wpId) !== moduleId) {
+          throw new ChronoError({
+            code: ErrorCode.INCONSISTENT_REFERENCE,
+            severity: Severity.ERROR,
+            message: `WorkPackage '${wpId}' does not belong to Module '${moduleId}'`,
+            invariantRef: "INV §10.2",
+            affectedTarget: wpId,
+            suggestedAction: "Advance scopes inside one module",
+          });
+        }
+      } else {
+        if (scope.type !== "MOD") {
+          throw new ChronoError({
+            code: ErrorCode.VALIDATION_ERROR,
+            severity: Severity.ERROR,
+            message: `Scope '${scopeId}' is not a module: pass --wp for Work Packages`,
+            invariantRef: "INV §14.4",
+            affectedTarget: scopeId,
+            suggestedAction: "Advance the module or one of its Work Packages",
+          });
+        }
+        if (this.moduleWorkPackages(moduleId).length > 0) {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Module '${moduleId}' has Work Packages: advance them, not the module`,
+            invariantRef: "INV §5.1",
+            affectedTarget: moduleId,
+            suggestedAction: "Advance each Work Package through its own binding",
+          });
+        }
+      }
+      const binding = this.validateActiveBinding(caller, { moduleId, workPackageId: wpId });
+      const kind = this.bindingKind(binding.id);
+      const event = input.event;
+      const workEvents = wpId !== null
+        ? ["ImplementationDone", "VerificationReady", "SpekkioPassed", "SpekkioFailed", "CorrectionComplete"]
+        : ["ImplementationComplete", "SpekkioPassed", "SpekkioFailed", "CorrectionComplete"];
+      if (!workEvents.includes(event)) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Event '${event}' is not a scope-advance step for ${wpId !== null ? "a Work Package" : "a module"}: use ${workEvents.join(", ")}`,
+          invariantRef: "INV §14.4",
+          affectedTarget: scopeId,
+          suggestedAction: "Advance one legal forward step",
+        });
+      }
+      if (event === "ImplementationDone" || event === "ImplementationComplete" || event === "VerificationReady") {
+        if (kind !== "implementation" && kind !== "test" && kind !== "correction") {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `'${event}' requires an implementation, test, or correction binding, not '${kind}': reviewers never advance work`,
+            invariantRef: "INV §5.1",
+            affectedTarget: scopeId,
+            suggestedAction: "Advance work through its own bound worker",
+          });
+        }
+      }
+      if (event === "SpekkioPassed" || event === "SpekkioFailed") {
+        if (kind !== "verification" || caller.role !== "spekkio") {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `'${event}' requires the bound Spekkio verification binding: verdicts are Spekkio's independent authority`,
+            invariantRef: "INV §5.1",
+            affectedTarget: scopeId,
+            suggestedAction: "Record the verdict through the verification dispatch",
+          });
+        }
+        const want = event === "SpekkioPassed" ? "PASS" : "FAILED";
+        const reports = wpId !== null ? this.qa.listByWorkPackage(wpId) : this.qa.listByModule(moduleId);
+        const matching = reports.some((r) => r.verdict === want && (r.workPackageRevision ?? r.moduleRevision) === scope.revision);
+        if (!matching) {
+          throw new ChronoError({
+            code: ErrorCode.EVIDENCE_MISSING,
+            severity: Severity.BLOCKER,
+            message: `No ${want} verdict bound to revision ${scope.revision.slice(0, 16)}…: record the verdict before advancing`,
+            invariantRef: "INV §11.3",
+            affectedTarget: scopeId,
+            suggestedAction: "Record the Spekkio verdict for this exact revision first",
+          });
+        }
+      }
+      if (event === "CorrectionComplete" && kind !== "correction") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `'${event}' requires the bound correction binding for this scope's open loop`,
+          invariantRef: "INV §5.1",
+          affectedTarget: scopeId,
+          suggestedAction: "Correct through the dispatched correction binding",
+        });
+      }
+      // Terminal readiness (CF-7): the COMPLETE transition enforces
+      // the same profile-proportional gates the next-action projection
+      // reports — evidence, reviews, verdict, approvals, defects. The
+      // binding this advance rides on is itself excluded: it is the
+      // proof in flight, not an obstruction.
+      if (event === "SpekkioPassed") {
+        if (wpId !== null) {
+          const blockers = this.workPackageCompletionBlockers(wpId, binding.id);
+          if (blockers.length > 0) {
+            throw new ChronoError({
+              code: ErrorCode.COMPLETION_DENIED,
+              severity: Severity.BLOCKER,
+              message: `Work Package '${wpId}' cannot complete: ${blockers[0]!}`,
+              invariantRef: "INV §5.6",
+              affectedTarget: scopeId,
+              suggestedAction: "Satisfy the named prerequisite, then advance",
+            });
+          }
+        } else {
+          const authz = this.authorizeCompletion(moduleId, auth);
+          if (!authz.ok) {
+            throw new ChronoError({
+              code: ErrorCode.COMPLETION_DENIED,
+              severity: Severity.BLOCKER,
+              message: `Module '${moduleId}' cannot advance to PASSED: ${this.describeDenial(authz)}`,
+              invariantRef: "INV §5.6",
+              affectedTarget: scopeId,
+              suggestedAction: "Satisfy module completion first",
+            });
+          }
+        }
+      }
+      const project = this.projects.findById("default");
+      const archRevision = project.architectureRevision;
+      if (project.architectureState !== "approved" || archRevision === null) {
+        throw new ChronoError({
+          code: ErrorCode.APPROVAL_REQUIRED,
+          severity: Severity.BLOCKER,
+          message: `Scope '${scopeId}': architecture is not approved`,
+          invariantRef: "INV §5.5",
+          affectedTarget: scopeId,
+          suggestedAction: "Approve the architecture with its security approval first",
+        });
+      }
+      const grantId = this.issueBoundGrant({
+        moduleId,
+        workPackageId: wpId,
+        moduleRevision: this.artifacts.findById(moduleId).revision,
+        specIds: this.moduleSpecIds(moduleId),
+        archRevision,
+        role: caller.role,
+        sessionId: caller.session.id,
+        requestedBy: caller.role,
+        adapterId: null,
+      });
+      const result = this.transitionState(scopeId, event, {
+        actor: auth.actor,
+        session: auth.session,
+        grantId,
+      });
+      if (!result.ok) {
+        return result as unknown as CoreResult<{ scope: string; fromState: string; toState: string }>;
+      }
+      return { ok: true, value: { scope: scopeId, fromState: result.value!.fromState, toState: result.value!.toState } };
+    } catch (e) {
+      this.auditDenial(input.workPackageId ?? input.moduleId, "ScopeAdvance", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /** Dispatch kind for a binding id (advance/review gating reads kinds, never roles). */
+  private bindingKind(dispatchId: string): string {
+    return this.db.dispatches().findById(dispatchId).kind;
+  }
+
+  /**
+   * Per-tool authorization against the committed dispatch binding
+   * (CF-1): validates that the caller's session holds a live ACTIVE
+   * dispatch covering its scope with fresh revisions — WITHOUT
+   * minting any grant. The plugin pre-tool gate calls this for every
+   * worker mutation instead of re-authorizing execution.
+   * An explicit scope narrows the check to that module/WP; without one the
+   * session's own binding scope applies.
+   */
+  authorizeDispatchedTool(
+    auth: CallerAuth,
+    scope?: { moduleId: string; workPackageId: string | null }
+  ): CoreResult<{
+    dispatchId: string;
+    moduleId: string;
+    workPackageId: string | null;
+    role: string;
+    moduleRevision: string;
+    workPackageRevision: string | null;
+  }> {
+    try {
+      const caller = this.resolveCaller(auth, "authorize dispatched tool");
+      const binding = this.validateActiveBinding(caller, scope);
+      return {
+        ok: true,
+        value: {
+          dispatchId: binding.id,
+          moduleId: binding.moduleId,
+          workPackageId: binding.workPackageId,
+          role: binding.role,
+          moduleRevision: binding.moduleRevision,
+          workPackageRevision: binding.workPackageRevision,
+        },
+      };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Grant-or-binding authorization for lifecycle transitions (CF-1):
+   * a presented unconsumed grant takes the classic operator path;
+   * otherwise the caller's session must hold a live ACTIVE dispatch
+   * binding covering the scope. Enactment events
+   * (ExecutionStarted/ExecutionAssigned) always require the grant:
+   * only claim mints those, atomically with consumption.
+   */
+  private validateGrantOrBinding(
+    moduleId: string,
+    workPackageId: string | null,
+    guardContext: Record<string, unknown> | undefined,
+    caller: ResolvedCaller
+  ): void {
+    const grantId = guardContext?.["grantId"];
+    if (typeof grantId === "string" && grantId.length > 0) {
+      this.validateExecutionGrant(moduleId, workPackageId, guardContext, caller);
+      return;
+    }
+    this.validateActiveBinding(caller, { moduleId, workPackageId });
+  }
+
+  /**
+   * Shared freshness validation for a committed dispatch binding: the
+   * dispatch is ACTIVE and unexpired, the caller session is the bound
+   * worker session with the bound role, revisions match current
+   * state, scope permits mutation, attestations are current, and no
+   * blocker targets the scope. Throws the exact unmet condition.
+   */
+  private validateActiveBinding(caller: {
+    kind: string;
+    role: string;
+    session: { id: string; adapter: string; runtime: string };
+  }, scope?: { moduleId: string; workPackageId: string | null }): {
+    id: string;
+    moduleId: string;
+    workPackageId: string | null;
+    role: string;
+    moduleRevision: string;
+    workPackageRevision: string | null;
+  } {
+    const binding = this.db.dispatches().findActiveByWorkerSession(caller.session.id);
+    if (binding === null) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Session '${caller.session.id}' holds no active dispatch binding: claim a dispatch first`,
+        invariantRef: "INV §5.1",
+        affectedTarget: caller.session.id,
+        suggestedAction: "Claim a validated dispatch intent before acting",
+      });
+    }
+    if (scope !== undefined) {
+      if (binding.moduleId !== scope.moduleId) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Dispatch '${binding.id}' binds module '${binding.moduleId}', not '${scope.moduleId}'`,
+          invariantRef: "INV §10.2",
+          affectedTarget: scope.moduleId,
+          suggestedAction: "Act only inside the bound module",
+        });
+      }
+      // A module-scoped transition accepts a module-level binding or
+      // any binding of the same module; a WP-scoped transition needs
+      // the exact bound Work Package.
+      if (scope.workPackageId !== null && binding.workPackageId !== scope.workPackageId) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Dispatch '${binding.id}' binds work package '${binding.workPackageId ?? "none"}', not '${scope.workPackageId}'`,
+          invariantRef: "INV §10.2",
+          affectedTarget: scope.workPackageId,
+          suggestedAction: "Act only inside the bound Work Package",
+        });
+      }
+    }
+    // The store freezes the request-time role column; the delegation-time
+    // agent is the enacted worker. Compare through the same projection
+    // status commands use, never the raw column alone.
+    const boundRole = this.dispatchWorkerRole(binding);
+    if (boundRole === null || boundRole !== caller.role) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Dispatch '${binding.id}' binds role '${boundRole ?? "(awaiting delegation)"}', not '${caller.role}'`,
+        invariantRef: "INV §5.1",
+        affectedTarget: binding.id,
+        suggestedAction: "Act only through the bound worker role",
+      });
+    }
+    if (Number.isNaN(Date.parse(binding.expiresAt)) || Date.parse(binding.expiresAt) <= Date.parse(this.now())) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Dispatch '${binding.id}' expired at ${binding.expiresAt}: dispatch again`,
+        invariantRef: "INV §5.1",
+        affectedTarget: binding.id,
+        suggestedAction: "Request a fresh dispatch intent",
+      });
+    }
+    // Revision freshness: the binding authorizes exactly the snapshot
+    // it was claimed against; drift denies until re-dispatch.
+    const module = this.artifacts.findById(binding.moduleId);
+    if (module.revision !== binding.moduleRevision) {
+      throw new ChronoError({
+        code: ErrorCode.STALE_REVISION,
+        severity: Severity.BLOCKER,
+        message: `Dispatch '${binding.id}' binds module revision ${binding.moduleRevision.slice(0, 16)}… but '${binding.moduleId}' is now at ${module.revision.slice(0, 16)}…`,
+        invariantRef: "INV §10.3",
+        affectedTarget: binding.moduleId,
+        suggestedAction: "Dispatch again against the current revisions",
+      });
+    }
+    if (binding.workPackageId !== null) {
+      const wp = this.artifacts.findById(binding.workPackageId);
+      if (binding.workPackageRevision === null || wp.revision !== binding.workPackageRevision) {
+        throw new ChronoError({
+          code: ErrorCode.STALE_REVISION,
+          severity: Severity.BLOCKER,
+          message: `Dispatch '${binding.id}' binds a stale work-package revision`,
+          invariantRef: "INV §10.3",
+          affectedTarget: binding.workPackageId,
+          suggestedAction: "Dispatch again against the current revisions",
+        });
+      }
+      // A bound scope stays actionable through its execution
+      // lifecycle (RUNNING, IMPLEMENTED, VERIFYING, FAILED): advance,
+      // review, correction, and release all ride the same binding.
+      // Terminal (COMPLETE), blocked, and pre-execution states deny;
+      // the transition table governs which event fires from where.
+      if (wp.status === "PLANNED" || wp.status === "AUTHORIZED" || wp.status === "BLOCKED" || wp.status === "COMPLETE") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `WorkPackage '${binding.workPackageId}' is ${wp.status}: no live execution to act inside`,
+          invariantRef: "INV §5.3",
+          affectedTarget: binding.workPackageId,
+          suggestedAction: "Act only while the bound scope is under execution",
+        });
+      }
+    } else if (module.status === "DRAFT" || module.status === "AWAITING_APPROVAL" || module.status === "BLOCKED" || module.status === "COMPLETE") {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Module '${binding.moduleId}' is ${module.status}: no live execution to act inside`,
+        invariantRef: "INV §5.3",
+        affectedTarget: binding.moduleId,
+        suggestedAction: "Act only while the bound scope is under execution",
+      });
+    }
+    for (const specId of Object.keys(binding.specRevisions)) {
+      try {
+        const spec = this.artifacts.findById(specId);
+        if (spec.revision !== binding.specRevisions[specId]) {
+          throw new ChronoError({
+            code: ErrorCode.STALE_REVISION,
+            severity: Severity.BLOCKER,
+            message: `Dispatch '${binding.id}' binds stale Spec '${specId}'`,
+            invariantRef: "INV §10.3",
+            affectedTarget: specId,
+            suggestedAction: "Dispatch again against the current revisions",
+          });
+        }
+      } catch (e) {
+        if (e instanceof ChronoError) {
+          throw e;
+        }
+        throw new ChronoError({
+          code: ErrorCode.REFERENCE_UNRESOLVABLE,
+          severity: Severity.ERROR,
+          message: `Dispatch '${binding.id}' references missing Spec '${specId}'`,
+          invariantRef: "INV §10.2",
+          affectedTarget: specId,
+          suggestedAction: "Dispatch again against resolvable scopes",
+        });
+      }
+    }
+    this.requireCurrentRtk(binding.moduleId, { id: caller.session.id, adapter: caller.session.adapter, runtime: caller.session.runtime }, null);
+    this.requireCurrentSkill(binding.moduleId);
+    this.denyIfBlocked(binding.workPackageId ?? binding.moduleId);
+    this.denyIfBlocked(binding.moduleId);
+    return {
+      id: binding.id,
+      moduleId: binding.moduleId,
+      workPackageId: binding.workPackageId,
+      role: this.dispatchWorkerRole(binding) ?? binding.role,
+      moduleRevision: binding.moduleRevision,
+      workPackageRevision: binding.workPackageRevision,
+    };
   }
 
   /**
@@ -6002,6 +7354,633 @@ export class ChronoCore {
   }
 
   /**
+   * Project rigor policy, read-only. Unset projects evaluate at
+   * `standard`: the documented default. Explicit `lean` always comes
+   * from a recorded PO/gaspar calibration (see setPolicyProfile).
+   */
+  projectProfile(): PolicyProfile {
+    const row = this.db.projectPolicy().get();
+    if (row === null) {
+      return "standard";
+    }
+    return this.parseProfile(row.profile, "policy");
+  }
+
+  /** Raw policy row (null when never calibrated). */
+  describePolicy(): { profile: string; rationale: string; updatedBy: string; updatedAt: string; signed: boolean } | null {
+    const row = this.db.projectPolicy().get();
+    if (row === null) {
+      return null;
+    }
+    return {
+      profile: row.profile,
+      rationale: row.rationale,
+      updatedBy: row.updatedBy,
+      updatedAt: row.updatedAt,
+      signed: row.signature !== null,
+    };
+  }
+
+  private parseProfile(value: string, target: string): PolicyProfile {
+    if (value !== "lean" && value !== "standard" && value !== "critical") {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: `Unknown rigor profile '${value}': use lean, standard, or critical`,
+        invariantRef: "INV §14.4",
+        affectedTarget: target,
+        suggestedAction: "Select a PO-approved rigor profile",
+      });
+    }
+    return value;
+  }
+
+  /**
+   * Set the project rigor profile. Initial calibration (no stored
+   * policy) and raising rigor need gaspar/PO plus rationale; LOWERING
+   * rigor needs a PO session AND a valid signature over the canonical
+   * policy payload with a timestamp newer than the stored policy, so
+   * a captured downgrade can never re-apply after rigor was raised.
+   * Agents may propose but never silently downgrade.
+   */
+  setPolicyProfile(
+    input: { profile: string; rationale: string; signature?: string | undefined; timestamp?: string | undefined },
+    auth: CallerAuth
+  ): CoreResult<{ profile: PolicyProfile; downgraded: boolean }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const caller = this.resolveCaller(auth, "set policy profile");
+      this.requireCapability("policy.set", caller);
+      const profile = this.parseProfile(input.profile, "policy");
+      const rationale = input.rationale.trim();
+      if (rationale.length === 0 || rationale.length > 500) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Policy change requires a rationale of 1 to 500 characters",
+          invariantRef: "INV §14.4",
+          affectedTarget: "policy",
+          suggestedAction: "State why this rigor level applies",
+        });
+      }
+      const current = this.db.projectPolicy().get();
+      let downgraded = false;
+      let signature: string | null = null;
+      if (current !== null) {
+        const currentProfile = this.parseProfile(current.profile, "policy");
+        if (currentProfile === profile) {
+          return { ok: true, value: { profile, downgraded: false } };
+        }
+        if (isProfileDowngrade(currentProfile, profile)) {
+          downgraded = true;
+          if (caller.kind !== "po") {
+            throw new ChronoError({
+              code: ErrorCode.EXECUTION_DENIED,
+              severity: Severity.BLOCKER,
+              message: `Lowering rigor from '${currentProfile}' to '${profile}' requires an explicit signed PO policy decision`,
+              invariantRef: "INV §5.1",
+              affectedTarget: "policy",
+              suggestedAction: "Record the downgrade with a PO signature over the policy payload",
+            });
+          }
+          if (input.signature === undefined || input.signature.length === 0 || input.timestamp === undefined) {
+            throw new ChronoError({
+              code: ErrorCode.SIGNATURE_INVALID,
+              severity: Severity.ERROR,
+              message: "Policy downgrade requires a PO signature and timestamp",
+              invariantRef: "INV §4.3",
+              affectedTarget: "policy",
+              suggestedAction: "Sign the canonical policy payload with the enrolled PO key",
+            });
+          }
+          this.assertFreshTimestamp(input.timestamp, "policy");
+          if (Date.parse(input.timestamp) <= Date.parse(current.updatedAt)) {
+            throw new ChronoError({
+              code: ErrorCode.SIGNATURE_INVALID,
+              severity: Severity.ERROR,
+              message: "Policy signature predates the stored policy: replay denied",
+              invariantRef: "INV §4.3",
+              affectedTarget: "policy",
+              suggestedAction: "Sign a fresh policy payload",
+            });
+          }
+          this.verifySignatureOrThrow(
+            buildPolicyPayload({ profile, rationale, timestamp: input.timestamp }),
+            input.signature,
+            "policy"
+          );
+          signature = input.signature;
+        }
+      }
+      const stored = this.db.projectPolicy().set({
+        profile,
+        rationale,
+        updatedBy: `${caller.role}:${caller.session.id}`,
+        signature,
+        updatedAt: this.now(),
+      });
+      this.events.append({
+        eventType: "PolicyUpdated",
+        entityId: "policy",
+        payload: { profile, rationale, downgraded, signed: signature !== null },
+        actor: caller.auditActor,
+        priorState: current?.profile,
+        newState: profile,
+        reasoning: downgraded ? "PO-signed rigor downgrade" : "Rigor calibration",
+      });
+      void stored;
+      return { ok: true, value: { profile, downgraded } };
+    } catch (e) {
+      this.auditDenial("policy", "PolicySet", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Deterministic content risk for a module scope: classifies the
+   * module plus every module Spec's registered content. Pure function
+   * of persisted content — identical content always yields identical
+   * triggers, so no agent can suppress an escalation.
+   */
+  contentRiskFor(moduleId: string, specIds: string[]): { triggers: RiskTrigger[]; requiredProfile: PolicyProfile } {
+    const texts: string[] = [];
+    try {
+      texts.push(JSON.stringify(this.registrationContent(moduleId)));
+    } catch {
+      // Missing content denies downstream; risk evaluation stays total.
+    }
+    for (const specId of specIds) {
+      try {
+        texts.push(JSON.stringify(this.registrationContent(specId)));
+      } catch {
+        continue;
+      }
+    }
+    return classifyContentRisk(texts);
+  }
+
+  /** Effective rigor: project policy, content risk, and proposal compete by maximum. */
+  effectiveProfileFor(moduleId: string, proposed?: PolicyProfile): { profile: PolicyProfile; base: PolicyProfile; triggers: string[]; escalated: boolean } {
+    const base = this.projectProfile();
+    const specIds = this.moduleSpecIds(moduleId);
+    const { triggers, requiredProfile } = this.contentRiskFor(moduleId, specIds);
+    const profile = maxProfile(base, requiredProfile, proposed ?? "lean");
+    return {
+      profile,
+      base,
+      triggers: triggers.map((t) => t.key),
+      escalated: profileRank(requiredProfile) > profileRank(base),
+    };
+  }
+
+  /**
+   * Open correction loop lookup for correction binding. With an
+   * explicit defect (claim time) the loop is that defect's single
+   * OPEN loop; without one (request time) it is the scope's single
+   * OPEN loop, so the request binds `correctionOf` up front.
+   * Correction dispatches never proceed without their loop.
+   */
+  private requireOpenCorrectionLoop(moduleId: string, workPackageId: string | null, defectId: string | null): CorrectionRecord {
+    if (defectId !== null) {
+      const open = this.db.correctionLoops().findOpenByDefect(defectId);
+      if (open.length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Defect '${defectId}' has no open correction loop: open one before dispatching correction`,
+          invariantRef: "INV §5.1",
+          affectedTarget: defectId,
+          suggestedAction: "Open a correction loop for the defect first",
+        });
+      }
+      return open[0]!;
+    }
+    const scoped = this.db.correctionLoops().listByScope(moduleId, workPackageId)
+      .filter((l) => l.status === "OPEN" || l.status === "CORRECTING");
+    if (scoped.length === 0) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: "Scope has no open correction loop: open one for the defect before dispatching correction",
+        invariantRef: "INV §5.1",
+        affectedTarget: workPackageId ?? moduleId,
+        suggestedAction: "Open a correction loop for the defect first",
+      });
+    }
+    if (scoped.length > 1) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: "Scope has several open correction loops: resolve to one defect before dispatching correction",
+        invariantRef: "INV §5.1",
+        affectedTarget: workPackageId ?? moduleId,
+        suggestedAction: "Complete or escalate loops until one remains",
+      });
+    }
+    return scoped[0]!;
+  }
+
+  /**
+   * Assign a distinct review (CF-5): security-review binds Glenn,
+   * verification binds Spekkio. Kinds are never interchangeable, and
+   * at most one open assignment exists per (kind, scope, revision) —
+   * enforced by partial unique index. Gaspar/PO assign; the reviewer
+   * completes from their own session with evidence (Glenn) or a
+   * verdict (Spekkio), independent of the implementer session.
+   */
+  assignReview(
+    input: { kind: string; moduleId: string; workPackageId?: string | undefined },
+    auth: CallerAuth
+  ): CoreResult<{ reviewId: string; kind: string; reviewerRole: string }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const caller = this.resolveCaller(auth, "assign review");
+      this.requireCapability("review.assign", caller);
+      if (input.kind !== "security-review" && input.kind !== "verification") {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Unknown review kind '${input.kind}': use security-review or verification`,
+          invariantRef: "INV §14.4",
+          affectedTarget: input.moduleId,
+          suggestedAction: "Assign the review kind matching the required independence",
+        });
+      }
+      const reviewerRole = input.kind === "security-review" ? "glenn" : "spekkio";
+      const scopeId = input.workPackageId ?? input.moduleId;
+      const scope = this.artifacts.findById(scopeId);
+      if (input.workPackageId !== undefined) {
+        if (scope.type !== "WP" || this.workPackageModule(input.workPackageId) !== input.moduleId) {
+          throw new ChronoError({
+            code: ErrorCode.INCONSISTENT_REFERENCE,
+            severity: Severity.ERROR,
+            message: `WorkPackage '${input.workPackageId}' does not belong to Module '${input.moduleId}'`,
+            invariantRef: "INV §10.2",
+            affectedTarget: input.workPackageId,
+            suggestedAction: "Assign reviews inside one module scope",
+          });
+        }
+      } else if (scope.type !== "MOD") {
+        throw new ChronoError({
+          code: ErrorCode.INCONSISTENT_REFERENCE,
+          severity: Severity.ERROR,
+          message: `Review scope '${input.moduleId}' is not a Module`,
+          invariantRef: "INV §10.2",
+          affectedTarget: input.moduleId,
+          suggestedAction: "Assign reviews to a Module or Work Package",
+        });
+      }
+      this.assertSessionScope(caller, { moduleId: input.moduleId, workPackageId: input.workPackageId ?? null }, "assign review");
+      const reviewId = this.sequences.allocate("REV");
+      this.db.reviewAssignments().create({
+        id: reviewId,
+        kind: input.kind,
+        moduleId: input.moduleId,
+        workPackageId: input.workPackageId ?? null,
+        targetRevision: scope.revision,
+        reviewerRole,
+        createdAt: this.now(),
+      });
+      this.events.append({
+        eventType: "ReviewAssigned",
+        entityId: reviewId,
+        payload: { kind: input.kind, scope: scopeId, targetRevision: scope.revision, reviewerRole },
+        actor: caller.auditActor,
+        priorState: undefined,
+        newState: "ASSIGNED",
+        reasoning: "Distinct review dispatch target assigned",
+      });
+      return { ok: true, value: { reviewId, kind: input.kind, reviewerRole } };
+    } catch (e) {
+      if (e instanceof ChronoError && e.code === ErrorCode.DUPLICATE_IDENTITY) {
+        return this.handleError(e);
+      }
+      this.auditDenial(input.moduleId, "ReviewAssign", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Complete a review from the reviewer's own session. Glenn must show
+   * current Glenn evidence bound to the target revision; Spekkio must
+   * show a recorded verdict bound to it. The reviewer session must
+   * differ from every ACTIVE implementer session on the scope
+   * (independence); the target revision must still be current, else
+   * the assignment supersedes and the reviewer re-reviews.
+   */
+  completeReview(
+    input: { reviewId: string },
+    auth: CallerAuth
+  ): CoreResult<{ reviewId: string; status: string }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const caller = this.resolveCaller(auth, "complete review");
+      this.requireCapability("review.complete", caller);
+      const review = this.db.reviewAssignments().findById(input.reviewId);
+      if (review.status !== "ASSIGNED") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Review '${input.reviewId}' is '${review.status}', not ASSIGNED: replay denied`,
+          invariantRef: "INV §5.1",
+          affectedTarget: input.reviewId,
+          suggestedAction: "Complete each assigned review exactly once",
+        });
+      }
+      if (caller.role !== review.reviewerRole) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `'${review.kind}' review '${input.reviewId}' belongs to '${review.reviewerRole}', not '${caller.role}': reviewer impersonation denied`,
+          invariantRef: "INV §5.1",
+          affectedTarget: input.reviewId,
+          suggestedAction: "Complete the review as the assigned reviewer role",
+        });
+      }
+      const scopeId = review.workPackageId ?? review.moduleId;
+      const scope = this.artifacts.findById(scopeId);
+      if (scope.revision !== review.targetRevision) {
+        this.db.reviewAssignments().supersede(review.id);
+        throw new ChronoError({
+          code: ErrorCode.STALE_REVISION,
+          severity: Severity.BLOCKER,
+          message: `Review '${input.reviewId}' targeted revision ${review.targetRevision.slice(0, 16)}… but scope is now at ${scope.revision.slice(0, 16)}…: assignment superseded`,
+          invariantRef: "INV §10.3",
+          affectedTarget: scopeId,
+          suggestedAction: "Assign a fresh review against the current revision",
+        });
+      }
+      // Independence: the reviewer session must differ from every
+      // ACTIVE implementer/test/correction session bound to the scope.
+      for (const dispatch of this.db.dispatches().listByScope(review.moduleId, review.workPackageId)) {
+        if (
+          dispatch.status === "ACTIVE" &&
+          (dispatch.kind === "implementation" || dispatch.kind === "test" || dispatch.kind === "correction") &&
+          dispatch.workerSession !== null &&
+          dispatch.workerSession === caller.session.id
+        ) {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Reviewer session '${caller.session.id}' implemented this scope: independent review requires a different session`,
+            invariantRef: "INV §5.1",
+            affectedTarget: input.reviewId,
+            suggestedAction: "Review from a session that did not implement the scope",
+          });
+        }
+      }
+      if (review.kind === "security-review") {
+        const current = this.db.evidence().findCurrentByTargetRevision(review.targetRevision);
+        if (!current.some((e) => e.producer === "glenn")) {
+          throw new ChronoError({
+            code: ErrorCode.SECURITY_EVIDENCE_MISSING,
+            severity: Severity.BLOCKER,
+            message: `No current Glenn evidence bound to revision ${review.targetRevision.slice(0, 16)}…`,
+            invariantRef: "INV §7.6",
+            affectedTarget: scopeId,
+            suggestedAction: "Record Glenn security evidence for the exact revision first",
+          });
+        }
+      } else {
+        const reports = review.workPackageId === null
+          ? this.qa.listByModule(review.moduleId)
+          : this.qa.listByWorkPackage(review.workPackageId);
+        const bound = reports.filter((r) => {
+          const rev = review.workPackageId === null ? r.moduleRevision : r.workPackageRevision;
+          return rev === review.targetRevision;
+        });
+        if (bound.length === 0) {
+          throw new ChronoError({
+            code: ErrorCode.EVIDENCE_MISSING,
+            severity: Severity.BLOCKER,
+            message: `No verification verdict bound to revision ${review.targetRevision.slice(0, 16)}…`,
+            invariantRef: "INV §11.3",
+            affectedTarget: scopeId,
+            suggestedAction: "Record the Spekkio verdict for the exact revision first",
+          });
+        }
+      }
+      const completed = this.db.reviewAssignments().complete(review.id, caller.session.id, null, this.now());
+      this.events.append({
+        eventType: "ReviewSubmitted",
+        entityId: review.id,
+        payload: { kind: review.kind, scope: scopeId, targetRevision: review.targetRevision },
+        actor: caller.auditActor,
+        priorState: "ASSIGNED",
+        newState: "SUBMITTED",
+        reasoning: "Independent review submitted with bound evidence",
+      });
+      void completed;
+      return { ok: true, value: { reviewId: review.id, status: "SUBMITTED" } };
+    } catch (e) {
+      this.auditDenial(input.reviewId, "ReviewComplete", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Open a bounded correction loop for an open defect (CF-6).
+   * Attempt counts prior loops for the same defect; exceeding the
+   * effective profile's bound escalates immediately with a blocker
+   * instead of looping forever. At most one open loop per defect.
+   */
+  openCorrectionLoop(
+    defectId: string,
+    auth: CallerAuth
+  ): CoreResult<{ loopId: string; owner: string; attempt: number; maxAttempts: number; escalated: boolean }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const caller = this.resolveCaller(auth, "open correction loop");
+      this.requireCapability("correction.open", caller);
+      const defect = this.db.defects().findById(defectId);
+      if (defect.status === "resolved") {
+        throw new ChronoError({
+          code: ErrorCode.INVALID_STATE,
+          severity: Severity.ERROR,
+          message: `Defect '${defectId}' is already resolved: no correction loop applies`,
+          invariantRef: "INV §3.1",
+          affectedTarget: defectId,
+          suggestedAction: "Raise a new defect for any fresh finding",
+        });
+      }
+      if (this.db.correctionLoops().findOpenByDefect(defectId).length > 0) {
+        throw new ChronoError({
+          code: ErrorCode.DUPLICATE_IDENTITY,
+          severity: Severity.ERROR,
+          message: `Defect '${defectId}' already has an open correction loop`,
+          invariantRef: "INV §10.1",
+          affectedTarget: defectId,
+          suggestedAction: "Advance the open loop instead of reopening it",
+        });
+      }
+      // Scope: blocking scope when it names an artifact, else the
+      // first affected artifact's owning module.
+      const scopeId = defect.blockingScope ?? defect.affectedArtifacts[0];
+      if (scopeId === undefined || scopeId === null || scopeId.length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Defect '${defectId}' names no correctable scope`,
+          invariantRef: "INV §14.4",
+          affectedTarget: defectId,
+          suggestedAction: "Raise defects against concrete artifacts",
+        });
+      }
+      const scopeArtifact = this.artifacts.findById(scopeId);
+      const moduleId = scopeArtifact.type === "MOD" ? scopeId : this.artifactScopeModule(scopeId);
+      if (moduleId === null) {
+        throw new ChronoError({
+          code: ErrorCode.REFERENCE_UNRESOLVABLE,
+          severity: Severity.ERROR,
+          message: `Defect '${defectId}' scope '${scopeId}' resolves to no module`,
+          invariantRef: "INV §10.2",
+          affectedTarget: defectId,
+          suggestedAction: "Scope defects to module-owned artifacts",
+        });
+      }
+      const workPackageId = scopeArtifact.type === "WP" ? scopeId : null;
+      const affectedRevision = scopeArtifact.revision;
+      const prior = this.db.correctionLoops().listByScope(moduleId, workPackageId).filter((l) => l.defectId === defectId);
+      const attempt = prior.length + 1;
+      const effective = this.effectiveProfileFor(moduleId);
+      const maxAttempts = CORRECTION_MAX_ATTEMPTS[effective.profile];
+      const loopId = this.sequences.allocate("COR");
+      this.db.correctionLoops().create({
+        id: loopId,
+        defectId,
+        moduleId,
+        workPackageId,
+        affectedRevision,
+        ownerRole: defect.owner,
+        attempt,
+        maxAttempts,
+        createdAt: this.now(),
+      });
+      this.events.append({
+        eventType: "CorrectionOpened",
+        entityId: loopId,
+        payload: { defectId, owner: defect.owner, attempt, maxAttempts, affectedRevision },
+        actor: caller.auditActor,
+        priorState: undefined,
+        newState: "OPEN",
+        reasoning: "Bounded correction loop opened for the defect",
+      });
+      if (attempt > maxAttempts) {
+        return this.escalateCorrectionLoop(loopId, caller, defect, moduleId, attempt, maxAttempts);
+      }
+      return { ok: true, value: { loopId, owner: defect.owner, attempt, maxAttempts, escalated: false } };
+    } catch (e) {
+      this.auditDenial(defectId, "CorrectionOpen", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /** Terminal escalation: loop ESCALATED plus a PO-owned product blocker. */
+  private escalateCorrectionLoop(
+    loopId: string,
+    caller: { auditActor: string },
+    defect: { id: string },
+    moduleId: string,
+    attempt: number,
+    maxAttempts: number
+  ): CoreResult<{ loopId: string; owner: string; attempt: number; maxAttempts: number; escalated: boolean }> {
+    const now = this.now();
+    const updated = this.db.correctionLoops().findById(loopId);
+    if (updated.status === "OPEN" || updated.status === "CORRECTING" || updated.status === "REVERIFY") {
+      this.db.correctionLoops().escalate(loopId, now);
+    }
+    const blockerId = this.sequences.allocate("BLK");
+    this.db.blockers().create({
+      id: blockerId,
+      type: "PRODUCT_BLOCKER",
+      issuer: caller.auditActor,
+      issuerRole: "system",
+      issuerSession: null,
+      targetIds: [moduleId],
+      reason: `Correction loop '${loopId}' for defect '${defect.id}' exceeded ${maxAttempts} attempts (attempt ${attempt}): PO decision required`,
+      evidenceRefs: [],
+    });
+    this.events.append({
+      eventType: "CorrectionEscalated",
+      entityId: loopId,
+      payload: { defectId: defect.id, attempt, maxAttempts, blockerId },
+      actor: caller.auditActor,
+      priorState: updated.status,
+      newState: "ESCALATED",
+      reasoning: "Bounded retry exhausted: escalated with a product blocker",
+    });
+    const owner = this.db.correctionLoops().findById(loopId).ownerRole;
+    return { ok: true, value: { loopId, owner, attempt, maxAttempts, escalated: true } };
+  }
+
+  /**
+   * Complete correction work (owner or PO): requires owner evidence
+   * recorded after the loop opened, then invalidates every other
+   * current evidence row for the affected revision so Lucca/Glenn
+   * refresh and Spekkio re-verifies against current proof only.
+   */
+  completeCorrectionLoop(
+    loopId: string,
+    auth: CallerAuth
+  ): CoreResult<{ loopId: string; status: string; invalidatedEvidence: number }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const caller = this.resolveCaller(auth, "complete correction loop");
+      const loop = this.db.correctionLoops().findById(loopId);
+      if (caller.role !== loop.ownerRole && caller.role !== "PO") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Correction loop '${loopId}' is owned by '${loop.ownerRole}': completion by '${caller.role}' denied`,
+          invariantRef: "INV §5.1",
+          affectedTarget: loopId,
+          suggestedAction: "Complete correction as the responsible owner",
+        });
+      }
+      if (loop.status !== "CORRECTING") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Correction loop '${loopId}' is '${loop.status}', not CORRECTING: bind a correction dispatch first`,
+          invariantRef: "INV §5.1",
+          affectedTarget: loopId,
+          suggestedAction: "Dispatch the correction, evidence the fix, then complete",
+        });
+      }
+      const fresh = this.db.evidence().findCurrentByTargetRevision(loop.affectedRevision);
+      const ownerProof = fresh.some((e) => e.producer === loop.ownerRole && e.timestamp >= loop.createdAt);
+      if (!ownerProof) {
+        throw new ChronoError({
+          code: ErrorCode.EVIDENCE_MISSING,
+          severity: Severity.BLOCKER,
+          message: `Correction loop '${loopId}' has no ${loop.ownerRole} evidence recorded after it opened`,
+          invariantRef: "INV §11.3",
+          affectedTarget: loopId,
+          suggestedAction: "Record evidence of the fix before completing correction",
+        });
+      }
+      // Invalidate everything else bound to the affected revision:
+      // pre-correction proof must not satisfy later gates. The fix
+      // evidence recorded inside the correction window survives.
+      const invalidated = this.db.evidence().markStaleExcept(loop.affectedRevision, loop.ownerRole, loop.createdAt);
+      const advanced = this.db.correctionLoops().markReverify(loopId);
+      this.events.append({
+        eventType: "CorrectionCompleted",
+        entityId: loopId,
+        payload: { invalidatedEvidence: invalidated },
+        actor: caller.auditActor,
+        priorState: "CORRECTING",
+        newState: advanced.status,
+        reasoning: "Fix evidenced; pre-correction proof invalidated; re-verification required",
+      });
+      return { ok: true, value: { loopId, status: advanced.status, invalidatedEvidence: invalidated } };
+    } catch (e) {
+      this.auditDenial(loopId, "CorrectionComplete", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
    * The assigned role bound into a dispatch grant. Implementation work
    * assigns belthazar, melchior, prometheus, or lucca; independent
    * verification steps assign spekkio (the verdict author enacts its own
@@ -6009,11 +7988,11 @@ export class ChronoCore {
    * the human PO never take assigned work.
    */
   private requireAssignedRole(role: string, moduleId: string): string {
-    if (!["belthazar", "melchior", "prometheus", "lucca", "spekkio"].includes(role)) {
+    if (!["belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio"].includes(role)) {
       throw new ChronoError({
         code: ErrorCode.VALIDATION_ERROR,
         severity: Severity.ERROR,
-        message: `Invalid assignment role '${role}' for '${moduleId}': dispatched work assigns belthazar, melchior, prometheus, lucca, or spekkio (verification only)`,
+        message: `Invalid assignment role '${role}' for '${moduleId}': dispatched work assigns belthazar, melchior, prometheus, lucca, glenn (security-review only), or spekkio (verification only)`,
         invariantRef: "INV §14.4",
         affectedTarget: moduleId,
         suggestedAction: "Assign dispatched work to a capable role",
@@ -6268,8 +8247,15 @@ export class ChronoCore {
     return owned;
   }
 
-  /** Authorize one Work Package scope: ownership, state, deps, blockers. */
-  private authorizeWorkPackageScope(moduleId: string, wpId: string): void {
+  /**
+   * Authorize one Work Package scope: ownership, deps, blockers, and
+   * kind-fitting state. Implementation and test work starts positioned
+   * scopes (AUTHORIZED/RUNNING); reviews, verification, and correction
+   * address positioned work (IMPLEMENTED/VERIFYING/FAILED). Kinds are
+   * never interchangeable: a review dispatch cannot start unpositioned
+   * work, and implementation cannot re-enter verification.
+   */
+  private authorizeWorkPackageScope(moduleId: string, wpId: string, kind?: string): void {
     let wp: { id: string; status: string };
     try {
       wp = this.artifacts.findById(wpId);
@@ -6293,14 +8279,19 @@ export class ChronoCore {
         suggestedAction: "Scope execution to a Work Package of this Module",
       });
     }
-    if (wp.status !== "AUTHORIZED" && wp.status !== "RUNNING") {
+    const positioned = wp.status === "AUTHORIZED" || wp.status === "RUNNING";
+    const worked = wp.status === "IMPLEMENTED" || wp.status === "VERIFYING" || wp.status === "FAILED";
+    const fits = kind === "security-review" || kind === "verification" || kind === "correction" ? worked : positioned;
+    if (!fits) {
       throw new ChronoError({
         code: ErrorCode.EXECUTION_DENIED,
         severity: Severity.BLOCKER,
-        message: `WorkPackage '${wpId}' is ${wp.status}, not AUTHORIZED or RUNNING`,
+        message: `WorkPackage '${wpId}' is ${wp.status}: '${kind ?? "implementation"}' dispatches ${kind === "security-review" || kind === "verification" || kind === "correction" ? "require IMPLEMENTED, VERIFYING, or FAILED work" : "require an AUTHORIZED or RUNNING package"}`,
         invariantRef: "INV §5.3",
         affectedTarget: wpId,
-        suggestedAction: "Authorize the Work Package before dispatching it",
+        suggestedAction: kind === "security-review" || kind === "verification" || kind === "correction"
+          ? "Position the work first, then dispatch its review or correction"
+          : "Authorize the Work Package before dispatching it",
       });
     }
     for (const dep of this.readDependsOn(wpId)) {
@@ -6397,37 +8388,88 @@ export class ChronoCore {
         });
       }
 
-      const evidence = this.db.evidence().findByTargetRevision(moduleArtifact.revision);
-      if (!evidence.some((e) => e.producer === "lucca" && e.result === "pass")) {
+      // Profile-proportional evidence (CF-11): lean needs focused
+      // implementation evidence plus the independent PASS above;
+      // standard adds Lucca, Glenn, and Implementation Security
+      // Acceptance; critical adds completed review assignments.
+      const effective = this.effectiveProfileFor(moduleId);
+      const evidence = this.db.evidence().findCurrentByTargetRevision(moduleArtifact.revision);
+      const workerEvidence = evidence.some(
+        (e) => (e.producer === "belthazar" || e.producer === "melchior" || e.producer === "prometheus" || e.producer === "lucca") && e.result === "pass"
+      );
+      if (!workerEvidence) {
         throw new ChronoError({
           code: ErrorCode.EVIDENCE_MISSING,
           severity: Severity.BLOCKER,
-          message: `Module ${moduleId} lacks current Lucca test evidence for this revision`,
+          message: `Module ${moduleId} lacks current implementation evidence for this revision`,
           invariantRef: "INV §11.3, DOM §6.6",
           affectedTarget: moduleId,
-          suggestedAction: "Record Lucca evidence before completion",
+          suggestedAction: "Record implementation evidence before completion",
         });
       }
-      if (!evidence.some((e) => e.producer === "glenn")) {
-        throw new ChronoError({
-          code: ErrorCode.SECURITY_EVIDENCE_MISSING,
-          severity: Severity.BLOCKER,
-          message: `Module ${moduleId} lacks current Glenn security evidence for this revision`,
-          invariantRef: "INV §7.6, DOM §6.6",
-          affectedTarget: moduleId,
-          suggestedAction: "Record Glenn security evidence before completion",
-        });
+      if (effective.profile === "standard" || effective.profile === "critical") {
+        if (!evidence.some((e) => e.producer === "lucca" && e.result === "pass")) {
+          throw new ChronoError({
+            code: ErrorCode.EVIDENCE_MISSING,
+            severity: Severity.BLOCKER,
+            message: `Module ${moduleId} lacks current Lucca test evidence for this revision (${effective.profile} profile)`,
+            invariantRef: "INV §11.3, DOM §6.6",
+            affectedTarget: moduleId,
+            suggestedAction: "Record Lucca evidence before completion",
+          });
+        }
+        const security = this.requiresSecurityReview(moduleId, effective.profile);
+        if (security.required) {
+          if (!evidence.some((e) => e.producer === "glenn")) {
+            throw new ChronoError({
+              code: ErrorCode.SECURITY_EVIDENCE_MISSING,
+              severity: Severity.BLOCKER,
+              message: `Module ${moduleId} lacks current Glenn security evidence for this revision (${security.reason})`,
+              invariantRef: "INV §7.6, DOM §6.6",
+              affectedTarget: moduleId,
+              suggestedAction: "Record Glenn security evidence before completion",
+            });
+          }
+          if (!this.hasValidApproval(moduleId, moduleArtifact.revision, "implementation-security")) {
+            throw new ChronoError({
+              code: ErrorCode.APPROVAL_REQUIRED,
+              severity: Severity.BLOCKER,
+              message: `Module ${moduleId} lacks a current Implementation Security Acceptance`,
+              invariantRef: "INV §7.2",
+              affectedTarget: moduleId,
+              suggestedAction: "Record the implementation-security decision for this revision",
+            });
+          }
+        }
       }
-
-      if (!this.hasValidApproval(moduleId, moduleArtifact.revision, "implementation-security")) {
-        throw new ChronoError({
-          code: ErrorCode.APPROVAL_REQUIRED,
-          severity: Severity.BLOCKER,
-          message: `Module ${moduleId} lacks a current Implementation Security Acceptance`,
-          invariantRef: "INV §7.2",
-          affectedTarget: moduleId,
-          suggestedAction: "Record the implementation-security decision for this revision",
-        });
+      if (effective.profile === "critical") {
+        const reviews = this.db.reviewAssignments().listByScope(moduleId, null);
+        const securityDone = reviews.some(
+          (r) => r.kind === "security-review" && r.status === "SUBMITTED" && r.targetRevision === moduleArtifact.revision
+        );
+        if (!securityDone) {
+          throw new ChronoError({
+            code: ErrorCode.SECURITY_EVIDENCE_MISSING,
+            severity: Severity.BLOCKER,
+            message: `Module ${moduleId} lacks a completed security review for this revision (critical profile)`,
+            invariantRef: "INV §7.6",
+            affectedTarget: moduleId,
+            suggestedAction: "Assign and complete an explicit Glenn security review",
+          });
+        }
+        const verificationDone = reviews.some(
+          (r) => r.kind === "verification" && r.status === "SUBMITTED" && r.targetRevision === moduleArtifact.revision
+        );
+        if (!verificationDone) {
+          throw new ChronoError({
+            code: ErrorCode.COMPLETION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Module ${moduleId} lacks a completed verification assignment for this revision (critical profile)`,
+            invariantRef: "INV §5.6",
+            affectedTarget: moduleId,
+            suggestedAction: "Assign and complete an explicit Spekkio verification review",
+          });
+        }
       }
 
       for (const defect of this.db.defects().listAll()) {
@@ -6442,6 +8484,21 @@ export class ChronoCore {
             invariantRef: "INV §5.6",
             affectedTarget: moduleId,
             suggestedAction: "Correct the defect and re-verify",
+          });
+        }
+      }
+      // Open correction loops own their defects until evidenced fix
+      // plus re-verification: completing around them is denied.
+      for (const wpId of this.moduleWorkPackages(moduleId)) {
+        const loops = this.db.correctionLoops().listByScope(moduleId, wpId);
+        if (loops.some((l) => l.status === "OPEN" || l.status === "CORRECTING")) {
+          throw new ChronoError({
+            code: ErrorCode.COMPLETION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Module ${moduleId} has an open correction loop: complete correction and re-verify first`,
+            invariantRef: "INV §5.6",
+            affectedTarget: moduleId,
+            suggestedAction: "Evidence the fix, complete the loop, and record a new verdict",
           });
         }
       }
@@ -6489,7 +8546,8 @@ export class ChronoCore {
     defectIds: string[] = [],
     waiverIds: string[] = [],
     evidenceIds: string[] = [],
-    auth: CallerAuth
+    auth: CallerAuth,
+    workPackageId?: string
   ): CoreResult<{ qaId: string }> {
     try {
       // Verdicts are Spekkio's independent authority, enacted through
@@ -6508,10 +8566,12 @@ export class ChronoCore {
         });
       }
 
-      // The module must exist and be under verification.
+      // The module must exist and be under verification — unless the
+      // verdict binds a Work Package, which carries its own
+      // verification state while the module aggregates (APPROVED).
       const module = this.requireReference(moduleId, "MOD", reviewer);
       const current = this.artifacts.findById(moduleId);
-      if (current.status !== "VERIFYING") {
+      if (workPackageId === undefined && current.status !== "VERIFYING") {
         throw new ChronoError({
           code: ErrorCode.INVALID_STATE,
           severity: Severity.ERROR,
@@ -6520,6 +8580,34 @@ export class ChronoCore {
           affectedTarget: moduleId,
           suggestedAction: "Complete implementation before recording a verdict",
         });
+      }
+      // Optional Work Package binding: the WP must belong to the
+      // module and be under verification, so WP-level verdicts are
+      // as rigorous as module-level ones.
+      let workPackageRevision: string | null = null;
+      if (workPackageId !== undefined) {
+        const wp = this.artifacts.findById(workPackageId);
+        if (wp.type !== "WP" || this.workPackageModule(workPackageId) !== moduleId) {
+          throw new ChronoError({
+            code: ErrorCode.INCONSISTENT_REFERENCE,
+            severity: Severity.ERROR,
+            message: `WorkPackage '${workPackageId}' does not belong to Module '${moduleId}'`,
+            invariantRef: "INV §10.2",
+            affectedTarget: workPackageId,
+            suggestedAction: "Bind verdicts to a Work Package of the reviewed module",
+          });
+        }
+        if (wp.status !== "VERIFYING") {
+          throw new ChronoError({
+            code: ErrorCode.INVALID_STATE,
+            severity: Severity.ERROR,
+            message: `WorkPackage '${workPackageId}' is ${wp.status}, not VERIFYING: no verdict applies`,
+            invariantRef: "INV §3.1",
+            affectedTarget: workPackageId,
+            suggestedAction: "Complete implementation before recording a verdict",
+          });
+        }
+        workPackageRevision = wp.revision;
       }
 
       // FAILED requires at least one existing classified defect [P9.4].
@@ -6630,7 +8718,7 @@ export class ChronoCore {
       this.qa.create({
         id: qaId,
         moduleId,
-        workPackageId: null,
+        workPackageId: workPackageId ?? null,
         verdict,
         reviewedEvidence: evidenceIds,
         defectIds,
@@ -6638,7 +8726,16 @@ export class ChronoCore {
         reviewer,
         timestamp: now,
         moduleRevision: module.revision,
-        workPackageRevision: null,
+        workPackageRevision,
+      });
+      this.progressCorrectionLoops({
+        moduleId,
+        workPackageId: workPackageId ?? null,
+        revision: workPackageRevision ?? module.revision,
+        verdict,
+        defectIds,
+        timestamp: now,
+        auditActor: caller.auditActor,
       });
 
       this.syncProjectState();
@@ -6646,6 +8743,173 @@ export class ChronoCore {
     } catch (e) {
       return this.handleError(e);
     }
+  }
+
+  /**
+   * Verdict-driven correction progression (CF-6): a FAILED verdict
+   * opens (or re-fails) one bounded loop per referenced defect; a
+   * PASS verdict closes every REVERIFY loop for the exact scope and
+   * revision. Loops that exhaust their profile bound escalate with a
+   * product blocker instead of looping forever.
+   */
+  private progressCorrectionLoops(input: {
+    moduleId: string;
+    workPackageId: string | null;
+    revision: string;
+    verdict: "PASS" | "FAILED" | "WAIVED";
+    defectIds: string[];
+    timestamp: string;
+    auditActor: string;
+  }): void {
+    if (input.verdict === "PASS") {
+      const loops = this.db.correctionLoops().listByScope(input.moduleId, input.workPackageId);
+      for (const loop of loops) {
+        if (loop.status === "REVERIFY" && loop.affectedRevision === input.revision) {
+          this.db.correctionLoops().close(loop.id, input.timestamp);
+          this.events.append({
+            eventType: "CorrectionClosed",
+            entityId: loop.id,
+            payload: { defectId: loop.defectId, qaTimestamp: input.timestamp },
+            actor: input.auditActor,
+            priorState: "REVERIFY",
+            newState: "CLOSED",
+            reasoning: "Re-verification passed: correction loop closed",
+          });
+        }
+      }
+      return;
+    }
+    if (input.verdict !== "FAILED") {
+      return;
+    }
+    for (const defectId of input.defectIds) {
+      const open = this.db.correctionLoops().findOpenByDefect(defectId);
+      if (open.length > 0) {
+        for (const loop of open) {
+          if (loop.status !== "REVERIFY") {
+            continue;
+          }
+          const advanced = this.db.correctionLoops().markRefailed(loop.id, input.timestamp);
+          this.events.append({
+            eventType: advanced.status === "ESCALATED" ? "CorrectionEscalated" : "CorrectionRefailed",
+            entityId: loop.id,
+            payload: { defectId, attempt: advanced.attempt, maxAttempts: advanced.maxAttempts },
+            actor: input.auditActor,
+            priorState: "REVERIFY",
+            newState: advanced.status,
+            reasoning: advanced.status === "ESCALATED"
+              ? "Bounded retry exhausted on re-verification failure"
+              : "Re-verification failed: next correction attempt",
+          });
+          if (advanced.status === "ESCALATED") {
+            this.raiseEscalationBlocker(loop, advanced.attempt, advanced.maxAttempts, input.auditActor);
+          }
+        }
+        continue;
+      }
+      this.autoOpenCorrectionLoop(defectId, input.auditActor);
+    }
+  }
+
+  /** Open a loop for a defect with no open loop (bounded, audited). */
+  private autoOpenCorrectionLoop(defectId: string, auditActor: string): void {
+    const defect = this.db.defects().findById(defectId);
+    const scopeId = defect.blockingScope ?? defect.affectedArtifacts[0];
+    if (scopeId === undefined || scopeId === null || scopeId.length === 0) {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: `Defect '${defectId}' names no correctable scope`,
+        invariantRef: "INV §14.4",
+        affectedTarget: defectId,
+        suggestedAction: "Raise defects against concrete artifacts",
+      });
+    }
+    const scopeArtifact = this.artifacts.findById(scopeId);
+    const moduleId = scopeArtifact.type === "MOD" ? scopeId : this.artifactScopeModule(scopeId);
+    if (moduleId === null) {
+      throw new ChronoError({
+        code: ErrorCode.REFERENCE_UNRESOLVABLE,
+        severity: Severity.ERROR,
+        message: `Defect '${defectId}' scope '${scopeId}' resolves to no module`,
+        invariantRef: "INV §10.2",
+        affectedTarget: defectId,
+        suggestedAction: "Scope defects to module-owned artifacts",
+      });
+    }
+    const workPackageId = scopeArtifact.type === "WP" ? scopeId : null;
+    const prior = this.db.correctionLoops().listByScope(moduleId, workPackageId).filter((l) => l.defectId === defectId);
+    const attempt = prior.length + 1;
+    const maxAttempts = CORRECTION_MAX_ATTEMPTS[this.effectiveProfileFor(moduleId).profile];
+    const loopId = this.sequences.allocate("COR");
+    this.db.correctionLoops().create({
+      id: loopId,
+      defectId,
+      moduleId,
+      workPackageId,
+      affectedRevision: scopeArtifact.revision,
+      ownerRole: defect.owner,
+      attempt,
+      maxAttempts,
+      createdAt: this.now(),
+    });
+    this.events.append({
+      eventType: "CorrectionOpened",
+      entityId: loopId,
+      payload: { defectId, owner: defect.owner, attempt, maxAttempts, affectedRevision: scopeArtifact.revision },
+      actor: auditActor,
+      priorState: undefined,
+      newState: "OPEN",
+      reasoning: "Bounded correction loop opened for the defect",
+    });
+    if (attempt > maxAttempts) {
+      const escalated = this.db.correctionLoops().escalate(loopId, this.now());
+      void escalated;
+      this.raiseEscalationBlocker(
+        { id: loopId, defectId, moduleId, ownerRole: defect.owner, attempt, maxAttempts },
+        attempt,
+        maxAttempts,
+        auditActor
+      );
+      this.events.append({
+        eventType: "CorrectionEscalated",
+        entityId: loopId,
+        payload: { defectId, attempt, maxAttempts },
+        actor: auditActor,
+        priorState: "OPEN",
+        newState: "ESCALATED",
+        reasoning: "Attempt bound already exceeded on open: escalated immediately",
+      });
+    }
+  }
+
+  /** Terminal escalation blocker owned by the PO decision that clears it. */
+  private raiseEscalationBlocker(
+    loop: { id: string; defectId: string; moduleId: string; ownerRole: string; attempt: number; maxAttempts: number },
+    attempt: number,
+    maxAttempts: number,
+    auditActor: string
+  ): void {
+    const blockerId = this.sequences.allocate("BLK");
+    this.db.blockers().create({
+      id: blockerId,
+      type: "PRODUCT_BLOCKER",
+      issuer: auditActor,
+      issuerRole: "system",
+      issuerSession: null,
+      targetIds: [loop.moduleId],
+      reason: `Correction loop '${loop.id}' for defect '${loop.defectId}' exceeded ${maxAttempts} attempts (attempt ${attempt}): PO decision required`,
+      evidenceRefs: [],
+    });
+    this.events.append({
+      eventType: "BlockerRaised",
+      entityId: blockerId,
+      payload: { type: "PRODUCT_BLOCKER", loopId: loop.id },
+      actor: auditActor,
+      priorState: undefined,
+      newState: "active",
+      reasoning: "Bounded correction retry exhausted",
+    });
   }
 
   /**
@@ -6749,11 +9013,170 @@ export class ChronoCore {
    * grant can never be consumed by an orchestrator session [CORE §7.6,
    * DOM §6.6].
    */
+  /**
+   * Aggregate completion authorization for a module whose Work Packages
+   * are all COMPLETE (CF-7): the module's implementation IS its
+   * packages, each proven through its own verdict chain. Module-level
+   * gates (traceability, architecture, blockers, defects, currency)
+   * still hold; per-revision verdict/evidence gates do not repeat at
+   * module scope.
+   */
+  private authorizeAggregateCompletion(moduleId: string, workPackageIds: string[], auth: CallerAuth): CoreResult<boolean> {
+    try {
+      const caller = this.resolveCaller(auth, "authorize aggregate completion");
+      this.requireCapability("completion.request", caller);
+      this.assertSessionScope(caller, { moduleId, workPackageId: null }, "authorize aggregate completion");
+      const incomplete = workPackageIds.filter((id) => {
+        try {
+          return this.artifacts.findById(id).status !== "COMPLETE";
+        } catch {
+          return true;
+        }
+      });
+      if (incomplete.length > 0) {
+        throw new ChronoError({
+          code: ErrorCode.COMPLETION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Module ${moduleId}: Work Packages not complete: ${incomplete.join(", ")}`,
+          invariantRef: "INV §5.6",
+          affectedTarget: moduleId,
+          suggestedAction: "Complete every Work Package before completing the module",
+        });
+      }
+      for (const specId of this.moduleSpecIds(moduleId)) {
+        const spec = this.artifacts.findById(specId);
+        if (spec.status !== "READY") {
+          throw new ChronoError({
+            code: ErrorCode.COMPLETION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Module ${moduleId}: Spec '${specId}' is ${spec.status}, traceability broken`,
+            invariantRef: "INV §10.5",
+            affectedTarget: moduleId,
+            suggestedAction: "Restore the approved Spec chain before completion",
+          });
+        }
+      }
+      const scopes = [moduleId, ...workPackageIds];
+      const activeBlockers = this.blockers.findActive(scopes);
+      const otherBlockers = activeBlockers.filter((b) => b.type !== "SECURITY_BLOCKER");
+      if (otherBlockers.length > 0) {
+        throw new ChronoError({
+          code: ErrorCode.COMPLETION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Active blockers prevent completion: ${otherBlockers.map((b) => b.reason).join(", ")}`,
+          invariantRef: "INV §5.6, DOM §6.6",
+          affectedTarget: moduleId,
+          suggestedAction: "Resolve all active blockers",
+        });
+      }
+      const moduleArtifact = this.artifacts.findById(moduleId);
+      for (const blocker of activeBlockers.filter((b) => b.type === "SECURITY_BLOCKER")) {
+        const waivers = this.db.waivers().findActiveForScope(moduleId, moduleArtifact.revision);
+        if (waivers.length === 0) {
+          throw new ChronoError({
+            code: ErrorCode.SECURITY_BLOCKER,
+            severity: Severity.BLOCKER,
+            message: `Security blocker '${blocker.id}' is unresolved and not validly waived`,
+            invariantRef: "INV §7.4",
+            affectedTarget: moduleId,
+            suggestedAction: "Resolve the security blocker or record a PO waiver for this revision",
+          });
+        }
+      }
+      for (const defect of this.db.defects().listAll()) {
+        const blocking = defect.status !== "resolved" &&
+          (defect.blockingScope === moduleId ||
+            defect.affectedArtifacts.includes(moduleId) ||
+            workPackageIds.some((w) => defect.blockingScope === w || defect.affectedArtifacts.includes(w)));
+        if (blocking) {
+          throw new ChronoError({
+            code: ErrorCode.COMPLETION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Blocking defect '${defect.id}' [${defect.classification}] remains ${defect.status}`,
+            invariantRef: "INV §5.6",
+            affectedTarget: moduleId,
+            suggestedAction: "Correct the defect and re-verify",
+          });
+        }
+      }
+      this.requireCurrentRtk(moduleId, { id: caller.session.id, adapter: caller.session.adapter, runtime: caller.session.runtime }, null);
+      this.requireCurrentSkill(moduleId);
+      return { ok: true, value: true };
+    } catch (e) {
+      this.auditDenial(moduleId, "AggregateCompletionAuthorization", e, auth.actor);
+      return this.handleError(e);
+    }
+  }
+
+  /** Enact aggregate completion: one authorized AllPackagesComplete transition (single grant, consumed). */
+  private advanceAggregateModule(moduleId: string, caller: ResolvedCaller, actor: string, session: { id: string; token: string }): CoreResult<{ state: string }> {
+    const artifact = this.artifacts.findById(moduleId);
+    if (!["APPROVED", "EXECUTING", "VERIFYING", "PASSED"].includes(artifact.status)) {
+      throw new ChronoError({
+        code: ErrorCode.COMPLETION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Module ${moduleId} is ${artifact.status}: aggregate completion advances only from APPROVED, EXECUTING, VERIFYING, or PASSED`,
+        invariantRef: "INV §5.6",
+        affectedTarget: moduleId,
+        suggestedAction: "Resolve the module state before completing",
+      });
+    }
+    const project = this.projects.findById("default");
+    const archRevision = project.architectureRevision;
+    if (project.architectureState !== "approved" || archRevision === null) {
+      throw new ChronoError({
+        code: ErrorCode.APPROVAL_REQUIRED,
+        severity: Severity.BLOCKER,
+        message: `Module ${moduleId}: architecture is not approved`,
+        invariantRef: "INV §5.5",
+        affectedTarget: moduleId,
+        suggestedAction: "Approve the architecture with its security approval first",
+      });
+    }
+    const grantId = this.issueBoundGrant({
+      moduleId,
+      workPackageId: null,
+      moduleRevision: artifact.revision,
+      specIds: this.moduleSpecIds(moduleId),
+      archRevision,
+      role: caller.role,
+      sessionId: caller.session.id,
+      requestedBy: caller.role,
+      adapterId: null,
+    });
+    const result = this.transitionState(moduleId, "AllPackagesComplete", { actor, session, grantId });
+    if (!result.ok) {
+      return result as unknown as CoreResult<{ state: string }>;
+    }
+    return { ok: true, value: { state: result.value!.toState } };
+  }
+
   completeModule(moduleId: string, auth: CallerAuth): CoreResult<{ state: string }> {
     try {
-      const authz = this.authorizeCompletion(moduleId, auth);
-      if (!authz.ok) {
-        return authz as unknown as CoreResult<{ state: string }>;
+      // Idempotent: a COMPLETE module re-reports success without
+      // re-minting grants or re-running the transition guard.
+      const current = this.artifacts.findById(moduleId);
+      if (current.status === "COMPLETE") {
+        const callerPeek = this.resolveCaller(auth, "complete module");
+        this.requireCapability("completion.request", callerPeek);
+        return { ok: true, value: { state: "COMPLETE" } };
+      }
+      const workPackages = this.moduleWorkPackages(moduleId);
+      if (workPackages.length === 0) {
+        const authz = this.authorizeCompletion(moduleId, auth);
+        if (!authz.ok) {
+          return authz as unknown as CoreResult<{ state: string }>;
+        }
+      } else {
+        // Aggregate path: every package proven through its own
+        // verdict chain, then one authorized AllPackagesComplete
+        // transition. No module-level verdict is synthesized.
+        const aggregate = this.authorizeAggregateCompletion(moduleId, workPackages, auth);
+        if (!aggregate.ok) {
+          return aggregate as unknown as CoreResult<{ state: string }>;
+        }
+        const caller = this.resolveCaller(auth, "complete module");
+        return this.advanceAggregateModule(moduleId, caller, auth.actor, auth.session);
       }
       const caller = this.resolveCaller(auth, "complete module");
 
@@ -6802,6 +9225,822 @@ export class ChronoCore {
       }
 
       return { ok: true, value: { state: result.value!.toState } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Completion readiness + lifecycle status (CF-6, CF-8)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Blocking reasons that keep one Work Package from completing, in
+   * precedence order. Empty means the package is ready for its
+   * Spekkio verdict / completion request. Mirrors the module-level
+   * authorizeCompletion checks at WP granularity, including the
+   * effective profile so lean packages are not held to standard
+   * evidence and standard packages are never waved through lean.
+   */
+  private workPackageCompletionBlockers(wpId: string, ignoreDispatchId?: string): string[] {
+    const reasons: string[] = [];
+    const wp = this.artifacts.findById(wpId);
+    if (wp.status === "COMPLETE") {
+      return reasons;
+    }
+    const moduleId = this.workPackageModule(wpId);
+    const effective = this.effectiveProfileFor(moduleId);
+
+    const dispatches = this.db.dispatches().listByScope(moduleId, wpId)
+      .filter((d) => (d.status === "PENDING" || d.status === "ENACTED" || d.status === "ACTIVE") && d.id !== ignoreDispatchId);
+    if (dispatches.length > 0) {
+      const latest = dispatches[dispatches.length - 1]!;
+      reasons.push(`dispatch '${latest.id}' [${latest.kind}] is ${latest.status}: claim and execute before completing`);
+    }
+
+    const loops = this.db.correctionLoops().listByScope(moduleId, wpId)
+      .filter((l) => l.status === "OPEN" || l.status === "CORRECTING");
+    const moduleLoops = this.db.correctionLoops().listByScope(moduleId, null)
+      .filter((l) => l.status === "OPEN" || l.status === "CORRECTING");
+    const firstLoop = loops.length > 0 ? loops[0]! : moduleLoops.length > 0 ? moduleLoops[0]! : null;
+    if (firstLoop !== null) {
+      reasons.push(`correction loop '${firstLoop.id}' is ${firstLoop.status}: evidence the fix and re-verify`);
+    }
+
+    const openReviews = this.db.reviewAssignments().listByScope(moduleId, wpId)
+      .filter((r) => r.status === "ASSIGNED");
+    if (openReviews.length > 0) {
+      reasons.push(`review '${openReviews[0]!.id}' [${openReviews[0]!.kind}] is ${openReviews[0]!.status}: submit the ${openReviews[0]!.reviewerRole} review`);
+    }
+
+    const activeBlockers = this.blockers.findActive([wpId, moduleId]);
+    if (activeBlockers.some((b) => b.type !== "SECURITY_BLOCKER")) {
+      reasons.push("active non-security blocker: resolve before completing");
+    }
+    if (activeBlockers.some((b) => b.type === "SECURITY_BLOCKER")) {
+      const waivers = this.db.waivers().findActiveForScope(wpId, wp.revision);
+      if (waivers.length === 0) {
+        reasons.push("unresolved security blocker without a valid waiver for this revision");
+      }
+    }
+
+    const evidence = this.db.evidence().findCurrentByTargetRevision(wp.revision);
+    const workerEvidence = evidence.some(
+      (e) => (e.producer === "belthazar" || e.producer === "melchior" || e.producer === "prometheus" || e.producer === "lucca") && e.result === "pass"
+    );
+    if (!workerEvidence) {
+      reasons.push("no current implementation evidence bound to this revision");
+    }
+    if (effective.profile === "standard" || effective.profile === "critical") {
+      if (!evidence.some((e) => e.producer === "lucca" && e.result === "pass")) {
+        reasons.push(`no current Lucca test evidence (${effective.profile} profile)`);
+      }
+      const security = this.requiresSecurityReview(moduleId, effective.profile);
+      if (security.required) {
+        if (!evidence.some((e) => e.producer === "glenn")) {
+          reasons.push(`no current Glenn security evidence (${security.reason})`);
+        }
+        // Security acceptance binds the package revision under review,
+        // not the module plan revision.
+        if (!this.hasValidApproval(wpId, wp.revision, "implementation-security")) {
+          reasons.push("no current Implementation Security Acceptance for this revision");
+        }
+      }
+    }
+    if (effective.profile === "critical") {
+      const reviews = this.db.reviewAssignments().listByScope(moduleId, wpId);
+      if (!reviews.some((r) => r.kind === "security-review" && r.status === "SUBMITTED" && r.targetRevision === wp.revision)) {
+        reasons.push("no completed security review for this revision (critical profile)");
+      }
+      if (!reviews.some((r) => r.kind === "verification" && r.status === "SUBMITTED" && r.targetRevision === wp.revision)) {
+        reasons.push("no completed verification assignment for this revision (critical profile)");
+      }
+    }
+
+    const verdicts = this.qa.listByWorkPackage(wpId)
+      .filter((r) => r.verdict === "PASS" && (r.workPackageRevision ?? r.moduleRevision) === wp.revision);
+    if (verdicts.length === 0) {
+      reasons.push("no Spekkio PASS bound to this revision");
+    }
+    return reasons;
+  }
+
+  /**
+   * The single highest-precedence next action for a scope, derived
+   * from Core records only. Workers see actions for their own scope;
+   * gaspar/PO see any scope. Batchable siblings of the same kind are
+   * listed in `alsoReady` with the profile batch cap applied
+   * (critical never batches: each item is dispatched explicitly).
+   */
+  nextAction(
+    input: { moduleId?: string; workPackageId?: string },
+    auth: CallerAuth
+  ): CoreResult<NextAction> {
+    try {
+      const caller = this.resolveCaller(auth, "next action");
+      this.requireCapability("status.next", caller);
+      const wpId = input.workPackageId ?? null;
+      const moduleId = wpId !== null ? this.workPackageModule(wpId) : (input.moduleId ?? null);
+      if (moduleId === null) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "next-action requires a module or work-package scope",
+          invariantRef: "INV §14.4",
+          affectedTarget: "project",
+          suggestedAction: "Pass --module or --work-package",
+        });
+      }
+      this.assertSessionScope(caller, { moduleId, workPackageId: wpId }, "next action");
+      const effective = this.effectiveProfileFor(moduleId);
+      const moduleArtifact = this.artifacts.findById(moduleId);
+
+      const openLoops = (m: string, w: string | null) =>
+        this.db.correctionLoops().listByScope(m, w)
+          .filter((l) => l.status === "OPEN" || l.status === "CORRECTING");
+      const loopAction = (
+        loop: { id: string; defectId: string; ownerRole: string; attempt: number; maxAttempts: number; status: string; moduleId: string; workPackageId: string | null },
+        targetKind: "module" | "work-package",
+        targetId: string
+      ): NextAction => {
+        const policyRule = `profile=${effective.profile}; attempt ${loop.attempt}/${loop.maxAttempts}`;
+        const escalation = loop.status === "ESCALATED" || loop.attempt >= loop.maxAttempts
+          ? { escalation: `loop '${loop.id}' is at/over its attempt bound: PO decision required` }
+          : {};
+        // Without a live correction dispatch the owner cannot act yet:
+        // Gaspar must dispatch the correction through the loop first.
+        const liveCorrection = this.db.dispatches().listByScope(loop.moduleId, loop.workPackageId)
+          .some((d) => d.kind === "correction" && (d.status === "PENDING" || d.status === "ENACTED" || d.status === "ACTIVE"));
+        if (!liveCorrection) {
+          return {
+            action: "request-correction",
+            targetKind,
+            targetId,
+            summary: `Correction loop '${loop.id}' [${loop.status}] owned by ${loop.ownerRole} has no correction dispatch: request one (kind correction) so the owner can evidence the fix for defect '${loop.defectId}'`,
+            reason: `open correction loop '${loop.id}' without a correction dispatch`,
+            policyRule,
+            ...escalation,
+          };
+        }
+        return {
+          action: "correct-defect",
+          targetKind,
+          targetId,
+          summary: `Correction loop '${loop.id}' [${loop.status}] attempt ${loop.attempt}/${loop.maxAttempts} owned by ${loop.ownerRole}: evidence the fix for defect '${loop.defectId}'`,
+          reason: `open correction loop '${loop.id}'`,
+          policyRule,
+          ...escalation,
+        };
+      };
+      // Module-scoped loops own the whole module (and every package
+      // in it); package-scoped loops own their package. Either gates
+      // its scope before any dispatch, review, or completion action.
+      const moduleLoop = openLoops(moduleId, null)[0];
+      if (moduleLoop !== undefined) {
+        return { ok: true, value: loopAction(moduleLoop, wpId !== null ? "work-package" : "module", wpId ?? moduleId) };
+      }
+      if (wpId !== null) {
+        const packageLoop = openLoops(moduleId, wpId)[0];
+        if (packageLoop !== undefined) {
+          return { ok: true, value: loopAction(packageLoop, "work-package", wpId) };
+        }
+      }
+
+      const targets = wpId !== null ? [wpId] : this.moduleWorkPackages(moduleId);
+      if (targets.length === 0) {
+        return {
+          ok: true,
+          value: {
+            action: "authorize-work",
+            targetKind: "module",
+            targetId: moduleId,
+            summary: `Module '${moduleId}' [${moduleArtifact.status}] has no Work Packages: authorize the first package`,
+            reason: "no executable scope exists yet",
+            policyRule: `profile=${effective.profile}`,
+          },
+        };
+      }
+
+      // Highest precedence first: open package-scoped loops own
+      // their package (module-scoped loops returned above).
+      for (const target of targets) {
+        const packageLoop = openLoops(moduleId, target)[0];
+        if (packageLoop !== undefined) {
+          return { ok: true, value: loopAction(packageLoop, "work-package", target) };
+        }
+      }
+
+      // Stale dispatched work blocks everything behind it.
+      for (const target of targets) {
+        const pending = this.db.dispatches().listByScope(moduleId, target)
+          .filter((d) => d.status === "PENDING" || d.status === "ENACTED" || d.status === "ACTIVE");
+        if (pending.length > 0) {
+          const latest = pending[pending.length - 1]!;
+          const ownBinding = caller.session.id === latest.workerSession;
+          const action = latest.status === "PENDING"
+            ? (ownBinding || caller.role === "gaspar" || caller.role === "PO" ? "claim-dispatch" : "await-claim")
+            : latest.status === "ENACTED"
+              ? "confirm-dispatch"
+              : "execute-dispatch";
+          const guidance = latest.status === "PENDING"
+            ? "claim it with the dispatched session, then confine the credential"
+            : latest.status === "ENACTED"
+              ? "confine the worker credential host-side, then confirm the claim"
+              : "execute the confirmed work, record evidence, then complete the dispatch";
+          return {
+            ok: true,
+            value: {
+              action,
+              targetKind: "work-package",
+              targetId: target,
+              summary: `Dispatch '${latest.id}' [${latest.kind}] is ${latest.status} for role ${this.dispatchWorkerRole(latest) ?? "(awaiting delegation)"}: ${guidance}`,
+              reason: `dispatch '${latest.id}' is ${latest.status}`,
+              policyRule: `profile=${latest.policyProfile}; attempt ${latest.attempt}`,
+            },
+          };
+        }
+      }
+
+      // Open reviews gate verification.
+      for (const target of targets) {
+        const open = this.db.reviewAssignments().listByScope(moduleId, target)
+          .filter((r) => r.status === "ASSIGNED");
+        if (open.length > 0) {
+          const review = open[0]!;
+          return {
+            ok: true,
+            value: {
+              action: "submit-review",
+              targetKind: "work-package",
+              targetId: target,
+              summary: `Review '${review.id}' [${review.kind}] for ${review.reviewerRole} is ${review.status} on revision ${review.targetRevision.slice(0, 12)}: submit the review`,
+              reason: `review '${review.id}' is ${review.status}`,
+              policyRule: `profile=${effective.profile}`,
+            },
+          };
+        }
+      }
+
+      // Completion readiness: batch siblings of the same kind.
+      const ready = targets.filter((t) => {
+        const artifact = this.artifacts.findById(t);
+        if (artifact.status === "COMPLETE") {
+          return false;
+        }
+        return this.workPackageCompletionBlockers(t).length === 0;
+      });
+      if (ready.length > 0) {
+        const first = ready[0]!;
+        const siblings = effective.profile === "critical" ? [] : ready.slice(1, 1 + BATCH_CAP[effective.profile]);
+        return {
+          ok: true,
+          value: {
+            action: "request-completion",
+            targetKind: "work-package",
+            targetId: first,
+            summary: `Work Package '${first}' is ready: record the Spekkio verdict if missing, then request completion`,
+            reason: "all completion blockers cleared",
+            policyRule: `profile=${effective.profile}`,
+            ...(siblings.length > 0 ? { alsoReady: siblings } : {}),
+          },
+        };
+      }
+
+      // Otherwise surface the first concrete blocker.
+      for (const target of targets) {
+        const artifact = this.artifacts.findById(target);
+        if (artifact.status === "COMPLETE") {
+          continue;
+        }
+        const blockers = this.workPackageCompletionBlockers(target);
+        if (blockers.length > 0) {
+          return {
+            ok: true,
+            value: {
+              action: "record-evidence",
+              targetKind: "work-package",
+              targetId: target,
+              summary: `Work Package '${target}' [${artifact.status}] is blocked: ${blockers[0]!}`,
+              reason: blockers[0]!,
+              policyRule: `profile=${effective.profile}`,
+            },
+          };
+        }
+      }
+
+      if (moduleArtifact.status === "COMPLETE") {
+        return {
+          ok: true,
+          value: {
+            action: "done",
+            targetKind: "module",
+            targetId: moduleId,
+            summary: `Module '${moduleId}' is COMPLETE: no further action`,
+            reason: "terminal state reached",
+            policyRule: `profile=${effective.profile}`,
+          },
+        };
+      }
+      // Modules with Work Packages complete by aggregate: every
+      // package COMPLETE rolls the module chain up. Package-less
+      // modules complete through their own verdict chain.
+      const ownedPackages = this.moduleWorkPackages(moduleId);
+      if (ownedPackages.length > 0) {
+        const incomplete = ownedPackages.filter((id) => {
+          try {
+            return this.artifacts.findById(id).status !== "COMPLETE";
+          } catch {
+            return true;
+          }
+        });
+        if (incomplete.length === 0) {
+          const aggregate = this.authorizeAggregateCompletion(moduleId, ownedPackages, auth);
+          if (aggregate.ok) {
+            return {
+              ok: true,
+              value: {
+                action: "complete-module",
+                targetKind: "module",
+                targetId: moduleId,
+                summary: `Module '${moduleId}': every Work Package is COMPLETE — complete the module by aggregate`,
+                reason: "all packages complete, aggregate gates clear",
+                policyRule: `profile=${effective.profile}`,
+              },
+            };
+          }
+          return {
+            ok: true,
+            value: {
+              action: "advance-module",
+              targetKind: "module",
+              targetId: moduleId,
+              summary: `Module '${moduleId}': ${this.describeDenial(aggregate)}`,
+              reason: this.describeDenial(aggregate),
+              policyRule: `profile=${effective.profile}`,
+            },
+          };
+        }
+        const first = incomplete[0]!;
+        const firstBlockers = this.workPackageCompletionBlockers(first);
+        return {
+          ok: true,
+          value: {
+            action: "advance-module",
+            targetKind: "module",
+            targetId: moduleId,
+            summary: `Module '${moduleId}': Work Package '${first}' is next${firstBlockers.length > 0 ? ` — ${firstBlockers[0]!}` : ""}`,
+            reason: firstBlockers.length > 0 ? firstBlockers[0]! : `Work Package '${first}' is not COMPLETE`,
+            policyRule: `profile=${effective.profile}`,
+          },
+        };
+      }
+      const authz = this.authorizeCompletion(moduleId, auth);
+      if (authz.ok) {
+        return {
+          ok: true,
+          value: {
+            action: "complete-module",
+            targetKind: "module",
+            targetId: moduleId,
+            summary: `Module '${moduleId}' passes completion authorization: complete it`,
+            reason: "module-level gates clear",
+            policyRule: `profile=${effective.profile}`,
+          },
+        };
+      }
+      return {
+        ok: true,
+        value: {
+          action: "advance-module",
+          targetKind: "module",
+          targetId: moduleId,
+          summary: `Module '${moduleId}' [${moduleArtifact.status}]: ${this.describeDenial(authz)}`,
+          reason: this.describeDenial(authz),
+          policyRule: `profile=${effective.profile}`,
+        },
+      };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Effective worker for a dispatch row: the delegation-time agent
+   * once bound, else the request-time role (correction owner), else
+   * null while the dispatch still awaits delegation. The `role`
+   * column is frozen by the store trigger, so projections must read
+   * through `delegatedAgent` — never the raw column alone.
+   */
+  private dispatchWorkerRole(dispatch: { role: string; delegatedAgent: string | null }): string | null {
+    if (dispatch.delegatedAgent !== null) {
+      return dispatch.delegatedAgent;
+    }
+    return dispatch.role !== "" ? dispatch.role : null;
+  }
+
+  /**
+   * Deterministic security-review requirement (CF-11 fast path): critical
+   * always mandates explicit Glenn review; standard mandates it only when
+   * the content risk classifier fires a trigger; lean never does (focused
+   * evidence plus the independent PASS). Glenn returns NOT_REQUIRED only
+   * through this rule with the auditable reason below — never by omission.
+   */
+  private requiresSecurityReview(moduleId: string, profile: PolicyProfile): { required: boolean; reason: string } {
+    if (profile === "critical") {
+      return { required: true, reason: "critical profile mandates explicit security review" };
+    }
+    if (profile === "lean") {
+      return { required: false, reason: "lean profile: focused evidence plus one independent completion check" };
+    }
+    const { triggers } = this.contentRiskFor(moduleId, this.moduleSpecIds(moduleId));
+    if (triggers.length === 0) {
+      return { required: false, reason: "standard profile with no content risk triggers: deterministic rule waives separate Glenn review" };
+    }
+    return { required: true, reason: `standard profile with risk triggers (${triggers.map((t) => t.key).join(", ")})` };
+  }
+
+  /** Human-readable denial reason for next-action surfacing. */
+  private describeDenial(result: CoreResult<unknown>): string {
+    if (result.ok) {
+      return "ready";
+    }
+    const err = (result as { ok: false; error: { code: string; message: string } }).error;
+    return `${err.code}: ${err.message}`;
+  }
+
+  /**
+   * Worker execution projection: own ACTIVE binding, scope states,
+   * and revision currency. gaspar/PO may query any scope; workers are
+   * confined to the module their session is bound to. Never exposes
+   * session tokens, keys, or grant secrets — session and grant ids
+   * only (opaque local metadata, never credentials).
+   */
+  executionStatus(
+    input: { moduleId?: string; workPackageId?: string },
+    auth: CallerAuth
+  ): CoreResult<ExecutionStatus> {
+    try {
+      const caller = this.resolveCaller(auth, "execution status");
+      this.requireCapability("status.execution", caller);
+      const wpId = input.workPackageId ?? null;
+      const moduleId = wpId !== null ? this.workPackageModule(wpId) : (input.moduleId ?? null);
+      if (moduleId === null) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "execution-status requires a module or work-package scope",
+          invariantRef: "INV §14.4",
+          affectedTarget: "project",
+          suggestedAction: "Pass --module or --work-package",
+        });
+      }
+      this.assertSessionScope(caller, { moduleId, workPackageId: wpId }, "execution status");
+      const moduleArtifact = this.artifacts.findById(moduleId);
+      const binding = this.db.dispatches().findActiveByWorkerSession(caller.session.id);
+      const ownDispatch = binding !== null && binding.moduleId === moduleId
+        && (wpId === null || binding.workPackageId === wpId)
+        ? {
+          dispatchId: binding.id,
+          kind: binding.kind,
+          role: this.dispatchWorkerRole(binding) ?? "(awaiting delegation)",
+          status: binding.status,
+          grantId: binding.grantId,
+          attempt: binding.attempt,
+          expiresAt: binding.expiresAt,
+        }
+        : null;
+      // Module scope aggregates the module row plus every package
+      // beneath it; package scope reads exactly its own row set.
+      const scopesToRead = wpId !== null
+        ? [{ moduleId, workPackageId: wpId }]
+        : [{ moduleId, workPackageId: null as string | null }, ...this.moduleWorkPackages(moduleId).map((id) => ({ moduleId, workPackageId: id as string | null }))];
+      const scopeDispatches = scopesToRead
+        .flatMap((scope) => this.db.dispatches().listByScope(scope.moduleId, scope.workPackageId))
+        .filter((d) => d.status === "PENDING" || d.status === "ENACTED" || d.status === "ACTIVE")
+        .map((d) => ({
+          dispatchId: d.id,
+          kind: d.kind,
+          role: this.dispatchWorkerRole(d) ?? "(awaiting delegation)",
+          status: d.status,
+          attempt: d.attempt,
+        }));
+      const packages = (wpId !== null ? [wpId] : this.moduleWorkPackages(moduleId)).map((id) => {
+        const artifact = this.artifacts.findById(id);
+        return { workPackageId: id, status: artifact.status, revision: artifact.revision };
+      });
+      return {
+        ok: true,
+        value: {
+          moduleId,
+          moduleStatus: moduleArtifact.status,
+          moduleRevision: moduleArtifact.revision,
+          workPackageId: wpId,
+          packages,
+          ownDispatch,
+          openDispatches: scopeDispatches,
+          profile: this.effectiveProfileFor(moduleId).profile,
+        },
+      };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Evidence projection for one content revision: current rows only,
+   * scoped like execution status. Omits diagnostics and content —
+   * models see producer/check/result/timestamp plus the evidence id
+   * needed to cite rows in verdicts. Stale rows are excluded (they
+   * are superseded history, not authority).
+   */
+  evidenceStatus(
+    input: { targetRevision: string },
+    auth: CallerAuth
+  ): CoreResult<EvidenceStatus> {
+    try {
+      const caller = this.resolveCaller(auth, "evidence status");
+      this.requireCapability("status.evidence", caller);
+      const revision = input.targetRevision;
+      const artifactId = this.artifacts.findArtifactIdByRevision(revision);
+      const scopeModule = artifactId !== null ? this.artifactScopeModule(artifactId) : null;
+      if (scopeModule !== null) {
+        this.assertSessionScope(
+          caller,
+          { moduleId: scopeModule, workPackageId: null },
+          "evidence status"
+        );
+      } else if (caller.role !== "gaspar" && caller.role !== "PO") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.ERROR,
+          message: "Evidence for an unknown revision is visible to gaspar/PO only",
+          invariantRef: "INV §6.4",
+          affectedTarget: revision.slice(0, 16),
+          suggestedAction: "Query evidence for a revision in your own scope",
+        });
+      }
+      const rows = this.db.evidence().findCurrentByTargetRevision(revision).map((e) => ({
+        evidenceId: e.id,
+        producer: e.producer,
+        check: e.checkName,
+        result: e.result,
+        recordedAt: e.timestamp,
+      }));
+      return {
+        ok: true,
+        value: {
+          targetRevision: revision,
+          artifactId,
+          current: rows,
+          staleSuperseded: this.db.evidence().findStaleByTargetRevision(revision).length,
+        },
+      };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Deep integrity check (gaspar/PO): cross-record consistency that
+   * per-scope status cannot see — policy/schema version alignment,
+   * enacted-but-unclaimed backlog, verdicts citing stale evidence,
+   * correction loops past their attempt bound without escalation.
+   * Findings are advisory records; repair stays explicit and PO-owned.
+   */
+  deepIntegrityCheck(auth: CallerAuth): CoreResult<DeepIntegrityReport> {
+    try {
+      const caller = this.resolveCaller(auth, "deep integrity check");
+      this.requireCapability("status.deep", caller);
+      const findings: DeepIntegrityFinding[] = [];
+
+      const schemaVersion = this.db.schemaVersion();
+      if (schemaVersion !== SCHEMA_VERSION) {
+        findings.push({
+          severity: "blocker",
+          check: "schema-version",
+          detail: `store reports schema_version '${schemaVersion}', runtime expects ${SCHEMA_VERSION}`,
+        });
+      }
+      for (const mod of this.artifacts.listByType("MOD")) {
+        const scopes: Array<{ moduleId: string; workPackageId: string | null }> = [{ moduleId: mod.id, workPackageId: null }];
+        for (const wpId of this.moduleWorkPackages(mod.id)) {
+          scopes.push({ moduleId: mod.id, workPackageId: wpId });
+        }
+        for (const scope of scopes) {
+          for (const dispatch of this.db.dispatches().listByScope(scope.moduleId, scope.workPackageId)) {
+            if (dispatch.status === "COMPLETED" || dispatch.status === "REVOKED" || dispatch.status === "EXPIRED") {
+              continue;
+            }
+            if (dispatch.grantId === null) {
+              continue;
+            }
+            try {
+              const grant = this.db.grants().findById(dispatch.grantId);
+              if (grant.policyVersion !== null && grant.policyVersion !== AUTHORITY_POLICY_VERSION) {
+                findings.push({
+                  severity: "blocker",
+                  check: "stale-policy-grant",
+                  detail: `dispatch '${dispatch.id}' holds a grant pinned to authority policy v${grant.policyVersion}, runtime is v${AUTHORITY_POLICY_VERSION}: re-authorize before completion`,
+                });
+              }
+            } catch {
+              findings.push({
+                severity: "blocker",
+                check: "dispatch-missing-grant",
+                detail: `dispatch '${dispatch.id}' references unknown grant '${dispatch.grantId}'`,
+              });
+            }
+          }
+        }
+      }
+
+      const nowIso = this.now();
+      for (const stale of this.db.dispatches().listStaleEnacted(nowIso)) {
+        findings.push({
+          severity: "warning",
+          check: "enacted-unclaimed",
+          detail: `dispatch '${stale.id}' [${stale.kind}] enacted without claim past TTL: run reconcile to expire or revoke`,
+        });
+      }
+      for (const stale of this.db.dispatches().listStalePending(nowIso)) {
+        findings.push({
+          severity: "warning",
+          check: "pending-expired",
+          detail: `dispatch '${stale.id}' [${stale.kind}] pending past TTL: run reconcile to expire it`,
+        });
+      }
+
+      for (const mod of this.artifacts.listByType("MOD")) {
+        for (const report of this.qa.listByModule(mod.id)) {
+          for (const evidenceId of report.reviewedEvidence) {
+            try {
+              const row = this.db.evidence().findById(evidenceId);
+              if (row.stale) {
+                findings.push({
+                  severity: "blocker",
+                  check: "verdict-cites-stale-evidence",
+                  detail: `verdict '${report.id}' cites stale evidence '${evidenceId}': re-verify on current evidence`,
+                });
+              }
+            } catch {
+              findings.push({
+                severity: "blocker",
+                check: "verdict-cites-missing-evidence",
+                detail: `verdict '${report.id}' cites unknown evidence '${evidenceId}'`,
+              });
+            }
+          }
+        }
+        for (const wpId of this.moduleWorkPackages(mod.id)) {
+          for (const loop of this.db.correctionLoops().listByScope(mod.id, wpId)) {
+            if ((loop.status === "OPEN" || loop.status === "CORRECTING") && loop.attempt > loop.maxAttempts) {
+              findings.push({
+                severity: "blocker",
+                check: "loop-over-bound",
+                detail: `correction loop '${loop.id}' attempt ${loop.attempt}/${loop.maxAttempts} not escalated: terminal escalation required`,
+              });
+            }
+          }
+        }
+      }
+
+      // Enacted bindings without a live worker session cannot be
+      // worked or confirmed: reconcile them instead of stranding them.
+      for (const mod of this.artifacts.listByType("MOD")) {
+        const scopes: Array<{ moduleId: string; workPackageId: string | null }> = [{ moduleId: mod.id, workPackageId: null }];
+        for (const wpId of this.moduleWorkPackages(mod.id)) {
+          scopes.push({ moduleId: mod.id, workPackageId: wpId });
+        }
+        for (const scope of scopes) {
+          for (const dispatch of this.db.dispatches().listByScope(scope.moduleId, scope.workPackageId)) {
+            if (dispatch.status !== "ENACTED" || dispatch.workerSession === null) {
+              continue;
+            }
+            try {
+              const worker = this.db.sessions().findById(dispatch.workerSession);
+              if (worker.revoked) {
+                findings.push({
+                  severity: "blocker",
+                  check: "enacted-without-session",
+                  detail: `dispatch '${dispatch.id}' is ENACTED but worker session '${worker.id}' is revoked: reconcile before re-dispatching`,
+                });
+              }
+            } catch {
+              findings.push({
+                severity: "blocker",
+                check: "enacted-without-session",
+                detail: `dispatch '${dispatch.id}' is ENACTED but worker session '${dispatch.workerSession}' is unknown: reconcile before re-dispatching`,
+              });
+            }
+          }
+        }
+      }
+
+      // Orphan worker sessions: live enactment-role sessions bound to
+      // no live dispatch as requester or worker. Gaspar/PO sessions
+      // idle legitimately; workers must not.
+      {
+        const liveDispatches: Array<{ requesterSession: string; workerSession: string | null; status: string }> = [];
+        for (const mod of this.artifacts.listByType("MOD")) {
+          for (const d of this.db.dispatches().listByScope(mod.id, null)) {
+            liveDispatches.push(d);
+          }
+          for (const wpId of this.moduleWorkPackages(mod.id)) {
+            for (const d of this.db.dispatches().listByScope(mod.id, wpId)) {
+              liveDispatches.push(d);
+            }
+          }
+        }
+        const referenced = new Set<string>();
+        for (const d of liveDispatches) {
+          if (d.status === "PENDING" || d.status === "ENACTED" || d.status === "ACTIVE") {
+            referenced.add(d.requesterSession);
+            if (d.workerSession !== null) {
+              referenced.add(d.workerSession);
+            }
+          }
+        }
+        for (const session of this.db.sessions().listLive(nowIso)) {
+          if (!(ENACTMENT_ROLES as readonly string[]).includes(session.role)) {
+            continue;
+          }
+          if (!referenced.has(session.id)) {
+            findings.push({
+              severity: "warning",
+              check: "orphan-session",
+              detail: `live ${session.role} session '${session.id}' binds no live dispatch: revoke it or let it expire`,
+            });
+          }
+        }
+      }
+
+      // Dangling planning index entries: structured ids with neither a
+      // registry row nor a recorded revision are unrecoverable without
+      // formal supersession (CF-8).
+      for (const indexed of this.readPlanningIndex()) {
+        if (!/^(SP|MOD|WP)-/.test(indexed)) {
+          continue;
+        }
+        let rowMissing = false;
+        try {
+          this.artifacts.findById(indexed);
+        } catch {
+          rowMissing = true;
+        }
+        if (rowMissing && this.db.runtimeConfig().get(this.planningRevisionKey(indexed)) === null) {
+          findings.push({
+            severity: "blocker",
+            check: "dangling-index",
+            detail: `planning index lists '${indexed}' with no registry row and no recorded revision: propose a replacement and supersede`,
+          });
+        }
+      }
+
+      // Reachability: every scope must resolve to exactly one next
+      // action (CF-9). A scope the orchestrator cannot advance is a
+      // defect in the lifecycle, not a quiet stall.
+      for (const mod of this.artifacts.listByType("MOD")) {
+        const scopes: Array<{ moduleId?: string; workPackageId?: string }> = [{ moduleId: mod.id }];
+        for (const wpId of this.moduleWorkPackages(mod.id)) {
+          scopes.push({ workPackageId: wpId });
+        }
+        for (const scope of scopes) {
+          const next = this.nextAction(scope, auth);
+          if (!next.ok) {
+            findings.push({
+              severity: "blocker",
+              check: "unreachable-scope",
+              detail: `scope '${scope.workPackageId ?? scope.moduleId}' has no next action: ${this.describeDenial(next)}`,
+            });
+          }
+        }
+      }
+
+      // Deterministic project validation folds in identities,
+      // traceability, approvals, evidence currency, attestations,
+      // runtime/drift, and projection agreement.
+      {
+        const validation = this.validate();
+        if (validation.ok) {
+          for (const error of validation.value!.errors) {
+            findings.push({ severity: "blocker", check: "validate", detail: error });
+          }
+          for (const warning of validation.value!.warnings) {
+            findings.push({ severity: "warning", check: "validate", detail: warning });
+          }
+        }
+      }
+
+      const blockers = findings.filter((f) => f.severity === "blocker").length;
+      return {
+        ok: true,
+        value: {
+          checkedAt: nowIso,
+          blockerCount: blockers,
+          warningCount: findings.length - blockers,
+          findings,
+        },
+      };
     } catch (e) {
       return this.handleError(e);
     }
@@ -7301,6 +10540,65 @@ export class ChronoCore {
     return `planning.revision.${id}`;
   }
 
+  /**
+   * Canonical recovery envelope key (CF-8): the exact canonical
+   * structured content last registered for a SP/MOD/WP row. Recovery
+   * restores these bytes verbatim only on proven byte-equivalence and
+   * never synthesizes semantics from title/body defaults.
+   */
+  private planningEnvelopeKey(id: string): string {
+    return `planning.envelope.${id}`;
+  }
+
+  /** Persist the recovery envelope for a structured write (same transaction as the row). */
+  private writeEnvelope(id: string, canonical: string): void {
+    this.db.runtimeConfig().set(this.planningEnvelopeKey(id), canonical);
+  }
+
+  /** Runtime-config key recording the proposing kind of a draft. */
+  private planningKindKey(id: string): string {
+    return `planning.kind.${id}`;
+  }
+
+  /**
+   * Authoritative planning kind for one draft id (kind-resolution
+   * repair): the recorded proposing kind wins; else the normative
+   * registry row type (MOD/WP/SP); else the identifier pattern scan.
+   * Pattern-only resolution misclassified MOD-xxxx drafts as
+   * kind=roadmap (roadmap accepts MOD ids and sorts first), sending
+   * revise/status/supersede down the unstructured path while propose
+   * had registered a structured row — status then reports active
+   * drafts that revise cannot touch.
+   */
+  private resolvePlanningKind(id: string): PlanningKind | undefined {
+    const recorded = this.db.runtimeConfig().get(this.planningKindKey(id));
+    if (recorded !== null && (Object.keys(PLANNING_KIND_DIR) as string[]).includes(recorded)) {
+      return recorded as PlanningKind;
+    }
+    try {
+      const row = this.artifacts.findById(id);
+      if (row.type === "MOD") {
+        return "module";
+      }
+      if (row.type === "WP") {
+        return "workpackage";
+      }
+      if (row.type === "SP") {
+        return "spec";
+      }
+    } catch {
+      // No normative row: fall through to the pattern scan.
+    }
+    return (Object.keys(PLANNING_KIND_DIR) as PlanningKind[]).find((k) => {
+      try {
+        assertPlanningId(k, id);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  }
+
   /** Runtime-config key recording which draft superseded this one (D3). */
   private planningSupersededKey(id: string): string {
     return `planning.superseded.${id}`;
@@ -7546,6 +10844,10 @@ export class ChronoCore {
             // Structured revision is the planning revision: one identity,
             // one current revision across file and registry.
             this.artifacts.create(id, family as string, revision, family === "WP" ? "PLANNED" : "DRAFT", contentHash, canonical);
+            // The draft defaults ARE the registered semantics at propose
+            // time (refined through review/revise, which preserve prior
+            // fields): envelope them so recovery can prove equivalence.
+            this.writeEnvelope(id, canonical);
           }
           if (kind === "architecture") {
             // The file revision IS the architecture revision: proposing
@@ -7570,6 +10872,7 @@ export class ChronoCore {
             this.db.securityProfiles().create(id, version, revision);
           }
           this.db.runtimeConfig().set(this.planningRevisionKey(id), revision);
+          this.db.runtimeConfig().set(this.planningKindKey(id), kind);
           this.addPlanningIndex(id);
           this.events.append({
             eventType: "ArtifactCreated",
@@ -7616,7 +10919,7 @@ export class ChronoCore {
     id: string,
     input: { title: string; body: string },
     auth: CallerAuth
-  ): CoreResult<{ id: string; revision: string; path: string; approvalCommand: string; healed: boolean }> {
+  ): CoreResult<{ id: string; revision: string; path: string; approvalCommand: string; healed: boolean; recovered: boolean }> {
     try {
       const caller = this.requireCapability("planning.revise", this.resolveCaller(auth, "revise planning artifact"));
       const index = this.readPlanningIndex();
@@ -7640,17 +10943,9 @@ export class ChronoCore {
           suggestedAction: "Propose a new revision under the replacing draft's identifier",
         });
       }
-      // Recover the kind from the identifier pattern (one id, one kind:
-      // destinations derive from (kind, id), so the accepting pattern
-      // is the kind).
-      const resolvedKind = (Object.keys(PLANNING_KIND_DIR) as PlanningKind[]).find((k) => {
-        try {
-          assertPlanningId(k, id);
-          return true;
-        } catch {
-          return false;
-        }
-      });
+      // Recover the kind authoritatively (recorded proposing kind,
+      // else normative row type, else identifier pattern).
+      const resolvedKind = this.resolvePlanningKind(id);
       if (resolvedKind === undefined) {
         throw new ChronoError({
           code: ErrorCode.VALIDATION_ERROR,
@@ -7666,6 +10961,137 @@ export class ChronoCore {
       const revision = computeRevisionHash({ kind: resolvedKind, id, title: input.title, body: input.body });
       const current = this.db.runtimeConfig().get(this.planningRevisionKey(id));
       const fileMissing = !fsExistsSync(dest);
+      const family = PLANNING_KIND_FAMILY[resolvedKind];
+      const structured = family === "SP" || family === "MOD" || family === "WP";
+      // Recovery probe (post-planning deadlock repair): the planning
+      // index and revision key may survive while the structured
+      // registry row (or the canonical file) is gone — status then
+      // reports an active draft that revise cannot touch
+      // (ENTITY_NOT_FOUND from the registry read). A missing row is
+      // recoverable for Specs (dependencies default safely); Modules
+      // and Work Packages carry relations no recovery may invent, so
+      // they fail with the governed supersede path instead.
+      let structuredRowMissing = false;
+      if (structured) {
+        try {
+          this.artifacts.findById(id);
+        } catch {
+          structuredRowMissing = true;
+        }
+      }
+      if (structuredRowMissing && family !== "SP") {
+        throw new ChronoError({
+          code: ErrorCode.ENTITY_NOT_FOUND,
+          severity: Severity.ERROR,
+          message:
+            `Planning draft '${id}' is indexed but its structured registry row is missing and cannot be rebuilt without its relations: ` +
+            `propose a replacement ${family === "MOD" ? "Module with --ref Specs" : "Work Package with --ref owning Module"}, then supersede '${id}' by it (harness history is preserved)`,
+          invariantRef: "INV §10.2",
+          affectedTarget: id,
+          suggestedAction: `Propose the replacement draft first, then run artifact supersede --id ${id} --by <replacement>`,
+        });
+      }
+      if (structuredRowMissing) {
+        // Governed rematerialization for Specs (CF-8): the candidate
+        // rebuilt from title/body defaults proves NOTHING by itself —
+        // recovery restores the canonical envelope bytes verbatim only
+        // when the candidate proves byte-equivalence against them.
+        // Anything else (or a missing envelope) denies toward formal
+        // supersession: invented semantics must never inherit approvals.
+        const envelope = this.db.runtimeConfig().get(this.planningEnvelopeKey(id));
+        if (envelope === null) {
+          throw new ChronoError({
+            code: ErrorCode.ENTITY_NOT_FOUND,
+            severity: Severity.ERROR,
+            message:
+              `Planning draft '${id}' is indexed but its structured registry row is missing and no recovery envelope exists: ` +
+              `propose a replacement Spec, then supersede '${id}' by it (harness history is preserved)`,
+            invariantRef: "INV §10.2",
+            affectedTarget: id,
+            suggestedAction: `Propose the replacement draft first, then run artifact supersede --id ${id} --by <replacement>`,
+          });
+        }
+        const recoveredContent = {
+          id,
+          title: input.title,
+          purpose: input.title,
+          body: input.body,
+          planningDraft: true,
+          dependencies: [],
+          inScope: [input.title],
+          acceptanceCriteria: [`${id} draft acceptance: ${input.title}`],
+        };
+        const candidateHash = computeRevisionHash({ id, content: recoveredContent });
+        let envelopeContent: unknown;
+        try {
+          envelopeContent = JSON.parse(envelope) as unknown;
+        } catch {
+          envelopeContent = null;
+        }
+        const envelopeHash = envelopeContent === null ? null : computeRevisionHash({ id, content: envelopeContent });
+        if (envelopeHash === null || envelopeHash !== candidateHash) {
+          throw new ChronoError({
+            code: ErrorCode.ENTITY_NOT_FOUND,
+            severity: Severity.ERROR,
+            message:
+              `Planning draft '${id}' is indexed but its structured registry row is missing and the supplied content does not reproduce the registered semantics: ` +
+              `propose a replacement Spec, then supersede '${id}' by it (harness history is preserved)`,
+            invariantRef: "INV §10.2",
+            affectedTarget: id,
+            suggestedAction: `Propose the replacement draft first, then run artifact supersede --id ${id} --by <replacement>`,
+          });
+        }
+        // Proven byte-equivalent: restore the envelope bytes verbatim.
+        // Identical content keeps the recorded revision, so current
+        // approvals stay valid on proven — never synthesized — semantics.
+        const recoveredRevision = revision;
+        const sameContent = current === recoveredRevision;
+        if (fileMissing || !sameContent) {
+          const file = this.renderPlanningFile(resolvedKind, id, input.title, input.body, recoveredRevision);
+          fsMkdirSync(pathDirname(dest), { recursive: true });
+          const tmp = `${dest}.chrono-tmp-${process.pid}`;
+          fsWriteFileSync(tmp, file, "utf8");
+          try {
+            fsRenameSync(tmp, dest);
+          } catch (e) {
+            try {
+              fsRmSync(tmp, { force: true });
+            } catch {
+              // Best-effort; the rename error below is authoritative.
+            }
+            throw e;
+          }
+        }
+        const canonical = envelope;
+        const contentHash = computeRevisionHash({ id, content: envelopeContent });
+        this.db.transaction(() => {
+          // restore (not create): the history row for an identical
+          // revision may still exist, and history is append-only.
+          this.artifacts.restore(id, "SP", recoveredRevision, "DRAFT", contentHash, canonical);
+          this.db.runtimeConfig().set(this.planningRevisionKey(id), recoveredRevision);
+          this.events.append({
+            eventType: "PlanningDraftRecovered",
+            entityId: id,
+            payload: {
+              type: "PLANNING_DRAFT",
+              kind: resolvedKind,
+              revision: recoveredRevision,
+              priorRevision: current,
+              fileRematerialized: fileMissing || !sameContent,
+              envelopeProven: true,
+            },
+            actor: caller.auditActor,
+            priorState: "DRAFT",
+            newState: "DRAFT",
+            reasoning: "Missing structured registry row restored from the proven canonical envelope; prior approvals stand only when the revision is unchanged",
+          });
+        });
+        this.syncProjectState();
+        const recoveryApprovalCommand =
+          `chrono approve --action planning-approval --scope ${id} --revision ${recoveredRevision} ` +
+          `--authority <PO> --rationale "<decision rationale>" --path <project>`;
+        return { ok: true, value: { id, revision: recoveredRevision, path: dest, approvalCommand: recoveryApprovalCommand, healed: false, recovered: true } };
+      }
       if (current === revision && !fileMissing) {
         throw new ChronoError({
           code: ErrorCode.DUPLICATE_IDENTITY,
@@ -7698,11 +11124,9 @@ export class ChronoCore {
         const healApprovalCommand =
           `chrono approve --action planning-approval --scope ${id} --revision ${revision} ` +
           `--authority <PO> --rationale "<decision rationale>" --path <project>`;
-        return { ok: true, value: { id, revision, path: dest, approvalCommand: healApprovalCommand, healed: true } };
+        return { ok: true, value: { id, revision, path: dest, approvalCommand: healApprovalCommand, healed: true, recovered: false } };
       }
       const file = this.renderPlanningFile(resolvedKind, id, input.title, input.body, revision);
-      const family = PLANNING_KIND_FAMILY[resolvedKind];
-      const structured = family === "SP" || family === "MOD" || family === "WP";
       // File first with backup: the previous draft is restorable when
       // the registry transaction fails, so a failed revise never loses
       // the last good revision.
@@ -7748,6 +11172,7 @@ export class ChronoCore {
             const canonical = canonicalize(nextContent);
             const contentHash = computeRevisionHash({ id, content: nextContent });
             this.artifacts.reviseContent(id, revision, artifact.status, contentHash, canonical);
+            this.writeEnvelope(id, canonical);
           }
           this.db.runtimeConfig().set(this.planningRevisionKey(id), revision);
           if (resolvedKind === "architecture") {
@@ -7790,7 +11215,7 @@ export class ChronoCore {
       const approvalCommand =
         `chrono approve --action planning-approval --scope ${id} --revision ${revision} ` +
         `--authority <PO> --rationale "<decision rationale>" --path <project>`;
-      return { ok: true, value: { id, revision, path: dest, approvalCommand, healed: false } };
+      return { ok: true, value: { id, revision, path: dest, approvalCommand, healed: false, recovered: false } };
     } catch (e) {
       return this.handleError(e);
     }
@@ -7860,14 +11285,7 @@ export class ChronoCore {
           });
         }
       }
-      const resolvedKind = (Object.keys(PLANNING_KIND_DIR) as PlanningKind[]).find((k) => {
-        try {
-          assertPlanningId(k, id);
-          return true;
-        } catch {
-          return false;
-        }
-      });
+      const resolvedKind = this.resolvePlanningKind(id);
       if (resolvedKind === undefined) {
         throw new ChronoError({
           code: ErrorCode.VALIDATION_ERROR,
@@ -7992,15 +11410,7 @@ export class ChronoCore {
         if (revision === null) {
           continue;
         }
-        const kind =
-          (Object.keys(PLANNING_KIND_DIR) as PlanningKind[]).find((k) => {
-            try {
-              assertPlanningId(k, id);
-              return true;
-            } catch {
-              return false;
-            }
-          }) ?? "unknown";
+        const kind = this.resolvePlanningKind(id) ?? "unknown";
         let filePresent = false;
         if (kind !== "unknown") {
           try {

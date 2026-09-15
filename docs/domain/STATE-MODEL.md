@@ -105,6 +105,7 @@ Execution begins                           APPROVED → EXECUTING
 Implementation complete                    EXECUTING → VERIFYING
 Spekkio PASS (no blocking issues)          VERIFYING → PASSED
 All DoD criteria satisfied                PASSED → COMPLETE
+All Work Packages COMPLETE (aggregate)    APPROVED|EXECUTING|VERIFYING|PASSED → COMPLETE
 Spekkio FAILED                             VERIFYING → FAILED
 Correction complete, re-authorized         FAILED → EXECUTING
 Blocker raised (any active state)          ANY → BLOCKED
@@ -112,7 +113,7 @@ Blocker resolved (validated re-entry)      BLOCKED → (prior valid state)
 PO requests revision / change control      AWAITING_APPROVAL → DRAFT
 ```
 
-> `[FW.§596, P3.9, P8.4, P8.5, P9.3]` Module approval binds to exact module and artifact revisions `[P8.4]`. Spekkio PASS triggers `PASSED`; final DoD yields `COMPLETE` `[P9.3]`.
+> `[FW.§596, P3.9, P8.4, P8.5, P9.3]` Module approval binds to exact module and artifact revisions `[P8.4]`. Spekkio PASS triggers `PASSED`; final DoD yields `COMPLETE` `[P9.3]`. A module whose Work Packages are all COMPLETE completes by aggregate (`AllPackagesComplete`): each package carries its own Spekkio PASS verdict chain, so the module records no separate verdict; module-level traceability, architecture, blocker, defect, and currency gates still hold `[CORE_FIX CF-7]`.
 
 ### 2.3 WorkPackage
 

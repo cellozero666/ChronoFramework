@@ -64,9 +64,13 @@
  * directly importable in tests: enforcement logic runs for real, with
  * only the gate/entry binaries substituted by fixtures.
  *
- * Tool policy version: TOOL_POLICY_VERSION=4 (see @chrono/domain
+ * Tool policy version: TOOL_POLICY_VERSION=6 (see @chrono/domain
  * OPENCODE_TOOL_POLICY). The lists below are generated from that policy;
  * the Core remains the authority — the plugin only shapes the intake.
+ * v5 adds the `delegate` class for OpenCode's real subagent-delegation
+ * tool (`task`: description/prompt/subagent_type, child sessions with
+ * parentID) plus the native dispatch tools (chrono_dispatch,
+ * chrono_dispatch_claim).
  *
  * OC-P11 planning distinction: `bash` invocations that are EXACTLY a
  * governed planning operation (`chrono artifact propose|revise|status`,
@@ -182,9 +186,64 @@ const PLANNING_TOOLS = new Set([
   "chrono_artifact_supersede",
   "chrono_approval_request",
   "chrono_approval_status",
+  "chrono_dispatch",
+  "chrono_dispatch_claim",
+]);
+// Native governed lifecycle tools (CORE_FIX vertical): narrow,
+// capability-gated state operations. Unbound (Gaspar/operator)
+// sessions may call them — each enforces its own session and the
+// Core validates every call. Bound worker sessions may call them too
+// (evidence, status, release, reviews); the Core enforces binding,
+// role, and scope per call. Planning tools stay denied to workers.
+const LIFECYCLE_TOOLS = new Set([
+  "chrono_next",
+  "chrono_execution_status",
+  "chrono_evidence_record",
+  "chrono_evidence_status",
+  "chrono_complete_request",
+  "chrono_review_request",
+  "chrono_review_complete",
+  "chrono_defect_record",
+  "chrono_defect_resolve",
+  "chrono_verify_record",
+  "chrono_correction_open",
+  "chrono_correction_complete",
+  "chrono_module_complete",
+  "chrono_wp_authorize",
+  "chrono_deep_check",
+  "chrono_policy_set",
+  "chrono_policy_status",
+  "chrono_dispatch_confirm",
+  "chrono_dispatch_release",
+  "chrono_dispatch_revoke",
+  "chrono_dispatch_reconcile",
 ]);
 const SKILL_PINNED_COMMIT = ${JSON.stringify(SKILL_RELEASE.pinnedCommit)};
 const SKILL_SOURCE_HASH = ${JSON.stringify(SKILL_RELEASE.sourceHash)};
+// Native dispatch (post-planning deadlock repair): OpenCode's real
+// delegation tool is "task" (description/prompt/subagent_type;
+// subagent sessions carry parentID + agent). Delegation is never
+// broadly allowed: one "task" call passes only when bound to a live
+// CHRONO dispatch for a kind-fitting role (checked host-side
+// through dispatch-task-check, never by model text). Reviewers enact
+// only review kinds; orchestration (gaspar), human (PO), and builtin
+// agents stay denied.
+const DELEGATE_TOOL = "task";
+// Dispatch kind → enactable roles (byte-parity with
+// @chrono/domain DISPATCH_KIND_ROLES; KIND_ROLES_PARITY test fails
+// closed on drift). Reviewers enact only review kinds.
+const DISPATCH_KIND_ROLES = {
+  implementation: ["belthazar", "melchior", "prometheus"],
+  test: ["lucca"],
+  "security-review": ["glenn"],
+  verification: ["spekkio"],
+  correction: ["belthazar", "melchior", "prometheus", "lucca", "glenn"],
+};
+// Hidden system agents (compaction/title/summary): runtime machinery,
+// never CHRONO workers. They keep existing behavior and are exempt
+// from child-session discipline.
+const HIDDEN_AGENTS = new Set(["compaction", "title", "summary"]);
+const DISPATCH_LEDGER_RELATIVE = ".chrono/opencode-dispatch.jsonl";
 
 // Approval tickets referenced from runtime-delivered question payloads.
 // Only an explicit human Approve (exact challenge, approval wording,
@@ -666,6 +725,22 @@ export const ChronoGatePlugin = async (ctx) => {
   // lets a transform without sessionID join the session it belongs to
   // instead of minting a duplicate entry.
   const latestByRoot = new Map();
+  // Subagent child sessions (native dispatch repair): childSessionKey
+  // -> { parentKey, agent } from session.created parentID/agent.
+  // Bounded past 100 (oldest evicted); session.deleted drops state.
+  // Drives transform scoping (no Gaspar contract for workers) and the
+  // fail-closed child discipline in tool.execute.before. Durable
+  // dispatch bindings live in the project ledger, never here.
+  const childSessions = new Map();
+  function rememberChildSession(childKey, parentKey, agent) {
+    childSessions.set(childKey, { parentKey, agent: typeof agent === "string" ? agent : null });
+    if (childSessions.size > 100) {
+      const oldest = childSessions.keys().next();
+      if (!oldest.done) {
+        childSessions.delete(oldest.value);
+      }
+    }
+  }
   let pluginLoadLogged = false;
 
   function entryBlocked(code, reason, root, attempts) {
@@ -1058,6 +1133,12 @@ export const ChronoGatePlugin = async (ctx) => {
   function dropSessionState(sessionId) {
     if (typeof sessionId === "string") {
       entryStates.delete(sessionId);
+      childSessions.delete(sessionId);
+      for (const [childKey, child] of [...childSessions.entries()]) {
+        if (child.parentKey === sessionId) {
+          childSessions.delete(childKey);
+        }
+      }
       for (const key of [...pendingQuestions.keys()]) {
         if (key.startsWith(sessionId + "|")) {
           pendingQuestions.delete(key);
@@ -1149,6 +1230,201 @@ export const ChronoGatePlugin = async (ctx) => {
       }
       return null;
     }
+  }
+
+  function readDispatchLedger(root) {
+    // Host dispatch ledger (.chrono/opencode-dispatch.jsonl): intents,
+    // delegations, claims. Missing file reads empty; corrupt lines are
+    // skipped (fail closed downstream: absent intent denies). Never
+    // throws; never carries secrets (tokens live in 0600 tmp files).
+    let raw = "";
+    try {
+      raw = readFileSync(join(canonicalRoot(root), DISPATCH_LEDGER_RELATIVE), "utf8");
+    } catch {
+      return [];
+    }
+    const records = [];
+    for (const line of String(raw).split("\\n")) {
+      if (line.length === 0) {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed !== null && typeof parsed === "object" && parsed.v === 1 && typeof parsed.kind === "string") {
+          records.push(parsed);
+        }
+      } catch {
+        continue;
+      }
+    }
+    return records;
+  }
+
+  function dispatchBindingFor(records, workerSessionKey) {
+    // Durable claimed binding for one worker OpenCode session, or
+    // null. Exact key match only — never guessed, never fuzzy.
+    for (let i = records.length - 1; i >= 0; i--) {
+      const record = records[i];
+      if (record.kind === "dispatch-claimed" && record.workerSessionKey === workerSessionKey) {
+        return record;
+      }
+    }
+    return null;
+  }
+
+  function hasHostSession(root, sessionKey) {
+    // A host entry token exists for this exact OpenCode session. The
+    // secret is never read here — existence only.
+    try {
+      return existsSync(hostTokenPath(canonicalRoot(root), sessionKey));
+    } catch {
+      return false;
+    }
+  }
+
+  function taskToolArgs(output) {
+    // Real OpenCode task tool shape (verified against the published
+    // source: description/prompt/subagent_type, optional task_id).
+    // Anything else is not a classifiable delegation.
+    const args = toolArgs(output);
+    if (args === null) {
+      return null;
+    }
+    const subagentType = args["subagent_type"];
+    if (typeof subagentType !== "string" || subagentType.length === 0) {
+      return null;
+    }
+    const taskId = args["task_id"];
+    return {
+      subagentType,
+      taskId: typeof taskId === "string" && taskId.length > 0 ? taskId : null,
+    };
+  }
+
+  function runTaskGate(root, sessionKey, output) {
+    // Delegation decision, host-side (native dispatch repair): the
+    // plugin never parses authority from model text. Bound workers
+    // are rejected by the caller; here the caller is a Gaspar-side
+    // session and the CLI decides against the durable ledger: one
+    // live unclaimed dispatch for this session plus an exact worker
+    // role, or denial with the exact reason. CLI unreachable denies.
+    const parsed = taskToolArgs(output);
+    if (parsed === null) {
+      throw new Error(
+        "[chrono] TASK_DENIED: task call without an explicit subagent_type is not classifiable delegation: name exactly one worker role."
+      );
+    }
+    const chronoBin = readEnv("CHRONO_BIN") ?? "chrono";
+    const argv = [
+      "dispatch-task-check", "--session", sessionKey, "--agent", parsed.subagentType,
+      "--path", root, "--json",
+    ];
+    if (parsed.taskId !== null) {
+      argv.push("--task-id", parsed.taskId);
+    }
+    const verdict = runChronoJson(chronoBin, argv, 30000);
+    if (verdict !== null && verdict.ok === true) {
+      logEvidence(root, {
+        kind: "dispatch-delegated",
+        session: publicSessionKey(sessionKey, root),
+        agent: parsed.subagentType,
+        dispatch: typeof verdict.dispatchId === "string" ? verdict.dispatchId : null,
+      });
+      return;
+    }
+    const code = verdict !== null && typeof verdict.error === "object" && verdict.error !== null && typeof verdict.error.code === "string"
+      ? verdict.error.code
+      : "TASK_DENIED";
+    const reason = verdict !== null && typeof verdict.error === "object" && verdict.error !== null && typeof verdict.error.message === "string"
+      ? verdict.error.message
+      : "delegation check unreachable: denying fail-closed";
+    throw new Error("[chrono] " + code + ": " + reason);
+  }
+
+  function runWorkerGate(root, sessionKey, binding, records, tool) {
+    // Bound-worker mutation gate (native dispatch repair): mutable
+    // tools act ONLY inside the claimed binding. Resolves module/WP
+    // from the intent, both credentials host-side, and runs the
+    // standard gate execution verdict. Anything missing, mismatched,
+    // or expired denies with the exact Core reason. Never exposes
+    // credentials.
+    const publicKey = publicSessionKey(sessionKey, root);
+    const deny = (code, reason) => {
+      logEvidence(root, { kind: "dispatch-worker-denied", session: publicKey, tool, reason: code });
+      throw new Error("[chrono] " + code + ": " + reason);
+    };
+    let intent = null;
+    for (const record of records) {
+      if (record.kind === "dispatch-requested" && record.dispatchId === binding.dispatchId) {
+        intent = record;
+      }
+    }
+    if (intent === null || typeof intent.module !== "string" || intent.module.length === 0) {
+      deny("DISPATCH_UNKNOWN", "no dispatch intent backs this worker binding: dispatch again.");
+      return;
+    }
+    if (typeof intent.expiresAt !== "string" || Number.isNaN(Date.parse(intent.expiresAt)) || Date.parse(intent.expiresAt) <= Date.now()) {
+      deny("DISPATCH_EXPIRED", "the dispatch intent expired: Gaspar dispatches again for a fresh intent.");
+      return;
+    }
+    const role = binding.role;
+    const intentKind = typeof intent.dispatchKind === "string" && intent.dispatchKind.length > 0 ? intent.dispatchKind : "implementation";
+    const kindRoles = DISPATCH_KIND_ROLES[intentKind];
+    if (typeof role !== "string" || !Array.isArray(kindRoles) || !kindRoles.includes(role)) {
+      deny("DISPATCH_ROLE", "the bound role cannot enact '" + intentKind + "' work: kinds are not interchangeable.");
+      return;
+    }
+    // Review bindings are read-only (CF-5): Spekkio never mutates
+    // product code and Glenn never edits around a finding — fixes
+    // arrive through correction dispatch by the defect owner. Only
+    // implementation, test, and correction bindings may mutate.
+    if (tool !== null && (intentKind === "security-review" || intentKind === "verification")) {
+      deny("DISPATCH_READONLY", "review bindings are read-only: record findings through lifecycle tools; fixes arrive through correction dispatch.");
+      return;
+    }
+    const workerToken = readHostToken(root, sessionKey);
+    if (workerToken === null) {
+      deny("DISPATCH_NO_SESSION", "no worker credential for this session: claim the dispatch first.");
+      return;
+    }
+    if (workerToken.slice(0, workerToken.indexOf("/")) !== binding.workerCoreSession) {
+      deny("DISPATCH_MISMATCH", "worker credential does not match the dispatch binding.");
+      return;
+    }
+    // Self-request shape (the assigned role querying its own
+    // dispatch): only the worker credential crosses, never the
+    // requester's. The Core binds requester === executor here.
+    const chronoBin = readEnv("CHRONO_BIN") ?? "chrono";
+    const argv = [
+      "gate", "execution", "--module", intent.module, "--as", role, "--role", role,
+      "--session-token", workerToken, "--path", root, "--json",
+    ];
+    if (typeof intent.wp === "string" && intent.wp.length > 0) {
+      argv.push("--wp", intent.wp);
+    }
+    let raw = null;
+    try {
+      raw = execFileSync(chronoBin, argv, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    } catch (e) {
+      raw = e && e.stdout ? String(e.stdout) : null;
+    }
+    if (raw === null) {
+      deny("GATE_UNREACHABLE", "execution gate unreachable: denying fail-closed.");
+      return;
+    }
+    let verdict = null;
+    try {
+      verdict = JSON.parse(raw);
+    } catch {
+      deny("GATE_UNREACHABLE", "execution gate returned non-JSON output: denying.");
+      return;
+    }
+    if (verdict && verdict.result === "AUTHORIZED") {
+      return;
+    }
+    const code = verdict && typeof verdict.code === "string" ? verdict.code : "DENIED";
+    const reason = verdict && typeof verdict.reason === "string" ? verdict.reason : "denied";
+    deny(code, reason);
   }
 
   function readHostPoKey() {
@@ -1459,6 +1735,35 @@ export const ChronoGatePlugin = async (ctx) => {
         }
         if (sessionId !== null) {
           latestByRoot.set(root, sessionId);
+          // Subagent correlation (native dispatch repair): OpenCode
+          // creates delegation children with parentID + agent
+          // (verified: task tool sessions.create parentID/agent). A
+          // child of a CHRONO session is tracked for transform
+          // scoping and child discipline; binding to a dispatch
+          // happens at claim time through the ledger, never here.
+          const createdProps = event !== null && typeof event === "object" && event.properties !== null && typeof event.properties === "object"
+            ? event.properties
+            : null;
+          const createdInfo = createdProps !== null && createdProps.info !== null && typeof createdProps.info === "object"
+            ? createdProps.info
+            : null;
+          const parentKey = createdInfo !== null && typeof createdInfo.parentID === "string" && createdInfo.parentID.length > 0
+            ? createdInfo.parentID
+            : null;
+          const childAgent = createdInfo !== null && typeof createdInfo.agent === "string" && createdInfo.agent.length > 0
+            ? createdInfo.agent
+            : null;
+          if (parentKey !== null && hasHostSession(root, parentKey)) {
+            rememberChildSession(sessionId, parentKey, childAgent);
+            if (childAgent !== null && !HIDDEN_AGENTS.has(childAgent)) {
+              logEvidence(root, {
+                kind: "dispatch-worker-observed",
+                session: publicSessionKey(sessionId, root),
+                agent: childAgent,
+                parent: publicSessionKey(parentKey, root),
+              });
+            }
+          }
           if (!entryStates.has(sessionId)) {
             try {
               await ensureEntryAsync(root, sessionId);
@@ -1511,6 +1816,13 @@ export const ChronoGatePlugin = async (ctx) => {
         const agent = input !== null && typeof input === "object" && typeof input.agent === "string" && input.agent.length > 0
           ? input.agent
           : "unknown";
+        // Backfill subagent identity observed late (native dispatch
+        // repair): a tracked child whose creation carried no agent
+        // name learns it here. Observation only, never enforcement.
+        const tracked = childSessions.get(key);
+        if (tracked !== undefined && tracked.agent === null && agent !== "unknown") {
+          rememberChildSession(key, tracked.parentKey, agent);
+        }
         logEvidence(root, {
           kind: "agent-selected",
           session: publicSessionKey(key, root),
@@ -1527,6 +1839,15 @@ export const ChronoGatePlugin = async (ctx) => {
         return;
       }
       const key = resolveSessionKey(input, root);
+      // Worker subagents never receive the Gaspar contract (native
+      // dispatch repair): a tracked non-hidden child session — bound
+      // to a dispatch or not — runs under its own role definition,
+      // never Gaspar identity. Skipped silently; the dispatch ledger
+      // carries the binding for audit.
+      const child = childSessions.get(key);
+      if (child !== undefined && (child.agent === null || !HIDDEN_AGENTS.has(child.agent))) {
+        return;
+      }
       // Authoritative injection gate: awaits the SAME shared per-session
       // entry work (never order-dependent) and throws ENTRY_BLOCKED on
       // ANY failure, which fails the LLM request instead of answering
@@ -1608,18 +1929,89 @@ export const ChronoGatePlugin = async (ctx) => {
         }
         return;
       }
-      if (kind === "planning" || PLANNING_TOOLS.has(tool)) {
-        // Native governed planning tools (OC-P11 correction, C5): real
-        // model-callable tools registered by this same setup
-        // (.opencode/tools/chrono.ts). Planning-governed, not generic
-        // shell mutation and not implementation dispatch: each enforces
-        // its Gaspar session itself and the Core validates every call.
-        // The gate requires proven entry, nothing more.
+      // Worker/child session discipline (native dispatch repair):
+      // subagent sessions never inherit Gaspar authority. A claimed
+      // worker session acts only through its dispatch binding; an
+      // unbound child session may read and may claim, nothing else.
+      // Reads already returned above; everything below enforces this.
+      const records = readDispatchLedger(root);
+      const binding = dispatchBindingFor(records, key);
+      const child = childSessions.get(key);
+      const childAgent = child !== undefined ? child.agent : undefined;
+      const isTrackedChild = child !== undefined && (childAgent === null || !HIDDEN_AGENTS.has(childAgent));
+      if (binding !== null) {
+        // Claimed worker session: the dispatch binding is its only
+        // authority. Re-claim passes through (the CLI denies the
+        // duplicate deterministically); lifecycle tools pass through
+        // (the Core enforces binding, role, and scope per call);
+        // every planning tool is denied (workers never plan, approve,
+        // or dispatch); task delegation is denied (depth limit is
+        // structural); question stays Core-gated downstream; reads
+        // returned above.
+        if (tool === "chrono_dispatch_claim") {
+          return;
+        }
+        if (LIFECYCLE_TOOLS.has(tool)) {
+          return;
+        }
+        if (tool === DELEGATE_TOOL) {
+          throw new Error(
+            "[chrono] TASK_DENIED: worker sessions never delegate: only Gaspar delegates, once per dispatch, through a live dispatch intent."
+          );
+        }
+        if (PLANNING_TOOLS.has(tool) || tool === "question") {
+          if (tool !== "question") {
+            throw new Error(
+              "[chrono] TOOL_DENIED: worker sessions cannot use planning tools: implement inside the bound module and Work Package, or stop and escalate."
+            );
+          }
+          return;
+        }
+        if (kind !== "mutate") {
+          throw new Error(
+            \`[chrono] TOOL_DENIED: tool '\${tool}' is not classified by CHRONO tool policy v6: deny-by-default until reviewed.\`
+          );
+        }
+        runWorkerGate(root, key, binding, records, tool);
+        return;
+      }
+      if (isTrackedChild) {
+        // Unbound child session: may read (returned above) and may
+        // attempt its first claim; every other tool denies fail-closed
+        // until a dispatch binds it. This closes the pre-existing gap
+        // where entry minted Gaspar credentials for any subagent
+        // session, which ungated workers could have borrowed.
+        if (tool === "chrono_dispatch_claim") {
+          return;
+        }
+        throw new Error(
+          "[chrono] DISPATCH_REQUIRED: this subagent session has no dispatch binding: claim a dispatched Work Package first with chrono_dispatch_claim, or stop."
+        );
+      }
+      if (kind === "planning" || PLANNING_TOOLS.has(tool) || LIFECYCLE_TOOLS.has(tool)) {
+        // Native governed planning and lifecycle tools (OC-P11
+        // correction, C5; CORE_FIX vertical): real model-callable tools
+        // registered by this same setup (.opencode/tools/chrono.ts).
+        // Governed, not generic shell mutation and not implementation
+        // dispatch: each enforces its own session itself and the Core
+        // validates every call. The gate requires proven entry,
+        // nothing more.
+        return;
+      }
+      if (tool === DELEGATE_TOOL) {
+        // OpenCode's real delegation tool (verified: id "task", args
+        // description/prompt/subagent_type). Never broadly allowed:
+        // the host decides through dispatch-task-check, bound to one
+        // live dispatch and a kind-fitting role (reviewers only through
+        // review kinds). Anything else — unknown agents, builtins,
+        // gaspar/PO targets, worker callers, ambiguous or missing
+        // intents — denies here with the exact reason.
+        runTaskGate(root, key, output);
         return;
       }
       if (kind === "unknown") {
         throw new Error(
-          \`[chrono] TOOL_DENIED: tool '\${tool}' is not classified by CHRONO tool policy v3: deny-by-default until reviewed.\`
+          \`[chrono] TOOL_DENIED: tool '\${tool}' is not classified by CHRONO tool policy v6: deny-by-default until reviewed.\`
         );
       }
       // Bash compatibility: a bash invocation that is EXACTLY a governed

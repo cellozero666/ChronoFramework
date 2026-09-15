@@ -512,3 +512,252 @@ describe("Approval supersede schema (v17)", () => {
     }
   });
 });
+
+describe("Vertical lifecycle records (v18)", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-v18-test-"));
+  });
+
+  afterEach(() => {
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("creates dispatch/review/correction/policy records on every upgrade path with guards", () => {
+    for (const baseline of [1, 18]) {
+      const dir = mkdtempSync(join(tmpdir(), "chrono-v18-upgrade-"));
+      try {
+        const first = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          first.migrate(baseline);
+        } finally {
+          first.close();
+        }
+        const second = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          second.migrate();
+          expect(second.schemaVersion()).toBe(SCHEMA_VERSION);
+          // Dispatch lifecycle: create PENDING, delegate, claim CAS,
+          // confirm, complete; illegal jumps and deletes denied.
+          second.dispatches().create({
+            id: "DSP-0001", kind: "implementation", moduleId: "MOD-0001", workPackageId: "WP-0001",
+            moduleRevision: "r1", workPackageRevision: "r1", specRevisions: {}, role: "belthazar",
+            requesterSession: "SES-0001", adapterId: null, correctionOf: null, attempt: 1,
+            policyProfile: "standard", riskTriggers: [], rationale: "test",
+            expiresAt: "2026-09-15T00:00:00.000Z", createdAt: "2026-09-14T00:00:00.000Z",
+          });
+          expect(second.dispatches().findById("DSP-0001").status).toBe("PENDING");
+          // Backend guard: PENDING -> ACTIVE directly is illegal.
+          const raw = new Database(join(dir, "chrono.db"));
+          try {
+            expect(() => raw.prepare("UPDATE dispatch SET status = 'ACTIVE' WHERE id = 'DSP-0001'").run()).toThrow(
+              /legal claim lifecycle/
+            );
+            expect(() => raw.prepare("DELETE FROM dispatch WHERE id = 'DSP-0001'").run()).toThrow(/revoke instead/);
+            expect(() =>
+              raw.prepare("UPDATE dispatch SET module_id = 'MOD-0002' WHERE id = 'DSP-0001'").run()
+            ).toThrow(/frozen scope/);
+          } finally {
+            raw.close();
+          }
+          second.dispatches().recordDelegation("DSP-0001", "parent-1", "belthazar", "call-1");
+          expect(second.dispatches().claim("DSP-0001", "SES-0002", "GRANT-0001", "child-1")).toBe(true);
+          // Lost race: second claim collides.
+          expect(second.dispatches().claim("DSP-0001", "SES-0003", "GRANT-0002", "child-2")).toBe(false);
+          expect(second.dispatches().confirm("DSP-0001").status).toBe("ACTIVE");
+          expect(second.dispatches().confirm("DSP-0001").status).toBe("ACTIVE");
+          expect(second.dispatches().findActiveByWorkerSession("SES-0002")?.id).toBe("DSP-0001");
+          expect(second.dispatches().findByChildRuntimeSession("child-1")?.id).toBe("DSP-0001");
+          expect(second.dispatches().complete("DSP-0001", "2026-09-14T01:00:00.000Z").status).toBe("COMPLETED");
+          // Review assignment: single open per (kind, scope, revision).
+          second.reviewAssignments().create({
+            id: "REV-0001", kind: "security-review", moduleId: "MOD-0001", workPackageId: "WP-0001",
+            targetRevision: "r1", reviewerRole: "glenn", createdAt: "2026-09-14T00:00:00.000Z",
+          });
+          expect(() =>
+            second.reviewAssignments().create({
+              id: "REV-0002", kind: "security-review", moduleId: "MOD-0001", workPackageId: "WP-0001",
+              targetRevision: "r1", reviewerRole: "glenn", createdAt: "2026-09-14T00:00:00.000Z",
+            })
+          ).toThrow(/already assigned/);
+          expect(second.reviewAssignments().complete("REV-0001", "SES-0009", null, "2026-09-14T01:00:00.000Z").status).toBe("SUBMITTED");
+          // Correction loop: bounded advance, terminal escalation.
+          second.correctionLoops().create({
+            id: "COR-0001", defectId: "DEF-0001", moduleId: "MOD-0001", workPackageId: "WP-0001",
+            affectedRevision: "r1", ownerRole: "belthazar", attempt: 1, maxAttempts: 1,
+            createdAt: "2026-09-14T00:00:00.000Z",
+          });
+          expect(second.correctionLoops().findOpenByDefect("DEF-0001")).toHaveLength(1);
+          expect(second.correctionLoops().bindDispatch("COR-0001", "DSP-0001").status).toBe("CORRECTING");
+          expect(second.correctionLoops().markReverify("COR-0001").status).toBe("REVERIFY");
+          expect(second.correctionLoops().markRefailed("COR-0001", "2026-09-14T02:00:00.000Z").status).toBe("ESCALATED");
+          // Policy row: single-row upsert.
+          expect(second.projectPolicy().get()).toBe(null);
+          second.projectPolicy().set({ profile: "lean", rationale: "test", updatedBy: "gaspar", signature: null, updatedAt: "2026-09-14T00:00:00.000Z" });
+          expect(second.projectPolicy().get()?.profile).toBe("lean");
+        } finally {
+          second.close();
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+describe("Recovery envelopes (v19)", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-v19-test-"));
+  });
+
+  afterEach(() => {
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("backfills envelopes for pre-envelope structured rows on every upgrade path", () => {
+    // artifact_revision (the backfill source) exists from v2.
+    for (const baseline of [2, 18]) {
+      const dir = mkdtempSync(join(tmpdir(), "chrono-v19-upgrade-"));
+      try {
+        const first = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          first.migrate(baseline);
+        } finally {
+          first.close();
+        }
+        // A structured row registered before envelopes existed.
+        const content = JSON.stringify({ id: "SP-0001", title: "T" });
+        const raw = new Database(join(dir, "chrono.db"));
+        try {
+          raw
+            .prepare(
+              `INSERT INTO artifact (id, type, revision, status, created_at, updated_at, deleted, content_hash)
+               VALUES ('SP-0001', 'SP', 'rev-1', 'DRAFT', '2026-09-14T00:00:00.000Z', '2026-09-14T00:00:00.000Z', 0, 'h')`
+            )
+            .run();
+          raw
+            .prepare(
+              `INSERT INTO artifact_revision (id, revision, type, status, content_hash, content, created_at)
+               VALUES ('SP-0001', 'rev-1', 'SP', 'DRAFT', 'h', ?, '2026-09-14T00:00:00.000Z')`
+            )
+            .run(content);
+        } finally {
+          raw.close();
+        }
+        const second = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          second.migrate();
+          expect(second.schemaVersion()).toBe(SCHEMA_VERSION);
+          // Backfilled envelope carries the exact registered bytes.
+          expect(second.runtimeConfig().get("planning.envelope.SP-0001")).toBe(content);
+          // Re-running the migration never overwrites a proven envelope.
+          second.runtimeConfig().set("planning.envelope.SP-0001", "proven");
+          second.migrate();
+          expect(second.runtimeConfig().get("planning.envelope.SP-0001")).toBe("proven");
+        } finally {
+          second.close();
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+});
+  it("surfaces stale intents and unconfirmed enactments for the reconcile sweep", () => {
+    for (const baseline of [2, 18]) {
+      const dir = mkdtempSync(join(tmpdir(), "chrono-sweep-upgrade-"));
+      try {
+        const first = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          first.migrate(baseline);
+        } finally {
+          first.close();
+        }
+        const second = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          second.migrate();
+          const past = "2026-09-14T00:00:00.000Z";
+          const now = "2026-09-15T00:00:00.000Z";
+          const future = "2026-09-16T00:00:00.000Z";
+          const base = {
+            kind: "implementation", moduleId: "MOD-0001", workPackageId: "WP-0001",
+            moduleRevision: "r1", workPackageRevision: "r1", specRevisions: {}, role: "belthazar",
+            requesterSession: "SES-0001", adapterId: null, correctionOf: null, attempt: 1,
+            policyProfile: "standard", riskTriggers: [], rationale: "test", createdAt: past,
+          };
+          second.dispatches().create({ ...base, id: "DSP-PAST", expiresAt: past });
+          second.dispatches().create({ ...base, id: "DSP-LIVE", expiresAt: future });
+          second.dispatches().recordDelegation("DSP-PAST", "parent-1", "belthazar", "call-1");
+          // Enacted but never confirmed: the crash window reconcile closes.
+          expect(second.dispatches().claim("DSP-PAST", "SES-0002", "GRANT-0001", "child-1")).toBe(true);
+          expect(second.dispatches().listStalePending(now).map((d) => d.id)).toEqual([]);
+          expect(second.dispatches().listStaleEnacted(now).map((d) => d.id)).toEqual(["DSP-PAST"]);
+          // Expiry is inclusive: at the live intent's own expiry it sweeps too.
+          expect(second.dispatches().listStalePending(future).map((d) => d.id)).toEqual(["DSP-LIVE"]);
+        } finally {
+          second.close();
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+}); // close describe("Vertical lifecycle records (v18)")
+
+describe("Evidence invalidation (v18)", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-v18-evidence-"));
+  });
+
+  afterEach(() => {
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  function seedEvidence(id: string): void {
+    const raw = new Database(join(tempDir, "chrono.db"));
+    try {
+      raw
+        .prepare(
+          `INSERT INTO evidence (id, producer, tool, timestamp, target_revision, check_name, result, diagnostics, integrity_hash)
+           VALUES (?, 'lucca', 'vitest', '2026-09-14T00:00:00.000Z', ?, 'unit', 'pass', 'ok', 'h')`
+        )
+        .run(id, `sha256:${"b".repeat(64)}`);
+    } finally {
+      raw.close();
+    }
+  }
+
+  it("evidence invalidation flips only the stale flag and preserves history", () => {
+    const db = new ChronoDatabase({ path: join(tempDir, "chrono.db") });
+    try {
+      db.migrate();
+      seedEvidence("EVD-0001");
+      expect(db.evidence().findById("EVD-0001").stale).toBe(false);
+      expect(db.evidence().hasCurrentEvidence(`sha256:${"b".repeat(64)}`)).toBe(true);
+      expect(db.evidence().markStaleByRevision(`sha256:${"b".repeat(64)}`)).toBe(1);
+      expect(db.evidence().findById("EVD-0001").stale).toBe(true);
+      expect(db.evidence().hasCurrentEvidence(`sha256:${"b".repeat(64)}`)).toBe(false);
+      // Full history still lists the row; other columns frozen.
+      expect(db.evidence().listAll()).toHaveLength(1);
+      const raw = new Database(join(tempDir, "chrono.db"));
+      try {
+        expect(() => raw.prepare("UPDATE evidence SET result = 'fail' WHERE id = 'EVD-0001'").run()).toThrow(/immutable/);
+        expect(() => raw.prepare("DELETE FROM evidence WHERE id = 'EVD-0001'").run()).toThrow(/immutable|DELETE forbidden/);
+      } finally {
+        raw.close();
+      }
+    } finally {
+      db.close();
+    }
+  });
+});

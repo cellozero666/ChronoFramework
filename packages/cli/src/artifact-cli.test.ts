@@ -8,6 +8,7 @@
  * authority: propose output presents the exact approval ceremony.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import Database from "better-sqlite3";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -201,6 +202,101 @@ describe("OC-P11 artifact CLI", () => {
     });
     expect(healed.exitCode).toBe(0);
     expect(JSON.parse(healed.stdout)).toMatchObject({ ok: true, healed: true });
+  });
+
+  it("recovers a registry row lost with its file (SP-0003/SP-0004 repair)", () => {
+    const first = runArtifactPropose(tempDir, {
+      kind: "spec", id: "SP-0003", title: "Old", bodyFile: bodyFile("old", "Old contract."),
+      as: "gaspar", sessionToken: gasparToken, json: true,
+    });
+    expect(first.exitCode).toBe(0);
+    // Pilot inconsistency: the index and revision key survive while the
+    // canonical file AND the structured registry row are gone.
+    rmSync(join(tempDir, ".chrono/specs/SP-0003.md"));
+    const raw = new Database(join(tempDir, ".chrono", "chrono.db"));
+    try {
+      raw.prepare("DELETE FROM artifact WHERE id = 'SP-0003'").run();
+    } finally {
+      raw.close();
+    }
+    const statusBefore = runArtifactStatus(tempDir, { as: "gaspar", sessionToken: gasparToken, json: true });
+    const before = (JSON.parse(statusBefore.stdout) as { items: Array<{ id: string; filePresent: boolean; lifecycle: string }> }).items;
+    expect(before.find((i) => i.id === "SP-0003")).toMatchObject({ filePresent: false, lifecycle: "active" });
+    // Non-identical content denies toward formal supersession (CF-8):
+    // rebuilt defaults cannot prove the registered semantics, so no
+    // invented row inherits the identity. The file stays absent until
+    // a replacement is proposed and supersedes the lost draft.
+    const recovered = runArtifactRevise(tempDir, {
+      id: "SP-0003", title: "Old rebuilt", bodyFile: bodyFile("rebuilt", "Old contract, rebuilt after loss."),
+      as: "gaspar", sessionToken: gasparToken, json: true,
+    });
+    expect(recovered.exitCode).toBe(1);
+    const rec = JSON.parse(recovered.stdout) as { error: { code: string; message: string; suggestedAction: string } };
+    expect(rec.error.code).toBe("ENTITY_NOT_FOUND");
+    expect(rec.error.message).toMatch(/does not reproduce the registered semantics/);
+    expect(rec.error.suggestedAction).toMatch(/supersede/);
+    expect(existsSync(join(tempDir, ".chrono/specs/SP-0003.md"))).toBe(false);
+    // Formal supersession recovers the workflow: propose the
+    // replacement, supersede the lost draft, keep harness history.
+    const replacement = runArtifactPropose(tempDir, {
+      kind: "spec", id: "SP-0005", title: "Old rebuilt", bodyFile: bodyFile("rebuilt", "Old contract, rebuilt after loss."),
+      as: "gaspar", sessionToken: gasparToken, json: true,
+    });
+    expect(replacement.exitCode).toBe(0);
+    const superseded = runArtifactSupersede(tempDir, { id: "SP-0003", supersededBy: "SP-0005", as: "gaspar", sessionToken: gasparToken, json: true });
+    expect(superseded.exitCode).toBe(0);
+    expect(JSON.parse(superseded.stdout)).toMatchObject({ ok: true, id: "SP-0003", supersededBy: "SP-0005" });
+  });
+
+  it("recovers with the recorded revision intact when content is identical", () => {
+    const first = runArtifactPropose(tempDir, {
+      kind: "spec", id: "SP-0004", title: "Same", bodyFile: bodyFile("same", "Same contract."),
+      as: "gaspar", sessionToken: gasparToken, json: true,
+    });
+    expect(first.exitCode).toBe(0);
+    const firstRev = (JSON.parse(first.stdout) as { revision: string }).revision;
+    rmSync(join(tempDir, ".chrono/specs/SP-0004.md"));
+    const raw = new Database(join(tempDir, ".chrono", "chrono.db"));
+    try {
+      raw.prepare("DELETE FROM artifact WHERE id = 'SP-0004'").run();
+    } finally {
+      raw.close();
+    }
+    // Identical title+body reproduces the recorded revision: the row
+    // returns, the file returns, approvals stand.
+    const recovered = runArtifactRevise(tempDir, {
+      id: "SP-0004", title: "Same", bodyFile: bodyFile("same2", "Same contract."),
+      as: "gaspar", sessionToken: gasparToken, json: true,
+    });
+    expect(recovered.exitCode).toBe(0);
+    expect(JSON.parse(recovered.stdout)).toMatchObject({ revision: firstRev, healed: false, recovered: true });
+    expect(existsSync(join(tempDir, ".chrono/specs/SP-0004.md"))).toBe(true);
+  });
+
+  it("module/work-package rows that cannot be rebuilt fail toward supersede, not a bare NOT_FOUND", () => {
+    const spec = runArtifactPropose(tempDir, {
+      kind: "spec", id: "SP-0009", title: "S", bodyFile: bodyFile("sp9", "Spec contract."),
+      as: "gaspar", sessionToken: gasparToken, json: true,
+    });
+    expect(spec.exitCode).toBe(0);
+    const first = runArtifactPropose(tempDir, {
+      kind: "module", id: "MOD-0009", title: "M", bodyFile: bodyFile("mod", "Module plan."),
+      references: ["SP-0009"],
+      as: "gaspar", sessionToken: gasparToken, json: true,
+    });
+    expect(first.exitCode).toBe(0);
+    const raw = new Database(join(tempDir, ".chrono", "chrono.db"));
+    try {
+      raw.prepare("DELETE FROM artifact WHERE id = 'MOD-0009'").run();
+    } finally {
+      raw.close();
+    }
+    const denied = runArtifactRevise(tempDir, {
+      id: "MOD-0009", title: "M2", bodyFile: bodyFile("mod2", "Changed."),
+      as: "gaspar", sessionToken: gasparToken, json: true,
+    });
+    expect(denied.exitCode).toBe(1);
+    expect(JSON.parse(denied.stdout).error.message).toMatch(/supersede/);
   });
 
   it("status output carries no body content or secrets", () => {

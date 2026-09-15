@@ -6,6 +6,7 @@ export const CHRONO_ERROR_CODES = [
   // Authorization failures [INV §14.1]
   "EXECUTION_DENIED",
   "COMPLETION_DENIED",
+  "TASK_DENIED",
   "APPROVAL_REQUIRED",
   "SECURITY_BLOCKER",
   "BLOCKED_RTK",
@@ -91,6 +92,7 @@ export class ChronoError extends Error {
 export const ErrorCode = {
   EXECUTION_DENIED: "EXECUTION_DENIED" as const,
   COMPLETION_DENIED: "COMPLETION_DENIED" as const,
+  TASK_DENIED: "TASK_DENIED" as const,
   APPROVAL_REQUIRED: "APPROVAL_REQUIRED" as const,
   SECURITY_BLOCKER: "SECURITY_BLOCKER" as const,
   BLOCKED_RTK: "BLOCKED_RTK" as  const,

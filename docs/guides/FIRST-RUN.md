@@ -138,6 +138,43 @@ explicit UI decision, finalization result, Core-reported
 authoritative/current state, rejection reason, and duplicate or
 replay detection — without secrets.
 
+## 3.2 Dispatch Work Packages without leaving the runtime
+
+Once the module and its Work Packages are approved and current,
+Gaspar continues automatically — no shell, no exported tokens, no
+terminal action from you:
+
+1. Gaspar calls `chrono_dispatch` with the module id, the Work
+   Package id, the dispatch kind, and a short rationale. Every Core
+   gate is validated (approvals, Specs READY, fresh Harnesses,
+   attestations, blockers); a denial names the exact unmet
+   prerequisite.
+2. Gaspar delegates to exactly one kind-fitting worker with the
+   native `task` tool: belthazar, melchior, prometheus, or lucca
+   for implementation and test work; Glenn through a
+   `security-review` dispatch; Spekkio through a `verification`
+   dispatch; the defect owner through a `correction` dispatch.
+3. The worker's first action is `chrono_dispatch_claim`, which
+   binds its session to the dispatch, enacts the binding, and
+   confirms credential confinement. Its file and shell tools
+   then work only inside the bound module and Work Package, and
+   every tool call re-validates the binding without minting
+   grants.
+4. Gaspar coordinates and routes evidence; it cannot implement,
+   and the worker cannot delegate further or leave its scope.
+   Evidence, reviews, verdicts, correction loops, completion, and
+   the next Work Package all run through the `chrono_*` lifecycle
+   tools; `chrono_next` always names the single highest-precedence
+   action.
+
+If a planning file goes missing, `chrono_artifact_status` says so
+explicitly: revising with identical content rematerializes it. If
+a Spec's registry row was lost, recovery restores the registered
+semantics only when the supplied content proves byte-equivalence
+against the canonical recovery envelope (approvals stand only
+then); anything else denies toward formal supersession — invented
+content never inherits approvals.
+
 ## 4. Re-run, repair, and diagnose
 
 ```sh

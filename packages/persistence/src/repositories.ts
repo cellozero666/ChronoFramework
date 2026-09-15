@@ -158,6 +158,7 @@ export interface EvidenceRecord {
   result: string;
   diagnostics: string | null;
   integrityHash: string;
+  stale: boolean;
 }
 
 /**
@@ -407,6 +408,7 @@ interface EvidenceRow {
   result: unknown;
   diagnostics: unknown;
   integrity_hash: unknown;
+  stale: unknown;
 }
 
 /**
@@ -635,6 +637,56 @@ export class ArtifactRepository {
       ).run(newStatus, now, id);
     });
     tx();
+  }
+
+  /**
+   * Rematerialize a lost current row (governed recovery): re-inserts
+   * the missing `artifact` row and backfills the history row only
+   * when that exact revision was never recorded. Existing rows and
+   * existing history are never touched (no UPDATE, no DELETE), so
+   * history stays append-only and tombstones are never resurrected:
+   * a present row (even deleted=1) denies with DUPLICATE_IDENTITY.
+   */
+  restore(
+    id: string,
+    type: string,
+    revision: string,
+    status: string,
+    contentHash: string,
+    content: string
+  ): void {
+    const now = new Date().toISOString();
+    try {
+      const tx = this.db.transaction(() => {
+        this.db.prepare(
+          `INSERT INTO artifact (id, type, revision, status, created_at, updated_at, deleted, content_hash)
+           VALUES (?, ?, ?, ?, ?, ?, 0, ?)`
+        ).run(id, type, revision, status, now, now, contentHash);
+        const hist = this.db
+          .prepare("SELECT 1 AS one FROM artifact_revision WHERE id = ? AND revision = ? LIMIT 1")
+          .get(id, revision) as { one: number } | undefined;
+        if (hist === undefined) {
+          this.db.prepare(
+            `INSERT INTO artifact_revision (id, revision, type, status, content_hash, content, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).run(id, revision, type, status, contentHash, content, now);
+        }
+      });
+      tx();
+    } catch (e) {
+      const code = (e as { code?: string }).code;
+      if (code === "SQLITE_CONSTRAINT_PRIMARYKEY" || code === "SQLITE_CONSTRAINT_UNIQUE") {
+        throw new ChronoError({
+          code: ErrorCode.DUPLICATE_IDENTITY,
+          severity: Severity.ERROR,
+          message: `Artifact ${id} already exists`,
+          invariantRef: "INV §10.1",
+          affectedTarget: id,
+          suggestedAction: "Use a different identifier or reference the existing artifact",
+        });
+      }
+      throw e;
+    }
   }
 
   /** List every recorded revision of an artifact, oldest first. */
@@ -1105,9 +1157,56 @@ export class EvidenceRepository {
     return rows.map((r) => this.mapEvidenceRow(r));
   }
 
+  /** Current (non-staled) evidence for a revision, newest first. Gates read this, never the full history. */
+  findCurrentByTargetRevision(revision: string): EvidenceRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM evidence WHERE target_revision = ? AND stale = 0 ORDER BY timestamp DESC")
+      .all(revision) as EvidenceRow[];
+
+    return rows.map((r) => this.mapEvidenceRow(r));
+  }
+
+  /** Superseded (stale) evidence for a revision, newest first. Status projections count these; gates ignore them. */
+  findStaleByTargetRevision(revision: string): EvidenceRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM evidence WHERE target_revision = ? AND stale = 1 ORDER BY timestamp DESC")
+      .all(revision) as EvidenceRow[];
+
+    return rows.map((r) => this.mapEvidenceRow(r));
+  }
+
   /** Check if current evidence exists for a revision [P9.3] */
   hasCurrentEvidence(revision: string): boolean {
-    return this.findByTargetRevision(revision).length > 0;
+    return this.findCurrentByTargetRevision(revision).length > 0;
+  }
+
+  /**
+   * Invalidate every current evidence row bound to a revision
+   * (correction cycles). Append-only history is preserved; only the
+   * stale flag flips 0 -> 1 under the immutability trigger. Returns
+   * the invalidated row count.
+   */
+  markStaleByRevision(revision: string): number {
+    const info = this.db
+      .prepare("UPDATE evidence SET stale = 1 WHERE target_revision = ? AND stale = 0")
+      .run(revision);
+    return Number(info.changes);
+  }
+
+  /**
+   * Invalidate current evidence except rows produced by `producer`
+   * at or after `sinceIso` (the fix evidence recorded inside the
+   * correction window survives; everything older goes stale).
+   */
+  markStaleExcept(revision: string, producer: string, sinceIso: string): number {
+    const info = this.db
+      .prepare(
+        `UPDATE evidence SET stale = 1
+         WHERE target_revision = ? AND stale = 0
+           AND NOT (producer = ? AND timestamp >= ?)`
+      )
+      .run(revision, producer, sinceIso);
+    return Number(info.changes);
   }
 
   findById(id: string): EvidenceRecord {
@@ -1147,6 +1246,7 @@ export class EvidenceRepository {
       result: row.result as string,
       diagnostics: row.diagnostics as string | null,
       integrityHash: row.integrity_hash as string,
+      stale: Boolean(row.stale),
     };
   }
 }
@@ -1930,6 +2030,18 @@ export class SessionRepository {
 
   touch(id: string, at: string): void {
     this.db.prepare("UPDATE agent_session SET last_seen = ? WHERE id = ?").run(at, id);
+  }
+
+  /**
+   * Live sessions for integrity sweeps (deep check, reconcile): not
+   * revoked and not yet expired at `nowIso`. Findings carry ids and
+   * roles only — token hashes never leave the store.
+   */
+  listLive(nowIso: string): AgentSessionRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM agent_session WHERE revoked = 0 AND expires_at > ? ORDER BY issued_at ASC")
+      .all(nowIso) as AgentSessionRow[];
+    return rows.map((r) => this.mapSessionRow(r));
   }
 
   revoke(id: string): AgentSessionRecord {
@@ -2815,6 +2927,794 @@ export class CeremonyClaimRepository {
       approvalId: row.approval_id,
       claimedAt: row.claimed_at,
     }));
+  }
+}
+
+export interface DispatchRecord {
+  id: string;
+  kind: string;
+  moduleId: string;
+  workPackageId: string | null;
+  moduleRevision: string;
+  workPackageRevision: string | null;
+  specRevisions: Record<string, string>;
+  role: string;
+  requesterSession: string;
+  adapterId: string | null;
+  status: string;
+  workerSession: string | null;
+  grantId: string | null;
+  parentRuntimeSession: string | null;
+  delegatedAgent: string | null;
+  taskCallId: string | null;
+  childRuntimeSession: string | null;
+  correctionOf: string | null;
+  attempt: number;
+  policyProfile: string;
+  riskTriggers: string[];
+  rationale: string;
+  expiresAt: string;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+interface DispatchRow {
+  id: unknown;
+  kind: unknown;
+  module_id: unknown;
+  work_package_id: unknown;
+  module_revision: unknown;
+  work_package_revision: unknown;
+  spec_revisions: unknown;
+  role: unknown;
+  requester_session: unknown;
+  adapter_id: unknown;
+  status: unknown;
+  worker_session: unknown;
+  grant_id: unknown;
+  parent_runtime_session: unknown;
+  delegated_agent: unknown;
+  task_call_id: unknown;
+  child_runtime_session: unknown;
+  correction_of: unknown;
+  attempt: unknown;
+  policy_profile: unknown;
+  risk_triggers: unknown;
+  rationale: unknown;
+  expires_at: unknown;
+  created_at: unknown;
+  completed_at: unknown;
+}
+
+/**
+ * Core-owned dispatch authority (CORE_FIX CF-2). Intents, delegations,
+ * claims, bindings, status, expiry, and revocation live here — never
+ * in a host JSONL file. Single-use transitions use conditional writes
+ * (exactly-one-row flips, fail closed on races); the status trigger
+ * backstops every raw path.
+ */
+export class DispatchRepository {
+  constructor(private readonly db: Database) {}
+
+  create(dispatch: {
+    id: string;
+    kind: string;
+    moduleId: string;
+    workPackageId: string | null;
+    moduleRevision: string;
+    workPackageRevision: string | null;
+    specRevisions: Record<string, string>;
+    role: string;
+    requesterSession: string;
+    adapterId: string | null;
+    correctionOf: string | null;
+    attempt: number;
+    policyProfile: string;
+    riskTriggers: string[];
+    rationale: string;
+    expiresAt: string;
+    createdAt: string;
+  }): DispatchRecord {
+    try {
+      this.db.prepare(
+        `INSERT INTO dispatch (id, kind, module_id, work_package_id, module_revision,
+           work_package_revision, spec_revisions, role, requester_session, adapter_id,
+           status, worker_session, grant_id, parent_runtime_session, delegated_agent,
+           task_call_id, child_runtime_session, correction_of, attempt, policy_profile,
+           risk_triggers, rationale, expires_at, created_at, completed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', NULL, NULL, NULL, NULL,
+           NULL, NULL, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      ).run(
+        dispatch.id, dispatch.kind, dispatch.moduleId, dispatch.workPackageId,
+        dispatch.moduleRevision, dispatch.workPackageRevision, JSON.stringify(dispatch.specRevisions),
+        dispatch.role, dispatch.requesterSession, dispatch.adapterId, dispatch.correctionOf,
+        dispatch.attempt, dispatch.policyProfile, JSON.stringify(dispatch.riskTriggers),
+        dispatch.rationale, dispatch.expiresAt, dispatch.createdAt
+      );
+    } catch {
+      throw new ChronoError({
+        code: ErrorCode.DUPLICATE_IDENTITY,
+        severity: Severity.ERROR,
+        message: `Dispatch '${dispatch.id}' already exists`,
+        invariantRef: "INV §10.1",
+        affectedTarget: dispatch.id,
+        suggestedAction: "Dispatch again for a fresh intent",
+      });
+    }
+    return this.findById(dispatch.id);
+  }
+
+  findById(id: string): DispatchRecord {
+    const row = this.db
+      .prepare("SELECT * FROM dispatch WHERE id = ?")
+      .get(id) as DispatchRow | undefined;
+    if (row === undefined) {
+      throw new ChronoError({
+        code: ErrorCode.ENTITY_NOT_FOUND,
+        severity: Severity.ERROR,
+        message: `Dispatch '${id}' not found`,
+        invariantRef: "INV §10.2",
+        affectedTarget: id,
+        suggestedAction: "Request a dispatch intent first",
+      });
+    }
+    return this.mapRow(row);
+  }
+
+  /** Live dispatch intents requested by one Core session (expiry evaluated by callers). */
+  listByRequester(requesterSession: string): DispatchRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM dispatch WHERE requester_session = ? ORDER BY created_at ASC")
+      .all(requesterSession) as DispatchRow[];
+    return rows.map((r) => this.mapRow(r));
+  }
+
+  /** Dispatch currently bound to one worker Core session (at most one ACTIVE). */
+  findActiveByWorkerSession(workerSession: string): DispatchRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM dispatch WHERE worker_session = ? AND status = 'ACTIVE' ORDER BY created_at DESC LIMIT 1")
+      .get(workerSession) as DispatchRow | undefined;
+    return row === undefined ? null : this.mapRow(row);
+  }
+
+  /** Dispatch claimed into one runtime child session (at most one). */
+  findByChildRuntimeSession(childKey: string): DispatchRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM dispatch WHERE child_runtime_session = ? AND status IN ('ENACTED','ACTIVE') ORDER BY created_at DESC LIMIT 1")
+      .get(childKey) as DispatchRow | undefined;
+    return row === undefined ? null : this.mapRow(row);
+  }
+
+  /** Open correction loops' dispatches are separate rows; list dispatches touching a scope. */
+  listByScope(moduleId: string, workPackageId: string | null): DispatchRecord[] {
+    const rows = workPackageId === null
+      ? this.db
+        .prepare("SELECT * FROM dispatch WHERE module_id = ? AND work_package_id IS NULL ORDER BY created_at ASC")
+        .all(moduleId) as DispatchRow[]
+      : this.db
+        .prepare("SELECT * FROM dispatch WHERE module_id = ? AND work_package_id = ? ORDER BY created_at ASC")
+        .all(moduleId, workPackageId) as DispatchRow[];
+    return rows.map((r) => this.mapRow(r));
+  }
+
+  /** Record a task delegation: exactly one delegation per dispatch. */
+  recordDelegation(id: string, parentRuntimeSession: string, agent: string, taskCallId: string | null): DispatchRecord {
+    const info = this.db
+      .prepare(
+        `UPDATE dispatch SET parent_runtime_session = ?, delegated_agent = ?, task_call_id = ?
+         WHERE id = ? AND status = 'PENDING' AND delegated_agent IS NULL`
+      )
+      .run(parentRuntimeSession, agent, taskCallId, id);
+    if (info.changes !== 1) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Dispatch '${id}' cannot accept a delegation: not pending or already delegated`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Delegate once per live dispatch intent",
+      });
+    }
+    return this.findById(id);
+  }
+
+  /**
+   * Atomic claim: PENDING -> ENACTED binding worker session, grant,
+   * and child runtime session in one conditional flip. Returns false
+   * (no state change) when another claim won the race.
+   */
+  claim(id: string, workerSession: string, grantId: string, childRuntimeSession: string): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE dispatch SET status = 'ENACTED', worker_session = ?, grant_id = ?, child_runtime_session = ?
+         WHERE id = ? AND status = 'PENDING'`
+      )
+      .run(workerSession, grantId, childRuntimeSession, id);
+    return info.changes === 1;
+  }
+
+  /** Confirm credential confinement: ENACTED -> ACTIVE. Idempotent on ACTIVE. */
+  confirm(id: string): DispatchRecord {
+    const current = this.findById(id);
+    if (current.status === "ACTIVE") {
+      return current;
+    }
+    const info = this.db
+      .prepare("UPDATE dispatch SET status = 'ACTIVE' WHERE id = ? AND status = 'ENACTED'")
+      .run(id);
+    if (info.changes !== 1) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Dispatch '${id}' cannot confirm: expected ENACTED, found '${current.status}'`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Claim the dispatch first, then confirm credential confinement",
+      });
+    }
+    return this.findById(id);
+  }
+
+  /** Terminal moves with audit-safe single conditional flips. */
+  complete(id: string, completedAt: string): DispatchRecord {
+    return this.moveTerminal(id, "COMPLETED", completedAt);
+  }
+
+  revoke(id: string): DispatchRecord {
+    const current = this.findById(id);
+    if (current.status === "REVOKED") {
+      return current;
+    }
+    return this.moveTerminal(id, "REVOKED", current.completedAt ?? new Date().toISOString());
+  }
+
+  expire(id: string): DispatchRecord {
+    const current = this.findById(id);
+    if (current.status === "EXPIRED") {
+      return current;
+    }
+    return this.moveTerminal(id, "EXPIRED", current.completedAt ?? new Date().toISOString());
+  }
+
+  private moveTerminal(id: string, toStatus: "COMPLETED" | "REVOKED" | "EXPIRED", completedAt: string): DispatchRecord {
+    const from = toStatus === "COMPLETED" ? "'ACTIVE'" : "'PENDING','ENACTED','ACTIVE'";
+    const info = this.db
+      .prepare(`UPDATE dispatch SET status = ?, completed_at = ? WHERE id = ? AND status IN (${from})`)
+      .run(toStatus, completedAt, id);
+    if (info.changes !== 1) {
+      const current = this.findById(id);
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Dispatch '${id}' cannot move to '${toStatus}' from '${current.status}'`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Inspect the dispatch lifecycle before terminal moves",
+      });
+    }
+    return this.findById(id);
+  }
+
+  /** Stale-claim sweep input: ENACTED rows at or past expiry. */
+  listStaleEnacted(nowIso: string): DispatchRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM dispatch WHERE status = 'ENACTED' AND expires_at <= ? ORDER BY created_at ASC")
+      .all(nowIso) as DispatchRow[];
+    return rows.map((r) => this.mapRow(r));
+  }
+
+  /** Stale-intent sweep input: PENDING rows at or past expiry. */
+  listStalePending(nowIso: string): DispatchRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM dispatch WHERE status = 'PENDING' AND expires_at <= ? ORDER BY created_at ASC")
+      .all(nowIso) as DispatchRow[];
+    return rows.map((r) => this.mapRow(r));
+  }
+
+  private mapRow(row: DispatchRow): DispatchRecord {
+    const parseStrings = (value: unknown): Record<string, string> => {
+      if (typeof value !== "string") {
+        return {};
+      }
+      try {
+        const parsed: unknown = JSON.parse(value);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          return {};
+        }
+        const out: Record<string, string> = {};
+        for (const [key, entry] of Object.entries(parsed)) {
+          if (typeof entry === "string") {
+            out[key] = entry;
+          }
+        }
+        return out;
+      } catch {
+        return {};
+      }
+    };
+    const parseKeys = (value: unknown): string[] => {
+      if (typeof value !== "string") {
+        return [];
+      }
+      try {
+        const parsed: unknown = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed.filter((e): e is string => typeof e === "string") : [];
+      } catch {
+        return [];
+      }
+    };
+    return {
+      id: row.id as string,
+      kind: row.kind as string,
+      moduleId: row.module_id as string,
+      workPackageId: row.work_package_id as string | null,
+      moduleRevision: row.module_revision as string,
+      workPackageRevision: row.work_package_revision as string | null,
+      specRevisions: parseStrings(row.spec_revisions),
+      role: row.role as string,
+      requesterSession: row.requester_session as string,
+      adapterId: row.adapter_id as string | null,
+      status: row.status as string,
+      workerSession: row.worker_session as string | null,
+      grantId: row.grant_id as string | null,
+      parentRuntimeSession: row.parent_runtime_session as string | null,
+      delegatedAgent: row.delegated_agent as string | null,
+      taskCallId: row.task_call_id as string | null,
+      childRuntimeSession: row.child_runtime_session as string | null,
+      correctionOf: row.correction_of as string | null,
+      attempt: row.attempt as number,
+      policyProfile: row.policy_profile as string,
+      riskTriggers: parseKeys(row.risk_triggers),
+      rationale: row.rationale as string,
+      expiresAt: row.expires_at as string,
+      createdAt: row.created_at as string,
+      completedAt: row.completed_at as string | null,
+    };
+  }
+}
+
+export interface ReviewRecord {
+  id: string;
+  kind: string;
+  moduleId: string;
+  workPackageId: string | null;
+  targetRevision: string;
+  reviewerRole: string;
+  reviewerSession: string | null;
+  dispatchId: string | null;
+  status: string;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+interface ReviewRow {
+  id: unknown;
+  kind: unknown;
+  module_id: unknown;
+  work_package_id: unknown;
+  target_revision: unknown;
+  reviewer_role: unknown;
+  reviewer_session: unknown;
+  dispatch_id: unknown;
+  status: unknown;
+  created_at: unknown;
+  completed_at: unknown;
+}
+
+/**
+ * Distinct review dispatch targets (CF-5): security review (Glenn)
+ * and independent verification (Spekkio) are first-class assignments
+ * with independence from the implementer session, never
+ * interchangeable with implementation. One open assignment per
+ * (kind, scope, revision), enforced by partial unique index.
+ */
+export class ReviewRepository {
+  constructor(private readonly db: Database) {}
+
+  create(review: {
+    id: string;
+    kind: string;
+    moduleId: string;
+    workPackageId: string | null;
+    targetRevision: string;
+    reviewerRole: string;
+    createdAt: string;
+  }): ReviewRecord {
+    try {
+      this.db.prepare(
+        `INSERT INTO review_assignment (id, kind, module_id, work_package_id, target_revision,
+           reviewer_role, reviewer_session, dispatch_id, status, created_at, completed_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 'ASSIGNED', ?, NULL)`
+      ).run(
+        review.id, review.kind, review.moduleId, review.workPackageId,
+        review.targetRevision, review.reviewerRole, review.createdAt
+      );
+    } catch {
+      throw new ChronoError({
+        code: ErrorCode.DUPLICATE_IDENTITY,
+        severity: Severity.ERROR,
+        message: `Open ${review.kind} review already assigned for this scope and revision`,
+        invariantRef: "INV §10.1",
+        affectedTarget: review.moduleId,
+        suggestedAction: "Complete or supersede the open review first",
+      });
+    }
+    return this.findById(review.id);
+  }
+
+  findById(id: string): ReviewRecord {
+    const row = this.db
+      .prepare("SELECT * FROM review_assignment WHERE id = ?")
+      .get(id) as ReviewRow | undefined;
+    if (row === undefined) {
+      throw new ChronoError({
+        code: ErrorCode.ENTITY_NOT_FOUND,
+        severity: Severity.ERROR,
+        message: `Review assignment '${id}' not found`,
+        invariantRef: "INV §10.2",
+        affectedTarget: id,
+        suggestedAction: "Assign the review first",
+      });
+    }
+    return this.mapRow(row);
+  }
+
+  findOpen(kind: string, moduleId: string, workPackageId: string | null, targetRevision: string): ReviewRecord | null {
+    const row = (workPackageId === null
+      ? this.db
+        .prepare("SELECT * FROM review_assignment WHERE kind = ? AND module_id = ? AND work_package_id IS NULL AND target_revision = ? AND status = 'ASSIGNED' ORDER BY created_at DESC LIMIT 1")
+        .get(kind, moduleId, targetRevision)
+      : this.db
+        .prepare("SELECT * FROM review_assignment WHERE kind = ? AND module_id = ? AND work_package_id = ? AND target_revision = ? AND status = 'ASSIGNED' ORDER BY created_at DESC LIMIT 1")
+        .get(kind, moduleId, workPackageId, targetRevision)) as ReviewRow | undefined;
+    return row === undefined ? null : this.mapRow(row);
+  }
+
+  listByScope(moduleId: string, workPackageId: string | null): ReviewRecord[] {
+    const rows = (workPackageId === null
+      ? this.db
+        .prepare("SELECT * FROM review_assignment WHERE module_id = ? AND work_package_id IS NULL ORDER BY created_at ASC")
+        .all(moduleId)
+      : this.db
+        .prepare("SELECT * FROM review_assignment WHERE module_id = ? AND work_package_id = ? ORDER BY created_at ASC")
+        .all(moduleId, workPackageId)) as ReviewRow[];
+    return rows.map((r) => this.mapRow(r));
+  }
+
+  /** Complete with reviewer binding: exactly one flip from ASSIGNED. */
+  complete(id: string, reviewerSession: string, dispatchId: string | null, completedAt: string): ReviewRecord {
+    const info = this.db
+      .prepare(
+        `UPDATE review_assignment SET status = 'SUBMITTED', reviewer_session = ?, dispatch_id = ?, completed_at = ?
+         WHERE id = ? AND status = 'ASSIGNED'`
+      )
+      .run(reviewerSession, dispatchId, completedAt, id);
+    if (info.changes !== 1) {
+      const current = this.findById(id);
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Review '${id}' cannot complete from '${current.status}': replay denied`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Complete an assigned review exactly once",
+      });
+    }
+    return this.findById(id);
+  }
+
+  /** Revision moved under an open assignment: supersede it, never silently retarget. */
+  supersede(id: string): ReviewRecord {
+    const info = this.db
+      .prepare("UPDATE review_assignment SET status = 'SUPERSEDED' WHERE id = ? AND status = 'ASSIGNED'")
+      .run(id);
+    if (info.changes !== 1) {
+      return this.findById(id);
+    }
+    return this.findById(id);
+  }
+
+  private mapRow(row: ReviewRow): ReviewRecord {
+    return {
+      id: row.id as string,
+      kind: row.kind as string,
+      moduleId: row.module_id as string,
+      workPackageId: row.work_package_id as string | null,
+      targetRevision: row.target_revision as string,
+      reviewerRole: row.reviewer_role as string,
+      reviewerSession: row.reviewer_session as string | null,
+      dispatchId: row.dispatch_id as string | null,
+      status: row.status as string,
+      createdAt: row.created_at as string,
+      completedAt: row.completed_at as string | null,
+    };
+  }
+}
+
+export interface CorrectionRecord {
+  id: string;
+  defectId: string;
+  moduleId: string;
+  workPackageId: string | null;
+  affectedRevision: string;
+  ownerRole: string;
+  attempt: number;
+  maxAttempts: number;
+  status: string;
+  dispatchId: string | null;
+  createdAt: string;
+  closedAt: string | null;
+}
+
+interface CorrectionRow {
+  id: unknown;
+  defect_id: unknown;
+  module_id: unknown;
+  work_package_id: unknown;
+  affected_revision: unknown;
+  owner_role: unknown;
+  attempt: unknown;
+  max_attempts: unknown;
+  status: unknown;
+  dispatch_id: unknown;
+  created_at: unknown;
+  closed_at: unknown;
+}
+
+/**
+ * Bounded correction loops (CF-6): identity, owner, affected
+ * revision, attempt count, and terminal escalation. Attempts advance
+ * only through re-verification; exceeding the profile bound
+ * escalates with a blocker instead of looping forever.
+ */
+export class CorrectionRepository {
+  constructor(private readonly db: Database) {}
+
+  create(loop: {
+    id: string;
+    defectId: string;
+    moduleId: string;
+    workPackageId: string | null;
+    affectedRevision: string;
+    ownerRole: string;
+    attempt: number;
+    maxAttempts: number;
+    createdAt: string;
+  }): CorrectionRecord {
+    try {
+      this.db.prepare(
+        `INSERT INTO correction_loop (id, defect_id, module_id, work_package_id, affected_revision,
+           owner_role, attempt, max_attempts, status, dispatch_id, created_at, closed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', NULL, ?, NULL)`
+      ).run(
+        loop.id, loop.defectId, loop.moduleId, loop.workPackageId, loop.affectedRevision,
+        loop.ownerRole, loop.attempt, loop.maxAttempts, loop.createdAt
+      );
+    } catch {
+      throw new ChronoError({
+        code: ErrorCode.DUPLICATE_IDENTITY,
+        severity: Severity.ERROR,
+        message: `Correction loop '${loop.id}' already exists`,
+        invariantRef: "INV §10.1",
+        affectedTarget: loop.id,
+        suggestedAction: "Advance the existing loop instead of reopening it",
+      });
+    }
+    return this.findById(loop.id);
+  }
+
+  findById(id: string): CorrectionRecord {
+    const row = this.db
+      .prepare("SELECT * FROM correction_loop WHERE id = ?")
+      .get(id) as CorrectionRow | undefined;
+    if (row === undefined) {
+      throw new ChronoError({
+        code: ErrorCode.ENTITY_NOT_FOUND,
+        severity: Severity.ERROR,
+        message: `Correction loop '${id}' not found`,
+        invariantRef: "INV §10.2",
+        affectedTarget: id,
+        suggestedAction: "Open a correction loop for the defect first",
+      });
+    }
+    return this.mapRow(row);
+  }
+
+  /** Open (non-terminal) loops for one defect, oldest first. */
+  findOpenByDefect(defectId: string): CorrectionRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM correction_loop WHERE defect_id = ? AND status IN ('OPEN','CORRECTING','REVERIFY') ORDER BY created_at ASC")
+      .all(defectId) as CorrectionRow[];
+    return rows.map((r) => this.mapRow(r));
+  }
+
+  /** Loops touching one scope (any status), oldest first. */
+  listByScope(moduleId: string, workPackageId: string | null): CorrectionRecord[] {
+    const rows = (workPackageId === null
+      ? this.db
+        .prepare("SELECT * FROM correction_loop WHERE module_id = ? AND work_package_id IS NULL ORDER BY created_at ASC")
+        .all(moduleId)
+      : this.db
+        .prepare("SELECT * FROM correction_loop WHERE module_id = ? AND work_package_id = ? ORDER BY created_at ASC")
+        .all(moduleId, workPackageId)) as CorrectionRow[];
+    return rows.map((r) => this.mapRow(r));
+  }
+
+  /** Bind the correction dispatch that enacts this loop's fix. */
+  bindDispatch(id: string, dispatchId: string): CorrectionRecord {
+    const current = this.findById(id);
+    if (current.status !== "OPEN" && current.status !== "CORRECTING") {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Correction loop '${id}' is '${current.status}': no dispatch binds here`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Open a fresh correction loop for further work",
+      });
+    }
+    const next = current.status === "OPEN" ? "CORRECTING" : current.status;
+    const info = this.db
+      .prepare("UPDATE correction_loop SET status = ?, dispatch_id = ? WHERE id = ?")
+      .run(next, dispatchId, id);
+    if (info.changes !== 1) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Correction loop '${id}' cannot bind dispatch '${dispatchId}'`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Inspect the loop lifecycle before binding",
+      });
+    }
+    return this.findById(id);
+  }
+
+  /** Correction work evidenced: move to re-verification. */
+  markReverify(id: string): CorrectionRecord {
+    const info = this.db
+      .prepare("UPDATE correction_loop SET status = 'REVERIFY' WHERE id = ? AND status = 'CORRECTING'")
+      .run(id);
+    if (info.changes !== 1) {
+      const current = this.findById(id);
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Correction loop '${id}' is '${current.status}', not CORRECTING: complete correction work first`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Bind a correction dispatch and evidence the fix first",
+      });
+    }
+    return this.findById(id);
+  }
+
+  /** Re-verification failed again: next attempt or terminal escalation. */
+  markRefailed(id: string, closedAt: string): CorrectionRecord {
+    const current = this.findById(id);
+    if (current.status !== "REVERIFY") {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Correction loop '${id}' is '${current.status}', not REVERIFY: nothing to re-fail`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Complete correction work before re-verification",
+      });
+    }
+    const nextAttempt = current.attempt + 1;
+    if (nextAttempt > current.maxAttempts) {
+      this.db
+        .prepare("UPDATE correction_loop SET status = 'ESCALATED', closed_at = ? WHERE id = ?")
+        .run(closedAt, id);
+      return this.findById(id);
+    }
+    this.db
+      .prepare("UPDATE correction_loop SET status = 'CORRECTING', attempt = ?, dispatch_id = NULL WHERE id = ?")
+      .run(nextAttempt, id);
+    return this.findById(id);
+  }
+
+  /** Terminal escalation from any live state (bounded retry exhausted). */
+  escalate(id: string, closedAt: string): CorrectionRecord {
+    const info = this.db
+      .prepare("UPDATE correction_loop SET status = 'ESCALATED', closed_at = ? WHERE id = ? AND status IN ('OPEN','CORRECTING','REVERIFY')")
+      .run(closedAt, id);
+    if (info.changes !== 1) {
+      const current = this.findById(id);
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Correction loop '${id}' is '${current.status}': escalation applies only to live loops`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Escalate live loops; terminal loops stay terminal",
+      });
+    }
+    return this.findById(id);
+  }
+
+  /** Verified fix: terminal close. */
+  close(id: string, closedAt: string): CorrectionRecord {
+    const info = this.db
+      .prepare("UPDATE correction_loop SET status = 'CLOSED', closed_at = ? WHERE id = ? AND status = 'REVERIFY'")
+      .run(closedAt, id);
+    if (info.changes !== 1) {
+      const current = this.findById(id);
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Correction loop '${id}' is '${current.status}', not REVERIFY: verify the fix first`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Record a new verification verdict before closing",
+      });
+    }
+    return this.findById(id);
+  }
+
+  private mapRow(row: CorrectionRow): CorrectionRecord {
+    return {
+      id: row.id as string,
+      defectId: row.defect_id as string,
+      moduleId: row.module_id as string,
+      workPackageId: row.work_package_id as string | null,
+      affectedRevision: row.affected_revision as string,
+      ownerRole: row.owner_role as string,
+      attempt: row.attempt as number,
+      maxAttempts: row.max_attempts as number,
+      status: row.status as string,
+      dispatchId: row.dispatch_id as string | null,
+      createdAt: row.created_at as string,
+      closedAt: row.closed_at as string | null,
+    };
+  }
+}
+
+export interface PolicyRecord {
+  profile: string;
+  rationale: string;
+  updatedBy: string;
+  signature: string | null;
+  updatedAt: string;
+}
+
+/**
+ * Versioned project rigor policy (CF-11). Exactly one row (`id =
+ * 'policy'); updates replace it, every change appends a PolicyUpdated
+ * audit event in the Core. Downgrade cryptography lives in the Core
+ * (signatures need key verification); the table only stores the
+ * decision and its proof.
+ */
+export class PolicyRepository {
+  constructor(private readonly db: Database) {}
+
+  get(): PolicyRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM project_policy WHERE id = 'policy'")
+      .get() as
+      | { profile: unknown; rationale: unknown; updated_by: unknown; signature: unknown; updated_at: unknown }
+      | undefined;
+    if (row === undefined) {
+      return null;
+    }
+    return {
+      profile: row.profile as string,
+      rationale: row.rationale as string,
+      updatedBy: row.updated_by as string,
+      signature: row.signature as string | null,
+      updatedAt: row.updated_at as string,
+    };
+  }
+
+  set(record: { profile: string; rationale: string; updatedBy: string; signature: string | null; updatedAt: string }): PolicyRecord {
+    this.db.prepare(
+      `INSERT INTO project_policy (id, profile, rationale, updated_by, signature, updated_at)
+       VALUES ('policy', ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET profile = excluded.profile, rationale = excluded.rationale,
+         updated_by = excluded.updated_by, signature = excluded.signature, updated_at = excluded.updated_at`
+    ).run(record.profile, record.rationale, record.updatedBy, record.signature, record.updatedAt);
+    return this.get() as PolicyRecord;
   }
 }
 

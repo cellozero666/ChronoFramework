@@ -20,14 +20,14 @@
 import type { AgentRole } from "./state.js";
 
 /** Version of this authority policy, persisted with authorization evidence. */
-export const AUTHORITY_POLICY_VERSION = "8";
+export const AUTHORITY_POLICY_VERSION = "9";
 
 /**
  * Version of the runtime tool-classification policy below. Bumped
  * independently from the authority matrix: tool classification affects
  * pre-tool gate decisions, never grant semantics.
  */
-export const TOOL_POLICY_VERSION = "4";
+export const TOOL_POLICY_VERSION = "6";
 
 export type CapabilityHolder = AgentRole | "PO";
 
@@ -53,6 +53,17 @@ export type CoreOperation =
   | "waiver.expire"
   | "execution.request"
   | "completion.request"
+  | "review.assign"
+  | "review.complete"
+  | "correction.open"
+  | "policy.set"
+  | "dispatch.reconcile"
+  | "dispatch.release"
+  | "scope.advance"
+  | "status.next"
+  | "status.execution"
+  | "status.evidence"
+  | "status.deep"
   | "session.revoke"
   | "attestation.record"
   | "adapter.register"
@@ -88,6 +99,17 @@ export const ROLE_CAPABILITIES: Record<CoreOperation, readonly CapabilityHolder[
   "waiver.expire": ["gaspar", "PO"],
   "execution.request": ["gaspar", "PO"],
   "completion.request": ["gaspar", "spekkio", "PO"],
+  "review.assign": ["gaspar", "PO"],
+  "review.complete": ["glenn", "spekkio"],
+  "correction.open": ["gaspar", "spekkio", "PO"],
+  "policy.set": ["gaspar", "PO"],
+  "dispatch.reconcile": ["gaspar", "PO"],
+  "dispatch.release": ["belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio", "gaspar", "PO"],
+  "scope.advance": ["belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio"],
+  "status.next": ["gaspar", "belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio", "PO"],
+  "status.execution": ["gaspar", "belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio", "PO"],
+  "status.evidence": ["gaspar", "belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio", "PO"],
+  "status.deep": ["gaspar", "PO"],
   "session.revoke": ["gaspar", "PO"],
   "attestation.record": ["gaspar", "PO"],
   "adapter.register": ["PO"],
@@ -116,6 +138,9 @@ export const EVENT_ROLE_ALLOWLIST: Record<string, readonly CapabilityHolder[]> =
   CorrectionComplete: [...ALL_WORKERS, "gaspar", "PO"],
   ChangeControlInitiated: ["gaspar", "PO"],
   DefinitionOfDoneSatisfied: ["gaspar", "PO"],
+  // Aggregate module completion rides the completion authority
+  // (gaspar/spekkio/PO), never worker execution roles.
+  AllPackagesComplete: ["gaspar", "spekkio", "PO"],
   WorkPackageAuthorized: ["gaspar", "PO"],
   ExecutionAssigned: [...ALL_WORKERS, "gaspar", "PO"],
   ImplementationDone: [...ALL_WORKERS, "gaspar", "PO"],
@@ -162,12 +187,17 @@ export function isCapable(
  * - "mutate": tools capable of filesystem, process, network, package, Git,
  *   credential, deployment, destructive, or production-impacting effects.
  *   They require a full execution-gate decision with dispatch scope.
+ * - "delegate": OpenCode's real subagent-delegation tool (`task`,
+ *   args `description`/`prompt`/`subagent_type`, child sessions with
+ *   `parentID`). Delegation is NEVER broadly allowed: one `task` call
+ *   passes only when bound to a live CHRONO dispatch for the exact
+ *   worker role. Unknown, builtin, or ungated delegation stays denied.
  *
  * Deny-by-default: any tool not listed here — including future built-ins,
  * MCP tools (`mcp_*`), and custom tools — is DENIED until classified in a
  * reviewed policy release. Tool names are adapter data, never authority.
  */
-export type ToolClassification = "read" | "mutate" | "planning";
+export type ToolClassification = "read" | "mutate" | "planning" | "delegate" | "lifecycle";
 
 export const OPENCODE_TOOL_POLICY: Record<string, ToolClassification> = {
   read: "read",
@@ -183,6 +213,7 @@ export const OPENCODE_TOOL_POLICY: Record<string, ToolClassification> = {
   apply_patch: "mutate",
   webfetch: "mutate",
   websearch: "mutate",
+  task: "delegate",
   // Native governed planning tools (OC-P11 correction): real
   // model-callable tools registered by the generated plugin. They are
   // neither generic shell mutation nor implementation dispatch: each
@@ -191,9 +222,62 @@ export const OPENCODE_TOOL_POLICY: Record<string, ToolClassification> = {
   chrono_artifact_status: "planning",
   chrono_artifact_propose: "planning",
   chrono_artifact_revise: "planning",
+  chrono_artifact_supersede: "planning",
   chrono_approval_request: "planning",
   chrono_approval_status: "planning",
+  // Native governed dispatch tools (post-planning deadlock repair):
+  // chrono_dispatch opens a dispatch intent after full gate
+  // validation (Gaspar session, host-held); chrono_dispatch_claim
+  // binds one worker subagent session to it. Entry only at the gate;
+  // every deeper check lives in the Core.
+  chrono_dispatch: "planning",
+  chrono_dispatch_claim: "planning",
+  // Native governed lifecycle tools (CORE_FIX vertical): narrow,
+  // capability-gated state operations for the executable workflow
+  // (evidence, completion, reviews, defects, verdicts, corrections,
+  // orchestration). Entry plus Core role/scope/binding checks at the
+  // gate; every deeper check lives in the Core.
+  chrono_next: "lifecycle",
+  chrono_execution_status: "lifecycle",
+  chrono_evidence_record: "lifecycle",
+  chrono_evidence_status: "lifecycle",
+  chrono_complete_request: "lifecycle",
+  chrono_review_request: "lifecycle",
+  chrono_review_complete: "lifecycle",
+  chrono_defect_record: "lifecycle",
+  chrono_defect_resolve: "lifecycle",
+  chrono_verify_record: "lifecycle",
+  chrono_correction_open: "lifecycle",
+  chrono_correction_complete: "lifecycle",
+  chrono_module_complete: "lifecycle",
+  chrono_wp_authorize: "lifecycle",
+  chrono_deep_check: "lifecycle",
+  chrono_policy_set: "lifecycle",
+  chrono_policy_status: "lifecycle",
+  chrono_dispatch_confirm: "lifecycle",
+  chrono_dispatch_release: "lifecycle",
+  chrono_dispatch_revoke: "lifecycle",
+  chrono_dispatch_reconcile: "lifecycle",
+  chrono_scope_advance: "lifecycle",
 };
+
+/**
+ * Canonical worker roles a native `task` delegation may target
+ * without a kind-fitting dispatch: implementation (belthazar,
+ * melchior, prometheus) and test evidence (lucca). Review kinds
+ * additionally admit glenn (security-review) and spekkio
+ * (verification) through a live dispatch of that kind — see
+ * DISPATCH_KIND_ROLES and isEnactmentRole. Orchestration (gaspar),
+ * human (PO), builtins, and unknown names are never delegable.
+ */
+export const DISPATCHABLE_WORKER_ROLES = ["belthazar", "melchior", "prometheus", "lucca"] as const;
+
+export type DispatchableWorkerRole = (typeof DISPATCHABLE_WORKER_ROLES)[number];
+
+/** True only for the four WP execution roles delegable via `task`. */
+export function isDispatchableWorkerRole(role: string): role is DispatchableWorkerRole {
+  return (DISPATCHABLE_WORKER_ROLES as readonly string[]).includes(role);
+}
 
 /**
  * Check an OpenCode tool name against the classification policy.

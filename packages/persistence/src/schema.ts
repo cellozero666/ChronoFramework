@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 19;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -770,5 +770,211 @@ export const MIGRATIONS: Record<number, string> = {
     END;
     CREATE UNIQUE INDEX idx_approval_active_triple
       ON approval (scope_artifact_id, scope_revision, action) WHERE revoked = 0;
+  `,
+  18: `
+    -- CORE_FIX vertical lifecycle: dispatch authority moves from the
+    -- host JSONL ledger into Core-owned SQLite records. Intents,
+    -- delegations, claims, bindings, status, expiry, and revocation
+    -- are database-enforced (constraints, conditional writes,
+    -- triggers) and revalidated by the Core on every use. The JSONL
+    -- file is no longer written or read; it was never authoritative.
+    CREATE TABLE dispatch (
+      id                    TEXT PRIMARY KEY,
+      kind                  TEXT NOT NULL,
+      module_id             TEXT NOT NULL,
+      work_package_id       TEXT,
+      module_revision       TEXT NOT NULL,
+      work_package_revision TEXT,
+      spec_revisions        TEXT NOT NULL,
+      role                  TEXT NOT NULL,
+      requester_session     TEXT NOT NULL,
+      adapter_id            TEXT,
+      status                TEXT NOT NULL,
+      worker_session        TEXT,
+      grant_id              TEXT,
+      parent_runtime_session TEXT,
+      delegated_agent       TEXT,
+      task_call_id          TEXT,
+      child_runtime_session TEXT,
+      correction_of         TEXT,
+      attempt               INTEGER NOT NULL DEFAULT 1,
+      policy_profile        TEXT NOT NULL,
+      risk_triggers         TEXT NOT NULL,
+      rationale             TEXT NOT NULL,
+      expires_at            TEXT NOT NULL,
+      created_at            TEXT NOT NULL,
+      completed_at          TEXT
+    );
+    CREATE INDEX idx_dispatch_worker ON dispatch(worker_session);
+    CREATE INDEX idx_dispatch_scope ON dispatch(module_id, work_package_id);
+    CREATE INDEX idx_dispatch_status ON dispatch(status);
+    -- Legal lifecycle: PENDING -> ENACTED -> ACTIVE -> COMPLETED, with
+    -- REVOKED/EXPIRED exits from any live state. Terminal states are
+    -- frozen. Scope, revisions, role, and requester are immutable once
+    -- recorded; only the claim/completion bindings may be filled in.
+    CREATE TRIGGER dispatch_status_guard BEFORE UPDATE ON dispatch
+    WHEN NOT (
+      (
+        (OLD.status = 'PENDING' AND NEW.status IN ('PENDING', 'ENACTED', 'REVOKED', 'EXPIRED')) OR
+        (OLD.status = 'ENACTED' AND NEW.status IN ('ACTIVE', 'REVOKED', 'EXPIRED')) OR
+        (OLD.status = 'ACTIVE' AND NEW.status IN ('COMPLETED', 'REVOKED', 'EXPIRED'))
+      )
+      AND OLD.id IS NEW.id
+      AND OLD.kind IS NEW.kind
+      AND OLD.module_id IS NEW.module_id
+      AND OLD.work_package_id IS NEW.work_package_id
+      AND OLD.module_revision IS NEW.module_revision
+      AND OLD.work_package_revision IS NEW.work_package_revision
+      AND OLD.spec_revisions IS NEW.spec_revisions
+      AND OLD.role IS NEW.role
+      AND OLD.requester_session IS NEW.requester_session
+      AND OLD.adapter_id IS NEW.adapter_id
+      AND OLD.correction_of IS NEW.correction_of
+      AND OLD.attempt IS NEW.attempt
+      AND OLD.policy_profile IS NEW.policy_profile
+      AND OLD.risk_triggers IS NEW.risk_triggers
+      AND OLD.rationale IS NEW.rationale
+      AND OLD.expires_at IS NEW.expires_at
+      AND OLD.created_at IS NEW.created_at
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'dispatch rows mutate only through the legal claim lifecycle with frozen scope bindings');
+    END;
+    CREATE TRIGGER dispatch_no_delete BEFORE DELETE ON dispatch
+    BEGIN
+      SELECT RAISE(ABORT, 'dispatch rows cannot be deleted: revoke instead');
+    END;
+    -- Distinct review dispatch types (CF-5): security review and
+    -- independent verification are first-class assignments, never
+    -- interchangeable with implementation. One open assignment per
+    -- (kind, scope, revision); completion binds reviewer, evidence
+    -- or verdict, and independence from the implementer session.
+    CREATE TABLE review_assignment (
+      id                TEXT PRIMARY KEY,
+      kind              TEXT NOT NULL,
+      module_id         TEXT NOT NULL,
+      work_package_id   TEXT,
+      target_revision   TEXT NOT NULL,
+      reviewer_role     TEXT NOT NULL,
+      reviewer_session  TEXT,
+      dispatch_id       TEXT,
+      status            TEXT NOT NULL,
+      created_at        TEXT NOT NULL,
+      completed_at      TEXT
+    );
+    CREATE UNIQUE INDEX idx_review_open
+      ON review_assignment (kind, module_id, COALESCE(work_package_id, ''), target_revision)
+      WHERE status = 'ASSIGNED';
+    CREATE INDEX idx_review_scope ON review_assignment(module_id, work_package_id);
+    CREATE TRIGGER review_status_guard BEFORE UPDATE ON review_assignment
+    WHEN NOT (
+      (
+        (OLD.status = 'ASSIGNED' AND NEW.status IN ('SUBMITTED', 'SUPERSEDED'))
+      )
+      AND OLD.id IS NEW.id
+      AND OLD.kind IS NEW.kind
+      AND OLD.module_id IS NEW.module_id
+      AND OLD.work_package_id IS NEW.work_package_id
+      AND OLD.target_revision IS NEW.target_revision
+      AND OLD.reviewer_role IS NEW.reviewer_role
+      AND OLD.created_at IS NEW.created_at
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'review assignments mutate only ASSIGNED -> SUBMITTED/SUPERSEDED with frozen scope');
+    END;
+    CREATE TRIGGER review_no_delete BEFORE DELETE ON review_assignment
+    BEGIN
+      SELECT RAISE(ABORT, 'review assignments cannot be deleted');
+    END;
+    -- Bounded correction loops (CF-6): identity, owner, affected
+    -- revision, attempt count, and terminal escalation. One open loop
+    -- per defect; attempts advance only through re-verification.
+    CREATE TABLE correction_loop (
+      id                TEXT PRIMARY KEY,
+      defect_id         TEXT NOT NULL,
+      module_id         TEXT NOT NULL,
+      work_package_id   TEXT,
+      affected_revision TEXT NOT NULL,
+      owner_role        TEXT NOT NULL,
+      attempt           INTEGER NOT NULL,
+      max_attempts      INTEGER NOT NULL,
+      status            TEXT NOT NULL,
+      dispatch_id       TEXT,
+      created_at        TEXT NOT NULL,
+      closed_at         TEXT
+    );
+    CREATE INDEX idx_correction_defect ON correction_loop(defect_id);
+    CREATE INDEX idx_correction_scope ON correction_loop(module_id, work_package_id);
+    CREATE TRIGGER correction_status_guard BEFORE UPDATE ON correction_loop
+    WHEN NOT (
+      (
+        (OLD.status = 'OPEN' AND NEW.status IN ('CORRECTING', 'ESCALATED')) OR
+        (OLD.status = 'CORRECTING' AND NEW.status IN ('REVERIFY', 'ESCALATED')) OR
+        (OLD.status = 'REVERIFY' AND NEW.status IN ('CORRECTING', 'CLOSED', 'ESCALATED'))
+      )
+      AND OLD.id IS NEW.id
+      AND OLD.defect_id IS NEW.defect_id
+      AND OLD.module_id IS NEW.module_id
+      AND OLD.work_package_id IS NEW.work_package_id
+      AND OLD.affected_revision IS NEW.affected_revision
+      AND OLD.owner_role IS NEW.owner_role
+      AND OLD.max_attempts IS NEW.max_attempts
+      AND OLD.created_at IS NEW.created_at
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'correction loops mutate only through the bounded OPEN -> CORRECTING -> REVERIFY -> CLOSED/ESCALATED lifecycle');
+    END;
+    CREATE TRIGGER correction_no_delete BEFORE DELETE ON correction_loop
+    BEGIN
+      SELECT RAISE(ABORT, 'correction loops cannot be deleted');
+    END;
+    -- Versioned project rigor policy (CF-11): exactly one row. Profile
+    -- changes append PolicyUpdated audit events in the Core; lowering
+    -- rigor additionally requires a valid PO signature (Core-enforced,
+    -- never trigger-enforced since verification needs cryptography).
+    CREATE TABLE project_policy (
+      id          TEXT PRIMARY KEY CHECK(id = 'policy'),
+      profile     TEXT NOT NULL,
+      rationale   TEXT NOT NULL,
+      updated_by  TEXT NOT NULL,
+      signature   TEXT,
+      updated_at  TEXT NOT NULL
+    );
+    -- Evidence invalidation for correction cycles (CF-6): evidence rows
+    -- stay immutable except the stale flag 0 -> 1, mirroring the
+    -- approval revocation pattern. Gates read current (stale = 0) rows
+    -- only; history is preserved for audit.
+    ALTER TABLE evidence ADD COLUMN stale INTEGER NOT NULL DEFAULT 0;
+    DROP TRIGGER IF EXISTS trg_evidence_no_update;
+    CREATE TRIGGER trg_evidence_no_update BEFORE UPDATE ON evidence
+    WHEN NOT (
+      OLD.stale = 0 AND NEW.stale = 1
+      AND OLD.id IS NEW.id
+      AND OLD.producer IS NEW.producer
+      AND OLD.tool IS NEW.tool
+      AND OLD.timestamp IS NEW.timestamp
+      AND OLD.target_revision IS NEW.target_revision
+      AND OLD.check_name IS NEW.check_name
+      AND OLD.result IS NEW.result
+      AND OLD.diagnostics IS NEW.diagnostics
+      AND OLD.integrity_hash IS NEW.integrity_hash
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'evidence is immutable except invalidation (stale 0 to 1)');
+    END;
+  `,
+  19: `
+    -- Canonical recovery envelopes (CF-8): every structured registry
+    -- row (SP/MOD/WP) carries a second copy of its exact canonical
+    -- structured content under planning.envelope.<id>. Recovery never
+    -- synthesizes semantics: it restores the envelope bytes verbatim
+    -- only when the recomputed candidate proves byte-equivalence
+    -- against them, and otherwise requires formal supersession.
+    -- Backfill from current revision content for pre-envelope rows.
+    INSERT OR REPLACE INTO runtime_config (key, value, updated_at)
+    SELECT 'planning.envelope.' || a.id, r.content, datetime('now')
+    FROM artifact a JOIN artifact_revision r ON r.id = a.id AND r.revision = a.revision
+    WHERE a.type IN ('SP', 'MOD', 'WP') AND a.deleted = 0
+      AND NOT EXISTS (SELECT 1 FROM runtime_config WHERE key = 'planning.envelope.' || a.id);
   `,
 };
