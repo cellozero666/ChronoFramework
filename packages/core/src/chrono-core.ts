@@ -131,6 +131,13 @@ interface UnresolvedCaller {
  * lists batchable same-kind siblings within the profile batch cap;
  * `escalation` carries a terminal-escalation notice when present.
  */
+/** Lifecycle actions whose preconditions are dry-runnable through the shared source. */
+export type CheckableAction =
+  | "activate-module" | "authorize-wp" | "request-dispatch" | "assign-review"
+  | "claim-dispatch" | "confirm-dispatch" | "submit-review"
+  | "request-completion" | "complete-module" | "record-evidence"
+  | "correct-defect" | "request-correction";
+
 export interface NextAction {
   readonly action: string;
   readonly targetKind: "module" | "work-package";
@@ -140,6 +147,12 @@ export interface NextAction {
   readonly policyRule: string;
   readonly alsoReady?: string[];
   readonly escalation?: string;
+  /**
+   * Dispatch/review kind carried by kind-parameterized actions
+   * (`request-dispatch`, `assign-review`): the exact kind the dry-run
+   * accepted, so callers never guess it.
+   */
+  readonly kind?: string;
 }
 
 /** Worker execution projection: own binding, scope states, revision currency (CF-8). No secrets, ever. */
@@ -7581,12 +7594,51 @@ export class ChronoCore {
   }
 
   /**
+   * Reviewability by kind and scope state (CF-12 shared precondition
+   * source): a review assignment is committable only when its target
+   * has positioned work to review. Work Packages review at
+   * IMPLEMENTED/VERIFYING (a verdict additionally requires
+   * VERIFYING at record time); package-less Modules review at
+   * EXECUTING/VERIFYING. Anything earlier (PLANNED, AUTHORIZED,
+   * DRAFT, AWAITING_APPROVAL, APPROVED) has no positioned work, so
+   * assignment would strand an unreachable row. Used by
+   * `assignReview`, `nextAction`, `deep_check`, and the
+   * reachability meta-test: one rule, never divergent copies.
+   */
+  isReviewableScope(kind: string, entityType: string, status: string): { reviewable: boolean; reason: string } {
+    if (kind !== "security-review" && kind !== "verification") {
+      return { reviewable: false, reason: `unknown review kind '${kind}': use security-review or verification` };
+    }
+    if (entityType === "WP") {
+      if (status === "IMPLEMENTED" || status === "VERIFYING") {
+        return { reviewable: true, reason: `${kind} reviewable: Work Package has positioned work (${status})` };
+      }
+      return {
+        reviewable: false,
+        reason: `${kind} review requires an IMPLEMENTED or VERIFYING Work Package: scope is ${status} with no positioned work`,
+      };
+    }
+    if (entityType === "MOD") {
+      if (status === "EXECUTING" || status === "VERIFYING") {
+        return { reviewable: true, reason: `${kind} reviewable: Module has positioned work (${status})` };
+      }
+      return {
+        reviewable: false,
+        reason: `${kind} review requires an EXECUTING or VERIFYING Module: scope is ${status} with no positioned work`,
+      };
+    }
+    return { reviewable: false, reason: `reviews bind Modules or Work Packages, not '${entityType}' scopes` };
+  }
+
+  /**
    * Assign a distinct review (CF-5): security-review binds Glenn,
    * verification binds Spekkio. Kinds are never interchangeable, and
    * at most one open assignment exists per (kind, scope, revision) —
    * enforced by partial unique index. Gaspar/PO assign; the reviewer
    * completes from their own session with evidence (Glenn) or a
    * verdict (Spekkio), independent of the implementer session.
+   * CF-12: the target must be reviewable for the kind BEFORE the row
+   * is committed, so no unreachable REV-* row can exist.
    */
   assignReview(
     input: { kind: string; moduleId: string; workPackageId?: string | undefined },
@@ -7631,6 +7683,20 @@ export class ChronoCore {
         });
       }
       this.assertSessionScope(caller, { moduleId: input.moduleId, workPackageId: input.workPackageId ?? null }, "assign review");
+      // CF-12: reviewability precedes persistence. A review assigned
+      // to a scope that cannot enter verification strands an
+      // unreachable row no workflow can complete.
+      const reviewability = this.isReviewableScope(input.kind, scope.type, scope.status);
+      if (!reviewability.reviewable) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Review assignment refused: ${reviewability.reason}`,
+          invariantRef: "INV §5.6",
+          affectedTarget: scopeId,
+          suggestedAction: "Position the work first (implement to IMPLEMENTED/VERIFYING), then assign its review",
+        });
+      }
       const reviewId = this.sequences.allocate("REV");
       this.db.reviewAssignments().create({
         id: reviewId,
@@ -7774,6 +7840,66 @@ export class ChronoCore {
       return { ok: true, value: { reviewId: review.id, status: "SUBMITTED" } };
     } catch (e) {
       this.auditDenial(input.reviewId, "ReviewComplete", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Reconcile a premature review assignment (CF-12): an ASSIGNED row
+   * whose target cannot enter verification (committed before
+   * reviewability gating) is preserved append-only as INVALID
+   * history. INVALID rows are terminal and non-blocking: completion
+   * requires ASSIGNED-or-SUBMITTED shapes only, the open-assignment
+   * index covers ASSIGNED only, and the no-delete trigger is
+   * untouched. Gaspar/PO only. Reconciling an already-terminal row
+   * denies; reconciling a review for a currently reviewable target
+   * denies (nothing to reconcile — complete or supersede it).
+   */
+  reconcileReview(
+    input: { reviewId: string },
+    auth: CallerAuth
+  ): CoreResult<{ reviewId: string; status: string }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const caller = this.resolveCaller(auth, "reconcile review");
+      this.requireCapability("review.reconcile", caller);
+      const review = this.db.reviewAssignments().findById(input.reviewId);
+      if (review.status !== "ASSIGNED") {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Review '${input.reviewId}' is '${review.status}', not ASSIGNED: only open premature assignments reconcile`,
+          invariantRef: "INV §5.1",
+          affectedTarget: input.reviewId,
+          suggestedAction: "Reconcile each premature assignment exactly once",
+        });
+      }
+      const scopeId = review.workPackageId ?? review.moduleId;
+      const scope = this.artifacts.findById(scopeId);
+      const reviewability = this.isReviewableScope(review.kind, scope.type, scope.status);
+      if (reviewability.reviewable) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Review '${input.reviewId}' targets a currently reviewable scope (${scope.type} ${scope.status}): complete or supersede it instead of reconciling`,
+          invariantRef: "INV §5.6",
+          affectedTarget: scopeId,
+          suggestedAction: "Submit the review with its proof, or supersede it on revision change",
+        });
+      }
+      const invalidated = this.db.reviewAssignments().markInvalid(review.id);
+      this.events.append({
+        eventType: "ReviewReconciled",
+        entityId: review.id,
+        payload: { kind: review.kind, scope: scopeId, targetRevision: review.targetRevision, reason: reviewability.reason },
+        actor: caller.auditActor,
+        priorState: "ASSIGNED",
+        newState: "INVALID",
+        reasoning: "Premature assignment preserved as invalid history; it cannot block the repaired workflow",
+      });
+      return { ok: true, value: { reviewId: review.id, status: invalidated.status } };
+    } catch (e) {
+      this.auditDenial(input.reviewId, "ReviewReconcile", e, actor);
       return this.handleError(e);
     }
   }
@@ -8333,6 +8459,23 @@ export class ChronoCore {
     try {
       const caller = this.resolveCaller(auth, "authorize completion");
       this.requireCapability("completion.request", caller);
+      return this.checkModuleCompletion(moduleId, caller);
+    } catch (e) {
+      this.auditDenial(moduleId, "CompletionAuthorization", e, auth.actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Pure module-completion readiness (CF-12 shared precondition
+   * source): identical checks to `authorizeCompletion` with zero
+   * persistence, so `nextAction`, `deep_check`, and the reachability
+   * meta-test can dry-run completion without auditing denials. The
+   * auditing wrapper above preserves exact behavior for all
+   * state-changing callers.
+   */
+  checkModuleCompletion(moduleId: string, caller: ResolvedCaller): CoreResult<boolean> {
+    try {
       this.assertSessionScope(caller, { moduleId, workPackageId: null }, "authorize completion");
       const moduleArtifact = this.artifacts.findById(moduleId);
 
@@ -8522,7 +8665,6 @@ export class ChronoCore {
 
       return { ok: true, value: true };
     } catch (e) {
-      this.auditDenial(moduleId, "CompletionAuthorization", e, auth.actor);
       return this.handleError(e);
     }
   }
@@ -9014,6 +9156,524 @@ export class ChronoCore {
    * DOM §6.6].
    */
   /**
+   * Module activation preconditions, evaluated without persistence
+   * (CF-12 shared precondition source). Returns the list of unmet
+   * prerequisites; empty means `activateModule` would be accepted
+   * immediately. The same function backs the activation op,
+   * `nextAction`, `deep_check`, and the reachability meta-test: one
+   * executable source, never three divergent rule copies.
+   *
+   * A planning-approval alone never activates: both the planning
+   * acceptance AND the module-approval decision must be current for
+   * the exact revision, plus READY specs and no blockers. A mere
+   * planning approval therefore never turns into module authority.
+   */
+  checkModuleActivation(moduleId: string): Array<{ code: string; message: string; suggestedAction?: string }> {
+    const unmet: Array<{ code: string; message: string; suggestedAction?: string }> = [];
+    let artifact: { id: string; type: string; status: string; revision: string };
+    try {
+      artifact = this.artifacts.findById(moduleId);
+    } catch {
+      unmet.push({
+        code: ErrorCode.ENTITY_NOT_FOUND,
+        message: `Module '${moduleId}' does not exist: register it before activation`,
+      });
+      return unmet;
+    }
+    if (artifact.type !== "MOD") {
+      unmet.push({
+        code: ErrorCode.VALIDATION_ERROR,
+        message: `Scope '${moduleId}' is not a Module: activation applies to Modules only`,
+      });
+      return unmet;
+    }
+    if (artifact.status === "APPROVED") {
+      return unmet;
+    }
+    if (artifact.status === "COMPLETE") {
+      unmet.push({
+        code: ErrorCode.INVALID_STATE,
+        message: `Module '${moduleId}' is already terminal (COMPLETE): activation is moot`,
+      });
+      return unmet;
+    }
+    if (artifact.status !== "DRAFT" && artifact.status !== "AWAITING_APPROVAL") {
+      unmet.push({
+        code: ErrorCode.INVALID_STATE,
+        message: `Module '${moduleId}' is ${artifact.status}: activation advances only DRAFT or AWAITING_APPROVAL scopes`,
+      });
+      return unmet;
+    }
+    if (!this.hasValidApproval(moduleId, artifact.revision, "planning-approval")) {
+      unmet.push({
+        code: ErrorCode.APPROVAL_REQUIRED,
+        message: `Module '${moduleId}' lacks a current planning-approval for revision ${artifact.revision.slice(0, 16)}…: record the PO planning decision first`,
+        suggestedAction: "Record a signed planning-approval binding this exact revision",
+      });
+    }
+    if (!this.hasValidApproval(moduleId, artifact.revision, "module-approval")) {
+      unmet.push({
+        code: ErrorCode.APPROVAL_REQUIRED,
+        message: `Module '${moduleId}' lacks a current module-approval for revision ${artifact.revision.slice(0, 16)}…: record the PO module decision first`,
+        suggestedAction: "Record a signed module-approval binding this exact revision",
+      });
+    }
+    try {
+      this.guardModulePlanned(moduleId);
+    } catch (e) {
+      const action = e instanceof ChronoError ? e.suggestedAction : undefined;
+      unmet.push(action === undefined
+        ? {
+          code: e instanceof ChronoError ? e.code : ErrorCode.VALIDATION_ERROR,
+          message: e instanceof Error ? e.message : String(e),
+        }
+        : {
+          code: e instanceof ChronoError ? e.code : ErrorCode.VALIDATION_ERROR,
+          message: e instanceof Error ? e.message : String(e),
+          suggestedAction: action,
+        });
+    }
+    return unmet;
+  }
+
+  /**
+   * Canonical Module activation (CF-12): validates the exact current
+   * planning and module approvals, then legally enacts
+   * `DRAFT -> AWAITING_APPROVAL (ModulePlanned) -> APPROVED
+   * (ModuleApproved)` in order. Idempotent: replay on APPROVED
+   * returns the current projection without duplicating transitions;
+   * a crash between the two transitions leaves AWAITING_APPROVAL,
+   * which resumes safely on the next call. Requires no PO terminal
+   * action, token, grant, or internal identifier beyond the caller
+   * session: Gaspar (or PO) planning authority suffices, and the
+   * approvals themselves remain exclusively PO-signed ceremony.
+   */
+  activateModule(moduleId: string, auth: CallerAuth): CoreResult<{ state: string; activated: boolean; revision: string }> {
+    const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
+    try {
+      const caller = this.resolveCaller(auth, "activate module");
+      this.requireCapability("module.activate", caller);
+      const artifact = this.artifacts.findById(moduleId);
+      if (artifact.type !== "MOD") {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Scope '${moduleId}' is not a Module: activation applies to Modules only`,
+          invariantRef: "INV §14.4",
+          affectedTarget: moduleId,
+          suggestedAction: "Activate the owning Module, not its packages",
+        });
+      }
+      this.assertSessionScope(caller, { moduleId, workPackageId: null }, "activate module");
+      if (artifact.status === "APPROVED") {
+        return { ok: true, value: { state: "APPROVED", activated: false, revision: artifact.revision } };
+      }
+      const unmet = this.checkModuleActivation(moduleId);
+      if (unmet.length > 0) {
+        const first = unmet[0]!;
+        throw new ChronoError({
+          code: (first.code as (typeof ErrorCode)[keyof typeof ErrorCode]) ?? ErrorCode.APPROVAL_REQUIRED,
+          severity: Severity.BLOCKER,
+          message: `Module '${moduleId}' cannot activate: ${first.message}`,
+          invariantRef: "INV §5.4",
+          affectedTarget: moduleId,
+          suggestedAction: "Satisfy the named prerequisite, then activate",
+        });
+      }
+      const guardContext = { actor: auth.actor, session: auth.session };
+      const current = this.artifacts.findById(moduleId).status;
+      if (current === "DRAFT") {
+        const planned = this.transitionState(moduleId, "ModulePlanned", guardContext);
+        if (!planned.ok) {
+          return planned as unknown as CoreResult<{ state: string; activated: boolean; revision: string }>;
+        }
+      }
+      const approved = this.transitionState(moduleId, "ModuleApproved", guardContext);
+      if (!approved.ok) {
+        return approved as unknown as CoreResult<{ state: string; activated: boolean; revision: string }>;
+      }
+      return { ok: true, value: { state: "APPROVED", activated: true, revision: this.artifacts.findById(moduleId).revision } };
+    } catch (e) {
+      this.auditDenial(moduleId, "ModuleActivation", e, actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Dry-run action preconditions (CF-12 shared executable source):
+   * evaluates whether a lifecycle action would be accepted RIGHT NOW
+   * by invoking the SAME guard functions the operations call —
+   * `guardModulePlanned`, `guardWorkPackageAuthorized`,
+   * `assertDispatchPrerequisites`, `requireOpenCorrectionLoop`,
+   * `workPackageCompletionBlockers`, `checkModuleCompletion`,
+   * `checkAggregateCompletion` — collecting unmet prerequisites
+   * instead of throwing, with zero persistence (every guard is a
+   * pure read; the auditing wrappers are never entered).
+   *
+   * Orchestration actions (activate-module, authorize-wp,
+   * request-dispatch, assign-review) additionally require a
+   * Gaspar/PO caller: the Core would deny anyone else. All other
+   * actions evaluate state/record preconditions only, so any scoped
+   * caller learns the executable next step.
+   */
+  /**
+   * Adapter-aware dispatch-gate dry-run shared by `request-dispatch`
+   * and `request-correction` (CF-12 single source): the requester
+   * supplies the adapter at call time, so gates pass when ANY active
+   * adapter — including the session default — satisfies routing.
+   * Returns the unmet prerequisites (empty when dispatchable).
+   */
+  private dryRunDispatchGates(
+    moduleId: string,
+    workPackageId: string | undefined,
+    caller: ResolvedCaller,
+    kind: string
+  ): Array<{ code: string; message: string }> {
+    const adapterCandidates: Array<string | null> = [null];
+    try {
+      for (const candidate of this.db.adapters().listAll()) {
+        if (candidate.status === "active" && !adapterCandidates.includes(candidate.id)) {
+          adapterCandidates.push(candidate.id);
+        }
+      }
+    } catch {
+      // Adapter registry unreadable: evaluate the session default only.
+    }
+    let firstUnmet: Array<{ code: string; message: string }> = [];
+    for (const candidate of adapterCandidates) {
+      const probe: Array<{ code: string; message: string }> = [];
+      try {
+        this.assertDispatchPrerequisites(
+          moduleId,
+          workPackageId,
+          { id: caller.session.id, adapter: caller.session.adapter, runtime: caller.session.runtime },
+          candidate,
+          kind
+        );
+      } catch (e) {
+        probe.push({
+          code: e instanceof ChronoError ? e.code : ErrorCode.VALIDATION_ERROR,
+          message: e instanceof Error ? e.message : String(e),
+        });
+      }
+      if (probe.length === 0) {
+        return [];
+      }
+      if (firstUnmet.length === 0) {
+        firstUnmet = probe;
+      }
+    }
+    return firstUnmet;
+  }
+
+  checkActionPreconditions(
+    action: CheckableAction,
+    scope: { moduleId: string; workPackageId: string | null },
+    auth: CallerAuth,
+    extra?: { kind?: string; dispatchId?: string; reviewId?: string; skipSessionBinding?: boolean }
+  ): { acceptable: boolean; unmet: Array<{ code: string; message: string; suggestedAction?: string }> } {
+    // skipSessionBinding (CF-12 verifier mode): deep_check verifies
+    // the action nextAction reported by evaluating state/record
+    // preconditions only. Session binding (requester/worker/reviewer
+    // session match) is enforced at execution time by the op itself;
+    // the verifier checks the action is executable in principle, not
+    // by the verifying session.
+    const unmet: Array<{ code: string; message: string; suggestedAction?: string }> = [];
+    const fail = (code: string, message: string, suggestedAction?: string): void => {
+      unmet.push(suggestedAction === undefined ? { code, message } : { code, message, suggestedAction });
+    };
+    const attempt = (fn: () => void): void => {
+      try {
+        fn();
+      } catch (e) {
+        fail(
+          e instanceof ChronoError ? e.code : ErrorCode.VALIDATION_ERROR,
+          e instanceof Error ? e.message : String(e),
+          e instanceof ChronoError ? e.suggestedAction : undefined
+        );
+      }
+    };
+    let caller: ResolvedCaller | null = null;
+    try {
+      caller = this.resolveCaller(auth, "check action preconditions");
+    } catch (e) {
+      fail(ErrorCode.VALIDATION_ERROR, e instanceof Error ? e.message : String(e));
+      return { acceptable: false, unmet };
+    }
+    // Orchestration authority mirrors the operation matrix exactly:
+    // matrix-backed capabilities where rows exist, the transition
+    // allowlist shape (gaspar/PO) where the op rides transitionState.
+    if (action === "activate-module") {
+      attempt(() => this.requireCapability("module.activate", caller!));
+    } else if (action === "request-dispatch") {
+      attempt(() => this.requireCapability("execution.request", caller!));
+    } else if (action === "assign-review") {
+      attempt(() => this.requireCapability("review.assign", caller!));
+    } else if (action === "authorize-wp" && caller.kind !== "po" && caller.role !== "gaspar") {
+      fail(ErrorCode.EXECUTION_DENIED, `Action 'authorize-wp' requires Gaspar or PO planning authority, not '${caller.role}'`);
+    }
+    const moduleId = scope.moduleId;
+    const wpId = scope.workPackageId;
+    const scopeId = wpId ?? moduleId;
+    switch (action) {
+      case "activate-module": {
+        for (const item of this.checkModuleActivation(moduleId)) {
+          fail(item.code, item.message);
+        }
+        break;
+      }
+      case "authorize-wp": {
+        if (wpId === null) {
+          fail(ErrorCode.VALIDATION_ERROR, "Work Package authorization requires a work-package scope");
+          break;
+        }
+        try {
+          const wp = this.artifacts.findById(wpId);
+          if (wp.status !== "PLANNED") {
+            fail(ErrorCode.INVALID_STATE, `Work Package '${wpId}' is ${wp.status}, not PLANNED: nothing to authorize`);
+            break;
+          }
+        } catch (e) {
+          fail(ErrorCode.ENTITY_NOT_FOUND, e instanceof Error ? e.message : String(e));
+          break;
+        }
+        attempt(() => this.guardWorkPackageAuthorized(wpId));
+        break;
+      }
+      case "request-dispatch": {
+        const kind = extra?.kind ?? "implementation";
+        if (!(DISPATCH_KINDS as readonly string[]).includes(kind)) {
+          fail(ErrorCode.VALIDATION_ERROR, `Unknown dispatch kind '${kind}'`);
+          break;
+        }
+        // Adapter-aware dry-run (CF-12): the requester supplies the
+        // adapter at call time, so acceptability holds when ANY active
+        // adapter — including the session default — satisfies routing.
+        for (const item of this.dryRunDispatchGates(moduleId, wpId ?? undefined, caller, kind)) {
+          fail(item.code, item.message);
+        }
+        if (unmet.length > 0) {
+          break;
+        }
+        if (kind === "correction") {
+          attempt(() => this.requireOpenCorrectionLoop(moduleId, wpId, null));
+        }
+        break;
+      }
+      case "assign-review": {
+        const kind = extra?.kind ?? "verification";
+        let entityType = "WP";
+        let status = "";
+        try {
+          const scopeArtifact = this.artifacts.findById(scopeId);
+          entityType = scopeArtifact.type;
+          status = scopeArtifact.status;
+        } catch (e) {
+          fail(ErrorCode.ENTITY_NOT_FOUND, e instanceof Error ? e.message : String(e));
+          break;
+        }
+        const reviewability = this.isReviewableScope(kind, entityType, status);
+        if (!reviewability.reviewable) {
+          fail(ErrorCode.EXECUTION_DENIED, reviewability.reason);
+          break;
+        }
+        try {
+          const artifact = this.artifacts.findById(scopeId);
+          const open = this.db.reviewAssignments().findOpen(kind, moduleId, wpId, artifact.revision);
+          if (open !== null) {
+            fail(ErrorCode.DUPLICATE_IDENTITY, `${kind} review '${open.id}' is already assigned for this scope and revision: complete it first`);
+          }
+        } catch (e) {
+          fail(ErrorCode.ENTITY_NOT_FOUND, e instanceof Error ? e.message : String(e));
+        }
+        break;
+      }
+      case "claim-dispatch": {
+        const dispatchId = extra?.dispatchId ?? "";
+        if (dispatchId.length === 0) {
+          fail(ErrorCode.VALIDATION_ERROR, "Claim requires a dispatch id");
+          break;
+        }
+        try {
+          const dispatch = this.db.dispatches().findById(dispatchId);
+          if (dispatch.status !== "PENDING") {
+            fail(ErrorCode.EXECUTION_DENIED, `Dispatch '${dispatchId}' is '${dispatch.status}', not PENDING: replay denied`);
+            break;
+          }
+          if (Number.isNaN(Date.parse(dispatch.expiresAt)) || Date.parse(dispatch.expiresAt) <= Date.parse(this.now())) {
+            fail(ErrorCode.EXECUTION_DENIED, `Dispatch '${dispatchId}' is expired: dispatch again`);
+            break;
+          }
+          if (dispatch.delegatedAgent === null) {
+            fail(ErrorCode.EXECUTION_DENIED, `Dispatch '${dispatchId}' has no recorded task delegation: delegate first`);
+            break;
+          }
+          if (extra?.skipSessionBinding !== true && caller.session.id !== dispatch.requesterSession) {
+            fail(ErrorCode.EXECUTION_DENIED, `Dispatch '${dispatchId}' was requested by another session: claim from the requesting session`);
+            break;
+          }
+          if (dispatch.kind === "correction") {
+            attempt(() => this.requireOpenCorrectionLoop(dispatch.moduleId, dispatch.workPackageId, dispatch.correctionOf));
+          }
+        } catch (e) {
+          fail(e instanceof ChronoError ? e.code : ErrorCode.ENTITY_NOT_FOUND, e instanceof Error ? e.message : String(e));
+        }
+        break;
+      }
+      case "confirm-dispatch": {
+        const dispatchId = extra?.dispatchId ?? "";
+        if (dispatchId.length === 0) {
+          fail(ErrorCode.VALIDATION_ERROR, "Confirm requires a dispatch id");
+          break;
+        }
+        try {
+          const dispatch = this.db.dispatches().findById(dispatchId);
+          if (dispatch.status !== "ENACTED" && dispatch.status !== "ACTIVE") {
+            fail(ErrorCode.EXECUTION_DENIED, `Dispatch '${dispatchId}' is '${dispatch.status}', not ENACTED: nothing to confirm`);
+            break;
+          }
+          if (extra?.skipSessionBinding !== true && caller.session.id !== dispatch.requesterSession && caller.session.id !== dispatch.workerSession) {
+            fail(ErrorCode.EXECUTION_DENIED, `Dispatch '${dispatchId}' confirmation requires its requester or worker session`);
+            break;
+          }
+        } catch (e) {
+          fail(e instanceof ChronoError ? e.code : ErrorCode.ENTITY_NOT_FOUND, e instanceof Error ? e.message : String(e));
+        }
+        break;
+      }
+      case "submit-review": {
+        const reviewId = extra?.reviewId ?? "";
+        if (reviewId.length === 0) {
+          fail(ErrorCode.VALIDATION_ERROR, "Submit requires a review id");
+          break;
+        }
+        try {
+          const review = this.db.reviewAssignments().findById(reviewId);
+          if (review.status !== "ASSIGNED") {
+            fail(ErrorCode.EXECUTION_DENIED, `Review '${reviewId}' is '${review.status}', not ASSIGNED`);
+            break;
+          }
+          if (extra?.skipSessionBinding !== true && caller.role !== review.reviewerRole) {
+            fail(ErrorCode.EXECUTION_DENIED, `'${review.kind}' review belongs to '${review.reviewerRole}', not '${caller.role}': reviewer impersonation denied`);
+            break;
+          }
+          const targetId = review.workPackageId ?? review.moduleId;
+          const target = this.artifacts.findById(targetId);
+          if (target.revision !== review.targetRevision) {
+            fail(ErrorCode.STALE_REVISION, `Review '${reviewId}' targeted a moved revision: supersede and reassign`);
+            break;
+          }
+          if (review.kind === "security-review") {
+            const current = this.db.evidence().findCurrentByTargetRevision(review.targetRevision);
+            if (!current.some((e) => e.producer === "glenn")) {
+              fail(ErrorCode.SECURITY_EVIDENCE_MISSING, `No current Glenn evidence bound to revision ${review.targetRevision.slice(0, 16)}…`);
+            }
+          } else {
+            const reports = review.workPackageId === null
+              ? this.qa.listByModule(review.moduleId)
+              : this.qa.listByWorkPackage(review.workPackageId);
+            const bound = reports.filter((r) => {
+              const rev = review.workPackageId === null ? r.moduleRevision : r.workPackageRevision;
+              return rev === review.targetRevision;
+            });
+            if (bound.length === 0) {
+              fail(ErrorCode.EVIDENCE_MISSING, `No verification verdict bound to revision ${review.targetRevision.slice(0, 16)}…`);
+              break;
+            }
+          }
+        } catch (e) {
+          fail(e instanceof ChronoError ? e.code : ErrorCode.ENTITY_NOT_FOUND, e instanceof Error ? e.message : String(e));
+        }
+        break;
+      }
+      case "request-completion": {
+        if (wpId === null) {
+          fail(ErrorCode.VALIDATION_ERROR, "Completion request requires a work-package scope (modules complete via complete-module)");
+          break;
+        }
+        for (const blocker of this.workPackageCompletionBlockers(wpId)) {
+          fail(ErrorCode.COMPLETION_DENIED, blocker);
+        }
+        break;
+      }
+      case "complete-module": {
+        const owned = this.moduleWorkPackages(moduleId);
+        if (owned.length === 0) {
+          const readiness = this.checkModuleCompletion(moduleId, caller);
+          if (!readiness.ok) {
+            fail(readiness.error?.code ?? ErrorCode.COMPLETION_DENIED, readiness.error?.message ?? "module completion denied");
+          }
+        } else {
+          const readiness = this.checkAggregateCompletion(moduleId, owned, caller);
+          if (!readiness.ok) {
+            fail(readiness.error?.code ?? ErrorCode.COMPLETION_DENIED, readiness.error?.message ?? "aggregate completion denied");
+          }
+        }
+        break;
+      }
+      case "record-evidence": {
+        try {
+          this.requireCapability("evidence.record", caller);
+        } catch (e) {
+          fail(ErrorCode.EXECUTION_DENIED, e instanceof Error ? e.message : String(e));
+          break;
+        }
+        try {
+          const target = this.artifacts.findById(scopeId);
+          const executable = target.type === "WP"
+            ? target.status === "RUNNING" || target.status === "IMPLEMENTED" || target.status === "VERIFYING" || target.status === "FAILED"
+            : target.status === "EXECUTING" || target.status === "VERIFYING" || target.status === "FAILED";
+          if (!executable) {
+            fail(ErrorCode.INVALID_STATE, `Scope '${scopeId}' is ${target.status}: evidence belongs to executed work, position the scope first`);
+          }
+        } catch (e) {
+          fail(ErrorCode.ENTITY_NOT_FOUND, e instanceof Error ? e.message : String(e));
+        }
+        break;
+      }
+      case "correct-defect": {
+        // Mirrors the loopAction rule exactly (same source): an open
+        // loop with a live correction dispatch is actionable — the
+        // owner evidences the fix (no binding required) and completes
+        // the CORRECTING loop. ENACTED bindings count: confirmation
+        // is a credential-hygiene step, not a work gate.
+        const loops = this.db.correctionLoops().listByScope(moduleId, wpId)
+          .filter((l) => l.status === "OPEN" || l.status === "CORRECTING");
+        const liveBound = loops.some(() =>
+          this.db.dispatches().listByScope(moduleId, wpId).some(
+            (d) => d.kind === "correction" && (d.status === "PENDING" || d.status === "ENACTED" || d.status === "ACTIVE")
+          )
+        );
+        if (!liveBound) {
+          fail(ErrorCode.EXECUTION_DENIED, "No live correction dispatch on this scope: request and claim the correction dispatch first");
+        }
+        break;
+      }
+      case "request-correction": {
+        const loops = this.db.correctionLoops().listByScope(moduleId, wpId)
+          .filter((l) => l.status === "OPEN" || l.status === "CORRECTING");
+        if (loops.length === 0) {
+          fail(ErrorCode.EXECUTION_DENIED, "No open correction loop on this scope: open one for the defect first");
+          break;
+        }
+        if (caller.kind !== "po" && caller.role !== "gaspar") {
+          fail(ErrorCode.EXECUTION_DENIED, "Correction dispatch requires Gaspar or PO planning authority");
+          break;
+        }
+        for (const item of this.dryRunDispatchGates(moduleId, wpId ?? undefined, caller, "correction")) {
+          fail(item.code, item.message);
+        }
+        if (unmet.length > 0) {
+          break;
+        }
+        attempt(() => this.requireOpenCorrectionLoop(moduleId, wpId, null));
+        break;
+      }
+    }
+    return { acceptable: unmet.length === 0, unmet };
+  }
+
+  /**
    * Aggregate completion authorization for a module whose Work Packages
    * are all COMPLETE (CF-7): the module's implementation IS its
    * packages, each proven through its own verdict chain. Module-level
@@ -9025,6 +9685,21 @@ export class ChronoCore {
     try {
       const caller = this.resolveCaller(auth, "authorize aggregate completion");
       this.requireCapability("completion.request", caller);
+      return this.checkAggregateCompletion(moduleId, workPackageIds, caller);
+    } catch (e) {
+      this.auditDenial(moduleId, "AggregateCompletionAuthorization", e, auth.actor);
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Pure aggregate-completion readiness (CF-12 shared precondition
+   * source): identical checks to `authorizeAggregateCompletion` with
+   * zero persistence, for dry-run evaluation by `nextAction`,
+   * `deep_check`, and the reachability meta-test.
+   */
+  checkAggregateCompletion(moduleId: string, workPackageIds: string[], caller: ResolvedCaller): CoreResult<boolean> {
+    try {
       this.assertSessionScope(caller, { moduleId, workPackageId: null }, "authorize aggregate completion");
       const incomplete = workPackageIds.filter((id) => {
         try {
@@ -9103,7 +9778,6 @@ export class ChronoCore {
       this.requireCurrentSkill(moduleId);
       return { ok: true, value: true };
     } catch (e) {
-      this.auditDenial(moduleId, "AggregateCompletionAuthorization", e, auth.actor);
       return this.handleError(e);
     }
   }
@@ -9354,6 +10028,68 @@ export class ChronoCore {
       this.assertSessionScope(caller, { moduleId, workPackageId: wpId }, "next action");
       const effective = this.effectiveProfileFor(moduleId);
       const moduleArtifact = this.artifacts.findById(moduleId);
+      const targets = wpId !== null ? [wpId] : this.moduleWorkPackages(moduleId);
+
+      // CF-12: an unactivated module cannot execute anything — not
+      // loops, dispatches, reviews, or evidence. Activation outranks
+      // every other branch: it is the only executable step while the
+      // module is DRAFT or AWAITING_APPROVAL. When prerequisites are
+      // missing, the PO/human ceremony holds the workflow: surface it
+      // explicitly instead of an action the Core would deny.
+      if (moduleArtifact.status === "DRAFT" || moduleArtifact.status === "AWAITING_APPROVAL") {
+        const activation = this.checkActionPreconditions("activate-module", { moduleId, workPackageId: null }, auth);
+        if (activation.acceptable) {
+          return {
+            ok: true,
+            value: {
+              action: "activate-module",
+              targetKind: "module",
+              targetId: moduleId,
+              summary: `Module '${moduleId}' [${moduleArtifact.status}] holds current planning and module approvals: activate it to APPROVED`,
+              reason: "module activation is the executable next step",
+              policyRule: `profile=${effective.profile}`,
+            },
+          };
+        }
+        return {
+          ok: true,
+          value: {
+            action: "await-approval",
+            targetKind: "module",
+            targetId: moduleId,
+            summary: `Module '${moduleId}' [${moduleArtifact.status}] cannot activate yet: ${activation.unmet[0]?.message ?? "prerequisites unmet"}`,
+            reason: activation.unmet.map((u) => u.message).join("; ") || "activation prerequisites unmet",
+            policyRule: `profile=${effective.profile}`,
+          },
+        };
+      }
+
+      // CF-12: a PLANNED package authorizes before anything else can
+      // touch it. Authorization outranks loops, dispatches, and
+      // reviews on that scope: none of them are executable first.
+      for (const target of targets) {
+        try {
+          if (this.artifacts.findById(target).status !== "PLANNED") {
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        const authorizable = this.checkActionPreconditions("authorize-wp", { moduleId, workPackageId: target }, auth);
+        if (authorizable.acceptable) {
+          return {
+            ok: true,
+            value: {
+              action: "authorize-wp",
+              targetKind: "work-package",
+              targetId: target,
+              summary: `Work Package '${target}' [PLANNED] is authorizable: authorize it for execution`,
+              reason: "package authorization is the executable next step",
+              policyRule: `profile=${effective.profile}`,
+            },
+          };
+        }
+      }
 
       const openLoops = (m: string, w: string | null) =>
         this.db.correctionLoops().listByScope(m, w)
@@ -9394,59 +10130,306 @@ export class ChronoCore {
       };
       // Module-scoped loops own the whole module (and every package
       // in it); package-scoped loops own their package. Either gates
-      // its scope before any dispatch, review, or completion action.
+      // its scope before any dispatch, review, or completion action —
+      // but only through immediately executable steps (see below).
       const moduleLoop = openLoops(moduleId, null)[0];
       if (moduleLoop !== undefined) {
-        return { ok: true, value: loopAction(moduleLoop, wpId !== null ? "work-package" : "module", wpId ?? moduleId) };
+        const loopScope = { moduleId, workPackageId: moduleLoop.workPackageId };
+        if (
+          this.checkActionPreconditions("request-correction", loopScope, auth).acceptable &&
+          loopAction(moduleLoop, wpId !== null ? "work-package" : "module", wpId ?? moduleId).action === "request-correction"
+        ) {
+          return { ok: true, value: loopAction(moduleLoop, wpId !== null ? "work-package" : "module", wpId ?? moduleId) };
+        }
+        if (this.checkActionPreconditions("correct-defect", loopScope, auth).acceptable) {
+          return { ok: true, value: loopAction(moduleLoop, wpId !== null ? "work-package" : "module", wpId ?? moduleId) };
+        }
       }
       if (wpId !== null) {
         const packageLoop = openLoops(moduleId, wpId)[0];
         if (packageLoop !== undefined) {
-          return { ok: true, value: loopAction(packageLoop, "work-package", wpId) };
+          const loopScope = { moduleId, workPackageId: wpId };
+          if (
+            this.checkActionPreconditions("request-correction", loopScope, auth).acceptable &&
+            loopAction(packageLoop, "work-package", wpId).action === "request-correction"
+          ) {
+            return { ok: true, value: loopAction(packageLoop, "work-package", wpId) };
+          }
+          if (this.checkActionPreconditions("correct-defect", loopScope, auth).acceptable) {
+            return { ok: true, value: loopAction(packageLoop, "work-package", wpId) };
+          }
         }
       }
 
-      const targets = wpId !== null ? [wpId] : this.moduleWorkPackages(moduleId);
       if (targets.length === 0) {
-        return {
-          ok: true,
-          value: {
-            action: "authorize-work",
-            targetKind: "module",
-            targetId: moduleId,
-            summary: `Module '${moduleId}' [${moduleArtifact.status}] has no Work Packages: authorize the first package`,
-            reason: "no executable scope exists yet",
-            policyRule: `profile=${effective.profile}`,
-          },
-        };
+        // A held package-less module names its blocker first: no
+        // forward move exists while gated.
+        const moduleActive = this.blockers.findActive([moduleId]);
+        if (moduleActive.length > 0) {
+          const first = moduleActive[0]!;
+          return {
+            ok: true,
+            value: {
+              action: "blocked",
+              targetKind: "module",
+              targetId: moduleId,
+              summary: `Module '${moduleId}' [${moduleArtifact.status}] is held by blocker '${first.id}': ${first.reason}`,
+              reason: `active blocker '${first.id}' gates this scope`,
+              policyRule: `profile=${effective.profile}`,
+            },
+          };
+        }
+        // Package-less module (CF-12): the module scope itself walks
+        // the same executable chain packages do — unsettled
+        // dispatches, open reviews, review assignment, and live
+        // bindings gate before any fresh dispatch, and completion
+        // precedes re-dispatch. Every step below runs the shared
+        // dry-run source, so nothing is recommended that the Core
+        // would deny.
+        const moduleScope = { moduleId, workPackageId: null as string | null };
+        {
+          const pending = this.db.dispatches().listByScope(moduleId, null)
+            .filter((d) => d.status === "PENDING" || d.status === "ENACTED");
+          if (pending.length > 0) {
+            const latest = pending[pending.length - 1]!;
+            let action: string;
+            if (latest.status === "PENDING") {
+              const claimable = this.checkActionPreconditions("claim-dispatch", moduleScope, auth, { dispatchId: latest.id });
+              action = claimable.acceptable ? "claim-dispatch" : "await-claim";
+            } else {
+              const confirmable = this.checkActionPreconditions("confirm-dispatch", moduleScope, auth, { dispatchId: latest.id });
+              action = confirmable.acceptable ? "confirm-dispatch" : "await-claim";
+            }
+            const guidance = action === "await-claim"
+              ? "another session owns this dispatch: await its claim, or delegate afresh once it settles"
+              : latest.status === "PENDING"
+                ? "claim it with the dispatched session, then confine the credential"
+                : "confine the worker credential host-side, then confirm the claim";
+            return {
+              ok: true,
+              value: {
+                action,
+                targetKind: "module",
+                targetId: moduleId,
+                summary: `Dispatch '${latest.id}' [${latest.kind}] is ${latest.status} for role ${this.dispatchWorkerRole(latest) ?? "(awaiting delegation)"}: ${guidance}`,
+                reason: `dispatch '${latest.id}' is ${latest.status}`,
+                policyRule: `profile=${latest.policyProfile}; attempt ${latest.attempt}`,
+              },
+            };
+          }
+        }
+        {
+          const open = this.db.reviewAssignments().listByScope(moduleId, null)
+            .filter((r) => r.status === "ASSIGNED");
+          if (open.length > 0) {
+            const review = open[0]!;
+            const submittable = this.checkActionPreconditions(
+              "submit-review", moduleScope, auth, { reviewId: review.id }
+            );
+            if (submittable.acceptable) {
+              return {
+                ok: true,
+                value: {
+                  action: "submit-review",
+                  targetKind: "module",
+                  targetId: moduleId,
+                  summary: `Review '${review.id}' [${review.kind}] for ${review.reviewerRole} is ${review.status} on revision ${review.targetRevision.slice(0, 12)}: submit the review`,
+                  reason: `review '${review.id}' is ${review.status}`,
+                  policyRule: `profile=${effective.profile}`,
+                },
+              };
+            }
+          }
+        }
+        if (moduleArtifact.status !== "COMPLETE") {
+          // Live implementation/test/correction bindings settle
+          // first: the review binds the stable revision the worker
+          // leaves behind on release.
+          const working = this.db.dispatches().listByScope(moduleId, null)
+            .some((d) => (d.status === "PENDING" || d.status === "ENACTED" || d.status === "ACTIVE") &&
+              (d.kind === "implementation" || d.kind === "test" || d.kind === "correction"));
+          if (!working) {
+            const kinds: string[] = [];
+            const security = this.requiresSecurityReview(moduleId, effective.profile);
+            if (security.required) {
+              kinds.push("security-review");
+            }
+            kinds.push("verification");
+            const existing = this.db.reviewAssignments().listByScope(moduleId, null);
+            for (const kind of kinds) {
+              // A submitted review for the current revision already
+              // satisfies the kind: never assign twice. An open
+              // assignment fails the dry-run below (duplicate), so it
+              // falls through to the binding/dispatch steps instead.
+              if (existing.some((r) => r.kind === kind && r.status === "SUBMITTED" && r.targetRevision === moduleArtifact.revision)) {
+                continue;
+              }
+              const assignable = this.checkActionPreconditions(
+                "assign-review", moduleScope, auth, { kind }
+              );
+              if (assignable.acceptable) {
+                return {
+                  ok: true,
+                  value: {
+                    action: "assign-review",
+                    kind,
+                    targetKind: "module",
+                    targetId: moduleId,
+                    summary: `${kind === "security-review" ? "Glenn security review" : "Spekkio verification"} needed for '${moduleId}' [${moduleArtifact.status}]: assign the review`,
+                    reason: `no open ${kind} assignment for the current revision`,
+                    policyRule: `profile=${effective.profile}`,
+                  },
+                };
+              }
+            }
+          }
+        }
+        {
+          const active = this.db.dispatches().listByScope(moduleId, null)
+            .filter((d) => d.status === "ACTIVE");
+          if (active.length > 0) {
+            const latest = active[active.length - 1]!;
+            const ownBinding = caller.session.id === latest.workerSession;
+            let action: string;
+            if (ownBinding) {
+              const evidenced = this.checkActionPreconditions("record-evidence", moduleScope, auth);
+              action = evidenced.acceptable ? "record-evidence" : "execute-dispatch";
+            } else {
+              action = "execute-dispatch";
+            }
+            return {
+              ok: true,
+              value: {
+                action,
+                targetKind: "module",
+                targetId: moduleId,
+                summary: `Dispatch '${latest.id}' [${latest.kind}] is ${latest.status} for role ${this.dispatchWorkerRole(latest) ?? "(awaiting delegation)"}: execute the confirmed work, record evidence, then complete the dispatch`,
+                reason: `dispatch '${latest.id}' is ${latest.status}`,
+                policyRule: `profile=${latest.policyProfile}; attempt ${latest.attempt}`,
+              },
+            };
+          }
+        }
+        // Completion precedes re-dispatch: a PASSED module with no
+        // live binding completes; it never dispatches again.
+        if (moduleArtifact.status !== "COMPLETE") {
+          const completable = this.checkActionPreconditions("complete-module", moduleScope, auth);
+          if (completable.acceptable) {
+            return {
+              ok: true,
+              value: {
+                action: "complete-module",
+                targetKind: "module",
+                targetId: moduleId,
+                summary: `Module '${moduleId}' passes completion authorization: complete it`,
+                reason: "module-level gates clear",
+                policyRule: `profile=${effective.profile}`,
+              },
+            };
+          }
+        }
+        // Package-less module: dispatch directly at module scope when
+        // the gates pass and no live binding exists; otherwise the
+        // first package must be authorized through planning.
+        if (moduleArtifact.status !== "COMPLETE") {
+          const live = this.db.dispatches().listByScope(moduleId, null)
+            .some((d) => d.status === "PENDING" || d.status === "ENACTED" || d.status === "ACTIVE");
+          if (!live) {
+            const dispatchable = this.checkActionPreconditions(
+              "request-dispatch", moduleScope, auth, { kind: "implementation" }
+            );
+            if (dispatchable.acceptable) {
+              return {
+                ok: true,
+                value: {
+                  action: "request-dispatch",
+                  kind: "implementation",
+                  targetKind: "module",
+                  targetId: moduleId,
+                  summary: `Module '${moduleId}' [${moduleArtifact.status}] is dispatchable: request an implementation dispatch, delegate, and claim`,
+                  reason: "implementation dispatch gates pass with no live dispatch",
+                  policyRule: `profile=${effective.profile}`,
+                },
+              };
+            }
+          }
+        }
+        // COMPLETE rejoins the shared tail (`done`); anything else
+        // with no executable step authorizes its first package.
+        if (moduleArtifact.status === "COMPLETE") {
+          // Fall through to the shared terminal handling below.
+        } else {
+          return {
+            ok: true,
+            value: {
+              action: "authorize-work",
+              targetKind: "module",
+              targetId: moduleId,
+              summary: `Module '${moduleId}' [${moduleArtifact.status}] has no Work Packages: authorize the first package`,
+              reason: "no executable scope exists yet",
+              policyRule: `profile=${effective.profile}`,
+            },
+          };
+        }
       }
 
       // Highest precedence first: open package-scoped loops own
-      // their package (module-scoped loops returned above).
+      // their package (module-scoped loops returned above). Loop
+      // actions are returned only when immediately executable —
+      // request-correction needs a dispatchable correction path,
+      // correct-defect needs a live correction dispatch on the loop —
+      // otherwise the workflow falls through to the step that
+      // unblocks them.
       for (const target of targets) {
         const packageLoop = openLoops(moduleId, target)[0];
         if (packageLoop !== undefined) {
-          return { ok: true, value: loopAction(packageLoop, "work-package", target) };
+          const requestable = this.checkActionPreconditions(
+            "request-correction", { moduleId, workPackageId: packageLoop.workPackageId }, auth
+          );
+          if (requestable.acceptable) {
+            const acted = loopAction(packageLoop, "work-package", target);
+            if (acted.action === "request-correction") {
+              return { ok: true, value: acted };
+            }
+          }
+          const correctable = this.checkActionPreconditions(
+            "correct-defect", { moduleId, workPackageId: packageLoop.workPackageId }, auth
+          );
+          if (correctable.acceptable) {
+            const acted = loopAction(packageLoop, "work-package", target);
+            if (acted.action === "correct-defect") {
+              return { ok: true, value: acted };
+            }
+          }
         }
       }
 
-      // Stale dispatched work blocks everything behind it.
+      // Unsettled dispatches block everything behind them. Each
+      // dispatch action is returned only when its dry-run
+      // preconditions hold for this caller (CF-12): a claim the Core
+      // would deny is never recommended. ACTIVE bindings defer to
+      // review assignment below when the scope is reviewable and a
+      // review is still needed: the reviewer proceeds in parallel
+      // while the worker finishes.
       for (const target of targets) {
         const pending = this.db.dispatches().listByScope(moduleId, target)
-          .filter((d) => d.status === "PENDING" || d.status === "ENACTED" || d.status === "ACTIVE");
+          .filter((d) => d.status === "PENDING" || d.status === "ENACTED");
         if (pending.length > 0) {
           const latest = pending[pending.length - 1]!;
-          const ownBinding = caller.session.id === latest.workerSession;
-          const action = latest.status === "PENDING"
-            ? (ownBinding || caller.role === "gaspar" || caller.role === "PO" ? "claim-dispatch" : "await-claim")
-            : latest.status === "ENACTED"
-              ? "confirm-dispatch"
-              : "execute-dispatch";
-          const guidance = latest.status === "PENDING"
-            ? "claim it with the dispatched session, then confine the credential"
-            : latest.status === "ENACTED"
-              ? "confine the worker credential host-side, then confirm the claim"
-              : "execute the confirmed work, record evidence, then complete the dispatch";
+          const dispatchScope = { moduleId, workPackageId: target };
+          let action: string;
+          if (latest.status === "PENDING") {
+            const claimable = this.checkActionPreconditions("claim-dispatch", dispatchScope, auth, { dispatchId: latest.id });
+            action = claimable.acceptable ? "claim-dispatch" : "await-claim";
+          } else {
+            const confirmable = this.checkActionPreconditions("confirm-dispatch", dispatchScope, auth, { dispatchId: latest.id });
+            action = confirmable.acceptable ? "confirm-dispatch" : "await-claim";
+          }
+          const guidance = action === "await-claim"
+            ? "another session owns this dispatch: await its claim, or delegate afresh once it settles"
+            : latest.status === "PENDING"
+              ? "claim it with the dispatched session, then confine the credential"
+              : "confine the worker credential host-side, then confirm the claim";
           return {
             ok: true,
             value: {
@@ -9461,20 +10444,155 @@ export class ChronoCore {
         }
       }
 
-      // Open reviews gate verification.
+      // Open reviews gate verification — but only when submission
+      // is immediately executable (CF-12): the assigned reviewer
+      // calls with bound proof against the current revision. Anything
+      // else falls through instead of recommending a denial.
       for (const target of targets) {
         const open = this.db.reviewAssignments().listByScope(moduleId, target)
           .filter((r) => r.status === "ASSIGNED");
         if (open.length > 0) {
           const review = open[0]!;
+          const submittable = this.checkActionPreconditions(
+            "submit-review", { moduleId, workPackageId: target }, auth, { reviewId: review.id }
+          );
+          if (submittable.acceptable) {
+            return {
+              ok: true,
+              value: {
+                action: "submit-review",
+                targetKind: "work-package",
+                targetId: target,
+                summary: `Review '${review.id}' [${review.kind}] for ${review.reviewerRole} is ${review.status} on revision ${review.targetRevision.slice(0, 12)}: submit the review`,
+                reason: `review '${review.id}' is ${review.status}`,
+                policyRule: `profile=${effective.profile}`,
+              },
+            };
+          }
+        }
+      }
+
+      // Review assignment (CF-12): a reviewable scope with no open
+      // assignment of the needed kind is assigned before verification
+      // can proceed. Security-review precedes verification when the
+      // profile requires it; verification otherwise. Live
+      // implementation/test/correction bindings settle first: reviews
+      // bind the stable revision the worker leaves behind.
+      for (const target of targets) {
+        let artifact: { status: string; revision: string };
+        try {
+          artifact = this.artifacts.findById(target);
+        } catch {
+          continue;
+        }
+        if (artifact.status === "COMPLETE") {
+          continue;
+        }
+        // Live implementation/test/correction bindings settle
+        // first: the review binds the stable revision the worker
+        // leaves behind on release.
+        const working = this.db.dispatches().listByScope(moduleId, target)
+          .some((d) => (d.status === "PENDING" || d.status === "ENACTED" || d.status === "ACTIVE") &&
+            (d.kind === "implementation" || d.kind === "test" || d.kind === "correction"));
+        if (working) {
+          continue;
+        }
+        const kinds: string[] = [];
+        const security = this.requiresSecurityReview(moduleId, effective.profile);
+        if (security.required) {
+          kinds.push("security-review");
+        }
+        kinds.push("verification");
+        const existing = this.db.reviewAssignments().listByScope(moduleId, target);
+        for (const kind of kinds) {
+          // A submitted review for the current revision already
+          // satisfies the kind: never assign twice.
+          if (existing.some((r) => r.kind === kind && r.status === "SUBMITTED" && r.targetRevision === artifact.revision)) {
+            continue;
+          }
+          const assignable = this.checkActionPreconditions(
+            "assign-review", { moduleId, workPackageId: target }, auth, { kind }
+          );
+          if (assignable.acceptable) {
+            return {
+              ok: true,
+              value: {
+                action: "assign-review",
+                kind,
+                targetKind: "work-package",
+                targetId: target,
+                summary: `${kind === "security-review" ? "Glenn security review" : "Spekkio verification"} needed for '${target}' [${artifact.status}]: assign the review`,
+                reason: `no open ${kind} assignment for the current revision`,
+                policyRule: `profile=${effective.profile}`,
+              },
+            };
+          }
+        }
+      }
+
+      // Live bindings (CF-12): the holder's executable step is
+      // evidencing the work (advancement rides the same binding via
+      // scope-advance); anyone else observes execution in progress.
+      for (const target of targets) {
+        const active = this.db.dispatches().listByScope(moduleId, target)
+          .filter((d) => d.status === "ACTIVE");
+        if (active.length > 0) {
+          const latest = active[active.length - 1]!;
+          const dispatchScope = { moduleId, workPackageId: target };
+          const ownBinding = caller.session.id === latest.workerSession;
+          let action: string;
+          if (ownBinding) {
+            const evidenced = this.checkActionPreconditions("record-evidence", dispatchScope, auth);
+            action = evidenced.acceptable ? "record-evidence" : "execute-dispatch";
+          } else {
+            action = "execute-dispatch";
+          }
           return {
             ok: true,
             value: {
-              action: "submit-review",
+              action,
               targetKind: "work-package",
               targetId: target,
-              summary: `Review '${review.id}' [${review.kind}] for ${review.reviewerRole} is ${review.status} on revision ${review.targetRevision.slice(0, 12)}: submit the review`,
-              reason: `review '${review.id}' is ${review.status}`,
+              summary: `Dispatch '${latest.id}' [${latest.kind}] is ${latest.status} for role ${this.dispatchWorkerRole(latest) ?? "(awaiting delegation)"}: execute the confirmed work, record evidence, then complete the dispatch`,
+              reason: `dispatch '${latest.id}' is ${latest.status}`,
+              policyRule: `profile=${latest.policyProfile}; attempt ${latest.attempt}`,
+            },
+          };
+        }
+      }
+
+      // Forward dispatch (CF-12): an undispatched scope whose
+      // implementation gates pass is dispatched before anything
+      // downstream is recommended. Evidence, reviews, and completion
+      // all presuppose a positioned, claimed binding.
+      for (const target of targets) {
+        let artifact: { status: string };
+        try {
+          artifact = this.artifacts.findById(target);
+        } catch {
+          continue;
+        }
+        if (artifact.status === "COMPLETE") {
+          continue;
+        }
+        const live = this.db.dispatches().listByScope(moduleId, target)
+          .some((d) => d.status === "PENDING" || d.status === "ENACTED" || d.status === "ACTIVE");
+        if (live) {
+          continue;
+        }
+        const dispatchable = this.checkActionPreconditions(
+          "request-dispatch", { moduleId, workPackageId: target }, auth, { kind: "implementation" }
+        );
+        if (dispatchable.acceptable) {
+          return {
+            ok: true,
+            value: {
+              action: "request-dispatch",
+              kind: "implementation",
+              targetKind: "work-package",
+              targetId: target,
+              summary: `Work Package '${target}' [${artifact.status}] is dispatchable: request an implementation dispatch, delegate, and claim`,
+              reason: "implementation dispatch gates pass with no live dispatch",
               policyRule: `profile=${effective.profile}`,
             },
           };
@@ -9506,7 +10624,46 @@ export class ChronoCore {
         };
       }
 
-      // Otherwise surface the first concrete blocker.
+      // Awaiting reviewer proof: an ASSIGNED review whose proof is
+      // missing advances only through its reviewer. Name them instead
+      // of recommending an action the caller cannot complete.
+      for (const target of targets) {
+        let targetArtifact: { status: string };
+        try {
+          targetArtifact = this.artifacts.findById(target);
+        } catch {
+          continue;
+        }
+        if (targetArtifact.status === "COMPLETE") {
+          continue;
+        }
+        const assigned = this.db.reviewAssignments().listByScope(moduleId, target)
+          .filter((r) => r.status === "ASSIGNED");
+        for (const review of assigned) {
+          const proof = this.checkActionPreconditions(
+            "submit-review", { moduleId, workPackageId: target }, auth, { reviewId: review.id, skipSessionBinding: true }
+          );
+          if (!proof.acceptable) {
+            return {
+              ok: true,
+              value: {
+                action: "await-action",
+                targetKind: "work-package",
+                targetId: target,
+                summary: `Review '${review.id}' [${review.kind}] waits on ${review.reviewerRole}: ${proof.unmet[0]?.message ?? "proof pending"}`,
+                reason: `assigned review proof missing: ${proof.unmet.map((u) => u.message).join("; ") || "pending"}`,
+                policyRule: `profile=${effective.profile}`,
+              },
+            };
+          }
+        }
+      }
+
+      // Otherwise surface the first concrete blocker — but only as
+      // an executable evidence step when the scope is positioned for
+      // executed work (CF-12). Evidence belongs to RUNNING and worked
+      // scopes; recommending it for AUTHORIZED, PLANNED, or DRAFT
+      // scopes skips the lifecycle and is never returned.
       for (const target of targets) {
         const artifact = this.artifacts.findById(target);
         if (artifact.status === "COMPLETE") {
@@ -9514,20 +10671,57 @@ export class ChronoCore {
         }
         const blockers = this.workPackageCompletionBlockers(target);
         if (blockers.length > 0) {
+          const evidenced = this.checkActionPreconditions("record-evidence", { moduleId, workPackageId: target }, auth);
+          if (evidenced.acceptable) {
+            return {
+              ok: true,
+              value: {
+                action: "record-evidence",
+                targetKind: "work-package",
+                targetId: target,
+                summary: `Work Package '${target}' [${artifact.status}] is blocked: ${blockers[0]!}`,
+                reason: blockers[0]!,
+                policyRule: `profile=${effective.profile}`,
+              },
+            };
+          }
+        }
+      }
+
+      // Terminal informative holds (CF-12): nothing above is
+      // executable, so name exactly what gates the scope. Active
+      // blockers name their resolution; otherwise the PO/human
+      // ceremony holds the workflow — never an action the Core
+      // would deny.
+      for (const target of targets) {
+        let artifact: { status: string };
+        try {
+          artifact = this.artifacts.findById(target);
+        } catch {
+          continue;
+        }
+        if (artifact.status === "COMPLETE") {
+          continue;
+        }
+        const active = this.blockers.findActive([target, moduleId]);
+        if (active.length > 0) {
+          const first = active[0]!;
           return {
             ok: true,
             value: {
-              action: "record-evidence",
+              action: "blocked",
               targetKind: "work-package",
               targetId: target,
-              summary: `Work Package '${target}' [${artifact.status}] is blocked: ${blockers[0]!}`,
-              reason: blockers[0]!,
+              summary: `Work Package '${target}' [${artifact.status}] is held by blocker '${first.id}': ${first.reason}`,
+              reason: `active blocker '${first.id}' gates this scope`,
               policyRule: `profile=${effective.profile}`,
             },
           };
         }
       }
-
+      // Terminal state resolves before approval holds: a COMPLETE
+      // module needs no prerequisites, so `done` must precede the
+      // await-approval shadow below (CF-12 reachability).
       if (moduleArtifact.status === "COMPLETE") {
         return {
           ok: true,
@@ -9540,6 +10734,22 @@ export class ChronoCore {
             policyRule: `profile=${effective.profile}`,
           },
         };
+      }
+      {
+        const activation = this.checkActionPreconditions("activate-module", { moduleId, workPackageId: null }, auth);
+        if (!activation.acceptable && activation.unmet.length > 0) {
+          return {
+            ok: true,
+            value: {
+              action: "await-approval",
+              targetKind: "module",
+              targetId: moduleId,
+              summary: `Module '${moduleId}' [${moduleArtifact.status}] waits on PO/human prerequisites: ${activation.unmet[0]!.message}`,
+              reason: activation.unmet.map((u) => u.message).join("; "),
+              policyRule: `profile=${effective.profile}`,
+            },
+          };
+        }
       }
       // Modules with Work Packages complete by aggregate: every
       // package COMPLETE rolls the module chain up. Package-less
@@ -9807,6 +11017,137 @@ export class ChronoCore {
    * correction loops past their attempt bound without escalation.
    * Findings are advisory records; repair stays explicit and PO-owned.
    */
+  /**
+   * Verify one reported next action independently (CF-12): re-derive
+   * acceptability from the shared precondition source and confirm
+   * grounding for informative actions. Imperative actions run the
+   * state/record dry-run (session binding is enforced at execution,
+   * so verification uses verifier mode); informative actions verify
+   * the rows they describe exist. Returns findings (empty when the
+   * report is sound).
+   */
+  verifyReportedAction(
+    scope: { moduleId: string; workPackageId: string | null },
+    action: NextAction,
+    auth: CallerAuth
+  ): DeepIntegrityFinding[] {
+    const findings: DeepIntegrityFinding[] = [];
+    const target = action.targetKind === "work-package" ? action.targetId : scope.moduleId;
+    const targetScope = action.targetKind === "work-package"
+      ? { moduleId: scope.moduleId, workPackageId: action.targetId }
+      : { moduleId: scope.moduleId, workPackageId: null };
+    const unreachable = (detail: string): void => {
+      findings.push({ severity: "blocker", check: "unreachable-next-action", detail });
+    };
+    const imperative = new Set([
+      "activate-module", "authorize-wp", "request-dispatch", "claim-dispatch",
+      "confirm-dispatch", "submit-review", "request-completion", "complete-module",
+      "record-evidence", "correct-defect", "request-correction", "assign-review",
+    ]);
+    if (!imperative.has(action.action)) {
+      // Informative actions verify by grounding, never by dry-run.
+      if (action.action === "await-claim") {
+        const rows = this.db.dispatches().listByScope(targetScope.moduleId, targetScope.workPackageId)
+          .filter((d) => d.status === "PENDING");
+        if (rows.length === 0) {
+          unreachable(`next action 'await-claim' for '${target}' names no PENDING dispatch`);
+        }
+      } else if (action.action === "execute-dispatch") {
+        const rows = this.db.dispatches().listByScope(targetScope.moduleId, targetScope.workPackageId)
+          .filter((d) => d.status === "ACTIVE");
+        if (rows.length === 0) {
+          unreachable(`next action 'execute-dispatch' for '${target}' names no ACTIVE dispatch`);
+        }
+      } else if (action.action === "advance-module") {
+        const incomplete = this.moduleWorkPackages(targetScope.moduleId).filter((id) => {
+          try {
+            return this.artifacts.findById(id).status !== "COMPLETE";
+          } catch {
+            return true;
+          }
+        });
+        if (incomplete.length === 0) {
+          unreachable(`next action 'advance-module' for '${target}' names no incomplete Work Package`);
+        }
+      } else if (action.action === "authorize-work") {
+        if (this.moduleWorkPackages(targetScope.moduleId).length > 0) {
+          unreachable(`next action 'authorize-work' for '${target}' contradicts existing Work Packages`);
+        }
+      } else if (action.action === "done") {
+        try {
+          if (this.artifacts.findById(target).status !== "COMPLETE") {
+            unreachable(`next action 'done' for '${target}' contradicts a non-terminal state`);
+          }
+        } catch {
+          unreachable(`next action 'done' names unknown scope '${target}'`);
+        }
+      } else if (action.action === "await-approval") {
+        const activation = this.checkActionPreconditions("activate-module", targetScope, auth);
+        if (activation.acceptable) {
+          unreachable(`next action 'await-approval' for '${target}' hides an acceptable activation`);
+        } else if (activation.unmet.length === 0) {
+          unreachable(`next action 'await-approval' for '${target}' names no unmet prerequisite`);
+        }
+      } else if (action.action === "blocked") {
+        const active = this.blockers.findActive([target, targetScope.moduleId]);
+        if (active.length === 0) {
+          unreachable(`next action 'blocked' for '${target}' names no active blocker`);
+        }
+      } else if (action.action === "await-action") {
+        // Grounded in an ASSIGNED review whose proof is still missing
+        // (the only await-action source): recompute proof-readiness.
+        const assigned = this.db.reviewAssignments().listByScope(targetScope.moduleId, targetScope.workPackageId)
+          .filter((r) => r.status === "ASSIGNED");
+        const pending = assigned.filter((r) => {
+          const proof = this.checkActionPreconditions(
+            "submit-review", targetScope, auth, { reviewId: r.id, skipSessionBinding: true }
+          );
+          return !proof.acceptable;
+        });
+        if (pending.length === 0) {
+          unreachable(`next action 'await-action' for '${target}' names no pending reviewer proof`);
+        }
+      } else {
+        unreachable(`next action '${action.action}' for '${target}' is not a known executable or informative action`);
+      }
+      return findings;
+    }
+    // Imperative actions: re-derive row ids exactly as nextAction did,
+    // then dry-run state preconditions in verifier mode.
+    let extra: { kind?: string; dispatchId?: string; reviewId?: string; skipSessionBinding?: boolean } | undefined;
+    if (action.action === "request-dispatch" || action.action === "assign-review") {
+      extra = action.kind !== undefined ? { kind: action.kind } : {};
+    } else if (action.action === "claim-dispatch" || action.action === "confirm-dispatch") {
+      const rows = this.db.dispatches().listByScope(targetScope.moduleId, targetScope.workPackageId)
+        .filter((d) => d.status === (action.action === "claim-dispatch" ? "PENDING" : "ENACTED") || d.status === "ACTIVE");
+      const latest = rows[rows.length - 1];
+      if (latest === undefined) {
+        unreachable(`next action '${action.action}' for '${target}' names no matching dispatch row`);
+        return findings;
+      }
+      extra = { dispatchId: latest.id, skipSessionBinding: true };
+    } else if (action.action === "submit-review") {
+      const rows = this.db.reviewAssignments().listByScope(targetScope.moduleId, targetScope.workPackageId)
+        .filter((r) => r.status === "ASSIGNED");
+      // First assigned, matching nextAction's selection order.
+      const first = rows[0];
+      if (first === undefined) {
+        unreachable(`next action 'submit-review' for '${target}' names no ASSIGNED review`);
+        return findings;
+      }
+      extra = { reviewId: first.id, skipSessionBinding: true };
+    } else {
+      extra = { skipSessionBinding: true };
+    }
+    const check = this.checkActionPreconditions(action.action as CheckableAction, targetScope, auth, extra);
+    if (!check.acceptable) {
+      unreachable(
+        `next action '${action.action}' for '${target}' fails dry-run: ${check.unmet.map((u) => u.message).join("; ") || "unknown"}`
+      );
+    }
+    return findings;
+  }
+
   deepIntegrityCheck(auth: CallerAuth): CoreResult<DeepIntegrityReport> {
     try {
       const caller = this.resolveCaller(auth, "deep integrity check");
@@ -9997,8 +11338,11 @@ export class ChronoCore {
       }
 
       // Reachability: every scope must resolve to exactly one next
-      // action (CF-9). A scope the orchestrator cannot advance is a
-      // defect in the lifecycle, not a quiet stall.
+      // action (CF-9), and every reported action must independently
+      // verify (CF-12): imperative actions re-run the shared dry-run,
+      // informative actions prove their grounding rows. A scope the
+      // orchestrator cannot advance — or an action the Core would
+      // deny — is a defect in the lifecycle, not a quiet stall.
       for (const mod of this.artifacts.listByType("MOD")) {
         const scopes: Array<{ moduleId?: string; workPackageId?: string }> = [{ moduleId: mod.id }];
         for (const wpId of this.moduleWorkPackages(mod.id)) {
@@ -10011,6 +11355,115 @@ export class ChronoCore {
               severity: "blocker",
               check: "unreachable-scope",
               detail: `scope '${scope.workPackageId ?? scope.moduleId}' has no next action: ${this.describeDenial(next)}`,
+            });
+            continue;
+          }
+          const verifiedScope = {
+            moduleId: mod.id,
+            workPackageId: scope.workPackageId ?? null,
+          };
+          for (const finding of this.verifyReportedAction(verifiedScope, next.value!, auth)) {
+            findings.push(finding);
+          }
+        }
+      }
+
+      // Approval/state agreement audit (CF-12 req 9): a current
+      // module-approval whose ModuleApproved transition was never
+      // enacted is the CF-12 split-brain shape — approvals recorded,
+      // lifecycle diverged. Planning-approval alone on pre-activation
+      // states is normal planning (it is an activation prerequisite,
+      // not a contradiction) and is not flagged.
+      for (const mod of this.artifacts.listByType("MOD")) {
+        if (mod.status !== "DRAFT" && mod.status !== "AWAITING_APPROVAL") {
+          continue;
+        }
+        if (this.hasValidApproval(mod.id, mod.revision, "module-approval")) {
+          findings.push({
+            severity: "blocker",
+            check: "approval-without-activation",
+            detail: `module '${mod.id}' holds a current module-approval at ${mod.status}: the ModuleApproved transition was never enacted — activate the module`,
+          });
+        }
+      }
+
+      // Premature reviews (CF-12 req 6): ASSIGNED rows whose target
+      // cannot enter verification can never complete meaningfully.
+        for (const mod of this.artifacts.listByType("MOD")) {
+        const reviewScopes: Array<{ moduleId: string; workPackageId: string | null }> = [{ moduleId: mod.id, workPackageId: null }];
+        for (const wpId of this.moduleWorkPackages(mod.id)) {
+          reviewScopes.push({ moduleId: mod.id, workPackageId: wpId });
+        }
+        for (const reviewScope of reviewScopes) {
+          for (const review of this.db.reviewAssignments().listByScope(reviewScope.moduleId, reviewScope.workPackageId)) {
+            if (review.status !== "ASSIGNED") {
+              continue;
+            }
+            const targetId = review.workPackageId ?? review.moduleId;
+            let targetType = "WP";
+            let targetStatus = "";
+            try {
+              const target = this.artifacts.findById(targetId);
+              targetType = target.type;
+              targetStatus = target.status;
+            } catch {
+              findings.push({
+                severity: "blocker",
+                check: "premature-review",
+                detail: `review '${review.id}' [${review.kind}] targets unknown scope '${targetId}'`,
+              });
+              continue;
+            }
+            const reviewability = this.isReviewableScope(review.kind, targetType, targetStatus);
+            if (!reviewability.reviewable) {
+              findings.push({
+                severity: "blocker",
+                check: "premature-review",
+                detail: `review '${review.id}' [${review.kind}] assigned to ${targetType} '${targetId}' [${targetStatus}]: ${reviewability.reason} — reconcile it`,
+              });
+            }
+          }
+        }
+      }
+
+      // Missing transition surface (CF-12 req 6): a scope positioned
+      // for forward dispatch whose gates fail ONLY on steps with no
+      // native path (harness recording, spec advancement) is
+      // genuinely stuck: neither the workflow nor the PO ceremony can
+      // clear it. Approval-shaped holds route through await-approval
+      // instead; blockers route through escalation.
+      for (const mod of this.artifacts.listByType("MOD")) {
+        const dispatchable: Array<{ moduleId: string; workPackageId: string | null }> = [];
+        if (this.moduleWorkPackages(mod.id).length === 0) {
+          if (mod.status === "APPROVED" || mod.status === "EXECUTING") {
+            dispatchable.push({ moduleId: mod.id, workPackageId: null });
+          }
+        }
+        for (const wpId of this.moduleWorkPackages(mod.id)) {
+          try {
+            const wp = this.artifacts.findById(wpId);
+            if (wp.status === "AUTHORIZED" || wp.status === "RUNNING") {
+              dispatchable.push({ moduleId: mod.id, workPackageId: wpId });
+            }
+          } catch {
+            continue;
+          }
+        }
+        for (const dispatchScope of dispatchable) {
+          const probe = this.checkActionPreconditions("request-dispatch", dispatchScope, auth, { kind: "implementation" });
+          if (probe.acceptable) {
+            continue;
+          }
+          const nativeLess = probe.unmet.filter((u) => {
+            const text = `${u.message} ${u.suggestedAction ?? ""}`;
+            return /harness/i.test(text) || /to READY|READY first|SpecApprovedReady/i.test(text);
+          });
+          if (nativeLess.length > 0) {
+            const target = dispatchScope.workPackageId ?? dispatchScope.moduleId;
+            findings.push({
+              severity: "blocker",
+              check: "missing-transition-surface",
+              detail: `scope '${target}' cannot dispatch and the blockers have no native path: ${nativeLess.map((u) => u.message).join("; ")}`,
             });
           }
         }

@@ -27,7 +27,7 @@ export const AUTHORITY_POLICY_VERSION = "9";
  * independently from the authority matrix: tool classification affects
  * pre-tool gate decisions, never grant semantics.
  */
-export const TOOL_POLICY_VERSION = "6";
+export const TOOL_POLICY_VERSION = "7";
 
 export type CapabilityHolder = AgentRole | "PO";
 
@@ -55,6 +55,8 @@ export type CoreOperation =
   | "completion.request"
   | "review.assign"
   | "review.complete"
+  | "review.reconcile"
+  | "module.activate"
   | "correction.open"
   | "policy.set"
   | "dispatch.reconcile"
@@ -101,6 +103,8 @@ export const ROLE_CAPABILITIES: Record<CoreOperation, readonly CapabilityHolder[
   "completion.request": ["gaspar", "spekkio", "PO"],
   "review.assign": ["gaspar", "PO"],
   "review.complete": ["glenn", "spekkio"],
+  "review.reconcile": ["gaspar", "PO"],
+  "module.activate": ["gaspar", "PO"],
   "correction.open": ["gaspar", "spekkio", "PO"],
   "policy.set": ["gaspar", "PO"],
   "dispatch.reconcile": ["gaspar", "PO"],
@@ -250,6 +254,8 @@ export const OPENCODE_TOOL_POLICY: Record<string, ToolClassification> = {
   chrono_correction_open: "lifecycle",
   chrono_correction_complete: "lifecycle",
   chrono_module_complete: "lifecycle",
+  chrono_module_activate: "lifecycle",
+  chrono_review_reconcile: "lifecycle",
   chrono_wp_authorize: "lifecycle",
   chrono_deep_check: "lifecycle",
   chrono_policy_set: "lifecycle",

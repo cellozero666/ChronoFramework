@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -976,5 +976,30 @@ export const MIGRATIONS: Record<number, string> = {
     FROM artifact a JOIN artifact_revision r ON r.id = a.id AND r.revision = a.revision
     WHERE a.type IN ('SP', 'MOD', 'WP') AND a.deleted = 0
       AND NOT EXISTS (SELECT 1 FROM runtime_config WHERE key = 'planning.envelope.' || a.id);
+  `,
+  20: `
+    -- Review reconciliation (CF-12): premature assignments committed
+    -- before reviewability gating (e.g. reviews assigned to scopes
+    -- that could never enter verification) are preserved append-only
+    -- as INVALID history instead of being deleted or completed. The
+    -- no-delete trigger is unchanged; the status guard gains the
+    -- terminal ASSIGNED -> INVALID move with frozen scope.
+    DROP TRIGGER review_status_guard;
+    CREATE TRIGGER review_status_guard BEFORE UPDATE ON review_assignment
+    WHEN NOT (
+      (
+        (OLD.status = 'ASSIGNED' AND NEW.status IN ('SUBMITTED', 'SUPERSEDED', 'INVALID'))
+      )
+      AND OLD.id IS NEW.id
+      AND OLD.kind IS NEW.kind
+      AND OLD.module_id IS NEW.module_id
+      AND OLD.work_package_id IS NEW.work_package_id
+      AND OLD.target_revision IS NEW.target_revision
+      AND OLD.reviewer_role IS NEW.reviewer_role
+      AND OLD.created_at IS NEW.created_at
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'review assignments mutate only ASSIGNED -> SUBMITTED/SUPERSEDED/INVALID with frozen scope');
+    END;
   `,
 };

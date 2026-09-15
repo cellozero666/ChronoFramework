@@ -64,7 +64,7 @@
  * directly importable in tests: enforcement logic runs for real, with
  * only the gate/entry binaries substituted by fixtures.
  *
- * Tool policy version: TOOL_POLICY_VERSION=6 (see @chrono/domain
+ * Tool policy version: TOOL_POLICY_VERSION=7 (see @chrono/domain
  * OPENCODE_TOOL_POLICY). The lists below are generated from that policy;
  * the Core remains the authority — the plugin only shapes the intake.
  * v5 adds the `delegate` class for OpenCode's real subagent-delegation
@@ -217,6 +217,9 @@ const LIFECYCLE_TOOLS = new Set([
   "chrono_dispatch_release",
   "chrono_dispatch_revoke",
   "chrono_dispatch_reconcile",
+  "chrono_scope_advance",
+  "chrono_module_activate",
+  "chrono_review_reconcile",
 ]);
 const SKILL_PINNED_COMMIT = ${JSON.stringify(SKILL_RELEASE.pinnedCommit)};
 const SKILL_SOURCE_HASH = ${JSON.stringify(SKILL_RELEASE.sourceHash)};

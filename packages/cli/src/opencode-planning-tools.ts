@@ -69,6 +69,8 @@ export const CHRONO_NATIVE_TOOLS = [
   "chrono_dispatch_reconcile",
   "chrono_scope_advance",
   "chrono_defect_resolve",
+  "chrono_module_activate",
+  "chrono_review_reconcile",
 ] as const;
 
 export type ChronoNativeTool = (typeof CHRONO_NATIVE_TOOLS)[number];
@@ -104,7 +106,7 @@ export function checkPlanningToolsFile(existing: string | null): PlanningToolsSt
 }
 
 /**
-  * Generated `.opencode/tools/chrono.ts`. Single file, thirty
+  * Generated `.opencode/tools/chrono.ts`. Single file, thirty-two
   * named exports (`chrono_<export>` tool names). Self-contained except
   * the pinned `@opencode-ai/plugin` import and node builtins.
   */
@@ -114,7 +116,7 @@ export function buildPlanningToolsFile(): string {
  * \`chrono setup --adapter <id>\` / \`chrono init --runtime opencode\`
  * — do not hand-edit (drift fails closed; repair regenerates).
  *
-  * Thirty model-callable tools (OpenCode names: chrono_<export>).
+  * Thirty-two model-callable tools (OpenCode names: chrono_<export>).
   * Planning (Gaspar entry):
   * - artifact_status: Core-backed planning status projection (safe).
   * - artifact_propose: materialize one planning draft (inline body).
@@ -141,6 +143,10 @@ export function buildPlanningToolsFile(): string {
   * - correction_open: open a bounded correction loop for a defect.
   * - correction_complete: complete a loop with evidenced fix (owner).
   * - module_complete: terminal module completion (runs authorization).
+  * - module_activate: activate a planned module to APPROVED after both
+  *   current approvals (Gaspar only; idempotent replay).
+  * - review_reconcile: reconcile a premature review as invalid history
+  *   (Gaspar only; append-only, never blocking).
   * - wp_authorize: authorize one Work Package (Gaspar only).
   * - deep_check: cross-record integrity before completion (Gaspar).
   * - policy_set: calibrate rigor (downgrades need a PO signature and
@@ -840,6 +846,38 @@ export const scope_advance = tool({
     const res = runChrono(argv);
     if (res.exit !== 0 || !res.json || res.json.ok !== true) {
       deny(res.json, "scope advance denied");
+    }
+    return JSON.stringify(res.json);
+  },
+});
+
+export const module_activate = tool({
+  description: "CHRONO: activate a planned module to APPROVED after its current planning and module approvals (Gaspar only; idempotent replay, resumable across restarts).",
+  args: {
+    module: tool.schema.string().describe("module identifier"),
+  },
+  async execute(args, context) {
+    const root = projectRoot(context.directory);
+    const token = hostToken(root, context.sessionID);
+    const res = runChrono(["module-activate", "--module", args.module, ...agentArgs(root, token, callerAgent(context))]);
+    if (res.exit !== 0 || !res.json || res.json.ok !== true) {
+      deny(res.json, "module activate denied");
+    }
+    return JSON.stringify(res.json);
+  },
+});
+
+export const review_reconcile = tool({
+  description: "CHRONO: reconcile a premature review assignment as invalid history (Gaspar only; append-only, never blocking).",
+  args: {
+    review: tool.schema.string().describe("review assignment id"),
+  },
+  async execute(args, context) {
+    const root = projectRoot(context.directory);
+    const token = hostToken(root, context.sessionID);
+    const res = runChrono(["review-reconcile", "--review", args.review, ...agentArgs(root, token, callerAgent(context))]);
+    if (res.exit !== 0 || !res.json || res.json.ok !== true) {
+      deny(res.json, "review reconcile denied");
     }
     return JSON.stringify(res.json);
   },

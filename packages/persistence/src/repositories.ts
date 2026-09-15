@@ -3414,6 +3414,31 @@ export class ReviewRepository {
     return this.findById(id);
   }
 
+  /**
+   * Reconcile a premature assignment (CF-12): an ASSIGNED review whose
+   * target could never enter verification is preserved append-only as
+   * INVALID history. Terminal and non-blocking: completion requires
+   * ASSIGNED, the open-assignment index covers ASSIGNED only, and the
+   * no-delete trigger is untouched.
+   */
+  markInvalid(id: string): ReviewRecord {
+    const info = this.db
+      .prepare("UPDATE review_assignment SET status = 'INVALID' WHERE id = ? AND status = 'ASSIGNED'")
+      .run(id);
+    if (info.changes !== 1) {
+      const current = this.findById(id);
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Review '${id}' cannot reconcile from '${current.status}': only ASSIGNED rows reconcile`,
+        invariantRef: "INV §5.1",
+        affectedTarget: id,
+        suggestedAction: "Reconcile premature assignments exactly once",
+      });
+    }
+    return this.findById(id);
+  }
+
   private mapRow(row: ReviewRow): ReviewRecord {
     return {
       id: row.id as string,

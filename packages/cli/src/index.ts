@@ -68,8 +68,10 @@ import {
   runNextAction,
   runPolicySet,
   runPolicyStatus,
+  runModuleActivate,
   runReviewAssign,
   runReviewComplete,
+  runReviewReconcile,
   runScopeAdvance,
   runVerifyRecord,
   runWpAuthorize,
@@ -3935,6 +3937,27 @@ export function createProgram(cwd: string): Command {
     });
 
   program
+    .command("module-activate")
+    .description("Activate a planned module to APPROVED after both current approvals (gaspar/PO; idempotent replay)")
+    .requiredOption("--module <id>", "module identifier")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runModuleActivate(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          module: String(opts.module ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
     .command("review-assign")
     .description("Assign a Glenn security review or Spekkio verification (gaspar/PO)")
     .requiredOption("--kind <kind>", "review kind: security-review or verification")
@@ -3972,6 +3995,27 @@ export function createProgram(cwd: string): Command {
       emitProgramResult(
         program,
         runReviewComplete(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          review: String(opts.review ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("review-reconcile")
+    .description("Reconcile a premature review as invalid append-only history (gaspar/PO; never blocking)")
+    .requiredOption("--review <id>", "review assignment id")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runReviewReconcile(projectPath, {
           as: String(opts.as ?? ""),
           ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
           review: String(opts.review ?? ""),

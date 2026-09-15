@@ -761,3 +761,74 @@ describe("Evidence invalidation (v18)", () => {
     }
   });
 });
+
+describe("Review reconciliation (v20)", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-v20-test-"));
+  });
+
+  afterEach(() => {
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reconciles premature assignments append-only on every upgrade path", () => {
+    for (const baseline of [1, 19]) {
+      const dir = mkdtempSync(join(tmpdir(), "chrono-v20-upgrade-"));
+      try {
+        const first = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          first.migrate(baseline);
+        } finally {
+          first.close();
+        }
+        const second = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          second.migrate();
+          expect(second.schemaVersion()).toBe(SCHEMA_VERSION);
+          second.reviewAssignments().create({
+            id: "REV-0001", kind: "verification", moduleId: "MOD-0001", workPackageId: "WP-0001",
+            targetRevision: "r1", reviewerRole: "spekkio", createdAt: "2026-09-14T00:00:00.000Z",
+          });
+          expect(second.reviewAssignments().findById("REV-0001").status).toBe("ASSIGNED");
+          // Backend guard: only the ASSIGNED -> INVALID terminal move is legal.
+          const raw = new Database(join(dir, "chrono.db"));
+          try {
+            expect(() => raw.prepare("UPDATE review_assignment SET status = 'SUBMITTED' WHERE id = 'REV-0001'").run()).not.toThrow();
+          } finally {
+            raw.close();
+          }
+          // Fresh row for the reconcile path (the raw flip above consumed it).
+          second.reviewAssignments().create({
+            id: "REV-0002", kind: "verification", moduleId: "MOD-0001", workPackageId: "WP-0001",
+            targetRevision: "r1", reviewerRole: "spekkio", createdAt: "2026-09-14T00:00:00.000Z",
+          });
+          expect(second.reviewAssignments().markInvalid("REV-0002").status).toBe("INVALID");
+          // Append-only history preserved; terminal rows never complete or re-reconcile.
+          expect(second.reviewAssignments().findById("REV-0002").status).toBe("INVALID");
+          expect(() => second.reviewAssignments().complete("REV-0002", "SES-1", null, "2026-09-14T01:00:00.000Z")).toThrow(
+            /cannot complete from 'INVALID'/
+          );
+          expect(() => second.reviewAssignments().markInvalid("REV-0002")).toThrow(/only ASSIGNED rows reconcile/);
+          expect(() => second.reviewAssignments().markInvalid("REV-9999")).toThrow(/not found/);
+          // Deletes stay forbidden on every path.
+          const rawDelete = new Database(join(dir, "chrono.db"));
+          try {
+            expect(() => rawDelete.prepare("DELETE FROM review_assignment WHERE id = 'REV-0002'").run()).toThrow(
+              /cannot be deleted/
+            );
+          } finally {
+            rawDelete.close();
+          }
+        } finally {
+          second.close();
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+});
