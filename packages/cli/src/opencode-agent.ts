@@ -37,6 +37,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { SKILL_RELEASE } from "@chrono/domain";
+import type { ChronoNativeTool } from "./opencode-planning-tools.js";
 
 /** Project-local OpenCode agent directory (official contract). */
 export const OPENCODE_AGENTS_DIR_RELATIVE = ".opencode/agents";
@@ -61,6 +62,189 @@ export function openCodeAgentPath(role: string): string {
 
 /** Project-relative path of the Gaspar primary definition. */
 export const GASPAR_AGENT_RELATIVE_PATH = openCodeAgentPath("gaspar");
+
+/**
+ * Exhaustive Gaspar route for one `chrono_next` action value (CF2-3).
+ * `tool` is the native tool Gaspar itself calls (with `args`);
+ * `tool: null` means Gaspar calls NO tool for this action — it is an
+ * explicit human/await hold (`hold` names the ceremony or waiter) or
+ * a step owned by another session (`hold` names that session's tool).
+ * Unknown action values never appear here: `resolveGasparNextAction`
+ * throws instead of degrading to prose or guessed commands.
+ */
+export interface GasparNextActionRoute {
+  readonly tool: ChronoNativeTool | null;
+  readonly args: readonly string[];
+  readonly hold: string | null;
+  readonly note: string;
+}
+
+/**
+ * Action-to-native-tool mapping for EVERY value `nextAction` can
+ * return (exactly the Core `NEXT_ACTIONS` universe — a test fails the
+ * build on any missing or extra key). The mandatory backbone:
+ * `activate-module -> chrono_module_activate`,
+ * `authorize-wp -> chrono_wp_authorize`,
+ * `request-dispatch -> chrono_dispatch` plus exactly one `task`
+ * delegation to a kind-fitting role.
+ */
+export const GASPAR_NEXT_ACTION_MAP: Record<string, GasparNextActionRoute> = {
+  "activate-module": {
+    tool: "chrono_module_activate", args: ["module"],
+    hold: null,
+    note: "DRAFT/AWAITING_APPROVAL with both current approvals: activate to APPROVED (idempotent replay).",
+  },
+  "await-approval": {
+    tool: null,
+    args: [],
+    hold: "PO/human ceremony holds the workflow: request the named approval with chrono_approval_request plus the native question tool, then stop — the PO decides in the UI; terminal steps are never delegated outward (no shell commands, token copies, variable exports, or manual dispatch context).",
+    note: "Activation authority missing (absent, revoked, stale, or wrong-revision planning/module approval).",
+  },
+  "approve-security": {
+    tool: "chrono_approval_request",
+    args: ["action=implementation-security", "scope=module", "revision=current module revision from chrono_execution_status"],
+    hold: "The PO answers VIA THE NATIVE question TOOL (explicit Approve names the challenge); on approval re-query chrono_next — it now advertises complete-module.",
+    note: "Every package COMPLETE (or package-less work positioned) but the Module Implementation Security Acceptance missing: this ceremony — never more work — unblocks completion.",
+  },
+  "authorize-wp": {
+    tool: "chrono_wp_authorize", args: ["wp"],
+    hold: null,
+    note: "PLANNED package with a valid owning module: authorize it for execution.",
+  },
+  "request-dispatch": {
+    tool: "chrono_dispatch",
+    args: ["module", "wp?", "kind (from the action)", "rationale"],
+    hold: null,
+    note: "Then delegate with the task tool to EXACTLY ONE kind-fitting role carrying the dispatch id (implementation/test: belthazar, melchior, prometheus, lucca; security-review: glenn; verification: spekkio; correction: the loop owner the Core binds). Never delegate twice for one intent.",
+  },
+  "claim-dispatch": {
+    tool: null,
+    args: [],
+    hold: "Worker handoff: the delegated worker's FIRST action is chrono_dispatch_claim with the dispatch id. Gaspar awaits the claim or delegates afresh once the intent settles — never claims worker dispatches itself.",
+    note: "PENDING intent owned by this session.",
+  },
+  "confirm-dispatch": {
+    tool: null,
+    args: [],
+    hold: "Confine the worker credential host-side, then the requester or worker confirms via chrono_dispatch_confirm. Never copy tokens into model-visible text.",
+    note: "ENACTED intent awaiting confinement confirmation.",
+  },
+  "await-claim": {
+    tool: null,
+    args: [],
+    hold: "Another session owns this dispatch: await its claim, or delegate afresh once it settles. Never hijack, never guess dispatch ids.",
+    note: "PENDING/ENACTED intent not claimable by this session.",
+  },
+  "execute-dispatch": {
+    tool: null,
+    args: [],
+    hold: "The bound worker executes inside its binding while Gaspar coordinates and routes evidence (chrono_execution_status to observe). Gaspar never implements, edits, or writes product code itself.",
+    note: "ACTIVE binding observed by a non-holder.",
+  },
+  "record-evidence": {
+    tool: null,
+    args: [],
+    hold: "The binding holder records passing proof with chrono_evidence_record bound to the exact scope revision, then advances with chrono_scope_advance. Gaspar never records worker evidence.",
+    note: "Own ACTIVE binding ready to evidence.",
+  },
+  "assign-review": {
+    tool: "chrono_review_request", args: ["kind (from the action)", "module", "wp?"],
+    hold: null,
+    note: "Reviewable scope with no open assignment of the needed kind: security-review binds Glenn, verification binds Spekkio.",
+  },
+  "submit-review": {
+    tool: null,
+    args: [],
+    hold: "The assigned reviewer submits with chrono_review_complete after binding proof (Glenn evidence or Spekkio verdict) to the exact revision. Gaspar never reviews, never impersonates reviewers.",
+    note: "ASSIGNED review whose proof is ready in the reviewer session.",
+  },
+  "await-action": {
+    tool: null,
+    args: [],
+    hold: "The named reviewer still owes proof: wait for their submission. Never submit for them, never reassign around them.",
+    note: "ASSIGNED review with proof still missing.",
+  },
+  "request-correction": {
+    tool: "chrono_dispatch",
+    args: ["module", "wp?", "kind=correction", "rationale"],
+    hold: null,
+    note: "Open correction loop with no correction dispatch: dispatch kind correction (the Core binds the defect owner — never Gaspar's choice), then exactly one task delegation to that owner.",
+  },
+  "correct-defect": {
+    tool: null,
+    args: [],
+    hold: "The loop owner evidences the fix with chrono_evidence_record and closes the loop with chrono_correction_complete; re-verification follows. Gaspar never corrects directly.",
+    note: "Open loop with a live correction dispatch.",
+  },
+  "request-completion": {
+    tool: null,
+    args: [],
+    hold: "Package readiness pointer: if the Spekkio verdict is missing, route a verification dispatch (chrono_dispatch kind verification + one delegation to spekkio); the bound Spekkio session advances. Gaspar never advances scopes itself.",
+    note: "Work Package with all completion blockers cleared.",
+  },
+  "complete-module": {
+    tool: "chrono_module_complete", args: ["module"],
+    hold: null,
+    note: "Module-level gates clear (packages aggregate or package-less verdict chain plus the security acceptance): complete (idempotent). Execute IMMEDIATELY after observing — no approval, transition, or mutation between observation and execution.",
+  },
+  "advance-module": {
+    tool: null,
+    args: [],
+    hold: "Module-level pointer, not a tool call: query chrono_next on the named Work Package and follow its action. Never treat this as completion.",
+    note: "Incomplete packages remain, or aggregate gates deny with a named prerequisite.",
+  },
+  "authorize-work": {
+    tool: null,
+    args: [],
+    hold: "No Work Packages exist yet: plan the first package through the governed planning tools (chrono_artifact_propose kind workpackage), never by hand-writing state.",
+    note: "Package-less module with no executable scope.",
+  },
+  "blocked": {
+    tool: null,
+    args: [],
+    hold: "Resolve the named blocker through its owning workflow (evidence, correction, waiver, or PO decision), then re-query chrono_next. Never bypass, never delete blockers.",
+    note: "Active blocker gates the scope.",
+  },
+  "done": {
+    tool: null,
+    args: [],
+    hold: "Terminal state: no further action. Report completion from Core state.",
+    note: "Module COMPLETE.",
+  },
+};
+
+/**
+ * Resolve one `chrono_next` action to Gaspar's route. Unknown values
+ * fail LOUDLY (throw) instead of prose or guessed commands — a new
+ * Core action without a map entry breaks here by design, forcing the
+ * map (and this contract) to grow explicitly.
+ */
+export function resolveGasparNextAction(action: string): GasparNextActionRoute {
+  const route = GASPAR_NEXT_ACTION_MAP[action];
+  if (route === undefined) {
+    throw new Error(
+      `unknown next action '${action}': no Gaspar route exists — fail closed, do not guess a command; extend GASPAR_NEXT_ACTION_MAP first`
+    );
+  }
+  return route;
+}
+
+/** Prose rendering of the map, embedded verbatim in the Gaspar contract. */
+function gasparNextActionTable(): string {
+  const lines: string[] = [
+    "## Next-action map (exhaustive — every `chrono_next` action routes here; anything else is a Core defect: stop and report it, never guess)",
+    "",
+  ];
+  for (const [action, route] of Object.entries(GASPAR_NEXT_ACTION_MAP)) {
+    const target = route.tool === null ? `HOLD: ${route.hold}` : `\`${route.tool}(${route.args.join(", ")})\`${route.hold === null ? "" : ` — then ${route.hold}`}`;
+    lines.push(`- \`${action}\` → ${target} — ${route.note}`);
+  }
+  lines.push(
+    "",
+    "Rules: continue autonomously through every executable action above. Stop for the Product Owner ONLY on the HOLD rows naming a genuine PO decision or signed approval (await-approval, approve-security, authorize-work, blocked). NEVER ask the Product Owner to run CHRONO internal commands, copy tokens or grants, export variables, or manually create dispatch context. NEVER implement, evidence, review, verify, correct, advance, or complete anything yourself: those verbs belong to bound worker, reviewer, or owner sessions through their own tools.",
+  );
+  return lines.join("\n");
+}
 
 /** Managed sidecar recording config ownership (CHRONO-owned, JSON). */
 export const OPENCODE_CONFIG_SIDECAR_RELATIVE = ".chrono/opencode-config.json";
@@ -181,9 +365,9 @@ const ROLE_BODIES: Record<ChronoOpenCodeRole, string> = {
     "  dispatch context, by design.",
     "- Drive the executable workflow with the lifecycle tools, not",
     "  prose: `chrono_next` names the single highest-precedence action",
-    "  for a scope (open correction loops first, then stale dispatches,",
-    "  open reviews, then readiness); `chrono_review_request` assigns",
-    "  Glenn/Spekkio reviews; `chrono_correction_open` opens a bounded",
+    "  for a scope; the Next-action map below routes every value to",
+    "  its tool or explicit hold. Supporting tools: `chrono_review_request`",
+    "  assigns Glenn/Spekkio reviews; `chrono_correction_open` opens a bounded",
     "  loop per defect; `chrono_policy_set` raises rigor (lowering",
     "  always denies here — downgrades are PO-signed at a terminal);",
     "  `chrono_deep_check` audits cross-record integrity before",
@@ -191,6 +375,8 @@ const ROLE_BODIES: Record<ChronoOpenCodeRole, string> = {
     "  restarts; `chrono_module_complete` completes what the gates",
     "  allow (idempotent). Quote the denial reason and fix the named",
     "  prerequisite instead of retrying blindly.",
+    "",
+    ...gasparNextActionTable().split("\n"),
     "- Apply the Karpathy Guidelines skill throughout (think before coding,",
     `  simplicity first, surgical changes, goal-driven verified execution; pinned ${SKILL_RELEASE.pinnedCommit})`,
     "  without ever simplifying away security, traceability, evidence,",

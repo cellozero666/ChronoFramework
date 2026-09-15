@@ -138,6 +138,38 @@ export type CheckableAction =
   | "request-completion" | "complete-module" | "record-evidence"
   | "correct-defect" | "request-correction";
 
+/**
+ * Every action value `nextAction` can return (CF2-3 single source):
+ * executable lifecycle steps plus explicit human/await holds. The
+ * Gaspar action-to-tool map and its test exhaust exactly this list;
+ * an action outside it fails loudly instead of degrading to prose.
+ */
+export const NEXT_ACTIONS = [
+  "activate-module",
+  "await-approval",
+  "approve-security",
+  "authorize-wp",
+  "request-dispatch",
+  "claim-dispatch",
+  "confirm-dispatch",
+  "await-claim",
+  "execute-dispatch",
+  "record-evidence",
+  "assign-review",
+  "submit-review",
+  "await-action",
+  "request-correction",
+  "correct-defect",
+  "request-completion",
+  "complete-module",
+  "advance-module",
+  "authorize-work",
+  "blocked",
+  "done",
+] as const;
+
+export type NextActionValue = (typeof NEXT_ACTIONS)[number];
+
 export interface NextAction {
   readonly action: string;
   readonly targetKind: "module" | "work-package";
@@ -3540,7 +3572,28 @@ export class ChronoCore {
         break;
       case "MOD:SpekkioPassed":
         this.requireQaVerdict(artifactId, revision, null, "PASS");
+        this.propagateAuthorization(
+          this.authorizeCompletion(artifactId, {
+            actor: guardContext?.["actor"] as string,
+            session: guardContext?.["session"] as { id: string; token: string },
+          }),
+          artifactId
+        );
         this.validateGrantOrBinding(artifactId, null, guardContext, caller);
+        break;
+      case "MOD:AllPackagesComplete":
+        // Aggregate completion enforces the same shared gates at
+        // the transition layer that the operation pre-check runs
+        // (CF2-1/§7): a direct transition can never bypass package
+        // completeness, security acceptance, defects, or currency.
+        this.propagateAuthorization(
+          this.authorizeAggregateCompletion(artifactId, this.moduleWorkPackages(artifactId), {
+            actor: guardContext?.["actor"] as string,
+            session: guardContext?.["session"] as { id: string; token: string },
+          }),
+          artifactId
+        );
+        this.validateExecutionGrant(artifactId, null, guardContext, caller);
         break;
       case "MOD:DefinitionOfDoneSatisfied":
         this.propagateAuthorization(
@@ -3574,10 +3627,39 @@ export class ChronoCore {
         this.denyIfBlocked(artifactId);
         this.validateGrantOrBinding(this.workPackageModule(artifactId), artifactId, guardContext, caller);
         break;
-      case "WP:SpekkioPassed":
+      case "WP:SpekkioPassed": {
         this.requireQaVerdict(artifactId, revision, artifactId, "PASS");
         this.validateGrantOrBinding(this.workPackageModule(artifactId), artifactId, guardContext, caller);
+        // Terminal readiness at the transition layer (§7): the same
+        // shared blockers advanceScope enforces. The ACTIVE binding
+        // covering this scope is proof in flight, not obstruction —
+        // excluded exactly as the operation excludes it. advanceScope
+        // always presents a freshly minted grant alongside the riding
+        // binding, so the exclusion keys off the binding, never the
+        // grant. No covering ACTIVE binding means any live dispatch
+        // rightly obstructs (fail-closed).
+        let exclusion: string | undefined;
+        try {
+          exclusion = this.validateActiveBinding(
+            caller,
+            { moduleId: this.workPackageModule(artifactId), workPackageId: artifactId }
+          ).id;
+        } catch {
+          exclusion = undefined;
+        }
+        const blockers = this.workPackageCompletionBlockers(artifactId, exclusion);
+        if (blockers.length > 0) {
+          throw new ChronoError({
+            code: ErrorCode.COMPLETION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Work Package '${artifactId}' cannot complete: ${blockers[0]!}`,
+            invariantRef: "INV §5.6",
+            affectedTarget: artifactId,
+            suggestedAction: "Satisfy the named prerequisite, then advance",
+          });
+        }
         break;
+      }
       case "WP:SpekkioFailed":
         this.requireQaVerdict(artifactId, revision, artifactId, "FAILED");
         this.validateGrantOrBinding(this.workPackageModule(artifactId), artifactId, guardContext, caller);
@@ -4035,6 +4117,10 @@ export class ChronoCore {
   private guardWorkPackageAuthorized(wpId: string): void {
     const moduleId = this.workPackageModule(wpId);
     const module = this.artifacts.findById(moduleId);
+    // Authorizing new package work presupposes current activation
+    // authority (CF2-2): a revoked or stale planning/module
+    // approval denies here, in the dry-run, and in nextAction alike.
+    this.requireActivationAuthority(moduleId);
     if (module.status !== "APPROVED" && module.status !== "EXECUTING") {
       throw new ChronoError({
         code: ErrorCode.EXECUTION_DENIED,
@@ -6003,27 +6089,12 @@ export class ChronoCore {
     this.requireCurrentRtk(moduleId, sessionInfo, adapterId);
     this.requireCurrentSkill(moduleId);
 
-    const approval = this.approvals.findByScope(moduleId, moduleArtifact.revision, "module-approval");
-    if (approval === null || approval.revoked) {
-      throw new ChronoError({
-        code: ErrorCode.APPROVAL_REQUIRED,
-        severity: Severity.BLOCKER,
-        message: `Module ${moduleId} lacks required PO approval`,
-        invariantRef: "INV §5.4, DOM §6.4",
-        affectedTarget: moduleId,
-        suggestedAction: "Record a signed module-approval binding this exact revision",
-      });
-    }
-    if (isStaleReference(approval.scopeRevision, moduleArtifact.revision)) {
-      throw new ChronoError({
-        code: ErrorCode.APPROVAL_REQUIRED,
-        severity: Severity.BLOCKER,
-        message: `Module ${moduleId} approval is stale after material change`,
-        invariantRef: "INV §4.4",
-        affectedTarget: moduleId,
-        suggestedAction: "Re-approve the current revision",
-      });
-    }
+    // New dispatch work presupposes current activation authority
+    // (CF2-2): both the planning and the module approval must be
+    // current for the exact revision — revoked, stale,
+    // wrong-revision, or non-authoritative approvals deny request,
+    // claim-time revalidation, and the dry-run identically.
+    this.requireActivationAuthority(moduleId);
 
     const archRev = project.architectureRevision;
     if (project.architectureState !== "approved" || archRev === null) {
@@ -6085,7 +6156,12 @@ export class ChronoCore {
       }
     }
 
-    this.denyOnPostApprovalChange(moduleId, specIds, approval.timestamp);
+    // Post-approval material changes still deny (existing gate):
+    // the current module-approval timestamp anchors the revision
+    // watch. Authority was revalidated above, so the row exists;
+    // the fallback only satisfies the type checker.
+    const moduleApproval = this.approvals.findByScope(moduleId, moduleArtifact.revision, "module-approval");
+    this.denyOnPostApprovalChange(moduleId, specIds, moduleApproval === null ? this.now() : moduleApproval.timestamp);
 
     if (workPackageId !== undefined) {
       this.authorizeWorkPackageScope(moduleId, workPackageId, kind);
@@ -7683,6 +7759,11 @@ export class ChronoCore {
         });
       }
       this.assertSessionScope(caller, { moduleId: input.moduleId, workPackageId: input.workPackageId ?? null }, "assign review");
+      // Assigning review work presupposes current activation
+      // authority (CF2-2): revoked or stale planning/module
+      // approvals deny here, in the dry-run, and in nextAction
+      // alike — never a stranded row.
+      this.requireActivationAuthority(input.moduleId);
       // CF-12: reviewability precedes persistence. A review assigned
       // to a scope that cannot enter verification strands an
       // unreachable row no workflow can complete.
@@ -8448,6 +8529,26 @@ export class ChronoCore {
   }
 
   /**
+   * Module-level Implementation Security Acceptance for the exact
+   * current module revision (CF2-1 shared precondition source): the
+   * PO backstop `validate()` requires of every VERIFYING, PASSED, and
+   * COMPLETE module, unconditionally. Returns null when a current
+   * approval holds, else the exact missing-authority message.
+   * Revoked, stale, wrong-scope, wrong-action, or wrong-revision
+   * approvals never satisfy it (`hasValidApproval` enforces all
+   * five). Drives package-less completion, aggregate completion,
+   * `nextAction`, and deep reachability verification — never
+   * divergent copies.
+   */
+  private moduleSecurityAcceptanceUnmet(moduleId: string): string | null {
+    const moduleArtifact = this.artifacts.findById(moduleId);
+    if (this.hasValidApproval(moduleId, moduleArtifact.revision, "implementation-security")) {
+      return null;
+    }
+    return `Module '${moduleId}' lacks a current Implementation Security Acceptance for revision ${moduleArtifact.revision.slice(0, 16)}…: record the implementation-security decision for this exact revision`;
+  }
+
+  /**
    * Evaluate completion authorization for a module.
    * Implements gate_completion [CORE §7.6, DOM §6.6]: Spekkio PASS bound
    * to the revision, current Lucca and Glenn evidence, current
@@ -8477,6 +8578,10 @@ export class ChronoCore {
   checkModuleCompletion(moduleId: string, caller: ResolvedCaller): CoreResult<boolean> {
     try {
       this.assertSessionScope(caller, { moduleId, workPackageId: null }, "authorize completion");
+      // Terminal completion presupposes current activation
+      // authority (CF2-2): a module whose planning or module
+      // approval lapsed cannot complete, whatever its verdicts.
+      this.requireActivationAuthority(moduleId);
       const moduleArtifact = this.artifacts.findById(moduleId);
 
       if (moduleArtifact.status !== "VERIFYING" && moduleArtifact.status !== "PASSED") {
@@ -8573,17 +8678,23 @@ export class ChronoCore {
               suggestedAction: "Record Glenn security evidence before completion",
             });
           }
-          if (!this.hasValidApproval(moduleId, moduleArtifact.revision, "implementation-security")) {
-            throw new ChronoError({
-              code: ErrorCode.APPROVAL_REQUIRED,
-              severity: Severity.BLOCKER,
-              message: `Module ${moduleId} lacks a current Implementation Security Acceptance`,
-              invariantRef: "INV §7.2",
-              affectedTarget: moduleId,
-              suggestedAction: "Record the implementation-security decision for this revision",
-            });
-          }
         }
+      }
+      // Module security acceptance is unconditional across profiles
+      // (CF2-1): validate() requires it of every VERIFYING, PASSED,
+      // and COMPLETE module, so package-less completion cannot
+      // succeed without it either — otherwise the terminal
+      // transition would immediately fail validation.
+      const acceptanceUnmet = this.moduleSecurityAcceptanceUnmet(moduleId);
+      if (acceptanceUnmet !== null) {
+        throw new ChronoError({
+          code: ErrorCode.APPROVAL_REQUIRED,
+          severity: Severity.BLOCKER,
+          message: acceptanceUnmet,
+          invariantRef: "INV §7.2",
+          affectedTarget: moduleId,
+          suggestedAction: "Record the implementation-security decision for this revision",
+        });
       }
       if (effective.profile === "critical") {
         const reviews = this.db.reviewAssignments().listByScope(moduleId, null);
@@ -9167,7 +9278,63 @@ export class ChronoCore {
    * acceptance AND the module-approval decision must be current for
    * the exact revision, plus READY specs and no blockers. A mere
    * planning approval therefore never turns into module authority.
+   *
+   * Both exact-revision approval checks (CF2-2 shared source):
+   * absent, revoked, stale, wrong-revision, or non-authoritative
+   * approvals are all reported through `hasValidApproval`, so
+   * freshness, revocation, scope, action, revision, and ceremony
+   * are enforced identically on first activation and every replay.
    */
+  private activationApprovalUnmet(
+    moduleId: string,
+    revision: string
+  ): Array<{ code: string; message: string; suggestedAction?: string }> {
+    const unmet: Array<{ code: string; message: string; suggestedAction?: string }> = [];
+    if (!this.hasValidApproval(moduleId, revision, "planning-approval")) {
+      unmet.push({
+        code: ErrorCode.APPROVAL_REQUIRED,
+        message: `Module '${moduleId}' lacks a current planning-approval for revision ${revision.slice(0, 16)}…: record the PO planning decision first`,
+        suggestedAction: "Record a signed planning-approval binding this exact revision",
+      });
+    }
+    if (!this.hasValidApproval(moduleId, revision, "module-approval")) {
+      unmet.push({
+        code: ErrorCode.APPROVAL_REQUIRED,
+        message: `Module '${moduleId}' lacks a current module-approval for revision ${revision.slice(0, 16)}…: record the PO module decision first`,
+        suggestedAction: "Record a signed module-approval binding this exact revision",
+      });
+    }
+    return unmet;
+  }
+
+  /**
+   * Throwing revalidation of activation authority (CF2-2 shared
+   * enforcing source): every NEW downstream authorization —
+   * Work Package authorization, dispatch request (including
+   * claim-time revalidation), review assignment, and both
+   * completion paths — presupposes current planning AND module
+   * approvals for the exact module revision. Revoked, stale,
+   * wrong-revision, or non-authoritative approvals deny with the
+   * exact missing authority. In-flight ACTIVE bindings settle
+   * mechanically (evidence, advance, release) but can never
+   * complete while this denies: terminal completion revalidates
+   * too, so no success-then-validate-failure shape survives.
+   */
+  private requireActivationAuthority(moduleId: string): void {
+    const unmet = this.checkModuleActivation(moduleId);
+    if (unmet.length > 0) {
+      const first = unmet[0]!;
+      throw new ChronoError({
+        code: (first.code as (typeof ErrorCode)[keyof typeof ErrorCode]) ?? ErrorCode.APPROVAL_REQUIRED,
+        severity: Severity.BLOCKER,
+        message: `Module '${moduleId}' lacks current activation authority: ${first.message}`,
+        invariantRef: "INV §5.4",
+        affectedTarget: moduleId,
+        suggestedAction: first.suggestedAction ?? "Restore the module planning and module approvals for the current revision",
+      });
+    }
+  }
+
   checkModuleActivation(moduleId: string): Array<{ code: string; message: string; suggestedAction?: string }> {
     const unmet: Array<{ code: string; message: string; suggestedAction?: string }> = [];
     let artifact: { id: string; type: string; status: string; revision: string };
@@ -9187,9 +9354,6 @@ export class ChronoCore {
       });
       return unmet;
     }
-    if (artifact.status === "APPROVED") {
-      return unmet;
-    }
     if (artifact.status === "COMPLETE") {
       unmet.push({
         code: ErrorCode.INVALID_STATE,
@@ -9197,26 +9361,29 @@ export class ChronoCore {
       });
       return unmet;
     }
-    if (artifact.status !== "DRAFT" && artifact.status !== "AWAITING_APPROVAL") {
-      unmet.push({
-        code: ErrorCode.INVALID_STATE,
-        message: `Module '${moduleId}' is ${artifact.status}: activation advances only DRAFT or AWAITING_APPROVAL scopes`,
-      });
+    if (artifact.status === "APPROVED") {
+      // Idempotent replay revalidates authority (CF2-2): no
+      // duplicate transition, but a revoked, stale, or otherwise
+      // invalid planning/module approval denies with the exact
+      // missing authority instead of reporting false success.
+      for (const item of this.activationApprovalUnmet(moduleId, artifact.revision)) {
+        unmet.push(item);
+      }
       return unmet;
     }
-    if (!this.hasValidApproval(moduleId, artifact.revision, "planning-approval")) {
-      unmet.push({
-        code: ErrorCode.APPROVAL_REQUIRED,
-        message: `Module '${moduleId}' lacks a current planning-approval for revision ${artifact.revision.slice(0, 16)}…: record the PO planning decision first`,
-        suggestedAction: "Record a signed planning-approval binding this exact revision",
-      });
+    if (artifact.status !== "DRAFT" && artifact.status !== "AWAITING_APPROVAL") {
+      // Post-activation states (EXECUTING, VERIFYING, PASSED,
+      // FAILED, BLOCKED) carry no activation transition, but their
+      // downstream steps all presuppose valid activation authority:
+      // surface the same hold so nextAction and deep-check never
+      // advertise work the Core would deny (CF2-2).
+      for (const item of this.activationApprovalUnmet(moduleId, artifact.revision)) {
+        unmet.push(item);
+      }
+      return unmet;
     }
-    if (!this.hasValidApproval(moduleId, artifact.revision, "module-approval")) {
-      unmet.push({
-        code: ErrorCode.APPROVAL_REQUIRED,
-        message: `Module '${moduleId}' lacks a current module-approval for revision ${artifact.revision.slice(0, 16)}…: record the PO module decision first`,
-        suggestedAction: "Record a signed module-approval binding this exact revision",
-      });
+    for (const item of this.activationApprovalUnmet(moduleId, artifact.revision)) {
+      unmet.push(item);
     }
     try {
       this.guardModulePlanned(moduleId);
@@ -9265,9 +9432,6 @@ export class ChronoCore {
         });
       }
       this.assertSessionScope(caller, { moduleId, workPackageId: null }, "activate module");
-      if (artifact.status === "APPROVED") {
-        return { ok: true, value: { state: "APPROVED", activated: false, revision: artifact.revision } };
-      }
       const unmet = this.checkModuleActivation(moduleId);
       if (unmet.length > 0) {
         const first = unmet[0]!;
@@ -9279,6 +9443,12 @@ export class ChronoCore {
           affectedTarget: moduleId,
           suggestedAction: "Satisfy the named prerequisite, then activate",
         });
+      }
+      // Idempotent replay (CF2-2): authority revalidated above, so
+      // an already-APPROVED module reports success with no duplicate
+      // transition — validation first, idempotency second.
+      if (this.artifacts.findById(moduleId).status === "APPROVED") {
+        return { ok: true, value: { state: "APPROVED", activated: false, revision: this.artifacts.findById(moduleId).revision } };
       }
       const guardContext = { actor: auth.actor, session: auth.session };
       const current = this.artifacts.findById(moduleId).status;
@@ -9656,8 +9826,15 @@ export class ChronoCore {
           fail(ErrorCode.EXECUTION_DENIED, "No open correction loop on this scope: open one for the defect first");
           break;
         }
-        if (caller.kind !== "po" && caller.role !== "gaspar") {
-          fail(ErrorCode.EXECUTION_DENIED, "Correction dispatch requires Gaspar or PO planning authority");
+        // A correction dispatch is requested through `requestDispatch`
+        // (kind correction), so the dry-run enforces exactly that
+        // operation's `execution.request` capability (gaspar/PO) —
+        // never a divergent copy. (Opening the loop itself is a
+        // separate `correction.open` step owned by gaspar/spekkio/PO.)
+        try {
+          this.requireCapability("execution.request", caller);
+        } catch (e) {
+          fail(ErrorCode.EXECUTION_DENIED, e instanceof Error ? e.message : String(e));
           break;
         }
         for (const item of this.dryRunDispatchGates(moduleId, wpId ?? undefined, caller, "correction")) {
@@ -9701,6 +9878,10 @@ export class ChronoCore {
   checkAggregateCompletion(moduleId: string, workPackageIds: string[], caller: ResolvedCaller): CoreResult<boolean> {
     try {
       this.assertSessionScope(caller, { moduleId, workPackageId: null }, "authorize aggregate completion");
+      // Aggregate completion presupposes current activation
+      // authority too (CF2-2): all packages COMPLETE cannot roll
+      // up while the module's own approvals lapsed.
+      this.requireActivationAuthority(moduleId);
       const incomplete = workPackageIds.filter((id) => {
         try {
           return this.artifacts.findById(id).status !== "COMPLETE";
@@ -9773,6 +9954,23 @@ export class ChronoCore {
             suggestedAction: "Correct the defect and re-verify",
           });
         }
+      }
+      // Module security acceptance is unconditional here too
+      // (CF2-1): validate() requires it of every COMPLETE module,
+      // so aggregate completion cannot succeed without it —
+      // otherwise `complete-module` would transition straight into
+      // a validation failure. Shared source with package-less
+      // completion, nextAction, and deep-check.
+      const acceptanceUnmet = this.moduleSecurityAcceptanceUnmet(moduleId);
+      if (acceptanceUnmet !== null) {
+        throw new ChronoError({
+          code: ErrorCode.APPROVAL_REQUIRED,
+          severity: Severity.BLOCKER,
+          message: acceptanceUnmet,
+          invariantRef: "INV §7.2",
+          affectedTarget: moduleId,
+          suggestedAction: "Record the implementation-security decision for this revision",
+        });
       }
       this.requireCurrentRtk(moduleId, { id: caller.session.id, adapter: caller.session.adapter, runtime: caller.session.runtime }, null);
       this.requireCurrentSkill(moduleId);
@@ -10064,6 +10262,30 @@ export class ChronoCore {
         };
       }
 
+      // CF2-2: revoked or stale activation authority gates every
+      // downstream step. The module's planning/module approvals are
+      // revalidated at the same observation boundary as dispatch,
+      // evidence, review, and completion: while invalid, the PO
+      // ceremony hold is the only truthful action — never WP
+      // authorization, dispatch, evidence, review, or completion.
+      // Terminal COMPLETE modules rejoin `done` below instead.
+      if (moduleArtifact.status !== "COMPLETE" && moduleArtifact.status !== "DRAFT" && moduleArtifact.status !== "AWAITING_APPROVAL") {
+        const activationUnmet = this.checkModuleActivation(moduleId);
+        if (activationUnmet.length > 0) {
+          return {
+            ok: true,
+            value: {
+              action: "await-approval",
+              targetKind: "module",
+              targetId: moduleId,
+              summary: `Module '${moduleId}' [${moduleArtifact.status}] lost valid activation authority: ${activationUnmet[0]!.message}`,
+              reason: activationUnmet.map((u) => u.message).join("; "),
+              policyRule: `profile=${effective.profile}`,
+            },
+          };
+        }
+      }
+
       // CF-12: a PLANNED package authorizes before anything else can
       // touch it. Authorization outranks loops, dispatches, and
       // reviews on that scope: none of them are executable first.
@@ -10323,6 +10545,28 @@ export class ChronoCore {
                 targetId: moduleId,
                 summary: `Module '${moduleId}' passes completion authorization: complete it`,
                 reason: "module-level gates clear",
+                policyRule: `profile=${effective.profile}`,
+              },
+            };
+          }
+          // Missing security acceptance is an explicit PO ceremony
+          // hold (CF2-1) — but only when it is the SOLE bar to
+          // completion. Anything else missing means more work (or a
+          // different hold) comes first; the shared dry-run names
+          // it, never a guess.
+          const onlyAcceptance = completable.unmet.length === 1 &&
+            completable.unmet[0]!.code === ErrorCode.APPROVAL_REQUIRED &&
+            completable.unmet[0]!.message.includes("Implementation Security Acceptance");
+          if (onlyAcceptance) {
+            const reason = completable.unmet[0]!.message;
+            return {
+              ok: true,
+              value: {
+                action: "approve-security",
+                targetKind: "module",
+                targetId: moduleId,
+                summary: `Module '${moduleId}' [${moduleArtifact.status}] is completion-ready except for its PO security acceptance: ${reason}`,
+                reason,
                 policyRule: `profile=${effective.profile}`,
               },
             };
@@ -10764,7 +11008,29 @@ export class ChronoCore {
           }
         });
         if (incomplete.length === 0) {
-          const aggregate = this.authorizeAggregateCompletion(moduleId, ownedPackages, auth);
+          // Missing security acceptance is an explicit PO ceremony
+          // hold (CF2-1), never a completion advertisement: the
+          // approval binds the exact current module revision, and
+          // only after it is recorded may `complete-module` appear.
+          const acceptanceUnmet = this.moduleSecurityAcceptanceUnmet(moduleId);
+          if (acceptanceUnmet !== null) {
+            return {
+              ok: true,
+              value: {
+                action: "approve-security",
+                targetKind: "module",
+                targetId: moduleId,
+                summary: `Module '${moduleId}': every Work Package is COMPLETE but ${acceptanceUnmet}`,
+                reason: acceptanceUnmet,
+                policyRule: `profile=${effective.profile}`,
+              },
+            };
+          }
+          // Side-effect-free readiness (CF2-1): the auditing
+          // wrapper would append denial events during a read-only
+          // projection; the pure shared precondition agrees with
+          // the real operation without persisting.
+          const aggregate = this.checkAggregateCompletion(moduleId, ownedPackages, caller);
           if (aggregate.ok) {
             return {
               ok: true,
@@ -10804,7 +11070,8 @@ export class ChronoCore {
           },
         };
       }
-      const authz = this.authorizeCompletion(moduleId, auth);
+      // Side-effect-free readiness (CF2-1): see the aggregate tail.
+      const authz = this.checkModuleCompletion(moduleId, caller);
       if (authz.ok) {
         return {
           ok: true,
@@ -11066,8 +11333,48 @@ export class ChronoCore {
             return true;
           }
         });
-        if (incomplete.length === 0) {
+        if (incomplete.length > 0) {
+          // An incomplete package grounds the advance pointer.
+        } else if (targetScope.workPackageId === null) {
+          // All packages COMPLETE (or package-less): the advance is
+          // grounded only when completion genuinely denies —
+          // recomputed from the shared precondition source for the
+          // matching module shape, never trusted blindly (CF2-1).
+          const owned = this.moduleWorkPackages(targetScope.moduleId);
+          let denied = "";
+          try {
+            const probeCaller = this.resolveCaller(auth, "verify reported action");
+            const probe = owned.length === 0
+              ? this.checkModuleCompletion(targetScope.moduleId, probeCaller)
+              : this.checkAggregateCompletion(targetScope.moduleId, owned, probeCaller);
+            if (!probe.ok) {
+              denied = this.describeDenial(probe);
+            }
+          } catch (e) {
+            denied = e instanceof Error ? e.message : String(e);
+          }
+          if (denied.length === 0) {
+            unreachable(`next action 'advance-module' for '${target}' hides acceptable completion: complete-module applies`);
+          }
+        } else {
           unreachable(`next action 'advance-module' for '${target}' names no incomplete Work Package`);
+        }
+      } else if (action.action === "approve-security") {
+        // Grounded in the genuinely missing Module-level
+        // Implementation Security Acceptance for the exact current
+        // revision (CF2-1): a current approval means completion —
+        // not ceremony — is the truthful action.
+        if (action.targetKind !== "module") {
+          unreachable(`next action 'approve-security' for '${target}' must target the module scope`);
+        } else {
+          try {
+            const unmet = this.moduleSecurityAcceptanceUnmet(targetScope.moduleId);
+            if (unmet === null) {
+              unreachable(`next action 'approve-security' for '${target}' hides a current Implementation Security Acceptance: complete-module applies`);
+            }
+          } catch (e) {
+            unreachable(`next action 'approve-security' for '${target}' names an unknown module: ${e instanceof Error ? e.message : String(e)}`);
+          }
         }
       } else if (action.action === "authorize-work") {
         if (this.moduleWorkPackages(targetScope.moduleId).length > 0) {
@@ -11383,6 +11690,26 @@ export class ChronoCore {
             severity: "blocker",
             check: "approval-without-activation",
             detail: `module '${mod.id}' holds a current module-approval at ${mod.status}: the ModuleApproved transition was never enacted — activate the module`,
+          });
+        }
+      }
+
+      // Activation authority audit (CF2-2): a post-activation module
+      // whose planning or module approval is no longer current
+      // (revoked, stale, wrong revision, non-authoritative) must not
+      // silently keep its state — the same hold nextAction surfaces.
+      // History stays append-only: the finding names the signed
+      // decision required to resume, never a rewrite.
+      for (const mod of this.artifacts.listByType("MOD")) {
+        if (mod.status === "DRAFT" || mod.status === "AWAITING_APPROVAL" || mod.status === "COMPLETE") {
+          continue;
+        }
+        const unmet = this.checkModuleActivation(mod.id);
+        if (unmet.length > 0) {
+          findings.push({
+            severity: "blocker",
+            check: "activation-authority-invalid",
+            detail: `module '${mod.id}' [${mod.status}] lost valid activation authority: ${unmet.map((u) => u.message).join("; ")}`,
           });
         }
       }

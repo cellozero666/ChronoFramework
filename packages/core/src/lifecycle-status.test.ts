@@ -214,6 +214,9 @@ describe("Lifecycle status (next-action, execution, evidence, deep check)", () =
       core.registerWorkPackage("WP-0001", "PLANNED", { id: "WP-0001", name: "W", module: "MOD-0002", dependsOn: [] }, gaspar).ok
     ).toBe(true);
     expect(core.transitionState("MOD-0002", "ModulePlanned", gaspar).ok).toBe(true);
+    // Converged activation authority (CF2-2): status, dispatch, and
+    // completion projections presuppose BOTH current approvals.
+    approve("planning-approval", "MOD-0002", core.getArtifact("MOD-0002").revision);
     approve("module-approval", "MOD-0002", core.getArtifact("MOD-0002").revision);
     expect(core.transitionState("MOD-0002", "ModuleApproved", gaspar).ok).toBe(true);
     expect(core.transitionState("WP-0001", "WorkPackageAuthorized", gaspar).ok).toBe(true);
@@ -428,15 +431,27 @@ describe("Lifecycle status (next-action, execution, evidence, deep check)", () =
     expect(
       core.registerWorkPackage("WP-0011", "PLANNED", { id: "WP-0011", name: "W11", module: "MOD-0011", dependsOn: [] }, gaspar).ok
     ).toBe(true);
+    // Activation authority precedes reviewability (CF2-2): the DRAFT
+    // module holds no approvals, so assignment denies on authority —
+    // still without committing a row.
     const denied = core.assignReview({ kind: "verification", moduleId: "MOD-0011", workPackageId: "WP-0011" }, gaspar);
     expect(denied.ok).toBe(false);
-    expect(denied.error?.code).toBe("EXECUTION_DENIED");
+    expect(denied.error?.code).toBe("APPROVAL_REQUIRED");
     // No row was committed: deep check finds no premature review.
     const checked = core.deepIntegrityCheck(gaspar);
     expect(checked.ok).toBe(true);
     expect(checked.value!.findings.filter((f) => f.check === "premature-review")).toHaveLength(0);
     // The DRAFT module still needs activation first.
     expect(core.nextAction({ workPackageId: "WP-0011" }, gaspar).value!.action).toBe("await-approval");
+  });
+
+  it("reviews refuse non-reviewable scopes once authority is current", () => {
+    // Positioned but not reviewable: AUTHORIZED packages carry no
+    // positioned work, so reviewability — not authority — denies.
+    const denied = core.assignReview({ kind: "verification", moduleId: "MOD-0002", workPackageId: "WP-0001" }, gaspar);
+    expect(denied.ok).toBe(false);
+    expect(denied.error?.code).toBe("EXECUTION_DENIED");
+    expect(denied.error?.message).toContain("IMPLEMENTED or VERIFYING");
   });
 
   it("reconcile preserves premature reviews as invalid non-blocking history", async () => {

@@ -10,12 +10,17 @@
  * through the packed `chrono entry` with the broker secret on stdin.
  *
  * The heavy flow runs only with CHRONO_BLACKBOX=1
- * (`npm run test:blackbox`): it needs `script(1)`/pty, network access
- * for the pinned skill fetch (a genuine init dependency), and a few
- * minutes. The default suite stays hermetic; the placeholder below
- * documents the entry point and always passes.
+ * (`npm run test:blackbox`): it needs `script(1)`/pty, a disposable
+ * npm cache and HOME, and a few minutes. The pinned skill is
+ * verified from a local hash-asserted fixture file (CF2-4) — no
+ * network. Live-upstream skill verification lives in the explicit
+ * network gate (`npm run test:network`). The default suite stays
+ * hermetic; the placeholder below documents the entry point and
+ * always passes.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { hashSkillSource, SKILL_RELEASE } from "@chrono/domain";
+import { FIXTURE_SKILL_MD } from "../test/test-skill-fixture.js";
 import {
   chmodSync,
   existsSync,
@@ -31,7 +36,6 @@ import { tmpdir } from "node:os";
 import { join, delimiter } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { get } from "node:https";
 
 const BLACKBOX = process.env["CHRONO_BLACKBOX"] === "1";
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
@@ -95,20 +99,6 @@ if (!BLACKBOX) {
       }
     }
     return null;
-  }
-
-  function checkUrl(url: string, timeoutMs: number): Promise<boolean> {
-    return new Promise((resolve) => {
-      const request = get(url, { timeout: timeoutMs }, (response) => {
-        response.resume();
-        resolve((response.statusCode ?? 0) < 500);
-      });
-      request.on("error", () => resolve(false));
-      request.on("timeout", () => {
-        request.destroy();
-        resolve(false);
-      });
-    });
   }
 
   /** Run `chrono init` under a real pty, typing back typed-confirmation challenges. */
@@ -204,11 +194,25 @@ if (!BLACKBOX) {
     });
   }
 
+  /**
+   * Child env (CF2-4 hermetic): fake fixtures first on PATH, a
+   * disposable HOME (no user npmrc/gitconfig/keychain helpers), a
+   * disposable npm cache (never the developer's), git without
+   * system/global config, the pinned skill source from the local
+   * hash-asserted fixture file (never the network), and no ambient
+   * session credential. Every packed-binary child inherits exactly this.
+   */
   function childEnv(box: BlackBox, extra?: Record<string, string>): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       PATH: `${box.fakeBin}${delimiter}${process.env["PATH"] ?? ""}`,
+      HOME: join(box.tmp, "home"),
       TMPDIR: box.tmp,
+      npm_config_cache: join(box.tmp, "npm-cache"),
+      npm_config_update_notifier: "false",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: join(box.tmp, "home", ".gitconfig"),
+      CHRONO_SKILL_SOURCE_FILE: join(box.tmp, "skill-source", "SKILL.md"),
       CHRONO_BIN: box.chronoBin,
     };
     delete env["CHRONO_SESSION_TOKEN"];
@@ -275,9 +279,8 @@ if (!BLACKBOX) {
       if (findOnPath("git") === null) {
         throw new Error("black-box prerequisite: git not found on PATH");
       }
-      if (!(await checkUrl("https://raw.githubusercontent.com/", 20000))) {
-        throw new Error("black-box prerequisite: skill fetch network unreachable (genuine init dependency)");
-      }
+      // Hermetic by construction (CF2-4): skill provenance verifies
+      // from the local fixture file — no network gate.
       const dir = mkdtempSync(join(tmpdir(), "chrono-pluginbox-"));
       const tarballs = join(dir, "tarballs");
       const install = join(dir, "install");
@@ -289,11 +292,35 @@ if (!BLACKBOX) {
       mkdirSync(fakeBin, { recursive: true });
       mkdirSync(project, { recursive: true });
       mkdirSync(tmp, { recursive: true });
-      execFileSync(
-        "npm",
-        ["pack", "--workspace=@chrono/domain", "--workspace=@chrono/persistence", "--workspace=@chrono/core", "--workspace=@chrono/cli", `--pack-destination=${tarballs}`],
-        { cwd: REPO_ROOT, timeout: 300000, stdio: ["ignore", "pipe", "pipe"] }
-      );
+      mkdirSync(join(tmp, "npm-cache"), { recursive: true });
+      mkdirSync(join(tmp, "home"), { recursive: true });
+      mkdirSync(join(tmp, "skill-source"), { recursive: true });
+      if (hashSkillSource(FIXTURE_SKILL_MD) !== SKILL_RELEASE.sourceHash) {
+        throw new Error("black-box setup: skill fixture drifted from the pinned source hash");
+      }
+      writeFileSync(join(tmp, "skill-source", "SKILL.md"), FIXTURE_SKILL_MD, "utf8");
+      // Disposable npm/home state for pack AND install (CF2-4): the
+      // developer's cache, npmrc, gitconfig, and credentials are
+      // never read. Each phase names itself on failure.
+      const boxEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        HOME: join(tmp, "home"),
+        TMPDIR: tmp,
+        npm_config_cache: join(tmp, "npm-cache"),
+        npm_config_update_notifier: "false",
+        GIT_CONFIG_NOSYSTEM: "1",
+        CHRONO_SKILL_SOURCE_FILE: join(tmp, "skill-source", "SKILL.md"),
+      };
+      delete boxEnv["CHRONO_SESSION_TOKEN"];
+      try {
+        execFileSync(
+          "npm",
+          ["pack", "--workspace=@chrono/domain", "--workspace=@chrono/persistence", "--workspace=@chrono/core", "--workspace=@chrono/cli", `--pack-destination=${tarballs}`],
+          { cwd: REPO_ROOT, timeout: 300000, stdio: ["ignore", "pipe", "pipe"], env: boxEnv }
+        );
+      } catch (e) {
+        throw new Error(`black-box setup: 'npm pack' phase failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
       writeFileSync(join(install, "package.json"), JSON.stringify({ name: "chrono-pluginbox", version: "1.0.0" }), "utf8");
       const packed = readdirSync(tarballs)
         .filter((name) => name.endsWith(".tgz"))
@@ -301,11 +328,16 @@ if (!BLACKBOX) {
       if (packed.length !== 4) {
         throw new Error(`black-box prerequisite: expected 4 tarballs, found ${packed.length}`);
       }
-      execFileSync("npm", ["install", "--no-audit", "--no-fund", ...packed], {
-        cwd: install,
-        timeout: 300000,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      try {
+        execFileSync("npm", ["install", "--no-audit", "--no-fund", ...packed], {
+          cwd: install,
+          timeout: 300000,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: boxEnv,
+        });
+      } catch (e) {
+        throw new Error(`black-box setup: 'npm install' phase failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
       const chronoBin = join(install, "node_modules", ".bin", "chrono");
       if (!existsSync(chronoBin)) {
         throw new Error("black-box install did not produce .bin/chrono");
@@ -464,9 +496,19 @@ if (!BLACKBOX) {
         throw new Error("black-box prerequisite: real opencode binary not found on PATH");
       }
       const b = requireBox();
-      const cleanEnv: NodeJS.ProcessEnv = { ...process.env, TMPDIR: b.tmp };
+      // Hermetic oracle env (CF2-4): the real binary resolves
+      // project-local config only — disposable HOME (no user
+      // config/credentials), no session carriers, no tool env.
+      const cleanEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        HOME: join(b.tmp, "home"),
+        TMPDIR: b.tmp,
+        npm_config_cache: join(b.tmp, "npm-cache"),
+        npm_config_update_notifier: "false",
+      };
       delete cleanEnv["CHRONO_SESSION_TOKEN"];
       delete cleanEnv["CHRONO_BIN"];
+      delete cleanEnv["CHRONO_SKILL_SOURCE_FILE"];
       const config = sh(realOpenCode, ["debug", "config"], { cwd: b.project, env: cleanEnv, timeout: 120000 });
       expect(config.exit).toBe(0);
       const resolved = JSON.parse(config.stdout) as { default_agent?: unknown; agent?: Record<string, unknown> };

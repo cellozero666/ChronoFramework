@@ -208,6 +208,9 @@ describe("Native dispatch (Core request/claim)", () => {
     ).toBe(true);
     expect(core.transitionState("MOD-0002", "ModulePlanned", gaspar).ok).toBe(true);
     modRev = core.getArtifact("MOD-0002").revision;
+    // Converged activation authority (CF2-2): dispatch presupposes
+    // BOTH current approvals.
+    approve("planning-approval", "MOD-0002", modRev);
     approve("module-approval", "MOD-0002", modRev);
     expect(core.transitionState("MOD-0002", "ModuleApproved", gaspar).ok).toBe(true);
     expect(core.transitionState("WP-0001", "WorkPackageAuthorized", gaspar).ok).toBe(true);
@@ -396,6 +399,9 @@ describe("Native dispatch (Core request/claim)", () => {
       core.registerModule("MOD-0004", "DRAFT", { id: "MOD-0004", name: "M4", purpose: "P", specs: ["SP-0001", "SP-0002"] }, gaspar).ok
     ).toBe(true);
     expect(core.transitionState("MOD-0004", "ModulePlanned", gaspar).ok).toBe(true);
+    // Both approvals current (CF2-2): the denial under test must be
+    // the harness gate, not activation authority.
+    approve("planning-approval", "MOD-0004", core.getArtifact("MOD-0004").revision);
     approve("module-approval", "MOD-0004", core.getArtifact("MOD-0004").revision);
     expect(core.transitionState("MOD-0004", "ModuleApproved", gaspar).ok).toBe(true);
     // Harness row lost (data loss/corruption scenario): the READY

@@ -128,9 +128,13 @@ export function buildPlanningToolsFile(): string {
   *   dispatch intent (Gaspar only; module/WP ids, kind, rationale).
   * - dispatch_claim: bind one worker subagent session to a dispatch
   *   intent (first call a worker makes; host-held credentials only).
-  * Lifecycle (CORE_FIX vertical; caller role from the session agent,
-  * Core-enforced capabilities and scope on every call):
-  * - next: highest-precedence next action for a scope.
+ * Lifecycle (CORE_FIX vertical; caller role from the session agent,
+ * Core-enforced capabilities and scope on every call):
+ * - next: highest-precedence next action for a scope. Route every
+ *   value through the Gaspar next-action map in the gaspar agent
+ *   contract (activate/authorize/dispatch/claim/confirm/evidence/
+ *   review/correction/completion/reconcile/holds/terminal); unknown
+ *   values fail loudly, never prose.
   * - execution_status: own binding, scope states, revision currency.
   * - evidence_record: bind passing proof to an exact revision.
   * - evidence_status: current evidence rows for a revision.
@@ -425,7 +429,7 @@ export const dispatch_claim = tool({
 });
 
 export const next = tool({
-  description: "CHRONO: highest-precedence next action for a module or work package, derived from Core records (open loops, stale dispatches, open reviews, readiness). Workers see their own scope.",
+  description: "CHRONO: highest-precedence next action for a module or work package, derived from Core records (activation, authorization, loops, dispatches, reviews, evidence, correction, completion, explicit holds). Route EVERY value through the Gaspar next-action map; unknown values are a Core defect — stop, never guess. Workers see their own scope.",
   args: {
     module: tool.schema.string().optional().describe("module identifier"),
     wp: tool.schema.string().optional().describe("work-package identifier (takes precedence over module)"),

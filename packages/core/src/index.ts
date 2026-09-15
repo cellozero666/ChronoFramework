@@ -7,9 +7,13 @@
 export {
   ChronoCore,
   type CallerAuth,
+  type CheckableAction,
   type CoreConfig,
   type CoreResult,
   type GateDecision,
+  type NextAction,
+  type NextActionValue,
   type PoEnrollment,
   type SessionAuthorization,
+  NEXT_ACTIONS,
 } from "./chrono-core.js";

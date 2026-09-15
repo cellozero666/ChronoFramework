@@ -282,6 +282,8 @@ function enrollTestPo(
       expect(core.registerModule("MOD-0001", "DRAFT", MOD, gaspar).ok).toBe(true);
       expect(core.transitionState("MOD-0001", "ModulePlanned", gaspar).ok).toBe(true);
       const modRev = core.getArtifact("MOD-0001").revision;
+      // Converged activation authority (CF2-2).
+      approve(core, privateKeyPem, "planning-approval", "MOD-0001", modRev);
       approve(core, privateKeyPem, "module-approval", "MOD-0001", modRev);
       expect(core.transitionState("MOD-0001", "ModuleApproved", gaspar).ok).toBe(true);
       // Attestations + security posture for execution.

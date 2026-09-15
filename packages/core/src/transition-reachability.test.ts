@@ -776,11 +776,22 @@ describe("Transition reachability (every nonterminal MOD/WP state)", () => {
     // its worker session with it: re-release is idempotent through a
     // live overseer session, never through the retired worker.
     expect(core.releaseDispatch(requested.value!.dispatchId, gaspar).ok).toBe(true);
+    // CF2-1 transition-layer gate: the terminal advance rides the
+    // ACTIVE verification binding, but without the PO security
+    // acceptance it denies — no success-then-validate-failure shape.
+    expectAction({ moduleId: "MOD-0030" }, gaspar, ["execute-dispatch"]);
+    const earlyAdvance = core.advanceScope({ moduleId: "MOD-0030", event: "SpekkioPassed" }, spekkio);
+    expect(earlyAdvance.ok).toBe(false);
+    // The terminal gate names the missing acceptance inside the
+    // advance envelope: same shared precondition, no divergence.
+    expect(earlyAdvance.error?.code).toBe("COMPLETION_DENIED");
+    expect(earlyAdvance.error?.message).toContain("Implementation Security Acceptance");
+    // The PO ceremony is recorded; the same advance now succeeds.
+    approve("implementation-security", "MOD-0030", core.getArtifact("MOD-0030").revision);
     expect(core.advanceScope({ moduleId: "MOD-0030", event: "SpekkioPassed" }, spekkio).ok).toBe(true);
     expect(core.getArtifact("MOD-0030").status).toBe("PASSED");
     // The verification binding settles before completion — the same
-    // release-then-advance precedence the package path enforces.
-    expectAction({ moduleId: "MOD-0030" }, gaspar, ["execute-dispatch"]);
+    // release-then-complete precedence the package path enforces.
     expect(core.releaseDispatch(verifying.value!.dispatchId, spekkio).ok).toBe(true);
     expectAction({ moduleId: "MOD-0030" }, gaspar, ["complete-module"]);
     expect(core.completeModule("MOD-0030", gaspar).ok).toBe(true);

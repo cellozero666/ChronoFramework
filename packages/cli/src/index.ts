@@ -1580,6 +1580,27 @@ export interface SkillVerifyOptions extends OutputOptions {
 }
 
 export function defaultFetchSkillSource(url: string): Promise<string> {
+  // Hermetic override for isolated verification (CF2-4): when
+  // CHRONO_SKILL_SOURCE_FILE points at a local file, its bytes are
+  // consumed INSTEAD of the network. Production checks are NOT
+  // weakened — `verifySkillRelease` still enforces the pinned commit
+  // hash, skill name, and MIT license on these exact bytes, so a
+  // wrong file fails closed downstream. The default black-box gate
+  // materializes the pinned bytes from its hash-asserted fixture;
+  // live-upstream verification lives in the explicit network gate.
+  const override = process.env["CHRONO_SKILL_SOURCE_FILE"];
+  if (override !== undefined && override.length > 0) {
+    let data: string;
+    try {
+      data = readFileSync(override, "utf8");
+    } catch (e) {
+      return Promise.reject(new Error(`Skill source file '${override}' unreadable: ${e instanceof Error ? e.message : String(e)}`));
+    }
+    if (data.length > 1024 * 1024) {
+      return Promise.reject(new Error(`Skill source file '${override}' exceeds the 1 MiB size cap`));
+    }
+    return Promise.resolve(data);
+  }
   return new Promise((resolve, reject) => {
     const request = get(
       url,

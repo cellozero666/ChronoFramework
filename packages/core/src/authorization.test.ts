@@ -205,6 +205,9 @@ function approvedModule(core: ChronoCore, sign: SignFn, privateKeyPem: string): 
   expect(core.registerModule("MOD-0001", "DRAFT", MOD, gaspar).ok).toBe(true);
   expect(core.transitionState("MOD-0001", "ModulePlanned", ctx).ok).toBe(true);
   const modRev = core.getArtifact("MOD-0001").revision;
+  // Converged activation authority (CF2-2): downstream authorization
+  // presupposes BOTH current approvals, so every fixture carries both.
+  approve(core, sign, "planning-approval", "MOD-0001", modRev);
   approve(core, sign, "module-approval", "MOD-0001", modRev);
   expect(core.transitionState("MOD-0001", "ModuleApproved", ctx).ok).toBe(true);
   return { modRev, gaspar };
@@ -1198,13 +1201,17 @@ describe("Completion authorization", () => {
     const fx = verifyingModule();
     approve(core, sign, "implementation-security", "MOD-0001", fx.revision);
     expect(core.recordVerification("MOD-0001", "PASS", "spekkio", [], [], [], fx.spekkio).ok).toBe(true);
-    const grantId = authorizeVerdict(fx);
-    expect(
-      core.transitionState("MOD-0001", "SpekkioPassed", { actor: "spekkio", session: fx.spekkio.session, grantId }).ok
-    ).toBe(true);
+    // Converged denial before any transition (CF2-1/§7): the
+    // completion authorization itself refuses without evidence.
     const res = core.authorizeCompletion("MOD-0001", fx.gaspar);
     expect(res.ok).toBe(false);
     expect(res.error?.code).toBe("EVIDENCE_MISSING");
+    // The terminal transition enforces the same shared gates at the
+    // transition layer: no success-then-validate-failure shape.
+    const grantId = authorizeVerdict(fx);
+    const advanced = core.transitionState("MOD-0001", "SpekkioPassed", { actor: "spekkio", session: fx.spekkio.session, grantId });
+    expect(advanced.ok).toBe(false);
+    expect(advanced.error?.code).toBe("EVIDENCE_MISSING");
   });
 
   it("denies without a bound Spekkio PASS", () => {
@@ -1305,11 +1312,14 @@ describe("Completion authorization", () => {
       core.transitionState("MOD-0001", "ImplementationComplete", { actor: "belthazar", session: fx.belthazar.session, grantId: progressGrant }).ok
     ).toBe(true);
     expect(core.recordVerification("MOD-0001", "PASS", "spekkio", [], [], [], fx.spekkio).ok).toBe(true);
+    // Converged order (CF2-1/§7): the defect resolves before the
+    // terminal transition — the transition layer enforces the same
+    // shared completion gates the operation runs.
+    expect(core.resolveDefect(defect.value!.id, fx.belthazar).ok).toBe(true);
     const passGrant = authorizeVerdict(fx);
     expect(
       core.transitionState("MOD-0001", "SpekkioPassed", { actor: "spekkio", session: fx.spekkio.session, grantId: passGrant }).ok
     ).toBe(true);
-    expect(core.resolveDefect(defect.value!.id, fx.belthazar).ok).toBe(true);
     expect(core.authorizeCompletion("MOD-0001", fx.gaspar).ok).toBe(true);
   });
 

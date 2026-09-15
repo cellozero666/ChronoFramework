@@ -20,6 +20,13 @@
  * Full run only under CHRONO_BLACKBOX=1 (`npm run test:blackbox`):
  * pack/install alone takes minutes. Without the flag this file
  * asserts the gate is off and proves nothing.
+ *
+ * Hermetic (CORE_FIX_2 CF2-4): disposable npm cache and HOME, no
+ * developer credentials or global state, pinned skill bytes from a
+ * local hash-asserted fixture (never the network), bounded external
+ * processes with phase-named failures. Live-upstream skill
+ * verification lives in the explicit network gate
+ * (`npm run test:network`).
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import {
@@ -48,6 +55,7 @@ import {
   convertSkillSource,
   fingerprintPublicKey,
   generateApprovalKeyPair,
+  hashSkillSource,
   managedAssetInventory,
   signApprovalPayload,
   skillGeneratedHashes,
@@ -112,15 +120,30 @@ if (!BLACKBOX) {
     chmodSync(path, 0o755);
   }
 
-  /** Child env: fake fixtures first on PATH, disposable keystore + npm cache, no pilot leakage. */
+  /**
+   * Child env (CF2-4 hermetic): fake fixtures first on PATH, a
+   * disposable HOME (no user npmrc/gitconfig/keychain helpers), a
+   * disposable npm cache (never the developer's), no update
+   * notifier, git without system/global config, the pinned skill
+   * source from the local hash-asserted fixture file (never the
+   * network), and no ambient session credential. Every packed-binary
+   * child — chrono, git, npm, rtk — inherits exactly this.
+   */
   function childEnv(b: BlackBox, extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    return {
+    const env: NodeJS.ProcessEnv = {
       ...process.env,
       PATH: `${b.fakeBin}${delimiter}${process.env["PATH"] ?? ""}`,
+      HOME: join(b.tmp, "home"),
       TMPDIR: b.tmp,
       npm_config_cache: join(b.tmp, "npm-cache"),
+      npm_config_update_notifier: "false",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: join(b.tmp, "home", ".gitconfig"),
+      CHRONO_SKILL_SOURCE_FILE: join(b.tmp, "skill-source", "SKILL.md"),
       ...(extra ?? {}),
     };
+    delete env["CHRONO_SESSION_TOKEN"];
+    return env;
   }
 
   /** Run the installed binary, parse JSON stdout, fail loudly with context. */
@@ -174,13 +197,40 @@ if (!BLACKBOX) {
       mkdirSync(project, { recursive: true });
       mkdirSync(tmp, { recursive: true });
       mkdirSync(join(tmp, "npm-cache"), { recursive: true });
+      mkdirSync(join(tmp, "home"), { recursive: true });
+      mkdirSync(join(tmp, "skill-source"), { recursive: true });
+      // Pinned skill bytes from the hash-asserted fixture (CF2-4):
+      // every packed-binary child verifies skill provenance from
+      // this file — the network is never consulted. Assertion here
+      // (not later) so a fixture drift fails the owning setup once.
+      if (hashSkillSource(FIXTURE_SKILL_MD) !== SKILL_RELEASE.sourceHash) {
+        throw new Error("black-box setup: skill fixture drifted from the pinned source hash");
+      }
+      writeFileSync(join(tmp, "skill-source", "SKILL.md"), FIXTURE_SKILL_MD, "utf8");
+      // Disposable npm/home state for pack AND install (CF2-4): the
+      // developer's cache, npmrc, gitconfig, and credentials are
+      // never read. Each phase names itself on failure so a stall
+      // points at pack vs install, never a bare timeout.
+      const boxEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        HOME: join(tmp, "home"),
+        TMPDIR: tmp,
+        npm_config_cache: join(tmp, "npm-cache"),
+        npm_config_update_notifier: "false",
+        GIT_CONFIG_NOSYSTEM: "1",
+      };
+      delete boxEnv["CHRONO_SESSION_TOKEN"];
       // Isolated pack + install of the four workspace tarballs: the
       // binary under test shares no files with the workspace.
-      execFileSync(
-        "npm",
-        ["pack", "--workspace=@chrono/domain", "--workspace=@chrono/persistence", "--workspace=@chrono/core", "--workspace=@chrono/cli", `--pack-destination=${tarballs}`],
-        { cwd: REPO_ROOT, timeout: 300000, stdio: ["ignore", "pipe", "pipe"] }
-      );
+      try {
+        execFileSync(
+          "npm",
+          ["pack", "--workspace=@chrono/domain", "--workspace=@chrono/persistence", "--workspace=@chrono/core", "--workspace=@chrono/cli", `--pack-destination=${tarballs}`],
+          { cwd: REPO_ROOT, timeout: 300000, stdio: ["ignore", "pipe", "pipe"], env: boxEnv }
+        );
+      } catch (e) {
+        throw new Error(`black-box setup: 'npm pack' phase failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
       writeFileSync(join(install, "package.json"), JSON.stringify({ name: "chrono-lifecycle-box", version: "1.0.0" }), "utf8");
       const packed = readdirSync(tarballs)
         .filter((name) => name.endsWith(".tgz"))
@@ -188,12 +238,16 @@ if (!BLACKBOX) {
       if (packed.length !== 4) {
         throw new Error(`black-box prerequisite: expected 4 tarballs, found ${packed.length}`);
       }
-      execFileSync("npm", ["install", "--no-audit", "--no-fund", ...packed], {
-        cwd: install,
-        timeout: 300000,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, npm_config_cache: join(tmp, "npm-cache"), npm_config_update_notifier: "false" },
-      });
+      try {
+        execFileSync("npm", ["install", "--no-audit", "--no-fund", ...packed], {
+          cwd: install,
+          timeout: 300000,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: boxEnv,
+        });
+      } catch (e) {
+        throw new Error(`black-box setup: 'npm install' phase failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
       const chronoBin = join(install, "node_modules", ".bin", "chrono");
       if (!existsSync(chronoBin)) {
         throw new Error("black-box install did not produce .bin/chrono");
@@ -423,6 +477,9 @@ if (!BLACKBOX) {
           if (!core.transitionState("MOD-0002", "ModulePlanned", gaspar).ok) {
             throw new Error("box module planned failed");
           }
+          // Converged activation authority (CF2-2): downstream
+          // authorization presupposes BOTH current approvals.
+          approve("planning-approval", "MOD-0002", core.getArtifact("MOD-0002").revision);
           approve("module-approval", "MOD-0002", core.getArtifact("MOD-0002").revision);
           if (!core.transitionState("MOD-0002", "ModuleApproved", gaspar).ok) {
             throw new Error("box module approved failed");
@@ -607,6 +664,15 @@ if (!BLACKBOX) {
      * through public Core methods with genuine signatures. This
      * embodies the human Product Owner step the packed binary
      * provably refuses without a live terminal — never a fake.
+     *
+     * CF2-1/CF2-2 contract (no hidden mutations): call ONLY after
+     * observing a ceremony-hold action (`await-approval` or
+     * `approve-security`) for this exact scope, and ALWAYS
+     * re-observe `next-action` before executing whatever it then
+     * advertises. NOTHING — no approval, transition, or other state
+     * change — may run between that second observation and its
+     * execution. A test that mutates between observe and execute is
+     * not a valid next-action proof.
      */
     function poApprove(b: BlackBox, keys: Keys, action: string, scopeId: string, scopeRev: string): void {
       const restore = fakeTty();
@@ -815,11 +881,19 @@ if (!BLACKBOX) {
       chrono(b, ["dispatch-release", "--dispatch", spekkio3, "--as", "spekkio", "--session-token", spekkioToken3]);
 
       // Module completion by aggregate, then terminal confirmation.
-      // The module-level Implementation Security Acceptance is the PO
-      // backstop validate() requires of every COMPLETE module.
-      expect(nextAction(b, keys, { module: "MOD-0002" })["action"]).toBe("complete-module");
+      // CF2-1 converged order: with all packages COMPLETE but the
+      // module-level Implementation Security Acceptance missing,
+      // next-action advertises the ceremony — never completion.
+      const hold = nextAction(b, keys, { module: "MOD-0002" });
+      expect(hold["action"]).toBe("approve-security");
+      expect(hold["targetId"]).toBe("MOD-0002");
+      // The PO ceremony binds the exact current module revision
+      // (modeled human at a terminal; the binary refuses without one).
       const modExec = chrono(b, ["execution-status", "--module", "MOD-0002", "--as", "gaspar", "--session-token", keys.gasparToken]);
       poApprove(b, keys, "implementation-security", "MOD-0002", modExec["moduleRevision"] as string);
+      // Re-observation advertises completion — and NOTHING runs
+      // between this observation and its execution below.
+      expect(nextAction(b, keys, { module: "MOD-0002" })["action"]).toBe("complete-module");
       const done = chrono(b, ["complete-module", "--module", "MOD-0002", "--as", "gaspar", "--session-token", keys.gasparToken]);
       expect(done["state"]).toBe("COMPLETE");
       const deep = chrono(b, ["deep-check", "--as", "gaspar", "--session-token", keys.gasparToken]);
@@ -1111,9 +1185,15 @@ if (!BLACKBOX) {
       chrono(b, ["dispatch-release", "--dispatch", spek, "--as", "spekkio", "--session-token", spekToken]);
 
       // 8. Aggregate completion, terminal confirmation, restart boundary.
-      expect(nextAction(b, keys, { module: "MOD-0002" })["action"]).toBe("complete-module");
+      // CF2-1 converged order (no hidden mutation): the ceremony is
+      // advertised first, performed, re-observed as completion, then
+      // executed with nothing in between.
+      const hold8 = nextAction(b, keys, { module: "MOD-0002" });
+      expect(hold8["action"]).toBe("approve-security");
+      expect(String(hold8["summary"])).toContain("Implementation Security Acceptance");
       const modExec = chrono(b, ["execution-status", "--module", "MOD-0002", ...gasparArgs]);
       poApprove(b, keys, "implementation-security", "MOD-0002", modExec["moduleRevision"] as string);
+      expect(nextAction(b, keys, { module: "MOD-0002" })["action"]).toBe("complete-module");
       const done = chrono(b, ["complete-module", "--module", "MOD-0002", ...gasparArgs]);
       expect(done["state"]).toBe("COMPLETE");
       expect(nextAction(b, keys, { module: "MOD-0002" })["action"]).toBe("done");

@@ -23,7 +23,7 @@ import {
   skillVendorPath,
 } from "@chrono/domain";
 import { ChronoCore } from "@chrono/core";
-import { runSkillVerify } from "./index.js";
+import { defaultFetchSkillSource, runSkillVerify } from "./index.js";
 
 // Frozen fixture: byte-exact canonical SKILL.md at the pinned commit
 // (verified: hashSkillSource === SKILL_RELEASE.sourceHash).
@@ -346,5 +346,59 @@ function enrollTestPo(
     const out = await runSkillVerify(tempDir, { as: "belthazar", session: worker, json: true }, okFetch);
     expect(out.exitCode).toBe(1);
     expect(out.stdout).toContain("EXECUTION_DENIED");
+  });
+
+  it("consumes CHRONO_SKILL_SOURCE_FILE instead of the network (CF2-4 hermetic override)", async () => {
+    const sourceFile = join(tempDir, "skill-source.md");
+    const { writeFileSync: writeSource } = await import("node:fs");
+    writeSource(sourceFile, CANONICAL_SKILL_MD, "utf8");
+    const previous = process.env["CHRONO_SKILL_SOURCE_FILE"];
+    process.env["CHRONO_SKILL_SOURCE_FILE"] = sourceFile;
+    try {
+      // The default fetcher reads the file without touching the URL.
+      const fetched = await defaultFetchSkillSource("https://example.invalid/skill.md");
+      expect(fetched).toBe(CANONICAL_SKILL_MD);
+      // End to end through the default fetcher: verify succeeds with
+      // no network fetch function involved at all.
+      const out = await runSkillVerify(tempDir, { as: "gaspar", session: gaspar.session, json: true }, defaultFetchSkillSource);
+      expect(out.exitCode).toBe(0);
+      expect(out.stdout).toContain(SKILL_RELEASE.pinnedCommit);
+    } finally {
+      if (previous === undefined) {
+        delete process.env["CHRONO_SKILL_SOURCE_FILE"];
+      } else {
+        process.env["CHRONO_SKILL_SOURCE_FILE"] = previous;
+      }
+    }
+  });
+
+  it("still enforces the pin on override bytes and names unreadable files (CF2-4)", async () => {
+    const { writeFileSync: writeSource } = await import("node:fs");
+    const tamperedFile = join(tempDir, "skill-tampered.md");
+    writeSource(tamperedFile, `${CANONICAL_SKILL_MD}\n<!-- tampered -->\n`, "utf8");
+    const previous = process.env["CHRONO_SKILL_SOURCE_FILE"];
+    try {
+      process.env["CHRONO_SKILL_SOURCE_FILE"] = tamperedFile;
+      await expect(defaultFetchSkillSource("https://example.invalid/skill.md")).resolves.toBe(
+        `${CANONICAL_SKILL_MD}\n<!-- tampered -->\n`
+      );
+      const tampered = await runSkillVerify(tempDir, { as: "gaspar", session: gaspar.session, json: true }, defaultFetchSkillSource);
+      expect(tampered.exitCode).toBe(1);
+      expect(tampered.stdout).toContain("SKILL_PROVENANCE_FAILURE");
+      process.env["CHRONO_SKILL_SOURCE_FILE"] = join(tempDir, "skill-missing.md");
+      await expect(defaultFetchSkillSource("https://example.invalid/skill.md")).rejects.toThrow(
+        /Skill source file '.*skill-missing\.md' unreadable/
+      );
+      const missing = await runSkillVerify(tempDir, { as: "gaspar", session: gaspar.session, json: true }, defaultFetchSkillSource);
+      expect(missing.exitCode).toBe(1);
+      expect(missing.stdout).toContain("BLOCKED_PROCESS_SKILL");
+      expect(missing.stdout).toContain("skill-missing.md");
+    } finally {
+      if (previous === undefined) {
+        delete process.env["CHRONO_SKILL_SOURCE_FILE"];
+      } else {
+        process.env["CHRONO_SKILL_SOURCE_FILE"] = previous;
+      }
+    }
   });
 });

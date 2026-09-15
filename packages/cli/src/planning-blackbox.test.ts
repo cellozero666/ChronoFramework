@@ -458,13 +458,31 @@ if (!BLACKBOX) {
       const tarballs = join(dir, "tarballs");
       const install = join(dir, "install");
       const project = join(dir, "project");
+      const boxTmp = join(dir, "tmp");
       mkdirSync(tarballs, { recursive: true });
       mkdirSync(install, { recursive: true });
       mkdirSync(project, { recursive: true });
+      mkdirSync(boxTmp, { recursive: true });
+      mkdirSync(join(boxTmp, "npm-cache"), { recursive: true });
+      mkdirSync(join(boxTmp, "home"), { recursive: true });
+      // Disposable npm/home state (CF2-4): pack, install, git, and
+      // the packed binary never read the developer's cache, npmrc,
+      // gitconfig, credentials, or session carriers.
+      const boxEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        HOME: join(boxTmp, "home"),
+        TMPDIR: boxTmp,
+        npm_config_cache: join(boxTmp, "npm-cache"),
+        npm_config_update_notifier: "false",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: join(boxTmp, "home", ".gitconfig"),
+      };
+      delete boxEnv["CHRONO_SESSION_TOKEN"];
+      delete boxEnv["CHRONO_BIN"];
       try {
         // Isolated pack of the four workspace tarballs (no workspace
         // links or source imports leak into the packed CLI).
-        const pack = sh("npm", ["pack", "--workspace=@chrono/domain", "--workspace=@chrono/persistence", "--workspace=@chrono/core", "--workspace=@chrono/cli", `--pack-destination=${tarballs}`], { cwd: REPO_ROOT, timeout: 300000 });
+        const pack = sh("npm", ["pack", "--workspace=@chrono/domain", "--workspace=@chrono/persistence", "--workspace=@chrono/core", "--workspace=@chrono/cli", `--pack-destination=${tarballs}`], { cwd: REPO_ROOT, timeout: 300000, env: boxEnv });
         expect(pack.exit).toBe(0);
         writeFileSync(join(install, "package.json"), JSON.stringify({ name: "chrono-ocp11-blackbox", version: "1.0.0" }), "utf8");
         const { readdirSync } = await import("node:fs");
@@ -472,12 +490,13 @@ if (!BLACKBOX) {
         expect(packed.length).toBe(4);
         // No test files ship inside the tarballs.
         void delimiter;
-        const installed = sh("npm", ["install", "--no-audit", "--no-fund", ...packed], { cwd: install, timeout: 300000 });
+        const installed = sh("npm", ["install", "--no-audit", "--no-fund", ...packed], { cwd: install, timeout: 300000, env: boxEnv });
         expect(installed.exit).toBe(0);
         const bin = join(install, "node_modules", ".bin", "chrono");
         expect(existsSync(bin)).toBe(true);
-        sh("git", ["init", "-q", "."], { cwd: project });
-        const dry = sh(bin, ["init", "--runtime", "opencode", "--dry-run", "--json", "--path", project], { cwd: project });
+        const gitInit = sh("git", ["init", "-q", "."], { cwd: project, env: boxEnv });
+        expect(gitInit.exit).toBe(0);
+        const dry = sh(bin, ["init", "--runtime", "opencode", "--dry-run", "--json", "--path", project], { cwd: project, env: boxEnv });
         expect(dry.exit).toBe(0);
         const plan = JSON.parse(dry.stdout) as { ok: boolean; dryRun: boolean; plan: unknown; detection: unknown };
         expect(plan.ok).toBe(true);
@@ -485,16 +504,16 @@ if (!BLACKBOX) {
         expect(typeof plan.plan).toBe("object");
         // The disposable project is untouched by the dry run.
         expect(existsSync(join(project, ".chrono"))).toBe(false);
-        const help = sh(bin, ["artifact", "--help"], { cwd: project });
+        const help = sh(bin, ["artifact", "--help"], { cwd: project, env: boxEnv });
         expect(help.exit).toBe(0);
         expect(help.stdout).toContain("propose");
         expect(help.stdout).toContain("revise");
         expect(help.stdout).toContain("status");
         // Native ceremony surface on the packed binary.
-        const proposeHelp = sh(bin, ["artifact", "propose", "--help"], { cwd: project });
+        const proposeHelp = sh(bin, ["artifact", "propose", "--help"], { cwd: project, env: boxEnv });
         expect(proposeHelp.exit).toBe(0);
         expect(proposeHelp.stdout).toContain("--body-stdin");
-        const requestHelp = sh(bin, ["approval-request", "--help"], { cwd: project });
+        const requestHelp = sh(bin, ["approval-request", "--help"], { cwd: project, env: boxEnv });
         expect(requestHelp.exit).toBe(0);
         expect(requestHelp.stdout).toContain("--security-implications");
         // Packed tarballs ship the native tool generator and ceremony

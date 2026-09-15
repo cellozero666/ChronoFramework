@@ -267,6 +267,8 @@ describe("Native governed dispatch", () => {
       core.registerWorkPackage("WP-0001", "PLANNED", { id: "WP-0001", name: "W", module: "MOD-0002", dependsOn: [] }, gaspar).ok
     ).toBe(true);
     expect(core.transitionState("MOD-0002", "ModulePlanned", gaspar).ok).toBe(true);
+    // Converged activation authority (CF2-2).
+    approve("planning-approval", "MOD-0002", core.getArtifact("MOD-0002").revision);
     approve("module-approval", "MOD-0002", core.getArtifact("MOD-0002").revision);
     expect(core.transitionState("MOD-0002", "ModuleApproved", gaspar).ok).toBe(true);
     expect(core.transitionState("WP-0001", "WorkPackageAuthorized", gaspar).ok).toBe(true);
