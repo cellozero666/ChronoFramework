@@ -45,6 +45,10 @@ export const CHRONO_ERROR_CODES = [
   "EVIDENCE_STALE",
   "EVIDENCE_MISSING",
   "SIGNATURE_INVALID",
+  // Workflow diagnostics [WORKFLOW-STABILIZATION §3: injected only
+  // through the documented advance() diagnostic seam, never by
+  // production paths]
+  "WORKFLOW_INJECTED_FAILURE",
 ] as const;
 
 export type ChronoErrorCode = (typeof CHRONO_ERROR_CODES)[number];
@@ -124,6 +128,7 @@ export const ErrorCode = {
   SKILL_ACTIVATION_FAILURE: "SKILL_ACTIVATION_FAILURE" as const,
   EVIDENCE_STALE: "EVIDENCE_STALE" as const,
   EVIDENCE_MISSING: "EVIDENCE_MISSING" as const,
+  WORKFLOW_INJECTED_FAILURE: "WORKFLOW_INJECTED_FAILURE" as const,
   SIGNATURE_INVALID: "SIGNATURE_INVALID" as const,
 } as const satisfies Record<string, ChronoErrorCode>;
 

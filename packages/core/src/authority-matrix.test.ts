@@ -7,12 +7,83 @@
  * [DOM §2.2, RUNTIME §2, Remediation §3A]
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { buildEnrollmentChallenge, buildEnrollmentPayload, buildSessionAuthorizationPayload, computeRevisionHash, fingerprintPublicKey, generateApprovalKeyPair, signApprovalPayload } from "@chrono/domain";
+import { RTK_UPSTREAM, SKILL_RELEASE, SKILL_RUNTIME_PATHS, SKILL_UPSTREAM, buildApprovalPayload, buildEnrollmentChallenge, buildEnrollmentPayload, buildSessionAuthorizationPayload, computeRevisionHash, convertSkillSource, fingerprintPublicKey, generateApprovalKeyPair, managedAssetInventory, signApprovalPayload, skillGeneratedHashes, skillVendorPath } from "@chrono/domain";
 import { ChronoCore, type CallerAuth } from "./chrono-core.js";
+
+// Byte-exact canonical SKILL.md at the pinned commit (same bytes as
+// every other suite's fixture; hash asserted by attestation setup).
+const FIXTURE_SKILL_MD = `---
+name: karpathy-guidelines
+description: Behavioral guidelines to reduce common LLM coding mistakes. Use when writing, reviewing, or refactoring code to avoid overcomplication, make surgical changes, surface assumptions, and define verifiable success criteria.
+license: MIT
+---
+
+# Karpathy Guidelines
+
+Behavioral guidelines to reduce common LLM coding mistakes, derived from [Andrej Karpathy's observations](https://x.com/karpathy/status/2015883857489522876) on LLM coding pitfalls.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+## 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+## 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+\`\`\`
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+\`\`\`
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+`;
 
 const SPEC = { id: "SP-0001", title: "T", purpose: "P" };
 
@@ -172,7 +243,9 @@ function fakeInteractiveTerminal(): () => void {
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "chrono-matrix-test-"));
-    core = new ChronoCore({ projectPath: tempDir });
+    // Project runtime selected at init (dispatch paths require a
+    // PO-selected runtime; capability tests never assert its absence).
+    core = new ChronoCore({ projectPath: tempDir, runtime: "test-runtime" });
     expect(core.init().ok).toBe(true);
     restoreTty = fakeInteractiveTerminal();
     ({ privateKeyPem, gaspar } = bootstrapAuthority(core));
@@ -220,16 +293,134 @@ function fakeInteractiveTerminal(): () => void {
     expect(core.validate().value?.errors ?? []).toHaveLength(0);
   });
 
-  it("each role records its own evidence; strangers cannot", () => {
-    expect(core.registerSpec("SP-0001", "DRAFT", SPEC, gaspar).ok).toBe(true);
+  it("each role records its own evidence through a live binding; strangers cannot", () => {
+    // Evidence rides ACTIVE dispatch bindings: every producer below
+    // holds a real claimed-and-confirmed binding for the scope it
+    // proves. Proof outside any binding denies, including gaspar's
+    // own session (orchestrators hold no bindings by construction).
+    expect(core.registerSpec("SP-0001", "DRAFT", { ...SPEC, inScope: ["a"], acceptanceCriteria: ["ac1"] }, gaspar).ok).toBe(true);
     expect(
       core.registerModule("MOD-0001", "DRAFT", { id: "MOD-0001", name: "M", purpose: "P", specs: ["SP-0001"] }, gaspar).ok
     ).toBe(true);
     const targetRevision = core.getArtifact("SP-0001").revision;
-    for (const role of ["belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio", "gaspar"]) {
-      const session = role === "gaspar" ? gaspar.session : openTestSession(core, role, "MOD-0001");
-      expect(core.recordEvidence(evidenceFor(role, targetRevision), { actor: role, session }).ok).toBe(true);
+    const approveNow = (action: string, scopeId: string, scopeRev: string): void => {
+      const signature = signApprovalPayload(
+        buildApprovalPayload({
+          action, scopeArtifactId: scopeId, scopeRevision: scopeRev,
+          authority: "PO", rationale: "matrix approval", timestamp: "2026-09-14T00:00:00.000Z",
+        }),
+        privateKeyPem
+      );
+      const res = core.recordApproval({
+        action, scopeArtifactId: scopeId, scopeRevision: scopeRev,
+        authority: "PO", rationale: "matrix approval", timestamp: "2026-09-14T00:00:00.000Z", signature,
+      });
+      expect(res.ok).toBe(true);
+    };
+    const proposed = core.proposeArchitecture({ title: "A" }, gaspar);
+    expect(proposed.ok).toBe(true);
+    const archRev = proposed.value!;
+    expect(core.submitArchitectureForReview(gaspar).ok).toBe(true);
+    approveNow("architecture-security", "ARCH", archRev);
+    expect(core.approveArchitecture(gaspar).ok).toBe(true);
+    expect(core.transitionState("SP-0001", "SpecSubmittedForReview", { actor: gaspar.actor, session: gaspar.session }).ok).toBe(true);
+    approveNow("architecture-security", "SP-0001", targetRevision);
+    expect(core.recordHarness(targetRevision, `sha256:${"a".repeat(64)}`, "# h", gaspar).ok).toBe(true);
+    expect(core.transitionState("SP-0001", "SpecApprovedReady", { actor: gaspar.actor, session: gaspar.session }).ok).toBe(true);
+    approveNow("planning-approval", "MOD-0001", core.getArtifact("MOD-0001").revision);
+    approveNow("module-approval", "MOD-0001", core.getArtifact("MOD-0001").revision);
+    expect(core.activateModule("MOD-0001", gaspar).ok).toBe(true);
+    expect(core.recordSecurityProfile({ title: "P", threats: [] }, gaspar).ok).toBe(true);
+    const rtkBin = join(tempDir, "fixture-rtk.sh");
+    writeFileSync(rtkBin, "#!/bin/sh\necho fixture-rtk 1.0.0-test\n", "utf8");
+    chmodSync(rtkBin, 0o755);
+    expect(
+      core.recordRtkAttestation(gaspar, {
+        binaryPath: rtkBin, binaryIdentity: "rtk-test", version: "1.0.0-test",
+        provenance: RTK_UPSTREAM, integrationMode: "test", routingTestPassed: true,
+        routingTestLog: "fixture", gained: true, savingsEvidence: null, ttlSeconds: 86400,
+      }).ok
+    ).toBe(true);
+    expect(
+      core.recordSkillAttestation(gaspar, {
+        upstream: SKILL_UPSTREAM, pinnedCommit: SKILL_RELEASE.pinnedCommit,
+        sourceHash: SKILL_RELEASE.sourceHash,
+        generatedHashes: skillGeneratedHashes(convertSkillSource(FIXTURE_SKILL_MD)),
+        converterVersion: SKILL_RELEASE.converterVersion, licenseStatus: "MIT", attribution: "MIT",
+        runtimeIdentity: "test", agentIdentity: "test", discoveryResult: "found",
+        permissionResult: "granted", activationTestPassed: true, ttlSeconds: 86400,
+      }).ok
+    ).toBe(true);
+    const vendorTarget = join(tempDir, skillVendorPath(SKILL_RELEASE.pinnedCommit));
+    mkdirSync(dirname(vendorTarget), { recursive: true });
+    writeFileSync(vendorTarget, FIXTURE_SKILL_MD, "utf8");
+    for (const runtime of ["claude", "opencode", "kiro"] as const) {
+      const target = join(tempDir, SKILL_RUNTIME_PATHS[runtime]);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, FIXTURE_SKILL_MD, "utf8");
     }
+    const entrypoint = join(tempDir, "fixture-runtime.sh");
+    writeFileSync(entrypoint, "#!/bin/sh\necho fixture-ok\n");
+    chmodSync(entrypoint, 0o755);
+    const po = { actor: "PO", session: bootstrapPrivilegedSession(core, "PO", privateKeyPem) };
+    expect(core.registerAdapter({ id: "fixture", name: "Fixture", entrypoint, conformanceProof: ["fixture --version"] }, po).ok).toBe(true);
+    const registrationHash = core.adapterRegistrationHash("fixture");
+    approveNow("adapter-registration", "fixture", registrationHash);
+    const adapterApproval = core.listApprovals().find((a) => a.scopeArtifactId === "fixture");
+    expect(adapterApproval).toBeTruthy();
+    expect(core.approveAdapter("fixture", adapterApproval!.id, po).ok).toBe(true);
+    const recordedProof = core.recordRoutingProof(gaspar, {
+      adapterId: "fixture", binaryPath: rtkBin, version: "1.0.0-test",
+      proofCommand: JSON.stringify([rtkBin, "gain"]),
+      preRoutingCommand: JSON.stringify(["ls", tempDir]),
+      commandHash: computeRevisionHash([rtkBin, "gain"]),
+      outputHash: computeRevisionHash("fixture gain ok"),
+      exitStatus: 0, gainAvailable: true,
+      timestamp: new Date().toISOString(), ttlSeconds: 86400,
+    });
+    expect(recordedProof.ok).toBe(true);
+    for (const spec of managedAssetInventory("fixture")) {
+      const target = join(tempDir, spec.path);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, spec.kind === "marker" ? `fixture-managed ${spec.marker ?? spec.path}\n` : `fixture-managed ${spec.path}\n`, "utf8");
+    }
+    expect(core.promoteRoutingProof(recordedProof.value!.id, po).ok).toBe(true);
+    // One bound producer at a time: request, delegate, claim, and
+    // confirm a kind-fitting dispatch, record through the binding,
+    // then release via oversight before the next role binds.
+    let seq = 0;
+    const bindRole = (role: string, kind: string): { auth: { actor: string; session: TestSession }; dispatchId: string } => {
+      seq += 1;
+      const requested = core.requestDispatch(
+        { moduleId: "MOD-0001", kind, rationale: "matrix binding", adapterId: "fixture" },
+        gaspar
+      );
+      expect(requested.ok).toBe(true);
+      expect(core.recordTaskDelegation({ agent: role, parentRuntimeSession: `opencode-parent-${seq}` }, gaspar).ok).toBe(true);
+      const claimed = core.claimDispatch({ dispatchId: requested.value!.dispatchId, childRuntimeSession: `opencode-child-${seq}` }, gaspar);
+      expect(claimed.ok).toBe(true);
+      expect(core.confirmClaim(requested.value!.dispatchId, gaspar).ok).toBe(true);
+      return {
+        auth: { actor: role, session: { id: claimed.value!.session.id, token: claimed.value!.session.token } },
+        dispatchId: requested.value!.dispatchId,
+      };
+    };
+    const kinds: Record<string, string> = {
+      belthazar: "implementation",
+      melchior: "implementation",
+      prometheus: "implementation",
+      lucca: "test",
+      glenn: "security-review",
+      spekkio: "verification",
+    };
+    for (const role of ["belthazar", "melchior", "prometheus", "lucca", "glenn", "spekkio"]) {
+      const bound = bindRole(role, kinds[role] as string);
+      expect(core.recordEvidence(evidenceFor(role, targetRevision), bound.auth).ok).toBe(true);
+      expect(core.releaseDispatch(bound.dispatchId, gaspar).ok).toBe(true);
+    }
+    // Gaspar holds no binding by construction: even the orchestrator
+    // cannot record proof outside a binding.
+    expect(core.recordEvidence(evidenceFor("gaspar", targetRevision), gaspar).ok).toBe(false);
     expect(core.recordEvidence(evidenceFor("mallory", targetRevision), { actor: "mallory", session: gaspar.session }).ok).toBe(false);
     expect(core.recordEvidence(evidenceFor("system", targetRevision), { actor: "system", session: gaspar.session }).ok).toBe(false);
     expect(core.recordEvidence(evidenceFor("luca", targetRevision), { actor: "luca", session: gaspar.session }).ok).toBe(false);

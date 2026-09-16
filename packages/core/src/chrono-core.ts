@@ -201,6 +201,35 @@ export type WorkflowDecision =
       moduleId: string;
       workPackageId: string | null;
       objective: string;
+      /**
+       * Machine phase of the underlying work: "request" (no dispatch
+       * row exists yet), "claim" (a PENDING/ENACTED dispatch awaits
+       * its worker), "execute" (an ACTIVE binding awaits its holder),
+       * "correct" (an open correction loop awaits its owner),
+       * "record-harness" (a spec revision awaits authored Harness
+       * content). Descriptive `objective` text must never be parsed:
+       * orchestration switches on this field plus the ids below.
+       */
+      phase: "request" | "claim" | "execute" | "correct" | "record-harness";
+      /** Dispatch row id when one exists (claim/execute phases), else null. */
+      dispatchId: string | null;
+      /**
+       * Adapter selected by the Core, or null. Always null: adapter
+       * choice belongs to the orchestrator side (the dry-run tries
+       * candidates, but the Core never commits to one on the
+       * caller's behalf).
+       */
+      adapterId: string | null;
+      /** Spec under Harness authorship (record-harness phase), else null. */
+      specId: string | null;
+      /** Exact spec revision the Harness must bind, else null. */
+      specRevision: string | null;
+      /** Open correction loop under correction (correct phase), else null. */
+      loopId: string | null;
+      /** Defect the correction loop owns, else null. */
+      defectId: string | null;
+      /** Loop attempt counter, else null. */
+      attempt: number | null;
     }
   | {
       type: "INDEPENDENT_REVIEW_REQUIRED";
@@ -209,6 +238,13 @@ export type WorkflowDecision =
       moduleId: string;
       workPackageId: string | null;
       targetRevision: string;
+      /**
+       * Assigned review row the reviewer must submit. Set whenever
+       * an ASSIGNED review exists (submit/await-action paths);
+       * null for request-completion, which names the verification
+       * still to be assigned — never an id parsed from prose.
+       */
+      reviewId: string | null;
     }
   | {
       type: "BLOCKED";
@@ -5418,6 +5454,18 @@ export class ChronoCore {
         },
         "record evidence"
       );
+      // Workflow honesty: evidence must ride a matching ACTIVE
+      // dispatch binding held by this session — proof recorded
+      // outside any binding can never advance the workflow (release
+      // and completion gates only honor bound proof), so recording
+      // it would strand an unreachable row. Existence, scope match,
+      // and freshness only; attestation/blocker gates stay where
+      // they belong (advance, release, verdict paths).
+      this.requireEvidenceBinding(
+        caller.session.id,
+        evidenceTarget === null ? null : this.artifactScopeModule(evidenceTarget),
+        targetWp
+      );
       this.assertNoSecrets(data.checkName, data.diagnostics, "evidence");
       if (!isRevisionHash(data.targetRevision)) {
         throw new ChronoError({
@@ -7169,6 +7217,23 @@ export class ChronoCore {
             suggestedAction: "Advance work through its own bound worker",
           });
         }
+        // Workflow honesty: marking work complete requires externally
+        // supplied proof — current passing evidence by this binding's
+        // role for the exact scope revision. Advancing without proof
+        // would move lifecycle state on assertion alone; release and
+        // verdict gates already demand the same proof downstream.
+        const evidenced = this.db.evidence().findCurrentByTargetRevision(scope.revision)
+          .some((e) => e.producer === caller.role && e.result === "pass");
+        if (!evidenced) {
+          throw new ChronoError({
+            code: ErrorCode.EVIDENCE_MISSING,
+            severity: Severity.BLOCKER,
+            message: `'${event}' on '${scopeId}': no current passing evidence by '${caller.role}' for this scope — record proof through the binding first`,
+            invariantRef: "INV §11.3",
+            affectedTarget: scopeId,
+            suggestedAction: "Record evidence of the work, then advance",
+          });
+        }
       }
       if (event === "SpekkioPassed" || event === "SpekkioFailed") {
         if (kind !== "verification" || caller.role !== "spekkio") {
@@ -7339,6 +7404,66 @@ export class ChronoCore {
       return;
     }
     this.validateActiveBinding(caller, { moduleId, workPackageId });
+  }
+
+  /**
+   * Binding existence for evidence recording: the caller session must
+   * hold one ACTIVE, unexpired dispatch whose scope covers the
+   * evidence scope (exact work package for WP evidence; same module
+   * for module/spec evidence; any live binding when the revision
+   * resolves to no artifact). Deliberately narrower than
+   * `validateActiveBinding` (no attestation/blocker/revision gates):
+   * this proves the proof rides a live binding, nothing more —
+   * downstream gates still judge currency and sufficiency.
+   */
+  private requireEvidenceBinding(
+    sessionId: string,
+    moduleId: string | null,
+    workPackageId: string | null
+  ): void {
+    const binding = this.db.dispatches().findActiveByWorkerSession(sessionId);
+    if (binding === null) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Session '${sessionId}' holds no active dispatch binding: evidence outside a binding cannot advance the workflow`,
+        invariantRef: "INV §5.1",
+        affectedTarget: sessionId,
+        suggestedAction: "Claim a validated dispatch intent before recording proof",
+      });
+    }
+    if (Number.isNaN(Date.parse(binding.expiresAt)) || Date.parse(binding.expiresAt) <= Date.parse(this.now())) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Dispatch '${binding.id}' expired: evidence on a dead binding cannot advance the workflow`,
+        invariantRef: "INV §5.1",
+        affectedTarget: binding.id,
+        suggestedAction: "Request a fresh dispatch intent",
+      });
+    }
+    if (moduleId !== null) {
+      if (binding.moduleId !== moduleId) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Dispatch '${binding.id}' binds module '${binding.moduleId}', not the evidence scope '${moduleId}'`,
+          invariantRef: "INV §10.2",
+          affectedTarget: moduleId,
+          suggestedAction: "Record proof inside the bound scope only",
+        });
+      }
+      if (workPackageId !== null && binding.workPackageId !== workPackageId) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Dispatch '${binding.id}' binds work package '${binding.workPackageId ?? "none"}', not '${workPackageId}'`,
+          invariantRef: "INV §10.2",
+          affectedTarget: workPackageId,
+          suggestedAction: "Record proof inside the bound Work Package only",
+        });
+      }
+    }
   }
 
   /**
@@ -11775,9 +11900,10 @@ export class ChronoCore {
   advance(
     input: { moduleId?: string; workPackageId?: string },
     auth: CallerAuth,
-    options?: { maxIterations?: number }
+    options?: { maxIterations?: number; failAfterSteps?: number }
   ): CoreResult<{ decision: WorkflowDecision; trail: NextAction[]; lastAction: NextAction | null }> {
     const maxIterations = options?.maxIterations ?? 50;
+    const failAfterSteps = options?.failAfterSteps;
     try {
       const caller = this.resolveCaller(auth, "advance workflow");
       this.requireCapability("status.next", caller);
@@ -11877,6 +12003,23 @@ export class ChronoCore {
           scope = consumed.followScope;
         } else {
           trail.push(consumed.action);
+        }
+        // Deterministic failure injection (diagnostic seam for
+        // restart-safety proofs): after exactly N committed steps
+        // the call aborts with a distinguishable error WITHOUT
+        // touching the (N+1)th step. Committed steps stand (each was
+        // its own transaction); the failed call writes nothing
+        // further; close/reopen plus a fresh advance() must resume
+        // past the injection point with no repetition or duplicate.
+        if (failAfterSteps !== undefined && trail.length >= failAfterSteps) {
+          throw new ChronoError({
+            code: ErrorCode.WORKFLOW_INJECTED_FAILURE,
+            severity: Severity.ERROR,
+            message: `Injected workflow failure after ${trail.length} committed steps (diagnostic seam, no state change beyond the committed prefix)`,
+            invariantRef: "INV §14.4",
+            affectedTarget: rootModuleId,
+            suggestedAction: "Re-invoke advance() to resume from persisted state",
+          });
         }
       }
       return {
@@ -12036,6 +12179,9 @@ export class ChronoCore {
           ? "correction"
           : (action.kind ?? "implementation");
         let owner: string | null = null;
+        let requestLoop:
+          | { id: string; defectId: string; attempt: number; ownerRole: string }
+          | null = null;
         if (action.action === "request-correction") {
           const preferred = actionWpId !== null
             ? this.db.correctionLoops().listByScope(moduleId, actionWpId)
@@ -12047,7 +12193,8 @@ export class ChronoCore {
             ? this.db.correctionLoops().listByScope(moduleId, wpId)
               .filter((l) => l.status === "OPEN" || l.status === "CORRECTING")
             : [];
-          owner = preferred[0]?.ownerRole ?? loops[0]?.ownerRole ?? scoped[0]?.ownerRole ?? null;
+          requestLoop = preferred[0] ?? loops[0] ?? scoped[0] ?? null;
+          owner = requestLoop?.ownerRole ?? null;
         }
         const scopeId = action.targetKind === "work-package" ? action.targetId : moduleId;
         return {
@@ -12059,6 +12206,14 @@ export class ChronoCore {
           objective:
             `Request a ${kind} dispatch for '${scopeId}' with a deterministic rationale, ` +
             `delegate exactly once to a kind-fitting role, then claim and confirm from the requesting session`,
+          phase: "request",
+          dispatchId: null,
+          adapterId: null,
+          specId: null,
+          specRevision: null,
+          loopId: requestLoop?.id ?? null,
+          defectId: requestLoop?.defectId ?? null,
+          attempt: requestLoop !== null ? requestLoop.attempt : null,
         };
       }
       case "claim-dispatch":
@@ -12082,6 +12237,14 @@ export class ChronoCore {
             action.action === "await-claim"
               ? `Delegate exactly once to a kind-fitting role, then claim ${named} from the claiming session before it expires`
               : `Claim ${named} as '${role}' from the requesting session, then confine the worker credential host-side`,
+          phase: "claim",
+          dispatchId: pending?.id ?? null,
+          adapterId: null,
+          specId: null,
+          specRevision: null,
+          loopId: null,
+          defectId: null,
+          attempt: null,
         };
       }
       case "execute-dispatch":
@@ -12103,6 +12266,14 @@ export class ChronoCore {
           objective:
             `Execute the confirmed work through ${named} as '${role}': record passing evidence bound to the ` +
             `exact scope revision, advance the scope through its legal forward step, then release the binding`,
+          phase: "execute",
+          dispatchId: live?.id ?? null,
+          adapterId: null,
+          specId: null,
+          specRevision: null,
+          loopId: null,
+          defectId: null,
+          attempt: null,
         };
       }
       case "submit-review":
@@ -12126,6 +12297,7 @@ export class ChronoCore {
           moduleId,
           workPackageId: actionWpId,
           targetRevision: review.targetRevision,
+          reviewId: review.id,
         };
       }
       case "correct-defect": {
@@ -12161,6 +12333,14 @@ export class ChronoCore {
           objective:
             `Evidence the fix for defect '${loop.defectId}' (loop '${loop.id}', attempt ` +
             `${loop.attempt}/${loop.maxAttempts}) as the owning role, then complete the loop for re-verification`,
+          phase: "correct",
+          dispatchId: null,
+          adapterId: null,
+          specId: null,
+          specRevision: null,
+          loopId: loop.id,
+          defectId: loop.defectId,
+          attempt: loop.attempt,
         };
       }
       case "request-completion": {
@@ -12177,6 +12357,7 @@ export class ChronoCore {
           moduleId,
           workPackageId: action.targetKind === "work-package" ? action.targetId : null,
           targetRevision: revision,
+          reviewId: null,
         };
       }
       case "record-harness": {
@@ -12195,6 +12376,14 @@ export class ChronoCore {
           objective:
             `Author and record the Harness for spec '${action.targetId}' at revision ${revision}: ` +
             `content plus its hash are creative input the Core never fabricates`,
+          phase: "record-harness",
+          dispatchId: null,
+          adapterId: null,
+          specId: action.targetKind === "spec" ? action.targetId : null,
+          specRevision: revision === "" ? null : revision,
+          loopId: null,
+          defectId: null,
+          attempt: null,
         };
       }
       case "blocked": {

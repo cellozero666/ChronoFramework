@@ -162,6 +162,43 @@ if (!STABILIZATION) {
       return res.value!.id;
     }
 
+    /**
+     * Tripwire: the holder session must own a live dispatch binding
+     * covering the scope right now (read through the public
+     * execution-status projection). Evidence and advances without
+     * one fail this walk instead of simulating worker mutation.
+     */
+    function assertBinding(
+      holder: { actor: string; session: { id: string; token: string } },
+      moduleId: string,
+      workPackageId: string | null
+    ): void {
+      const status = core.executionStatus(
+        workPackageId !== null ? { workPackageId } : { moduleId },
+        holder
+      );
+      expect(status.ok).toBe(true);
+      expect(
+        status.value!.ownDispatch,
+        `session for '${holder.actor}' holds no live binding`
+      ).toBeTruthy();
+    }
+
+    /**
+     * Tripwire: current passing proof by this producer for this
+     * revision must exist right now (read through the public
+     * evidence-status projection). Forward steps without it fail
+     * this walk instead of advancing on assertion alone.
+     */
+    function assertEvidenceCurrent(producer: string, revision: string): void {
+      const status = core.evidenceStatus({ targetRevision: revision }, gaspar);
+      expect(status.ok).toBe(true);
+      expect(
+        status.value!.current.some((e) => e.producer === producer && e.result === "pass"),
+        `no current passing evidence by '${producer}' for this revision`
+      ).toBe(true);
+    }
+
     /** Full execution stack: init through adapter approval. */
     function buildStack(): void {
       expect(core.registerModule(MOD, "DRAFT", { id: MOD, name: "M", purpose: "P", specs: ["SP-0001"] }, gaspar).ok).toBe(true);
@@ -261,6 +298,7 @@ if (!STABILIZATION) {
       // Every external input cites the boundary that directed it.
       const externalInputs: Array<{ boundary: string; op: string }> = [];
       const workers = new Map<string, { actor: string; session: { id: string; token: string } }>();
+      const delegated = new Set<string>();
       let childSeq = 0;
       const cite = (boundary: string, op: string): void => {
         expect(boundary.length, `external input '${op}' cites no boundary`).toBeGreaterThan(0);
@@ -283,25 +321,29 @@ if (!STABILIZATION) {
       ).ok).toBe(true);
 
       const doAgentWork = (d: Extract<WorkflowDecision, { type: "AGENT_WORK_REQUIRED" }>): void => {
-        const tag = `${d.type}:${d.kind}:${d.workPackageId ?? d.moduleId}`;
-        if (d.kind === "harness") {
+        const tag = `${d.type}:${d.phase}:${d.kind}:${d.workPackageId ?? d.moduleId}`;
+        // Phase-driven dispatch: every id and scope below comes from
+        // structured boundary fields. Descriptive text is never read.
+        if (d.phase === "record-harness") {
           // Harness content is creative input: authored here as the
-          // modeled planning step the boundary named (spec id parsed
-          // from the boundary's own fixed objective format).
-          const specId = /for spec '([A-Z]+-[0-9]+)'/.exec(d.objective)?.[1] ?? "SP-0001";
-          const rev = core.getArtifact(specId).revision;
+          // modeled planning step the boundary named.
+          expect(d.specId, "harness boundary names its spec").toBe("SP-0001");
+          expect(d.specRevision, "harness boundary names its revision").toBeTruthy();
+          const rev = core.getArtifact(d.specId as string).revision;
+          expect(rev).toBe(d.specRevision);
           const content = "# harness for SP-0001";
           expect(
             core.recordHarness(rev, `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`, content, gaspar).ok
           ).toBe(true);
-          cite(tag, `harness-record:${specId}@${rev.slice(0, 12)}`);
+          cite(tag, `harness-record:${d.specId}`);
           return;
         }
-        // Dispatch family: request (never auto-requested: rationale,
-        // adapter, and runtime delegation belong outside the Core),
-        // then delegate exactly once, claim, and confirm.
-        const pendingId = /'(DSP-[0-9]+)'/.exec(d.objective)?.[1] ?? null;
-        if (pendingId === null) {
+        if (d.phase === "request") {
+          // No dispatch row exists yet (boundary proves it): request
+          // with the boundary's kind/scope, then delegate exactly
+          // once, claim, and confirm.
+          expect(d.dispatchId, "request phase carries no dispatch row").toBe(null);
+          expect(d.adapterId, "Core never selects adapters").toBe(null);
           const requested = core.requestDispatch(
             {
               moduleId: d.moduleId,
@@ -323,21 +365,48 @@ if (!STABILIZATION) {
           cite(tag, `dispatch-chain:${dispatchId}:${d.role}`);
           return;
         }
-        const worker = workers.get(pendingId);
-        expect(worker, `no worker session for ${pendingId}`).toBeTruthy();
+        if (d.phase === "claim") {
+          // A pending row exists (boundary proves it): finish
+          // delegation exactly once unless already delegated, then
+          // claim and confirm into a worker session.
+          expect(d.dispatchId, "claim phase names its dispatch row").toBeTruthy();
+          const dispatchId = d.dispatchId as string;
+          if (!delegated.has(dispatchId)) {
+            expect(core.recordTaskDelegation({ agent: d.role, parentRuntimeSession: `opencode-parent-${dispatchId}` }, gaspar).ok).toBe(true);
+            delegated.add(dispatchId);
+          }
+          childSeq += 1;
+          const claimed = core.claimDispatch({ dispatchId, childRuntimeSession: `opencode-child-${childSeq}` }, gaspar);
+          expect(claimed.ok).toBe(true);
+          workers.set(dispatchId, { actor: d.role, session: { id: claimed.value!.session.id, token: claimed.value!.session.token } });
+          expect(core.confirmClaim(dispatchId, gaspar).ok).toBe(true);
+          cite(tag, `dispatch-chain:${dispatchId}:${d.role}`);
+          return;
+        }
+        // Execute phase: the holder session was minted by an earlier
+        // claim in this walk — sessions are tracked, never invented.
+        expect(d.phase).toBe("execute");
+        expect(d.dispatchId, "execute phase names its binding").toBeTruthy();
+        const bindingId = d.dispatchId as string;
+        const worker = workers.get(bindingId);
+        expect(worker, `worker session for ${bindingId} comes from its claim`).toBeTruthy();
         const holder = worker as { actor: string; session: { id: string; token: string } };
+        expect(holder.actor).toBe(d.role);
         // Holder executes inside its own binding: evidence, forward
-        // steps, then release. Kind determines the ride.
+        // steps, then release. Tripwires prove the binding is live
+        // and the proof is current before every step.
         const scope = { moduleId: d.moduleId, ...(d.workPackageId !== null ? { workPackageId: d.workPackageId } : {}) };
         const scopeRev = core.getArtifact(d.workPackageId ?? d.moduleId).revision;
         if (d.kind === "implementation") {
+          assertBinding(holder, d.moduleId, d.workPackageId);
           recordEvidenceAs(holder, scopeRev, "unit-impl");
-          cite(tag, `evidence-record:${pendingId}`);
+          cite(tag, `evidence-record:${bindingId}`);
+          assertEvidenceCurrent(d.role, scopeRev);
           expect(core.advanceScope({ ...scope, event: "ImplementationDone" }, holder).ok).toBe(true);
           expect(core.advanceScope({ ...scope, event: "VerificationReady" }, holder).ok).toBe(true);
-          cite(tag, `scope-advance:${pendingId}`);
-          expect(core.releaseDispatch(pendingId, holder).ok).toBe(true);
-          cite(tag, `dispatch-release:${pendingId}`);
+          cite(tag, `scope-advance:${bindingId}`);
+          expect(core.releaseDispatch(bindingId, holder).ok).toBe(true);
+          cite(tag, `dispatch-release:${bindingId}`);
           return;
         }
         throw new Error(`test driver has no worker playbook for kind '${d.kind}'`);
@@ -346,8 +415,10 @@ if (!STABILIZATION) {
       const doReviewWork = (d: Extract<WorkflowDecision, { type: "INDEPENDENT_REVIEW_REQUIRED" }>): void => {
         const tag = `${d.type}:${d.kind}:${d.workPackageId ?? d.moduleId}`;
         const scope = { moduleId: d.moduleId, ...(d.workPackageId !== null ? { workPackageId: d.workPackageId } : {}) };
-        // The assignment was consumed mechanically by advance(). The
-        // reviewer flow — dispatch, verdict, submission, advance,
+        // The assigned review id arrives on the boundary itself —
+        // the reviewer never reads prose to discover their work.
+        expect(d.reviewId, "review boundary names its assigned review").toBeTruthy();
+        // The reviewer flow — dispatch, verdict, submission, advance,
         // release — runs here as the boundary-directed response.
         const dispatched = core.requestDispatch(
           {
@@ -367,17 +438,11 @@ if (!STABILIZATION) {
         expect(claimed.ok).toBe(true);
         const reviewer = { actor: d.role, session: { id: claimed.value!.session.id, token: claimed.value!.session.token } };
         expect(core.confirmClaim(dispatched.value!.dispatchId, gaspar).ok).toBe(true);
+        assertBinding(reviewer, d.moduleId, d.workPackageId);
         expect(core.recordVerification(d.moduleId, "PASS", "spekkio", [], [], [], reviewer, d.workPackageId ?? undefined).ok).toBe(true);
         cite(tag, `verify-record:${dispatched.value!.dispatchId}`);
-        // The reviewer resolves their own assignment through their
-        // own status read (never handed an internal id).
-        const assigned = core.nextAction(scope, reviewer);
-        expect(assigned.ok).toBe(true);
-        expect(assigned.value!.action).toBe("submit-review");
-        const reviewId = /'(REV-[0-9]+)'/.exec(assigned.value!.summary)?.[1];
-        expect(reviewId, "reviewer resolves their assignment through their own status read").toBeTruthy();
-        expect(core.completeReview({ reviewId: reviewId as string }, reviewer).ok).toBe(true);
-        cite(tag, `review-complete:${reviewId}`);
+        expect(core.completeReview({ reviewId: d.reviewId as string }, reviewer).ok).toBe(true);
+        cite(tag, `review-complete:${d.reviewId}`);
         expect(core.advanceScope({ ...scope, event: "SpekkioPassed" }, reviewer).ok).toBe(true);
         cite(tag, `scope-advance:SpekkioPassed`);
         expect(core.releaseDispatch(dispatched.value!.dispatchId, reviewer).ok).toBe(true);
@@ -501,18 +566,29 @@ if (!STABILIZATION) {
         expect(core.completeReview({ reviewId: assigned.value!.reviewId }, spek.worker).ok).toBe(true);
         expect(core.releaseDispatch(spek.dispatchId, spek.worker).ok).toBe(true);
       };
-      const fixPhase = (): void => {
+      const fixPhase = (round: number): void => {
         // Governed correction on the freshly OPENED loop, then a
         // PASS verdict that closes it — the next FAILED opens the
         // next attempt. WP stays VERIFYING throughout (no terminal
-        // advance), so re-verification can continue.
+        // advance), so re-verification can continue. The loop id
+        // comes from the engine's own correct-defect boundary, never
+        // prose: the FAILED verdict auto-opened attempt `round`.
         const fix = roundTrip("correction", "belthazar");
         const rev = core.getArtifact(WP).revision;
+        assertBinding(fix.worker, MOD, WP);
         recordEvidenceAs(fix.worker, rev, "fix");
-        const looped = core.nextAction({ workPackageId: WP }, gaspar).value!;
-        const loopMatch = /'(COR-[0-9]+)'/.exec(looped.summary);
-        expect(loopMatch).not.toBe(null);
-        expect(core.completeCorrectionLoop(loopMatch![1]!, fix.worker).ok).toBe(true);
+        const observed = core.advance({ workPackageId: WP }, gaspar);
+        expect(observed.ok).toBe(true);
+        const boundary = observed.value!.decision;
+        expect(boundary.type).toBe("AGENT_WORK_REQUIRED");
+        if (boundary.type !== "AGENT_WORK_REQUIRED") {
+          throw new Error("expected a correction boundary");
+        }
+        expect(boundary.phase).toBe("correct");
+        expect(boundary.loopId, "correction boundary names its loop").toBeTruthy();
+        expect(boundary.defectId).toBe(defectId);
+        expect(boundary.attempt).toBe(round);
+        expect(core.completeCorrectionLoop(boundary.loopId as string, fix.worker).ok).toBe(true);
         expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "ImplementationDone" }, fix.worker).ok).toBe(true);
         expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "VerificationReady" }, fix.worker).ok).toBe(true);
         expect(core.releaseDispatch(fix.dispatchId, fix.worker).ok).toBe(true);
@@ -534,11 +610,11 @@ if (!STABILIZATION) {
       expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "VerificationReady" }, impl.worker).ok).toBe(true);
       expect(core.releaseDispatch(impl.dispatchId, impl.worker).ok).toBe(true);
       failPhase();
-      fixPhase();
+      fixPhase(1);
       failPhase();
-      fixPhase();
+      fixPhase(2);
       failPhase();
-      fixPhase();
+      fixPhase(3);
       // Fourth FAILED exceeds the bound of three: the verdict itself
       // escalates (fresh OPEN row, attempt 4 > max) and raises the PO
       // blocker — so no advance follows; the state is terminally held.
@@ -561,7 +637,8 @@ if (!STABILIZATION) {
       if (decision.type === "BLOCKED") {
         expect(decision.code).toBe("CORRECTION_ESCALATED");
         expect(decision.owner).toBe("PO");
-        expect(decision.reason).toContain("exceeded 3 attempts");
+        expect(decision.recoverable).toBe(true);
+        expect(decision.reason.length).toBeGreaterThan(0);
       }
     });
 
