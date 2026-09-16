@@ -275,14 +275,48 @@ repository is modified by any Core test. Runtime integration
 simplifications, real worker mutation of product files) remains open
 work — see §6.
 
+### 5.5 Minimal OpenCode advance integration (this tranche)
+
+The verified engine is reachable from a real OpenCode session
+through the smallest possible surface — no new workflow
+architecture, no lifecycle simulator:
+
+- `chrono advance --module <id>` / `--wp <id>` calls
+  `ChronoCore.advance()` and returns `{ ok, decision, trail,
+  lastAction }` as JSON (human output names the boundary only).
+- One native tool, `chrono_advance`, invokes that command with the
+  host-held Gaspar session (0600 file, never model-visible) and
+  returns the structured result; the caller authenticates exactly
+  like every other native tool.
+- Canonical policy v9 classifies `chrono_advance` as `planning`
+  (entry only at the gate; workers stay denied); the generated
+  plugin sets, version stamp, and runtime fingerprint derive from
+  the policy, so the addition propagates without copies.
+- Gaspar's generated contract leads with the advance driver: after
+  planning or any external workflow input, call `chrono_advance`
+  and switch only on `decision.type`; never choose transition tools
+  manually; never parse `summary`, `reason`, `objective`, or
+  `rationale`; never ask the Product Owner to operate CHRONO
+  internals. All thirty-eight legacy lifecycle tools stay emitted
+  for compatibility but leave the normal path.
+- Proven by `advance-integration.test.ts` (CLI returns all five
+  decision types as credential-free JSON; the exact generated tool
+  executes for real; the contract routes through `chrono_advance`;
+  policy v9 classifies it and the real gate passes it while unknown
+  tools stay denied; garbled prose never deflects a structured
+  result).
+
 ## 6. What unblocks this gate (separate authorization required)
 
 1. ~~Implement `advance()` per §3~~ — done, this tranche (engine,
    structured boundary fields, canonical evidence rule, restart-safe
    step transactions, prose-independence; full suite green).
-2. Runtime integration (OpenCode tools calling `advance()`,
-   Gaspar contract simplifications, real worker mutation of product
-   files) — explicitly later work.
+2. ~~Minimal OpenCode integration~~ — done hermetically this
+   tranche (§5.5: CLI, native tool, policy v9, Gaspar driver).
+   Still open: live OpenCode acceptance with paid-model execution
+   (provider login, global mutation, and model spend all need
+   explicit PO authorization), Claude Code / Kiro advance parity,
+   real worker mutation of product files, and the pilot retry.
 3. Independent review, then pilot.
 
 (End of file)

@@ -135,6 +135,48 @@ export function runNextAction(projectPath: string, options: ScopeOptions): CliOu
 }
 
 /** Worker execution projection: own binding, scope states, revision currency. */
+export function runAdvance(projectPath: string, options: ScopeOptions): CliOutput {
+  const asJson = options.json === true;
+  const auth = callerAuth(options);
+  if ("exitCode" in auth) {
+    return auth;
+  }
+  const core = openCore(projectPath, asJson);
+  if ("exitCode" in core) {
+    return core;
+  }
+  try {
+    const result = core.advance(
+      {
+        ...(options.module !== undefined && options.module.length > 0 ? { moduleId: options.module } : {}),
+        ...(options.wp !== undefined && options.wp.length > 0 ? { workPackageId: options.wp } : {}),
+      },
+      auth
+    );
+    if (!result.ok) {
+      return coreError(result.error, asJson);
+    }
+    const v = result.value!;
+    const d = v.decision;
+    // Human lines name the boundary and its structured routing only.
+    // Prose fields travel in JSON for operators; orchestration must
+    // switch on decision.type plus the structured ids, never parse them.
+    const lines = [
+      `decision: ${d.type}`,
+      ...(d.type === "PO_DECISION_REQUIRED" ? [`  ceremony: ${d.action} ${d.scopeId} @${d.revision.slice(0, 16)}…`] : []),
+      ...(d.type === "AGENT_WORK_REQUIRED" ? [`  work: ${d.phase} ${d.kind} ${d.workPackageId ?? d.moduleId} role=${d.role}`] : []),
+      ...(d.type === "INDEPENDENT_REVIEW_REQUIRED" ? [`  review: ${d.kind} ${d.workPackageId ?? d.moduleId} by ${d.role}`] : []),
+      ...(d.type === "BLOCKED" ? [`  blocked: ${d.code} owner=${d.owner}`] : []),
+      ...(d.type === "COMPLETE" ? [`  complete: ${d.moduleId}`] : []),
+      `  trail: ${v.trail.map((t) => t.action).join(", ") || "(none)"}`,
+    ];
+    return emitOk(v, lines, asJson);
+  } finally {
+    core.close();
+  }
+}
+
+/** Worker execution projection: own binding, scope states, revision currency. */
 export function runExecutionStatus(projectPath: string, options: ScopeOptions): CliOutput {
   const asJson = options.json === true;
   const auth = callerAuth(options);

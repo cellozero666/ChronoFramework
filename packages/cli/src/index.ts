@@ -60,6 +60,7 @@ import {
   runSpecSubmit,
 } from "./readiness-cli.js";
 import {
+  runAdvance,
   runCompleteModule,
   runCorrectionComplete,
   runCorrectionOpen,
@@ -3901,6 +3902,29 @@ export function createProgram(cwd: string): Command {
       emitProgramResult(
         program,
         runNextAction(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          ...(typeof opts.module === "string" && opts.module.length > 0 ? { module: opts.module } : {}),
+          ...(typeof opts.wp === "string" && opts.wp.length > 0 ? { wp: opts.wp } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("advance")
+    .description("Run the verified Core advance() for a scope and return its structured WorkflowDecision (Gaspar workflow driver: switch on decision.type)")
+    .option("--module <id>", "module scope identifier")
+    .option("--wp <id>", "work-package scope identifier (takes precedence over --module)")
+    .requiredOption("--as <actor>", "calling identity (must match the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runAdvance(projectPath, {
           as: String(opts.as ?? ""),
           ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
           ...(typeof opts.module === "string" && opts.module.length > 0 ? { module: opts.module } : {}),

@@ -90,6 +90,7 @@ describe("Policy-surface parity (canonical domain policy)", () => {
     expect(bytes).toContain(`CHRONO tool policy v${TOOL_POLICY_VERSION}`);
     expect(bytes).not.toContain("tool policy v6");
     expect(bytes).not.toContain("tool policy v7");
+    expect(bytes).not.toContain("tool policy v8");
     expect(bytes).not.toContain('"v4"');
   });
 

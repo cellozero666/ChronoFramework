@@ -418,12 +418,36 @@ const ROLE_BODIES: Record<ChronoOpenCodeRole, string> = {
     "  to gaspar/PO/builtin agents, and NEVER implement, edit, or write",
     "  product code yourself: your mutate tools stay denied without",
     "  dispatch context, by design.",
-    "- Drive the executable workflow with the lifecycle tools, not",
-    "  prose: `chrono_next` names the single highest-precedence action",
-    "  for a scope; the Next-action map below routes every value to",
-    "  its tool or explicit hold. Supporting tools: `chrono_review_request`",
-    "  assigns Glenn/Spekkio reviews; `chrono_correction_open` opens a bounded",
-    "  loop per defect; `chrono_policy_set` raises rigor (lowering",
+    "- Drive the executable workflow with `chrono_advance` — the only",
+    "  normal workflow driver. After planning or any external workflow",
+    "  input (approval landing, worker handoff, review submission,",
+    "  correction result, restart), call `chrono_advance` for the scope",
+    "  and switch ONLY on `decision.type`: `PO_DECISION_REQUIRED` opens",
+    "  the named ceremony and stops; `AGENT_WORK_REQUIRED` enacts the",
+    "  named phase through its structured ids; `INDEPENDENT_REVIEW_REQUIRED`",
+    "  routes the named reviewer through their structured review id;",
+    "  `BLOCKED` reports the named condition and its unblock step, then",
+    "  stops; `COMPLETE` ends the workflow. NEVER manually choose",
+    "  architecture, spec, module, or Work Package transition tools:",
+    "  `chrono_advance` consumes every safe mechanical step itself.",
+    "  NEVER parse `summary`, `reason`, `objective`, or `rationale`",
+    "  text to recover ids or decisions: orchestration reads structured",
+    "  fields only (phase, dispatchId, reviewId, loopId, action, scope,",
+    "  revision, role, kind), and any id absent from those fields does",
+    "  not exist. NEVER ask the Product Owner to execute CHRONO",
+    "  commands, run shell commands, export tokens, copy grants, or",
+    "  operate CHRONO internals.",
+    "- The legacy lifecycle tools (`chrono_next` plus the Next-action",
+    "  map below, `chrono_module_activate`, `chrono_wp_authorize`,",
+    "  `chrono_dispatch`, `chrono_review_request`, `chrono_correction_open`,",
+    "  `chrono_policy_set`, `chrono_deep_check`, `chrono_dispatch_reconcile`,",
+    "  `chrono_module_complete`, and their siblings) remain for",
+    "  compatibility and diagnosis only: the normal workflow above never",
+    "  calls transition tools directly. Supporting holds still apply:",
+    "  `chrono_review_request` assigns Glenn/Spekkio reviews only when the",
+    "  `INDEPENDENT_REVIEW_REQUIRED` boundary names no assigned review;",
+    "  `chrono_correction_open` opens a bounded loop only when the boundary",
+    "  names none; `chrono_policy_set` raises rigor (lowering",
     "  always denies here — downgrades are PO-signed at a terminal);",
     "  `chrono_deep_check` audits cross-record integrity before",
     "  completion; `chrono_dispatch_reconcile` sweeps stale claims after",
@@ -608,9 +632,9 @@ export function buildOpenCodeAgentDefinition(role: ChronoOpenCodeRole): string {
   // governance, while approval confirmation always asks the human
   // natively. Agent rules merge over global config and take
   // precedence; the in-execute ask() remains the backstop.
-  const permission =
+  const   permission =
     role === "gaspar"
-      ? "permission:\n  chrono_artifact_status: allow\n  chrono_artifact_propose: allow\n  chrono_artifact_revise: allow\n  chrono_artifact_supersede: allow\n  chrono_approval_request: allow\n  chrono_approval_status: allow\n  chrono_dispatch: allow\n  chrono_dispatch_claim: allow\n  question: allow\n"
+      ? "permission:\n  chrono_advance: allow\n  chrono_artifact_status: allow\n  chrono_artifact_propose: allow\n  chrono_artifact_revise: allow\n  chrono_artifact_supersede: allow\n  chrono_approval_request: allow\n  chrono_approval_status: allow\n  chrono_dispatch: allow\n  chrono_dispatch_claim: allow\n  question: allow\n"
       : "";
   return `---\ndescription: ${ROLE_DESCRIPTIONS[role]}\nmode: ${mode}\n${permission}---\n\n${ROLE_BODIES[role]}\n`;
 }

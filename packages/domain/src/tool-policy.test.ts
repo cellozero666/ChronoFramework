@@ -18,8 +18,13 @@ import {
 } from "./index.js";
 
 describe("OpenCode tool policy (dispatch repair)", () => {
-  it("is versioned at v8", () => {
-    expect(TOOL_POLICY_VERSION).toBe("8");
+  it("is versioned at v9", () => {
+    expect(TOOL_POLICY_VERSION).toBe("9");
+  });
+
+  it("classifies the advance workflow driver as a planning tool", () => {
+    expect(classifyOpencodeTool("chrono_advance")).toBe("planning");
+    expect(OPENCODE_TOOL_POLICY["chrono_advance"]).toBe("planning");
   });
 
   it("classifies activation and reconcile as lifecycle tools", () => {

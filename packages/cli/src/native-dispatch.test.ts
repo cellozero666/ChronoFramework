@@ -370,6 +370,7 @@ describe("Native governed dispatch", () => {
       "chrono_approval_status",
       "chrono_dispatch",
       "chrono_dispatch_claim",
+      "chrono_advance",
       "chrono_next",
       "chrono_execution_status",
       "chrono_evidence_record",

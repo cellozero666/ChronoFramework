@@ -26,7 +26,7 @@ function loadRow(overrides: Record<string, unknown> = {}): string {
     adapter: "opencode",
     kind: "plugin-load",
     chronoVersion: "0.1.0",
-    toolPolicyVersion: "8",
+    toolPolicyVersion: "9",
     buildFingerprint: FP,
     loadId: "123-test",
     ...overrides,
@@ -50,7 +50,7 @@ describe("Plugin generation handshake (stale runtime repair)", () => {
   }
 
   it("expects the running launcher identity with a deterministic fingerprint", () => {
-    expect(EXPECTED.toolPolicyVersion).toBe("8");
+    expect(EXPECTED.toolPolicyVersion).toBe("9");
     expect(EXPECTED.buildFingerprint).toBe(FP);
     expect(FP).toMatch(/^sha256:[0-9a-f]{64}$/);
   });
@@ -76,7 +76,7 @@ describe("Plugin generation handshake (stale runtime repair)", () => {
   it("reports current on a full handshake match", () => {
     writeEvidence([loadRow()]);
     const report = readActivationEvidence(tempDir);
-    expect(report.latestPluginLoad).toMatchObject({ loadId: "123-test", chronoVersion: "0.1.0", toolPolicyVersion: "8", buildFingerprint: FP });
+    expect(report.latestPluginLoad).toMatchObject({ loadId: "123-test", chronoVersion: "0.1.0", toolPolicyVersion: "9", buildFingerprint: FP });
     expect(report.runtimeStatus).toBe("current");
   });
 
@@ -90,7 +90,7 @@ describe("Plugin generation handshake (stale runtime repair)", () => {
         at: "2026-09-16T00:00:00.000Z",
         loadId: "old-1",
         chronoVersion: "0.1.0",
-        toolPolicyVersion: "8",
+        toolPolicyVersion: "9",
         buildFingerprint: FP,
         ...overrides,
       });

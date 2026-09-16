@@ -28,11 +28,12 @@ export const AUTHORITY_POLICY_VERSION = "9";
 /**
  * Version of the runtime tool-classification policy below. Bumped
  * independently from the authority matrix: tool classification affects
- * pre-tool gate decisions, never grant semantics. v8 classifies the
- * planning-runway tools (architecture/spec/harness advancement), so a
- * v7-loaded runtime is stale by definition.
+ * pre-tool gate decisions, never grant semantics. v9 adds the
+ * chrono_advance workflow driver (Gaspar calls advance() and switches
+ * on the structured decision); v8 classified the planning-runway
+ * tools, so a v8-loaded runtime is stale by definition.
  */
-export const TOOL_POLICY_VERSION = "8";
+export const TOOL_POLICY_VERSION = "9";
 
 export type CapabilityHolder = AgentRole | "PO";
 
@@ -241,6 +242,13 @@ export const OPENCODE_TOOL_POLICY: Record<string, ToolClassification> = {
   // every deeper check lives in the Core.
   chrono_dispatch: "planning",
   chrono_dispatch_claim: "planning",
+  // Workflow driver (WORKFLOW-STABILIZATION): chrono_advance runs the
+  // verified Core advance() for a scope and returns its structured
+  // WorkflowDecision. Gaspar calls it after planning or any external
+  // workflow input and switches on decision.type only — never manual
+  // transition tools, never parsed prose. Entry only at the gate;
+  // the Core owns every transition the engine consumes.
+  chrono_advance: "planning",
   // Native governed lifecycle tools (CORE_FIX vertical): narrow,
   // capability-gated state operations for the executable workflow
   // (evidence, completion, reviews, defects, verdicts, corrections,
