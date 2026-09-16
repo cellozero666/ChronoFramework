@@ -37,12 +37,42 @@ One Core-owned result type. Exactly these five boundaries — no
 tool names, no event names, no prose:
 
 ```ts
-export type WorkflowDecision =
-  | "PO_DECISION_REQUIRED"
-  | "AGENT_WORK_REQUIRED"
-  | "INDEPENDENT_REVIEW_REQUIRED"
-  | "BLOCKED"
-  | "COMPLETE";
+type WorkflowDecision =
+  | {
+      type: "PO_DECISION_REQUIRED";
+      action: string;      // approval action the ceremony must bind
+      scopeId: string;     // architecture, spec, or module under approval
+      revision: string;    // exact revision the ceremony must bind
+      rationale: string;   // why the ceremony blocks (Core-observed)
+    }
+  | {
+      type: "AGENT_WORK_REQUIRED";
+      role: AgentRole;     // worker identity that must act
+      kind: string;        // dispatch/enactment kind (incl. "harness")
+      moduleId: string;
+      workPackageId: string | null;
+      objective: string;   // fixed-format directive naming ids in play
+    }
+  | {
+      type: "INDEPENDENT_REVIEW_REQUIRED";
+      role: "glenn" | "spekkio";
+      kind: string;        // "security-review" | "verification"
+      moduleId: string;
+      workPackageId: string | null;
+      targetRevision: string;
+    }
+  | {
+      type: "BLOCKED";
+      code: string;        // CORRECTION_ESCALATED | NO_PROGRESS | ...
+      reason: string;      // blocking condition + what unblocks it
+      owner: AgentRole | "PO" | "system";
+      recoverable: boolean;
+    }
+  | {
+      type: "COMPLETE";
+      moduleId: string;
+      summary: string;
+    };
 ```
 
 Semantics (normative):
@@ -108,9 +138,12 @@ for the caller; no PO ceremony is required; no worker or reviewer
 session beyond the caller's own is required; no choice among
 alternatives exists (deterministic single next step); the step
 changes persisted lifecycle state or it does not count as
-progress. Dispatch requests, activation, authorization, review
-assignment, releases, reconciliations, and transitions that meet
-all five are consumable; claims, evidence, verdicts, reviews, and
+progress. Architecture submission/approval, spec submission/READY,
+Harness-adjacent readiness excluded, module activation, WP
+authorization, review assignment, and completion transitions that
+meet all five are consumable; dispatch requests (rationale,
+adapter, and runtime delegation belong outside the Core),
+Harness content, claims, evidence, verdicts, reviews, and
 corrections owned by another identity always resolve to
 `AGENT_WORK_REQUIRED` / `INDEPENDENT_REVIEW_REQUIRED`; missing
 approvals always resolve to `PO_DECISION_REQUIRED`.
@@ -133,29 +166,60 @@ Acceptance properties (asserted by the RED test):
 - the process ends in `COMPLETE`;
 - a bounded-loop failure becomes `BLOCKED`.
 
-## 5. RED evidence (current tree)
+## 5. Implementation evidence (current tree)
 
-`npm run test:workflow` fails, proving the gap architecturally:
+`ChronoCore.advance()` is implemented in
+`packages/core/src/chrono-core.ts` (discriminated `WorkflowDecision`
+union beside it; both re-exported from `@chrono/core`). Behavior:
 
-- `ChronoCore.advance` does not exist (`typeof` check);
-- the walk to `COMPLETE` requires N manually selected transitions
-  (logged; must be zero);
-- no `nextAction` resolves to a `WorkflowDecision` boundary
-  (tool steps only);
-- loop exhaustion surfaces tool actions, never `BLOCKED`.
+- Terminal escalation is checked before every observation, so a
+  live worker binding can never hide an ESCALATED loop: the fourth
+  FAILED verdict resolves to `BLOCKED` (`CORRECTION_ESCALATED`,
+  owner `PO`) with an empty trail.
+- Boundary derivation re-reads rows through the ACTION's own
+  target scope — a module-scope observation naming a package
+  binding resolves the package rows, never the empty module scope.
+- The progress snapshot covers lifecycle states plus dispatch,
+  review, evidence, verdict, loop, blocker, and approval counts,
+  so every legitimate external input moves it; a repeated action
+  on one target with an identical snapshot resolves to `BLOCKED`
+  (`NO_PROGRESS`), and the loop is strictly bounded (default 50,
+  overridable).
+- Dispatch requests, Harness content, claims, evidence, verdicts,
+  reviews, and corrections stay boundaries; architecture/spec
+  transitions, activation, authorization, review assignment, and
+  completion consume mechanically through the same guarded
+  operations the native tools call. A denied step aborts with its
+  exact denial — every consumed step is itself transactional, so
+  no partial write ever persists.
+- External-input operations (finalized approval, Harness record,
+  evidence, verdict, review submit, correction completion,
+  dispatch release) converge by re-invoking `advance()`: the
+  engine is stateless over persisted rows, so no op needed code
+  changes.
 
-`npm test` stays green: the RED suite runs only under
-`WORKFLOW_STABILIZATION=1` (established gate pattern, same as the
-black-box/network/host gates), asserting the flag is off by
-default. No existing test was modified; no production behavior
-was changed to make anything pass.
+`npm run test:workflow` passes (3/3): the full lifecycle walks on
+`advance()` alone to `COMPLETE` (validate clean, deep-check
+zero/zero, all three module approvals current), Gaspar initiates
+no lifecycle transition outside boundary-cited handlers, every
+external input cites its preceding boundary, and exhaustion
+resolves to `BLOCKED`. Focused engine coverage lives in
+`packages/core/src/advance.test.ts` (12 tests: all five variants,
+multi-transition advancement, no-fabrication, held-dependency
+blocking, iteration bound, lean exhaustion, restart persistence,
+idempotency, authority-loss abort, post-op convergence).
+
+`npm test` stays green: the workflow suite runs only under
+`WORKFLOW_STABILIZATION=1` (established gate pattern), asserting
+the flag is off by default. No existing test was modified for the
+engine; existing security checks are unchanged (all denial codes
+preserved and asserted).
 
 ## 6. What unblocks this gate (separate authorization required)
 
-1. Implement `advance()` per §3 (Core only; no prompt/prose logic).
-2. Turn this RED suite green without weakening a single
-   assertion (especially: zero manual selections, `BLOCKED` on
-   exhaustion, contract hygiene).
+1. ~~Implement `advance()` per §3~~ — done, this tranche.
+2. Runtime integration (OpenCode tools calling `advance()`,
+   Gaspar contract simplifications) — explicitly later work.
 3. Independent review, then pilot.
 
 (End of file)

@@ -179,21 +179,49 @@ export const NEXT_ACTIONS = [
 export type NextActionValue = (typeof NEXT_ACTIONS)[number];
 
 /**
- * Canonical workflow boundary (WORKFLOW-STABILIZATION, specified
- * only — see `docs/implementation/WORKFLOW-STABILIZATION.md`).
- * The future `ChronoCore.advance()` resolves every lifecycle state
- * to exactly one of these five boundaries after consuming all safe
- * mechanical transitions. No operation returns this type yet;
- * `nextAction` continues to report fine-grained executable actions
- * until `advance()` is implemented under separate authorization.
- * Type-only: no runtime behavior.
+ * Canonical workflow boundary (WORKFLOW-STABILIZATION — see
+ * `docs/implementation/WORKFLOW-STABILIZATION.md`). `ChronoCore.advance()`
+ * resolves every lifecycle state to exactly one of these five closed
+ * boundaries after consuming all safe mechanical transitions.
+ * `nextAction` continues to report fine-grained executable actions;
+ * this type is the coordination layer above it.
  */
 export type WorkflowDecision =
-  | "PO_DECISION_REQUIRED"
-  | "AGENT_WORK_REQUIRED"
-  | "INDEPENDENT_REVIEW_REQUIRED"
-  | "BLOCKED"
-  | "COMPLETE";
+  | {
+      type: "PO_DECISION_REQUIRED";
+      action: string;
+      scopeId: string;
+      revision: string;
+      rationale: string;
+    }
+  | {
+      type: "AGENT_WORK_REQUIRED";
+      role: AgentRole;
+      kind: string;
+      moduleId: string;
+      workPackageId: string | null;
+      objective: string;
+    }
+  | {
+      type: "INDEPENDENT_REVIEW_REQUIRED";
+      role: "glenn" | "spekkio";
+      kind: string;
+      moduleId: string;
+      workPackageId: string | null;
+      targetRevision: string;
+    }
+  | {
+      type: "BLOCKED";
+      code: string;
+      reason: string;
+      owner: AgentRole | "PO" | "system";
+      recoverable: boolean;
+    }
+  | {
+      type: "COMPLETE";
+      moduleId: string;
+      summary: string;
+    };
 
 export interface NextAction {
   readonly action: string;
@@ -11507,6 +11535,785 @@ export class ChronoCore {
       };
     } catch (e) {
       return this.handleError(e);
+    }
+  }
+
+  /**
+   * Terminal correction-loop escalation for one module scope, checked
+   * before every `nextAction` observation inside `advance()`: an
+   * ESCALATED loop whose defect is still unresolved gates the whole
+   * scope, and no live worker binding may hide it. Returns the
+   * BLOCKED boundary owned by the PO, or null when no live
+   * escalation gates this module.
+   */
+  private escalatedLoopBoundary(moduleId: string): WorkflowDecision | null {
+    const scopes: Array<string | null> = [null];
+    for (const wpId of this.moduleWorkPackages(moduleId)) {
+      scopes.push(wpId);
+    }
+    for (const wp of scopes) {
+      let loops: Array<{ id: string; defectId: string; attempt: number; maxAttempts: number; status: string }>;
+      try {
+        loops = this.db.correctionLoops().listByScope(moduleId, wp);
+      } catch {
+        continue;
+      }
+      for (const loop of loops) {
+        if (loop.status !== "ESCALATED") {
+          continue;
+        }
+        let resolved = false;
+        try {
+          resolved = this.defects.findById(loop.defectId).status === "resolved";
+        } catch {
+          resolved = false;
+        }
+        if (resolved) {
+          continue;
+        }
+        return {
+          type: "BLOCKED",
+          code: "CORRECTION_ESCALATED",
+          reason:
+            `Correction loop '${loop.id}' for defect '${loop.defectId}' exceeded ${loop.maxAttempts} attempts ` +
+            `(attempt ${loop.attempt}): PO decision required`,
+          owner: "PO",
+          recoverable: true,
+        };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Compact progress snapshot for stall detection inside `advance()`:
+   * lifecycle states plus live-row counts. Two observations of the
+   * same action on the same target with an identical snapshot mean
+   * the engine is not moving and must stop instead of looping.
+   */
+  private advanceSnapshot(moduleId: string): string {
+    const parts: string[] = [];
+    try {
+      const mod = this.artifacts.findById(moduleId);
+      parts.push(`MOD:${mod.status}:${mod.revision}`);
+    } catch {
+      parts.push("MOD:?");
+    }
+    for (const wpId of this.moduleWorkPackages(moduleId)) {
+      try {
+        parts.push(`WP:${wpId}:${this.artifacts.findById(wpId).status}`);
+      } catch {
+        parts.push(`WP:${wpId}:?`);
+      }
+    }
+    const tally = (rows: Array<{ status: string }>): string => {
+      const counts = new Map<string, number>();
+      for (const row of rows) {
+        counts.set(row.status, (counts.get(row.status) ?? 0) + 1);
+      }
+      return [...counts.entries()].sort().map(([s, n]) => `${s}=${n}`).join(",");
+    };
+    try {
+      const dispatches: Array<{ status: string }> = [];
+      for (const d of this.db.dispatches().listByScope(moduleId, null)) {
+        dispatches.push(d);
+      }
+      for (const wpId of this.moduleWorkPackages(moduleId)) {
+        for (const d of this.db.dispatches().listByScope(moduleId, wpId)) {
+          dispatches.push(d);
+        }
+      }
+      parts.push(`D:${tally(dispatches)}`);
+    } catch {
+      parts.push("D:?");
+    }
+    try {
+      const reviews: Array<{ status: string }> = [];
+      for (const r of this.db.reviewAssignments().listByScope(moduleId, null)) {
+        reviews.push(r);
+      }
+      for (const wpId of this.moduleWorkPackages(moduleId)) {
+        for (const r of this.db.reviewAssignments().listByScope(moduleId, wpId)) {
+          reviews.push(r);
+        }
+      }
+      parts.push(`R:${tally(reviews)}`);
+    } catch {
+      parts.push("R:?");
+    }
+    // Every external input class must move the snapshot, or a
+    // legitimate boundary round-trip looks like stagnation: evidence
+    // rows (worker proof), verdict rows (reviewer proof), loop
+    // tallies (correction progression), blocker counts (holds
+    // raised/resolved), and approval counts (PO ceremony landings).
+    try {
+      parts.push(`E:${this.db.evidence().listAll().length}`);
+    } catch {
+      parts.push("E:?");
+    }
+    try {
+      parts.push(`Q:${this.qa.listByModule(moduleId).length}`);
+    } catch {
+      parts.push("Q:?");
+    }
+    try {
+      const loops: Array<{ status: string }> = [];
+      for (const l of this.db.correctionLoops().listByScope(moduleId, null)) {
+        loops.push(l);
+      }
+      for (const wpId of this.moduleWorkPackages(moduleId)) {
+        for (const l of this.db.correctionLoops().listByScope(moduleId, wpId)) {
+          loops.push(l);
+        }
+      }
+      parts.push(`L:${tally(loops)}`);
+    } catch {
+      parts.push("L:?");
+    }
+    try {
+      parts.push(`B:${this.blockers.findActive([moduleId]).length}`);
+    } catch {
+      parts.push("B:?");
+    }
+    try {
+      parts.push(`A:${this.db.approvals().listAll().length}`);
+    } catch {
+      parts.push("A:?");
+    }
+    return parts.join("|");
+  }
+
+  /**
+   * Latest unsettled (PENDING/ENACTED) or live (ACTIVE) dispatch for
+   * one scope, newest last — the same selection order `nextAction`
+   * uses, so boundary derivation never diverges from it.
+   */
+  private latestScopeDispatch(
+    moduleId: string,
+    workPackageId: string | null,
+    statuses: ReadonlyArray<string>
+  ): {
+    id: string;
+    kind: string;
+    status: string;
+    delegatedAgent: string | null;
+    role: string;
+  } | null {
+    let rows: Array<{ id: string; kind: string; status: string; delegatedAgent: string | null; role: string }>;
+    try {
+      rows = this.db.dispatches().listByScope(moduleId, workPackageId)
+        .filter((d) => statuses.includes(d.status));
+    } catch {
+      return null;
+    }
+    if (rows.length === 0) {
+      return null;
+    }
+    return rows[rows.length - 1]!;
+  }
+
+  /**
+   * Worker role for an agent-work boundary: the delegation-time agent
+   * when bound, else the kind's primary dispatchable role from the
+   * existing domain matrix (deterministic, never a guess), else the
+   * fallback implementer. The objective always names the dispatch,
+   * so the role is routing, not invention.
+   */
+  private boundaryWorkerRole(
+    delegatedAgent: string | null,
+    kind: string
+  ): AgentRole {
+    if (delegatedAgent !== null && isAgentRole(delegatedAgent)) {
+      return delegatedAgent;
+    }
+    const primary = (DISPATCH_KIND_ROLES as Record<string, readonly string[]>)[kind]?.[0];
+    if (primary !== undefined && isAgentRole(primary)) {
+      return primary;
+    }
+    return "belthazar";
+  }
+
+  /**
+   * Owner for a BLOCKED boundary from a blocker row: the issuing
+   * identity when it maps onto the closed model, else the system.
+   */
+  private blockedOwner(issuerRole: string | null): AgentRole | "PO" | "system" {
+    if (issuerRole === "PO") {
+      return "PO";
+    }
+    if (issuerRole !== null && isAgentRole(issuerRole)) {
+      return issuerRole;
+    }
+    return "system";
+  }
+
+  /**
+   * Workflow engine (WORKFLOW-STABILIZATION): consume every safe,
+   * deterministic, non-creative transition for one scope until a
+   * closed workflow boundary is reached. Each consumed step runs
+   * through the SAME guarded operation the corresponding native tool
+   * calls — no duplicated predicates, no bypassed gates — and each
+   * committed step is itself transactional (the operations guarantee
+   * atomicity; a denied step aborts the loop with its exact denial
+   * instead of a partial write).
+   *
+   * Safe-mechanical (all must hold per step): the shared dry-run is
+   * acceptable for the caller; no PO ceremony, worker session beyond
+   * the caller's own, or reviewer session is required; no choice
+   * among alternatives exists; the step changes persisted lifecycle
+   * state. Claims, evidence, verdicts, reviews, corrections owned by
+   * another identity, Harness content, approvals, and code always
+   * resolve to boundaries instead.
+   *
+   * Termination: terminal escalation first (never hidden by live
+   * bindings), stall detection (same action on the same target with
+   * an identical progress snapshot), and a strict iteration bound
+   * (default 50, overridable for tests). Ambiguity, stagnation, or
+   * exhaustion all resolve to BLOCKED — never an unbounded loop,
+   * never a skipped denial.
+   */
+  advance(
+    input: { moduleId?: string; workPackageId?: string },
+    auth: CallerAuth,
+    options?: { maxIterations?: number }
+  ): CoreResult<{ decision: WorkflowDecision; trail: NextAction[]; lastAction: NextAction | null }> {
+    const maxIterations = options?.maxIterations ?? 50;
+    try {
+      const caller = this.resolveCaller(auth, "advance workflow");
+      this.requireCapability("status.next", caller);
+      const wpId = input.workPackageId ?? null;
+      const rootModuleId = wpId !== null ? this.workPackageModule(wpId) : (input.moduleId ?? null);
+      if (rootModuleId === null) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "advance requires a module or work-package scope",
+          invariantRef: "INV §14.4",
+          affectedTarget: "project",
+          suggestedAction: "Pass --module or --work-package",
+        });
+      }
+      let scope: { moduleId?: string; workPackageId?: string } =
+        wpId !== null ? { workPackageId: wpId } : { moduleId: rootModuleId };
+      const trail: NextAction[] = [];
+      const seen = new Map<string, string>();
+      let lastAction: NextAction | null = null;
+      for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+        // Terminal escalation gates everything, before any
+        // observation a live binding could otherwise shadow.
+        const escalated = this.escalatedLoopBoundary(rootModuleId);
+        if (escalated !== null) {
+          return { ok: true, value: { decision: escalated, trail, lastAction } };
+        }
+        const observed = this.nextAction(scope, auth);
+        if (!observed.ok) {
+          const denial = this.describeDenial(observed);
+          return {
+            ok: true,
+            value: {
+              decision: {
+                type: "BLOCKED",
+                code: "NO_NEXT_ACTION",
+                reason: `No next action resolves for this scope: ${denial}`,
+                owner: "system",
+                recoverable: false,
+              },
+              trail,
+              lastAction,
+            },
+          };
+        }
+        const action = observed.value!;
+        lastAction = action;
+        // Stall detection: the same action on the same target with
+        // an identical progress snapshot means no forward movement.
+        const visitKey = `${action.action}:${action.targetKind}:${action.targetId}`;
+        const snapshot = this.advanceSnapshot(rootModuleId);
+        const prior = seen.get(visitKey);
+        if (prior !== undefined && prior === snapshot) {
+          return {
+            ok: true,
+            value: {
+              decision: {
+                type: "BLOCKED",
+                code: "NO_PROGRESS",
+                reason:
+                  `Workflow stalled: '${action.action}' for '${action.targetId}' repeats with no state change ` +
+                  `(${action.reason})`,
+                owner: "system",
+                recoverable: true,
+              },
+              trail,
+              lastAction,
+            },
+          };
+        }
+        seen.set(visitKey, snapshot);
+        const boundary = this.advanceBoundary(action, scope);
+        if (boundary !== null) {
+          return { ok: true, value: { decision: boundary, trail, lastAction } };
+        }
+        const consumed = this.advanceConsume(action, scope, auth);
+        if (!consumed.ok) {
+          return {
+            ok: true,
+            value: {
+              decision: {
+                type: "BLOCKED",
+                code: consumed.code,
+                reason: consumed.reason,
+                owner: "system",
+                recoverable: true,
+              },
+              trail,
+              lastAction,
+            },
+          };
+        }
+        // Follow-pointers navigate into a package scope without
+        // executing anything: they advance the observation, never
+        // the trail (the trail records consumed steps only).
+        if (consumed.followScope !== undefined) {
+          scope = consumed.followScope;
+        } else {
+          trail.push(consumed.action);
+        }
+      }
+      return {
+        ok: true,
+        value: {
+          decision: {
+            type: "BLOCKED",
+            code: "ITERATION_BOUND",
+            reason: `Workflow did not converge within ${maxIterations} iterations: human triage required`,
+            owner: "system",
+            recoverable: true,
+          },
+          trail,
+          lastAction,
+        },
+      };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Boundary resolution for one observed action: a WorkflowDecision
+   * when the action needs external input (PO ceremony, worker or
+   * reviewer identity, terminal state), else null to consume it.
+   * Boundary derivation re-reads the same rows `nextAction` used —
+   * never parsed prose, never a competing map.
+   *
+   * Scope discipline: live rows (dispatches, reviews, loops) are
+   * resolved through the ACTION's own target — never the scope the
+   * engine was queried with. A module-scope observation routinely
+   * names a package binding; resolving through the query scope
+   * would read the wrong (empty) scope and misroute the boundary.
+   */
+  private advanceBoundary(
+    action: NextAction,
+    scope: { moduleId?: string; workPackageId?: string }
+  ): WorkflowDecision | null {
+    const moduleId = scope.workPackageId !== undefined
+      ? this.workPackageModule(scope.workPackageId)
+      : (scope.moduleId as string);
+    const wpId = scope.workPackageId ?? null;
+    const actionWpId = action.targetKind === "work-package" ? action.targetId : null;
+    switch (action.action) {
+      case "done": {
+        return { type: "COMPLETE", moduleId, summary: action.summary };
+      }
+      case "request-approval": {
+        const kind = action.kind ?? "";
+        if (kind.length === 0) {
+          return {
+            type: "BLOCKED",
+            code: "APPROVAL_UNNAMED",
+            reason: `Approval ceremony required but unnamed: ${action.reason}`,
+            owner: "system",
+            recoverable: true,
+          };
+        }
+        let revision: string | null = null;
+        try {
+          revision = action.targetKind === "architecture"
+            ? this.projects.findById("default").architectureRevision
+            : this.artifacts.findById(action.targetId).revision;
+        } catch {
+          revision = null;
+        }
+        if (revision === null) {
+          return {
+            type: "BLOCKED",
+            code: "APPROVAL_SCOPE_UNKNOWN",
+            reason: `Approval ceremony required for an unknown scope: ${action.reason}`,
+            owner: "system",
+            recoverable: true,
+          };
+        }
+        return {
+          type: "PO_DECISION_REQUIRED",
+          action: kind,
+          scopeId: action.targetId,
+          revision,
+          rationale: action.reason,
+        };
+      }
+      case "await-approval": {
+        // Parse-free convergence: the runway already ordered
+        // specs/architecture ahead of this hold, so a lingering
+        // await-approval names activation authority — first missing
+        // of planning-approval, then module-approval, at the exact
+        // current module revision.
+        let revision: string;
+        try {
+          revision = this.artifacts.findById(moduleId).revision;
+        } catch {
+          return {
+            type: "BLOCKED",
+            code: "SCOPE_UNKNOWN",
+            reason: `Activation hold for an unknown module: ${action.reason}`,
+            owner: "system",
+            recoverable: false,
+          };
+        }
+        if (!this.hasValidApproval(moduleId, revision, "planning-approval")) {
+          return {
+            type: "PO_DECISION_REQUIRED",
+            action: "planning-approval",
+            scopeId: moduleId,
+            revision,
+            rationale: action.reason,
+          };
+        }
+        if (!this.hasValidApproval(moduleId, revision, "module-approval")) {
+          return {
+            type: "PO_DECISION_REQUIRED",
+            action: "module-approval",
+            scopeId: moduleId,
+            revision,
+            rationale: action.reason,
+          };
+        }
+        return {
+          type: "BLOCKED",
+          code: "APPROVAL_UNRESOLVED",
+          reason: `Activation hold with current approvals: ${action.reason}`,
+          owner: "system",
+          recoverable: true,
+        };
+      }
+      case "approve-security": {
+        let revision: string;
+        try {
+          revision = this.artifacts.findById(moduleId).revision;
+        } catch {
+          return {
+            type: "BLOCKED",
+            code: "SCOPE_UNKNOWN",
+            reason: `Security acceptance hold for an unknown module: ${action.reason}`,
+            owner: "system",
+            recoverable: false,
+          };
+        }
+        return {
+          type: "PO_DECISION_REQUIRED",
+          action: "implementation-security",
+          scopeId: moduleId,
+          revision,
+          rationale: action.reason,
+        };
+      }
+      case "request-dispatch":
+      case "request-correction": {
+        // Dispatch intents are never auto-requested: the rationale,
+        // adapter choice, and exactly-once runtime delegation belong
+        // to the orchestrator side. The boundary names kind and
+        // scope; the owner comes from the open loop for corrections,
+        // else the kind's primary dispatchable role.
+        const kind = action.action === "request-correction"
+          ? "correction"
+          : (action.kind ?? "implementation");
+        let owner: string | null = null;
+        if (action.action === "request-correction") {
+          const preferred = actionWpId !== null
+            ? this.db.correctionLoops().listByScope(moduleId, actionWpId)
+              .filter((l) => l.status === "OPEN" || l.status === "CORRECTING")
+            : [];
+          const loops = this.db.correctionLoops().listByScope(moduleId, null)
+            .filter((l) => l.status === "OPEN" || l.status === "CORRECTING");
+          const scoped = wpId !== null && wpId !== actionWpId
+            ? this.db.correctionLoops().listByScope(moduleId, wpId)
+              .filter((l) => l.status === "OPEN" || l.status === "CORRECTING")
+            : [];
+          owner = preferred[0]?.ownerRole ?? loops[0]?.ownerRole ?? scoped[0]?.ownerRole ?? null;
+        }
+        const scopeId = action.targetKind === "work-package" ? action.targetId : moduleId;
+        return {
+          type: "AGENT_WORK_REQUIRED",
+          role: this.boundaryWorkerRole(owner, kind),
+          kind,
+          moduleId,
+          workPackageId: action.targetKind === "work-package" ? action.targetId : null,
+          objective:
+            `Request a ${kind} dispatch for '${scopeId}' with a deterministic rationale, ` +
+            `delegate exactly once to a kind-fitting role, then claim and confirm from the requesting session`,
+        };
+      }
+      case "claim-dispatch":
+      case "confirm-dispatch":
+      case "await-claim": {
+        const pending = this.latestScopeDispatch(moduleId, actionWpId, ["PENDING", "ENACTED"]);
+        const role = this.boundaryWorkerRole(
+          pending?.delegatedAgent ?? null,
+          pending?.kind ?? "implementation"
+        );
+        const named = pending !== null
+          ? `dispatch '${pending.id}' (${pending.status}, kind ${pending.kind})`
+          : "the pending dispatch";
+        return {
+          type: "AGENT_WORK_REQUIRED",
+          role,
+          kind: pending?.kind ?? "implementation",
+          moduleId,
+          workPackageId: actionWpId,
+          objective:
+            action.action === "await-claim"
+              ? `Delegate exactly once to a kind-fitting role, then claim ${named} from the claiming session before it expires`
+              : `Claim ${named} as '${role}' from the requesting session, then confine the worker credential host-side`,
+        };
+      }
+      case "execute-dispatch":
+      case "record-evidence": {
+        const live = this.latestScopeDispatch(moduleId, actionWpId, ["ACTIVE"]);
+        const role = this.boundaryWorkerRole(
+          live?.delegatedAgent ?? null,
+          live?.kind ?? "implementation"
+        );
+        const named = live !== null
+          ? `binding '${live.id}' (kind ${live.kind})`
+          : "the active binding";
+        return {
+          type: "AGENT_WORK_REQUIRED",
+          role,
+          kind: live?.kind ?? "implementation",
+          moduleId,
+          workPackageId: actionWpId,
+          objective:
+            `Execute the confirmed work through ${named} as '${role}': record passing evidence bound to the ` +
+            `exact scope revision, advance the scope through its legal forward step, then release the binding`,
+        };
+      }
+      case "submit-review":
+      case "await-action": {
+        const assigned = this.db.reviewAssignments().listByScope(moduleId, actionWpId)
+          .filter((r) => r.status === "ASSIGNED");
+        const review = assigned[0];
+        if (review === undefined) {
+          return {
+            type: "BLOCKED",
+            code: "REVIEW_UNRESOLVED",
+            reason: `Review hold with no assigned review: ${action.reason}`,
+            owner: "system",
+            recoverable: true,
+          };
+        }
+        return {
+          type: "INDEPENDENT_REVIEW_REQUIRED",
+          role: review.reviewerRole === "glenn" ? "glenn" : "spekkio",
+          kind: review.kind,
+          moduleId,
+          workPackageId: actionWpId,
+          targetRevision: review.targetRevision,
+        };
+      }
+      case "correct-defect": {
+        // Prefer the action's own scope (the loop nextAction
+        // observed), then module scope, then siblings — the boundary
+        // must describe the loop the action names.
+        const preferred = actionWpId !== null
+          ? this.db.correctionLoops().listByScope(moduleId, actionWpId)
+            .filter((l) => l.status === "OPEN" || l.status === "CORRECTING")
+          : [];
+        const loops = this.db.correctionLoops().listByScope(moduleId, null)
+          .filter((l) => l.status === "OPEN" || l.status === "CORRECTING");
+        const scoped = wpId !== null && wpId !== actionWpId
+          ? this.db.correctionLoops().listByScope(moduleId, wpId)
+            .filter((l) => l.status === "OPEN" || l.status === "CORRECTING")
+          : [];
+        const loop = preferred[0] ?? loops[0] ?? scoped[0];
+        if (loop === undefined) {
+          return {
+            type: "BLOCKED",
+            code: "LOOP_UNRESOLVED",
+            reason: `Correction hold with no open loop: ${action.reason}`,
+            owner: "system",
+            recoverable: true,
+          };
+        }
+        return {
+          type: "AGENT_WORK_REQUIRED",
+          role: isAgentRole(loop.ownerRole) ? loop.ownerRole : "belthazar",
+          kind: "correction",
+          moduleId,
+          workPackageId: loop.workPackageId,
+          objective:
+            `Evidence the fix for defect '${loop.defectId}' (loop '${loop.id}', attempt ` +
+            `${loop.attempt}/${loop.maxAttempts}) as the owning role, then complete the loop for re-verification`,
+        };
+      }
+      case "request-completion": {
+        let revision = "";
+        try {
+          revision = this.artifacts.findById(action.targetId).revision;
+        } catch {
+          revision = "";
+        }
+        return {
+          type: "INDEPENDENT_REVIEW_REQUIRED",
+          role: "spekkio",
+          kind: "verification",
+          moduleId,
+          workPackageId: action.targetKind === "work-package" ? action.targetId : null,
+          targetRevision: revision,
+        };
+      }
+      case "record-harness": {
+        let revision = "";
+        try {
+          revision = this.artifacts.findById(action.targetId).revision;
+        } catch {
+          revision = "";
+        }
+        return {
+          type: "AGENT_WORK_REQUIRED",
+          role: "gaspar",
+          kind: "harness",
+          moduleId,
+          workPackageId: null,
+          objective:
+            `Author and record the Harness for spec '${action.targetId}' at revision ${revision}: ` +
+            `content plus its hash are creative input the Core never fabricates`,
+        };
+      }
+      case "blocked": {
+        const active = this.blockers.findActive([action.targetId, moduleId]);
+        const first = active[0];
+        if (first === undefined) {
+          return {
+            type: "BLOCKED",
+            code: "BLOCKER_UNRESOLVED",
+            reason: `Blocker hold with no active blocker: ${action.reason}`,
+            owner: "system",
+            recoverable: true,
+          };
+        }
+        return {
+          type: "BLOCKED",
+          code: first.type,
+          reason: `Blocker '${first.id}': ${first.reason}`,
+          owner: this.blockedOwner(first.issuerRole),
+          recoverable: true,
+        };
+      }
+      case "authorize-work": {
+        return {
+          type: "BLOCKED",
+          code: "NO_EXECUTABLE_SCOPE",
+          reason: `No executable scope exists yet: ${action.reason}`,
+          owner: "PO",
+          recoverable: true,
+        };
+      }
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Consume one safe-mechanical action through the SAME guarded
+   * operation the corresponding native tool calls. Returns the
+   * observed action on success, the follow scope when an
+   * `advance-module` pointer redirects into a package scope, or the
+   * denial when the operation refuses (the loop then surfaces
+   * BLOCKED with the exact denial — never a partial write, since
+   * every operation below is itself transactional).
+   */
+  private advanceConsume(
+    action: NextAction,
+    scope: { moduleId?: string; workPackageId?: string },
+    auth: CallerAuth
+  ): {
+    ok: true;
+    action: NextAction;
+    followScope?: { moduleId?: string; workPackageId?: string };
+  } | {
+    ok: false;
+    code: string;
+    reason: string;
+  } {
+    const moduleId = scope.workPackageId !== undefined
+      ? this.workPackageModule(scope.workPackageId)
+      : (scope.moduleId as string);
+    const fail = (code: string, reason: string): { ok: false; code: string; reason: string } => ({ ok: false, code, reason });
+    const guardContext = { actor: auth.actor, session: auth.session };
+    switch (action.action) {
+      case "submit-architecture": {
+        const res = this.submitArchitectureForReview(auth);
+        return res.ok ? { ok: true, action } : fail(res.error?.code ?? "EXECUTION_DENIED", res.error?.message ?? "architecture submission denied");
+      }
+      case "approve-architecture": {
+        const res = this.approveArchitecture(auth);
+        return res.ok ? { ok: true, action } : fail(res.error?.code ?? "EXECUTION_DENIED", res.error?.message ?? "architecture approval denied");
+      }
+      case "submit-spec":
+      case "ready-spec": {
+        const eventType = action.action === "submit-spec" ? "SpecSubmittedForReview" : "SpecApprovedReady";
+        const res = this.transitionState(action.targetId, eventType, guardContext);
+        return res.ok ? { ok: true, action } : fail(res.error?.code ?? "EXECUTION_DENIED", res.error?.message ?? "spec transition denied");
+      }
+      case "activate-module": {
+        const res = this.activateModule(action.targetId, auth);
+        return res.ok ? { ok: true, action } : fail(res.error?.code ?? "EXECUTION_DENIED", res.error?.message ?? "module activation denied");
+      }
+      case "authorize-wp": {
+        const res = this.transitionState(action.targetId, "WorkPackageAuthorized", guardContext);
+        return res.ok ? { ok: true, action } : fail(res.error?.code ?? "EXECUTION_DENIED", res.error?.message ?? "work-package authorization denied");
+      }
+      case "assign-review": {
+        const res = this.assignReview(
+          {
+            kind: action.kind ?? "verification",
+            moduleId,
+            ...(action.targetKind === "work-package" ? { workPackageId: action.targetId } : {}),
+          },
+          auth
+        );
+        return res.ok ? { ok: true, action } : fail(res.error?.code ?? "EXECUTION_DENIED", res.error?.message ?? "review assignment denied");
+      }
+      case "complete-module": {
+        const res = this.completeModule(action.targetId, auth);
+        return res.ok ? { ok: true, action } : fail(res.error?.code ?? "EXECUTION_DENIED", res.error?.message ?? "module completion denied");
+      }
+      case "advance-module": {
+        // Informative pointer, not an execution: follow into the
+        // first incomplete package directly (computed here, never
+        // parsed from prose) or surface the aggregate denial below.
+        const incomplete = this.moduleWorkPackages(moduleId).filter((id) => {
+          try {
+            return this.artifacts.findById(id).status !== "COMPLETE";
+          } catch {
+            return true;
+          }
+        });
+        if (incomplete.length > 0) {
+          return { ok: true, action, followScope: { workPackageId: incomplete[0]! } };
+        }
+        return fail("COMPLETION_DENIED", action.reason);
+      }
+      default:
+        return fail("NOT_MECHANICAL", `Action '${action.action}' needs external input and is never auto-executed`);
     }
   }
 
