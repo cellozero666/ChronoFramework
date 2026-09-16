@@ -195,6 +195,18 @@ actually activated". After a failed first message, `doctor` tells
 you whether the plugin ever loaded and injected, without exposing
 any credential.
 
+Each plugin load also records its generation handshake (CHRONO
+version, tool policy version, deterministic build fingerprint, and
+per-load process identifier), surfaced as `runtimeStatus` in
+`doctor --json` and in the human `activation:` line. When the loaded
+generation disagrees with the installed expectations — e.g. plugin
+files were repaired or upgraded while OpenCode kept running —
+`doctor` blocks with `RUNTIME_RESTART_REQUIRED` (exit 1) instead of
+reporting readiness. The fix is always a complete OpenCode
+termination followed by a fresh process: rerunning `chrono init`
+repairs files on disk but never hot-reloads the running runtime,
+and the blocker clears automatically on the fresh load event.
+
 ### Project resolution (which directory is the project?)
 
 Every command resolves the project the same way, after canonicalizing

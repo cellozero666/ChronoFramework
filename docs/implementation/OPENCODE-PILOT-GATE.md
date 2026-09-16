@@ -1247,7 +1247,10 @@ The real test may start only when:
 3. a packed, isolated CHRONO installation passes `chrono init --dry-run` and
    non-paid setup smoke checks;
 4. `chrono doctor` reports the selected OpenCode adapter, authoritative RTK
-   proof, managed assets, broker, and Gaspar entry as ready;
+   proof, managed assets, broker, and Gaspar entry as ready, with no
+   `RUNTIME_RESTART_REQUIRED` block (the loaded plugin generation must
+   match the installed files — a fresh OpenCode process, not a repaired
+   one, proves it);
 5. the implementer provides a redacted step-by-step acceptance script and
    expected results;
 6. no Claude/Kiro absence is treated as a blocker when only OpenCode was
@@ -1282,6 +1285,10 @@ Using a disposable project and release-shaped packed packages, record:
 - one read-only operation and one harmless mutable operation reaching the live
   Core policy path;
 - restart/session renewal and persisted-state resume;
+- complete OpenCode termination followed by a fresh process whenever
+  plugin generation changes (`chrono init` repair alone never
+  hot-reloads the running runtime; `doctor` must block with
+  `RUNTIME_RESTART_REQUIRED` before the restart and clear after it);
 - denial on hook drift, expired/revoked credentials, missing Core, missing
   entry script, invalid projection, and RTK/asset drift;
 - redacted transcript, exit codes, hashes, audit references, and actual cost.

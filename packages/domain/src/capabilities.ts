@@ -17,7 +17,10 @@
  * No runtime-specific concepts [FW §22].
  */
 
+import { createHash } from "node:crypto";
 import type { AgentRole } from "./state.js";
+import { canonicalizeJson } from "./planning.js";
+import { SKILL_RELEASE } from "./release.js";
 
 /** Version of this authority policy, persisted with authorization evidence. */
 export const AUTHORITY_POLICY_VERSION = "9";
@@ -25,9 +28,11 @@ export const AUTHORITY_POLICY_VERSION = "9";
 /**
  * Version of the runtime tool-classification policy below. Bumped
  * independently from the authority matrix: tool classification affects
- * pre-tool gate decisions, never grant semantics.
+ * pre-tool gate decisions, never grant semantics. v8 classifies the
+ * planning-runway tools (architecture/spec/harness advancement), so a
+ * v7-loaded runtime is stale by definition.
  */
-export const TOOL_POLICY_VERSION = "7";
+export const TOOL_POLICY_VERSION = "8";
 
 export type CapabilityHolder = AgentRole | "PO";
 
@@ -256,6 +261,16 @@ export const OPENCODE_TOOL_POLICY: Record<string, ToolClassification> = {
   chrono_module_complete: "lifecycle",
   chrono_module_activate: "lifecycle",
   chrono_review_reconcile: "lifecycle",
+  // Planning-runway advancement (pilot repair): the pre-activation
+  // architecture/spec/harness operations are capability-gated state
+  // operations like the rest of the lifecycle surface — entry plus
+  // Core role/scope checks at the gate, every deeper check in Core.
+  chrono_architecture_submit: "lifecycle",
+  chrono_architecture_approve: "lifecycle",
+  chrono_spec_submit: "lifecycle",
+  chrono_spec_ready: "lifecycle",
+  chrono_spec_needs_revision: "lifecycle",
+  chrono_harness_record: "lifecycle",
   chrono_wp_authorize: "lifecycle",
   chrono_deep_check: "lifecycle",
   chrono_policy_set: "lifecycle",
@@ -294,6 +309,38 @@ export function classifyOpencodeTool(tool: string): ToolClassification | undefin
     return undefined;
   }
   return OPENCODE_TOOL_POLICY[tool];
+}
+
+/**
+ * Deterministic runtime/build fingerprint (single source of truth
+ * for plugin-generation identity): SHA-256 over the canonical tool
+ * policy (version + every classified tool) and the managed skill
+ * pin. Any tool addition, removal, reclassification, policy bump,
+ * or skill-pin change produces a different fingerprint, so old and
+ * new plugin generations are distinguishable without timestamps or
+ * operator memory. Optional overrides exist ONLY so tests can derive
+ * what a past generation's fingerprint would have been; production
+ * callers always use the canonical constants.
+ */
+export function buildRuntimeFingerprint(
+  policy: Record<string, ToolClassification> = OPENCODE_TOOL_POLICY,
+  skill: { readonly pinnedCommit: string; readonly sourceHash: string } = SKILL_RELEASE
+): string {
+  const tools = Object.keys(policy)
+    .sort()
+    .map((name) => `${name}:${policy[name] as string}`);
+  const digest = createHash("sha256")
+    .update(
+      canonicalizeJson({
+        authorityPolicy: AUTHORITY_POLICY_VERSION,
+        toolPolicy: TOOL_POLICY_VERSION,
+        tools,
+        skill: { commit: skill.pinnedCommit, hash: skill.sourceHash },
+      }),
+      "utf8"
+    )
+    .digest("hex");
+  return `sha256:${digest}`;
 }
 
 /**

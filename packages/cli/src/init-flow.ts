@@ -37,6 +37,8 @@ import { ChronoCore } from "@chrono/core";
 import {
   OPENCODE_TOOLS_PACKAGE_MARKER,
   SKILL_RELEASE,
+  TOOL_POLICY_VERSION,
+  buildRuntimeFingerprint,
   buildSessionAuthorizationPayload,
   computeRevisionHash,
   setupStepIndex,
@@ -2203,6 +2205,31 @@ export interface DoctorReport {
      * Build. Model self-identification is never consulted here.
      */
     readonly observed: boolean;
+    /**
+     * Latest OpenCode plugin load observed in this project's runtime
+     * evidence (stale-loaded-plugin repair): the generation handshake
+     * the loaded process reported — CHRONO version, tool policy,
+     * deterministic build fingerprint, per-load process identifier —
+     * or null when no load was ever recorded. Rows predating the
+     * handshake carry no generation claim and leave this null.
+     */
+    readonly latestPluginLoad: {
+      readonly at: string;
+      readonly loadId: string | null;
+      readonly chronoVersion: string | null;
+      readonly toolPolicyVersion: string | null;
+      readonly buildFingerprint: string | null;
+    } | null;
+    /**
+     * Generation agreement between the latest loaded plugin and the
+     * installed expectations: "current" (match), "stale" (an older
+     * generation is still loaded — restart OpenCode), "unknown" (no
+     * generation-claiming load was ever recorded; neutral, never
+     * blocking on its own).
+     */
+    readonly runtimeStatus: "current" | "stale" | "unknown";
+    /** Human explanation of the runtime status above. */
+    readonly runtimeDetail: string;
     readonly lastInjection: {
       readonly at: string;
       readonly session: string;
@@ -2289,6 +2316,60 @@ export interface DoctorReport {
 /** Hidden OpenCode system agents: never confuse them with the selected primary. */
 const OPENCODE_HIDDEN_AGENTS = new Set(["compaction", "title", "summary"]);
 
+/**
+ * Expected plugin generation: the running launcher's own identity.
+ * Any loaded generation that disagrees on any component is older by
+ * definition (versions and fingerprints only move forward).
+ */
+export function expectedPluginGeneration(): {
+  readonly chronoVersion: string;
+  readonly toolPolicyVersion: string;
+  readonly buildFingerprint: string;
+} {
+  return {
+    chronoVersion: CHRONO_VERSION,
+    toolPolicyVersion: TOOL_POLICY_VERSION,
+    buildFingerprint: buildRuntimeFingerprint(),
+  };
+}
+
+/**
+ * Generation agreement for one observed plugin load (stale-loaded
+ * runtime repair): "current" only on a full handshake match;
+ * "stale" when the load claims a generation that disagrees;
+ * "unknown" when the load carries no generation claim at all
+ * (pre-handshake rows) or when nothing was ever recorded — neutral,
+ * never blocking on its own. Old code runs old bytes: a mismatch
+ * always means the loaded process predates the installed
+ * expectations, never the reverse.
+ */
+export function pluginLoadStatus(
+  latest: DoctorReport["activation"]["latestPluginLoad"],
+  expected: { readonly chronoVersion: string; readonly toolPolicyVersion: string; readonly buildFingerprint: string } = expectedPluginGeneration()
+): { readonly status: "current" | "stale" | "unknown"; readonly detail: string } {
+  if (latest === null) {
+    return { status: "unknown", detail: "no plugin load was ever recorded for this project" };
+  }
+  if (latest.chronoVersion === null || latest.toolPolicyVersion === null || latest.buildFingerprint === null) {
+    return { status: "unknown", detail: `plugin load at ${latest.at} predates generation tracking: currency unprovable either way` };
+  }
+  if (
+    latest.chronoVersion !== expected.chronoVersion ||
+    latest.toolPolicyVersion !== expected.toolPolicyVersion ||
+    latest.buildFingerprint !== expected.buildFingerprint
+  ) {
+    return {
+      status: "stale",
+      detail:
+        `loaded plugin generation (chrono ${latest.chronoVersion}, tool policy v${latest.toolPolicyVersion}, ` +
+        `fingerprint ${latest.buildFingerprint.slice(0, 16)}…) disagrees with the installed expectations ` +
+        `(chrono ${expected.chronoVersion}, tool policy v${expected.toolPolicyVersion}, ` +
+        `fingerprint ${expected.buildFingerprint.slice(0, 16)}…): fully terminate OpenCode and open a fresh process`,
+    };
+  }
+  return { status: "current", detail: `loaded plugin generation matches the installed expectations (load ${latest.loadId ?? "unknown"} at ${latest.at})` };
+}
+
 export function readActivationEvidence(projectRoot: string): DoctorReport["activation"] {
   const absent = (detail: string): DoctorReport["activation"] => ({
     observed: false,
@@ -2298,6 +2379,9 @@ export function readActivationEvidence(projectRoot: string): DoctorReport["activ
     selectedAgent: null,
     defaultAgent: null,
     pluginLoads: 0,
+    latestPluginLoad: null,
+    runtimeStatus: "unknown",
+    runtimeDetail: "no plugin load was ever recorded for this project",
     detail,
   });
   let raw: string;
@@ -2307,6 +2391,7 @@ export function readActivationEvidence(projectRoot: string): DoctorReport["activ
     return absent("no runtime activation evidence recorded: static assets alone never prove Gaspar activation — open OpenCode in this project and send a message, then re-run chrono doctor");
   }
   let loads = 0;
+  let latestPluginLoad: DoctorReport["activation"]["latestPluginLoad"] = null;
   let lastInjection: DoctorReport["activation"]["lastInjection"] = null;
   let lastBlock: DoctorReport["activation"]["lastBlock"] = null;
   // Latest injection and visible primary-agent selection per session
@@ -2333,6 +2418,16 @@ export function readActivationEvidence(projectRoot: string): DoctorReport["activ
     }
     if (entry["kind"] === "plugin-load") {
       loads += 1;
+      // Latest load wins: after a restart the fresh process appends
+      // a new row, so generation comparison is always against the
+      // currently loaded plugin, never history.
+      latestPluginLoad = {
+        at: typeof entry["ts"] === "string" ? entry["ts"] : "unknown-time",
+        loadId: typeof entry["loadId"] === "string" ? entry["loadId"] : null,
+        chronoVersion: typeof entry["chronoVersion"] === "string" ? entry["chronoVersion"] : null,
+        toolPolicyVersion: typeof entry["toolPolicyVersion"] === "string" ? entry["toolPolicyVersion"] : null,
+        buildFingerprint: typeof entry["buildFingerprint"] === "string" ? entry["buildFingerprint"] : null,
+      };
     } else if (entry["kind"] === "projection-injected") {
       if (
         typeof entry["ts"] === "string" &&
@@ -2390,6 +2485,7 @@ export function readActivationEvidence(projectRoot: string): DoctorReport["activ
       gasparSession = session;
     }
   }
+  const runtime = pluginLoadStatus(latestPluginLoad);
   if (gasparSession === null) {
     if (lastInjection === null) {
       return {
@@ -2400,6 +2496,9 @@ export function readActivationEvidence(projectRoot: string): DoctorReport["activ
         selectedAgent,
         defaultAgent: null,
         pluginLoads: loads,
+        latestPluginLoad,
+        runtimeStatus: runtime.status,
+        runtimeDetail: runtime.detail,
         detail:
           lastBlock !== null
             ? `plugin ran but the last entry attempt was blocked (${lastBlock.code} at ${lastBlock.at}): run chrono doctor for recovery, then send a new OpenCode message`
@@ -2421,6 +2520,9 @@ export function readActivationEvidence(projectRoot: string): DoctorReport["activ
       selectedAgent,
       defaultAgent: null,
       pluginLoads: loads,
+      latestPluginLoad,
+      runtimeStatus: runtime.status,
+      runtimeDetail: runtime.detail,
       detail,
     };
   }
@@ -2432,6 +2534,9 @@ export function readActivationEvidence(projectRoot: string): DoctorReport["activ
     selectedAgent,
     defaultAgent: null,
     pluginLoads: loads,
+    latestPluginLoad,
+    runtimeStatus: runtime.status,
+    runtimeDetail: runtime.detail,
     detail: `session '${gasparSession}' selected Gaspar as primary agent with projection and skill context injected before generation`,
   };
 }
@@ -2656,6 +2761,9 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
     selectedAgent: null,
     defaultAgent: null,
     pluginLoads: 0,
+    latestPluginLoad: null,
+    runtimeStatus: "unknown",
+    runtimeDetail: "no plugin load was ever recorded for this project",
     detail: "no runtime activation evidence recorded",
   };
   const report: DoctorReport = {
@@ -2890,6 +2998,21 @@ export function runDoctor(projectPath: string, options: DoctorOptions = {}): Cli
         detail: `${activationBase.detail}; note: project default_agent is now '${defaultAgent}' — re-run chrono init to restore 'gaspar'`,
       };
     }
+    // Stale loaded runtime (generation handshake): repaired disk files
+    // never prove the live OpenCode process reloaded them. While the
+    // latest observed plugin load disagrees with the installed
+    // expectations, readiness is blocked until a full OpenCode restart
+    // loads a matching generation — which then clears automatically
+    // when its fresh load row becomes latest. Unknown (no generation
+    // claim ever recorded) stays neutral: static setup gates are
+    // unaffected by a runtime that never ran here.
+    if (activationBase.runtimeStatus === "stale") {
+      reasons.push(`RUNTIME_RESTART_REQUIRED: ${activationBase.runtimeDetail}`);
+      activation = {
+        ...activation,
+        detail: `${activation.detail} (blocking: ${activationBase.runtimeDetail})`,
+      };
+    }
     const filled: DoctorReport = {
       found: true,
       projectRoot: root,
@@ -3019,6 +3142,7 @@ function renderDoctor(report: DoctorReport): string {
     [
       "activation:",
       report.activation.observed ? "OBSERVED" : "NO RUNTIME EVIDENCE",
+      `runtime=${report.activation.runtimeStatus}`,
       `default_agent=${report.activation.defaultAgent ?? "(unknown)"}`,
       `selected=${report.activation.selectedAgent ?? "(unobserved)"}`,
       report.activation.lastInjection !== null

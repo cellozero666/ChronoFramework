@@ -12,18 +12,44 @@ import {
   DISPATCHABLE_WORKER_ROLES,
   OPENCODE_TOOL_POLICY,
   TOOL_POLICY_VERSION,
+  buildRuntimeFingerprint,
   classifyOpencodeTool,
   isDispatchableWorkerRole,
 } from "./index.js";
 
 describe("OpenCode tool policy (dispatch repair)", () => {
-  it("is versioned at v7", () => {
-    expect(TOOL_POLICY_VERSION).toBe("7");
+  it("is versioned at v8", () => {
+    expect(TOOL_POLICY_VERSION).toBe("8");
   });
 
   it("classifies activation and reconcile as lifecycle tools", () => {
     expect(classifyOpencodeTool("chrono_module_activate")).toBe("lifecycle");
     expect(classifyOpencodeTool("chrono_review_reconcile")).toBe("lifecycle");
+  });
+
+  it("classifies the planning-runway tools as lifecycle tools", () => {
+    for (const tool of [
+      "chrono_architecture_submit",
+      "chrono_architecture_approve",
+      "chrono_spec_submit",
+      "chrono_spec_ready",
+      "chrono_spec_needs_revision",
+      "chrono_harness_record",
+    ]) {
+      expect(classifyOpencodeTool(tool)).toBe("lifecycle");
+    }
+  });
+
+  it("emits a deterministic runtime fingerprint sensitive to policy, tools, and skill pin", () => {
+    const first = buildRuntimeFingerprint();
+    expect(first).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(buildRuntimeFingerprint()).toBe(first);
+    // Any classification change alters the generation identity.
+    const without = { ...OPENCODE_TOOL_POLICY };
+    delete without["chrono_harness_record"];
+    expect(buildRuntimeFingerprint(without)).not.toBe(first);
+    const reworded = { ...OPENCODE_TOOL_POLICY, chrono_next: "planning" as const };
+    expect(buildRuntimeFingerprint(reworded)).not.toBe(first);
   });
 
   it("classifies the real delegation tool explicitly, never broadly", () => {

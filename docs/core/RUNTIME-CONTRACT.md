@@ -63,6 +63,12 @@ Reference: `[FW §194-255]`, `[DOM §2.2]`.
 | `chrono artifact propose` | Gaspar/PO session | Propose and materialize a planning draft (DRAFT, untrusted) |
 | `chrono artifact revise` | Gaspar/PO session | Revise a planning draft (stales prior approvals) |
 | `chrono artifact status` | Gaspar/PO session | Safe planning status projection (no secrets) |
+| `chrono architecture-submit` | Gaspar/PO session | Submit the proposed architecture for review (planning runway) |
+| `chrono architecture-approve` | Gaspar/PO session | Approve the architecture (needs a current architecture-security approval) |
+| `chrono spec-submit` | Gaspar/PO session | Submit a DRAFT spec for review (planning runway) |
+| `chrono spec-ready` | Gaspar/PO session | Release a reviewed spec to READY (needs architecture-security, Harness, unblocked) |
+| `chrono spec-needs-revision` | Gaspar/PO session | Return a spec to DRAFT for revision (planning runway) |
+| `chrono harness-record` | Gaspar/PO session | Record the authoritative Harness for an exact Spec revision (planning runway) |
 
 ### 3.2 `chrono gate` interface
 
@@ -424,6 +430,8 @@ Each runtime adapter MUST demonstrate:
 5. **No hardcoded model**: No provider/model/version string in adapter source or defaults. `[INV §11.2]`.
 
 If any conformance point cannot be proven, the runtime adapter is non-conformant and the Core MUST deny dispatch for that runtime. `[INV §15.1]`.
+
+6. **Runtime generation handshake**: every OpenCode plugin load records its generation (CHRONO version, tool policy version, deterministic build fingerprint over the canonical tool policy and managed skill pin, per-load process identifier). `chrono doctor` compares the latest observed load against the installed expectations: a mismatch reports the blocking condition `RUNTIME_RESTART_REQUIRED` (exit 1) until a complete OpenCode termination followed by a fresh process loads a matching generation — which clears automatically on its fresh load event. Repaired disk files alone never report runtime readiness. Rerunning `chrono init` does not hot-reload a running OpenCode process.
 
 ---
 

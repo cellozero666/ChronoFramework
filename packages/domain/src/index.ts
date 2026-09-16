@@ -138,6 +138,7 @@ export {
   OPENCODE_TOOL_POLICY,
   ROLE_CAPABILITIES,
   TOOL_POLICY_VERSION,
+  buildRuntimeFingerprint,
   classifyOpencodeTool,
   isCapable,
   isDispatchableWorkerRole,

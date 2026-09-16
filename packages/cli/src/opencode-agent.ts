@@ -211,6 +211,38 @@ export const GASPAR_NEXT_ACTION_MAP: Record<string, GasparNextActionRoute> = {
     hold: "Terminal state: no further action. Report completion from Core state.",
     note: "Module COMPLETE.",
   },
+  "submit-architecture": {
+    tool: "chrono_architecture_submit", args: [],
+    hold: null,
+    note: "Proposed architecture not yet under review: submit it (planning runway, Core-ordered).",
+  },
+  "approve-architecture": {
+    tool: "chrono_architecture_approve", args: [],
+    hold: null,
+    note: "Architecture under review with a current architecture-security approval: enact approval (no ceremony needed when the approval already stands).",
+  },
+  "request-approval": {
+    tool: "chrono_approval_request",
+    args: ["action (from the action kind)", "scope (from the target)", "revision (current)"],
+    hold: "The PO answers VIA THE NATIVE question tool (one ticket per question; the Approve label names the challenge); then re-query chrono_next and verify the landing — never assume.",
+    note: "A PO ceremony is the missing prerequisite (architecture-security or planning-approval for the exact revision).",
+  },
+  "submit-spec": {
+    tool: "chrono_spec_submit", args: ["spec (from the target)"],
+    hold: null,
+    note: "DRAFT spec with a current planning-approval: submit it for review (planning runway, Core-ordered).",
+  },
+  "record-harness": {
+    tool: "chrono_harness_record",
+    args: ["revision (current)", "contentHash", "content"],
+    hold: null,
+    note: "REVIEW spec with no current Harness: record it (harnesses take no approval ceremony).",
+  },
+  "ready-spec": {
+    tool: "chrono_spec_ready", args: ["spec (from the target)"],
+    hold: null,
+    note: "REVIEW spec passing readiness gates: release it to READY (planning runway, Core-ordered).",
+  },
 };
 
 /**
@@ -244,11 +276,11 @@ function gasparCeremonyVerification(): string {
     "- If the approval did not land, diagnose by the ceremony kind and repeat correctly instead of proceeding: `approval-multi-ticket` → split into one-ticket questions; `approval-answer-no-match` → the answer did not echo the challenge, re-ask with the challenge in the label; `approval-no-session` → reopen OpenCode so entry redeems; `approval-no-key` → the PO signing key is unavailable, stop for the PO; `approval-ticket-not-live` → ticket consumed, expired, or stale, re-request for the current revision; `approval-record-denied` → quote the Core code and fix the named cause.",
     "- A `chrono_next` hold (`await-approval`, `approve-security`) clears only when the Core reports the approval current — never when the UI merely showed an answer.",
     "",
-    "## Planning runway (pre-activation order — native tools only, never file edits)",
+    "## Planning runway (Core-ordered — no separate map here)",
     "",
-    "- Architecture first: `chrono_architecture_submit`, then the `architecture-security` ceremony if no current approval stands (skip the ceremony when one already does — re-requesting denies as duplicate), then `chrono_architecture_approve`. File edits never move architecture state.",
-    "- Then per spec, in order: `chrono_spec_submit` → `architecture-security` ceremony for the exact spec revision → `chrono_harness_record` (harnesses take no approval ceremony) → `chrono_spec_ready`. A spec whose content changed needs its approvals re-issued for the new revision: freeze content before approving, or the cycle repeats.",
-    "- Only with every module spec READY does `chrono_module_activate` succeed; only then do `chrono_wp_authorize` and dispatch follow.",
+    "- Pre-activation planning has no workflow of its own in this contract: query `chrono_next` on the module and follow exactly what it returns. The Core orders architecture submission/approval, spec submission, harness recording, and READY transitions deterministically (see the Next-action map rows above); this prose never overrides, reorders, or duplicates that order.",
+    "- File edits never move lifecycle state (a file revision without a Core transition is prose, not progress). A spec whose content changed needs its approvals re-issued for the new revision: freeze content before approving, or the stale cycle repeats.",
+    "- Only with every module spec READY does `chrono_module_activate` succeed; only then do `chrono_wp_authorize` and dispatch follow — because the Core says so through `chrono_next`, not because this file lists the order.",
   ].join("\n");
 }
 

@@ -129,12 +129,12 @@ function fakeTty(): () => void {
   };
 }
 
-/** Deep-check finding names owned by the CF-12 reachability audit. */
+/** Deep-check finding names owned by the reachability audit. */
 const REACHABILITY_CHECKS = [
   "approval-without-activation",
+  "activation-authority-invalid",
   "premature-review",
   "unreachable-next-action",
-  "missing-transition-surface",
 ];
 
 describe("Transition reachability (every nonterminal MOD/WP state)", () => {

@@ -136,7 +136,9 @@ export type CheckableAction =
   | "activate-module" | "authorize-wp" | "request-dispatch" | "assign-review"
   | "claim-dispatch" | "confirm-dispatch" | "submit-review"
   | "request-completion" | "complete-module" | "record-evidence"
-  | "correct-defect" | "request-correction";
+  | "correct-defect" | "request-correction"
+  | "submit-architecture" | "approve-architecture"
+  | "submit-spec" | "record-harness" | "ready-spec";
 
 /**
  * Every action value `nextAction` can return (CF2-3 single source):
@@ -166,13 +168,25 @@ export const NEXT_ACTIONS = [
   "authorize-work",
   "blocked",
   "done",
+  "submit-architecture",
+  "approve-architecture",
+  "request-approval",
+  "submit-spec",
+  "record-harness",
+  "ready-spec",
 ] as const;
 
 export type NextActionValue = (typeof NEXT_ACTIONS)[number];
 
 export interface NextAction {
   readonly action: string;
-  readonly targetKind: "module" | "work-package";
+  /**
+   * Scope family the action targets: lifecycle scopes (module,
+   * work-package) plus planning-runway scopes (architecture, spec).
+   * Runway actions name their exact target so the orchestrator never
+   * guesses which architecture revision or spec revision to advance.
+   */
+  readonly targetKind: "module" | "work-package" | "architecture" | "spec";
   readonly targetId: string;
   readonly summary: string;
   readonly reason: string;
@@ -180,9 +194,10 @@ export interface NextAction {
   readonly alsoReady?: string[];
   readonly escalation?: string;
   /**
-   * Dispatch/review kind carried by kind-parameterized actions
-   * (`request-dispatch`, `assign-review`): the exact kind the dry-run
-   * accepted, so callers never guess it.
+   * Kind carried by kind-parameterized actions (`request-dispatch`,
+   * `assign-review`, `request-approval`): the exact kind the dry-run
+   * accepted (dispatch/review kind, or the approval action for
+   * `request-approval`), so callers never guess it.
    */
   readonly kind?: string;
 }
@@ -1313,9 +1328,20 @@ export class ChronoCore {
    * registrar exists so the READY gate can verify Harness existence and
    * freshness deterministically [P5.6, P7.5].
    */
-  recordHarness(specRevision: string, contentHash: string, content: string, auth: CallerAuth): CoreResult<string> {
+  /**
+   * Pure harness-record validation (runway shared precondition
+   * source): identical checks to `recordHarness` with zero
+   * persistence — capability, revision/hash shapes, non-empty
+   * content, and ownership by a known Specification revision.
+   */
+  checkHarnessRecord(
+    specRevision: string,
+    contentHash: string,
+    content: string,
+    caller: ResolvedCaller
+  ): CoreResult<{ ownerId: string }> {
     try {
-      this.resolveCaller(auth, "record harness");
+      this.requireCapability("harness.record", caller);
       if (!isRevisionHash(specRevision)) {
         throw new ChronoError({
           code: ErrorCode.VALIDATION_ERROR,
@@ -1358,8 +1384,20 @@ export class ChronoCore {
           suggestedAction: "Register the Spec revision before its Harness",
         });
       }
+      return { ok: true, value: { ownerId: owner.id } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
 
+  recordHarness(specRevision: string, contentHash: string, content: string, auth: CallerAuth): CoreResult<string> {
+    try {
       const harnessActor = this.requireCapability("harness.record", this.resolveCaller(auth, "record harness"));
+      const readiness = this.checkHarnessRecord(specRevision, contentHash, content, harnessActor);
+      if (!readiness.ok) {
+        return readiness as unknown as CoreResult<string>;
+      }
+      const owner = { id: readiness.value!.ownerId };
       const record = this.harnesses.create({
         specRevision,
         contentHash,
@@ -1435,37 +1473,34 @@ export class ChronoCore {
     }
   }
 
-  /** Move proposed architecture to security/architecture review. */
-  submitArchitectureForReview(auth: CallerAuth): CoreResult<string> {
+  /**
+   * Pure architecture-submission readiness (runway shared
+   * precondition source): identical checks to
+   * `submitArchitectureForReview` with zero persistence, so
+   * `nextAction`, `deep_check`, and the reachability meta-test can
+   * dry-run submission through the same gates the operation runs.
+   */
+  checkArchitectureSubmit(caller: ResolvedCaller): CoreResult<{ fromState: string }> {
     try {
-      const submitter = this.requireCapability("architecture.enact", this.resolveCaller(auth, "submit architecture"));
+      this.requireCapability("architecture.enact", caller);
       const project = this.projects.findById("default");
       const fromState = project.architectureState ?? "proposed";
       validateTransition("ARCHITECTURE", fromState, "under_review", "ArchitectureReviewed");
-      this.projects.setArchitecture("default", project.architectureId, project.architectureRevision, "under_review");
-      this.events.append({
-        eventType: "StateTransition",
-        entityId: "ARCH",
-        payload: { entityType: "ARCHITECTURE", eventType: "ArchitectureReviewed", fromState, toState: "under_review" },
-        actor: submitter.auditActor,
-        priorState: fromState,
-        newState: "under_review",
-        reasoning: "Architecture submitted for review",
-      });
-      this.syncProjectState();
-      return { ok: true, value: project.architectureRevision ?? "" };
+      return { ok: true, value: { fromState } };
     } catch (e) {
       return this.handleError(e);
     }
   }
 
   /**
-   * Approve architecture. Requires a valid Architecture Security Approval
-   * bound to the exact architecture revision [P4.4, STATE §2.5].
+   * Pure architecture-approval readiness (runway shared precondition
+   * source): identical checks to `approveArchitecture` with zero
+   * persistence — capability, exact-revision security approval, and
+   * legal transition.
    */
-  approveArchitecture(auth: CallerAuth): CoreResult<string> {
+  checkArchitectureApprove(caller: ResolvedCaller): CoreResult<{ revision: string; fromState: string }> {
     try {
-      const verifiedActor = this.requireCapability("architecture.enact", this.resolveCaller(auth, "approve architecture"));
+      this.requireCapability("architecture.enact", caller);
       const project = this.projects.findById("default");
       const revision = project.architectureRevision;
       if (revision === null) {
@@ -1490,6 +1525,53 @@ export class ChronoCore {
       }
       const fromState = project.architectureState ?? "under_review";
       validateTransition("ARCHITECTURE", fromState, "approved", "ArchitectureSecurityApproved");
+      return { ok: true, value: { revision, fromState } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /** Move proposed architecture to security/architecture review. */
+  submitArchitectureForReview(auth: CallerAuth): CoreResult<string> {
+    try {
+      const submitter = this.requireCapability("architecture.enact", this.resolveCaller(auth, "submit architecture"));
+      const readiness = this.checkArchitectureSubmit(submitter);
+      if (!readiness.ok) {
+        return readiness as unknown as CoreResult<string>;
+      }
+      const project = this.projects.findById("default");
+      const fromState = readiness.value!.fromState;
+      this.projects.setArchitecture("default", project.architectureId, project.architectureRevision, "under_review");
+      this.events.append({
+        eventType: "StateTransition",
+        entityId: "ARCH",
+        payload: { entityType: "ARCHITECTURE", eventType: "ArchitectureReviewed", fromState, toState: "under_review" },
+        actor: submitter.auditActor,
+        priorState: fromState,
+        newState: "under_review",
+        reasoning: "Architecture submitted for review",
+      });
+      this.syncProjectState();
+      return { ok: true, value: project.architectureRevision ?? "" };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
+   * Approve architecture. Requires a valid Architecture Security Approval
+   * bound to the exact architecture revision [P4.4, STATE §2.5].
+   */
+  approveArchitecture(auth: CallerAuth): CoreResult<string> {
+    try {
+      const verifiedActor = this.requireCapability("architecture.enact", this.resolveCaller(auth, "approve architecture"));
+      const readiness = this.checkArchitectureApprove(verifiedActor);
+      if (!readiness.ok) {
+        return readiness as unknown as CoreResult<string>;
+      }
+      const project = this.projects.findById("default");
+      const revision = readiness.value!.revision;
+      const fromState = readiness.value!.fromState;
       this.projects.setArchitecture("default", project.architectureId, revision, "approved");
       this.events.append({
         eventType: "StateTransition",
@@ -9536,11 +9618,85 @@ export class ChronoCore {
     return firstUnmet;
   }
 
+  /**
+   * Resolve the spec a runway dry-run evaluates: the explicitly
+   * named spec, else the module's first non-READY spec in
+   * registration order — the exact selection rule `nextAction`
+   * uses, so the dry-run never diverges from the advertisement.
+   */
+  private runwaySpecTarget(moduleId: string, specId: string | undefined): { id: string; status: string; revision: string } {
+    if (specId !== undefined) {
+      const scoped = this.artifacts.findById(specId);
+      if (scoped.type !== "SP") {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Scope '${specId}' is not a Spec: runway actions advance Specifications only`,
+          invariantRef: "INV §14.4",
+          affectedTarget: specId,
+          suggestedAction: "Advance the module's Specs, not its packages",
+        });
+      }
+      return { id: specId, status: scoped.status, revision: scoped.revision };
+    }
+    for (const candidate of this.moduleSpecIds(moduleId)) {
+      try {
+        const artifact = this.artifacts.findById(candidate);
+        if (artifact.status !== "READY") {
+          return { id: candidate, status: artifact.status, revision: artifact.revision };
+        }
+      } catch {
+        continue;
+      }
+    }
+    throw new ChronoError({
+      code: ErrorCode.INVALID_STATE,
+      severity: Severity.ERROR,
+      message: `Module '${moduleId}' has no pending Spec: every Spec is READY`,
+      invariantRef: "INV §14.4",
+      affectedTarget: moduleId,
+      suggestedAction: "Proceed with module activation",
+    });
+  }
+
+  /**
+   * Dry-run one spec lifecycle event through the EXACT check
+   * sequence `transitionState` runs — enactment allowlist, target
+   * derivation, legal-table validation, per-event guards — minus
+   * persistence and session-scope binding (verifier mode, like every
+   * other dry-run). Restricted to spec events: MOD/WP guards may
+   * audit denials, so they never run here.
+   */
+  private dryRunSpecTransition(
+    specId: string,
+    eventType: "SpecSubmittedForReview" | "SpecApprovedReady" | "SpecNeedsRevision",
+    caller: ResolvedCaller,
+    auth: CallerAuth
+  ): void {
+    if (!mayEnactEvent(eventType, caller.kind, caller.kind === "agent" ? (caller.role as AgentRole) : undefined)) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Event '${eventType}' on '${specId}' is not permitted to '${caller.role}' (authority policy v${AUTHORITY_POLICY_VERSION})`,
+        invariantRef: "INV §5.1",
+        affectedTarget: specId,
+        suggestedAction: "Escalate to the role that owns this transition",
+      });
+    }
+    const artifact = this.artifacts.findById(specId);
+    const toState = this.deriveTargetState(artifact.type as EntityType, eventType, artifact.status);
+    validateTransition(artifact.type as EntityType, artifact.status, toState, eventType, undefined);
+    this.evaluateTransitionGuards(
+      artifact.type, specId, artifact.revision, artifact.status, toState, eventType,
+      { actor: auth.actor, session: auth.session }, caller
+    );
+  }
+
   checkActionPreconditions(
     action: CheckableAction,
     scope: { moduleId: string; workPackageId: string | null },
     auth: CallerAuth,
-    extra?: { kind?: string; dispatchId?: string; reviewId?: string; skipSessionBinding?: boolean }
+    extra?: { kind?: string; dispatchId?: string; reviewId?: string; skipSessionBinding?: boolean; specId?: string }
   ): { acceptable: boolean; unmet: Array<{ code: string; message: string; suggestedAction?: string }> } {
     // skipSessionBinding (CF-12 verifier mode): deep_check verifies
     // the action nextAction reported by evaluating state/record
@@ -9846,6 +10002,80 @@ export class ChronoCore {
         attempt(() => this.requireOpenCorrectionLoop(moduleId, wpId, null));
         break;
       }
+      case "submit-architecture": {
+        attempt(() => this.requireCapability("architecture.enact", caller));
+        if (unmet.length > 0) {
+          break;
+        }
+        const readiness = this.checkArchitectureSubmit(caller);
+        if (!readiness.ok) {
+          fail(readiness.error?.code ?? ErrorCode.EXECUTION_DENIED, readiness.error?.message ?? "architecture submission denied");
+        }
+        break;
+      }
+      case "approve-architecture": {
+        attempt(() => this.requireCapability("architecture.enact", caller));
+        if (unmet.length > 0) {
+          break;
+        }
+        const readiness = this.checkArchitectureApprove(caller);
+        if (!readiness.ok) {
+          fail(readiness.error?.code ?? ErrorCode.EXECUTION_DENIED, readiness.error?.message ?? "architecture approval denied");
+        }
+        break;
+      }
+      case "submit-spec":
+      case "ready-spec": {
+        const eventType = action === "submit-spec" ? "SpecSubmittedForReview" : "SpecApprovedReady";
+        try {
+          const target = this.runwaySpecTarget(moduleId, extra?.specId);
+          this.dryRunSpecTransition(target.id, eventType, caller, auth);
+        } catch (e) {
+          fail(
+            e instanceof ChronoError ? e.code : ErrorCode.VALIDATION_ERROR,
+            e instanceof Error ? e.message : String(e),
+            e instanceof ChronoError ? e.suggestedAction : undefined
+          );
+        }
+        break;
+      }
+      case "record-harness": {
+        // Content and its hash ride the execution call (Gaspar
+        // supplies both inline, like dispatch rationale): the dry-run
+        // proves capability, spec currency, and the missing Harness —
+        // never the not-yet-supplied bytes. A present Harness denies
+        // here exactly as `recordHarness` denies on create
+        // (DUPLICATE_IDENTITY): re-recording is a duplicate, never
+        // an advance.
+        try {
+          this.requireCapability("harness.record", caller);
+          const target = this.runwaySpecTarget(moduleId, extra?.specId);
+          let exists = false;
+          try {
+            this.db.harnesses().findBySpecRevision(target.revision);
+            exists = true;
+          } catch {
+            exists = false;
+          }
+          if (exists) {
+            throw new ChronoError({
+              code: ErrorCode.DUPLICATE_IDENTITY,
+              severity: Severity.ERROR,
+              message: `Harness for revision ${target.revision} already exists: advance the Spec instead`,
+              invariantRef: "INV §10.1",
+              affectedTarget: target.id,
+              suggestedAction: "Advance the Spec to READY instead of re-recording",
+            });
+          }
+        } catch (e) {
+          fail(
+            e instanceof ChronoError ? e.code : ErrorCode.VALIDATION_ERROR,
+            e instanceof Error ? e.message : String(e),
+            e instanceof ChronoError ? e.suggestedAction : undefined
+          );
+        }
+        break;
+      }
     }
     return { acceptable: unmet.length === 0, unmet };
   }
@@ -10107,6 +10337,150 @@ export class ChronoCore {
   // ---------------------------------------------------------------------------
 
   /**
+   * Explicit PO-ceremony hold for one missing approval (runway
+   * shared shape): names the approval action, its scope, and the
+   * exact revision the ceremony must bind. The ceremony itself runs
+   * through `chrono_approval_request` plus the native question tool
+   * (one ticket per question, challenge in the Approve label);
+   * landing is verified, never assumed.
+   */
+  private approvalCeremonyAction(
+    kind: string,
+    targetKind: "architecture" | "spec",
+    targetId: string,
+    revision: string,
+    profile: string
+  ): NextAction {
+    return {
+      action: "request-approval",
+      kind,
+      targetKind,
+      targetId,
+      summary:
+        `'${targetId}' needs a current '${kind}' approval for revision ${revision.slice(0, 16)}…: ` +
+        `open a single-ticket ceremony (chrono_approval_request) and confirm through the native question tool, then re-query next-action`,
+      reason: `no current '${kind}' approval for '${targetId}' at the current revision`,
+      policyRule: `profile=${profile}`,
+    };
+  }
+
+  /**
+   * Planning-runway resolver (Core-owned coordination): architecture
+   * submission/approval, spec submission, harness recording, and spec
+   * READY, in dependency order, for one module scope. Approval state,
+   * lifecycle state, prerequisite state, and the next executable
+   * action resolve together: missing PO ceremonies surface as
+   * explicit `request-approval` actions naming their approval and
+   * scope, and executable transitions surface only when their shared
+   * dry-run holds for THIS caller (workers fall through to their own
+   * scoped actions downstream). Returns null when the runway is
+   * clear. Pure reads; the auditing wrappers are never entered.
+   */
+  private moduleRunwayAction(
+    moduleId: string,
+    auth: CallerAuth
+  ): NextAction | null {
+    const effective = this.effectiveProfileFor(moduleId);
+    const moduleScope = { moduleId, workPackageId: null as string | null };
+    const project = this.projects.findById("default");
+    const archState = project.architectureState;
+    const archRev = project.architectureRevision;
+    // No proposed architecture: the planning phase owns proposing
+    // (never a vacuous submit of nothing).
+    if (archRev !== null) {
+      if (archState !== "approved") {
+        if (
+          archState === "under_review" &&
+          !this.hasValidApproval("ARCH", archRev, "architecture-security")
+        ) {
+          return this.approvalCeremonyAction("architecture-security", "architecture", "ARCH", archRev, effective.profile);
+        }
+        const archAction = archState === "under_review" ? "approve-architecture" : "submit-architecture";
+        const archTarget = archState === "under_review" ? "approve it" : "submit it for review";
+        if (
+          this.checkActionPreconditions(archAction, moduleScope, auth).acceptable
+        ) {
+          return {
+            action: archAction,
+            targetKind: "architecture",
+            targetId: "ARCH",
+            summary: `Architecture @${archRev.slice(0, 16)}… [${archState ?? "proposed"}] is actionable: ${archTarget}`,
+            reason: archState === "under_review"
+              ? "current architecture-security approval stands: enact approval"
+              : "architecture submission is the executable next step",
+            policyRule: `profile=${effective.profile}`,
+          };
+        }
+        return null;
+      }
+      for (const specId of this.moduleSpecIds(moduleId)) {
+        let spec: { type: string; status: string; revision: string };
+        try {
+          spec = this.artifacts.findById(specId);
+        } catch {
+          continue;
+        }
+        if (spec.type !== "SP" || spec.status === "READY" || spec.status === "SUPERSEDED") {
+          continue;
+        }
+        if (!this.hasValidApproval(specId, spec.revision, "planning-approval")) {
+          return this.approvalCeremonyAction("planning-approval", "spec", specId, spec.revision, effective.profile);
+        }
+        if (spec.status === "DRAFT") {
+          if (this.checkActionPreconditions("submit-spec", moduleScope, auth, { specId }).acceptable) {
+            return {
+              action: "submit-spec",
+              targetKind: "spec",
+              targetId: specId,
+              summary: `Spec '${specId}' [DRAFT] holds a current planning-approval: submit it for review`,
+              reason: "spec submission is the executable next step",
+              policyRule: `profile=${effective.profile}`,
+            };
+          }
+          return null;
+        }
+        if (spec.status === "REVIEW") {
+          if (!this.hasValidApproval(specId, spec.revision, "architecture-security")) {
+            return this.approvalCeremonyAction("architecture-security", "spec", specId, spec.revision, effective.profile);
+          }
+          let harnessCurrent = false;
+          try {
+            harnessCurrent = !this.db.harnesses().findBySpecRevision(spec.revision).stale;
+          } catch {
+            harnessCurrent = false;
+          }
+          if (!harnessCurrent) {
+            if (this.checkActionPreconditions("record-harness", moduleScope, auth, { specId }).acceptable) {
+              return {
+                action: "record-harness",
+                targetKind: "spec",
+                targetId: specId,
+                summary: `Spec '${specId}' [REVIEW] has no current Harness for revision ${spec.revision.slice(0, 16)}…: record it`,
+                reason: "harness recording is the executable next step",
+                policyRule: `profile=${effective.profile}`,
+              };
+            }
+            return null;
+          }
+          if (this.checkActionPreconditions("ready-spec", moduleScope, auth, { specId }).acceptable) {
+            return {
+              action: "ready-spec",
+              targetKind: "spec",
+              targetId: specId,
+              summary: `Spec '${specId}' [REVIEW] passes readiness gates: release it to READY`,
+              reason: "spec READY transition is the executable next step",
+              policyRule: `profile=${effective.profile}`,
+            };
+          }
+          return null;
+        }
+        continue;
+      }
+    }
+    return null;
+  }
+
+  /**
    * Blocking reasons that keep one Work Package from completing, in
    * precedence order. Empty means the package is ready for its
    * Spekkio verdict / completion request. Mirrors the module-level
@@ -10227,6 +10601,24 @@ export class ChronoCore {
       const effective = this.effectiveProfileFor(moduleId);
       const moduleArtifact = this.artifacts.findById(moduleId);
       const targets = wpId !== null ? [wpId] : this.moduleWorkPackages(moduleId);
+
+      // Planning runway (Core-owned coordination): architecture
+      // submission/approval, spec submission, harness recording, and
+      // spec READY are lifecycle operations with native tools, and
+      // the Core orders them deterministically BEFORE activation,
+      // authorization, dispatch, and everything downstream. Approval
+      // state, lifecycle state, prerequisite state, and the next
+      // executable action resolve together here: a missing PO
+      // ceremony surfaces as an explicit `request-approval` naming
+      // its approval action and scope — never a vague hold, never an
+      // operation the Core would deny. Terminal COMPLETE modules
+      // rejoin `done` below instead.
+      if (moduleArtifact.status !== "COMPLETE") {
+        const runway = this.moduleRunwayAction(moduleId, auth);
+        if (runway !== null) {
+          return { ok: true, value: runway };
+        }
+      }
 
       // CF-12: an unactivated module cannot execute anything — not
       // loops, dispatches, reviews, or evidence. Activation outranks
@@ -11299,7 +11691,9 @@ export class ChronoCore {
     auth: CallerAuth
   ): DeepIntegrityFinding[] {
     const findings: DeepIntegrityFinding[] = [];
-    const target = action.targetKind === "work-package" ? action.targetId : scope.moduleId;
+    const target = action.targetKind === "work-package" || action.targetKind === "architecture" || action.targetKind === "spec"
+      ? action.targetId
+      : scope.moduleId;
     const targetScope = action.targetKind === "work-package"
       ? { moduleId: scope.moduleId, workPackageId: action.targetId }
       : { moduleId: scope.moduleId, workPackageId: null };
@@ -11310,6 +11704,7 @@ export class ChronoCore {
       "activate-module", "authorize-wp", "request-dispatch", "claim-dispatch",
       "confirm-dispatch", "submit-review", "request-completion", "complete-module",
       "record-evidence", "correct-defect", "request-correction", "assign-review",
+      "submit-architecture", "approve-architecture", "submit-spec", "record-harness", "ready-spec",
     ]);
     if (!imperative.has(action.action)) {
       // Informative actions verify by grounding, never by dry-run.
@@ -11414,6 +11809,29 @@ export class ChronoCore {
         if (pending.length === 0) {
           unreachable(`next action 'await-action' for '${target}' names no pending reviewer proof`);
         }
+      } else if (action.action === "request-approval") {
+        // Grounded in a genuinely missing approval for the exact
+        // current revision: a current approval means the transition
+        // it gates — not another ceremony — is the truthful action.
+        const kind = action.kind ?? "";
+        if (action.targetKind !== "architecture" && action.targetKind !== "spec") {
+          unreachable(`next action 'request-approval' for '${target}' must target an architecture or spec scope`);
+        } else if (kind.length === 0) {
+          unreachable(`next action 'request-approval' for '${target}' names no approval action`);
+        } else {
+          try {
+            const current = action.targetKind === "architecture"
+              ? this.projects.findById("default").architectureRevision
+              : this.artifacts.findById(action.targetId).revision;
+            if (current === null) {
+              unreachable(`next action 'request-approval' for '${target}' names a scope with no current revision`);
+            } else if (this.hasValidApproval(action.targetId, current, kind)) {
+              unreachable(`next action 'request-approval' for '${target}' hides a current '${kind}' approval`);
+            }
+          } catch (e) {
+            unreachable(`next action 'request-approval' for '${target}' names an unknown scope: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
       } else {
         unreachable(`next action '${action.action}' for '${target}' is not a known executable or informative action`);
       }
@@ -11421,9 +11839,19 @@ export class ChronoCore {
     }
     // Imperative actions: re-derive row ids exactly as nextAction did,
     // then dry-run state preconditions in verifier mode.
-    let extra: { kind?: string; dispatchId?: string; reviewId?: string; skipSessionBinding?: boolean } | undefined;
+    let extra: { kind?: string; dispatchId?: string; reviewId?: string; skipSessionBinding?: boolean; specId?: string } | undefined;
     if (action.action === "request-dispatch" || action.action === "assign-review") {
       extra = action.kind !== undefined ? { kind: action.kind } : {};
+    } else if (
+      action.action === "submit-spec" || action.action === "record-harness" || action.action === "ready-spec"
+    ) {
+      // Re-derive the spec exactly as nextAction did: the reported
+      // target when scoped, else the module's first pending spec.
+      if (action.targetKind === "spec") {
+        extra = { specId: action.targetId, skipSessionBinding: true };
+      } else {
+        extra = { skipSessionBinding: true };
+      }
     } else if (action.action === "claim-dispatch" || action.action === "confirm-dispatch") {
       const rows = this.db.dispatches().listByScope(targetScope.moduleId, targetScope.workPackageId)
         .filter((d) => d.status === (action.action === "claim-dispatch" ? "PENDING" : "ENACTED") || d.status === "ACTIVE");
@@ -11753,48 +12181,14 @@ export class ChronoCore {
         }
       }
 
-      // Missing transition surface (CF-12 req 6): a scope positioned
-      // for forward dispatch whose gates fail ONLY on steps with no
-      // native path (harness recording, spec advancement) is
-      // genuinely stuck: neither the workflow nor the PO ceremony can
-      // clear it. Approval-shaped holds route through await-approval
-      // instead; blockers route through escalation.
-      for (const mod of this.artifacts.listByType("MOD")) {
-        const dispatchable: Array<{ moduleId: string; workPackageId: string | null }> = [];
-        if (this.moduleWorkPackages(mod.id).length === 0) {
-          if (mod.status === "APPROVED" || mod.status === "EXECUTING") {
-            dispatchable.push({ moduleId: mod.id, workPackageId: null });
-          }
-        }
-        for (const wpId of this.moduleWorkPackages(mod.id)) {
-          try {
-            const wp = this.artifacts.findById(wpId);
-            if (wp.status === "AUTHORIZED" || wp.status === "RUNNING") {
-              dispatchable.push({ moduleId: mod.id, workPackageId: wpId });
-            }
-          } catch {
-            continue;
-          }
-        }
-        for (const dispatchScope of dispatchable) {
-          const probe = this.checkActionPreconditions("request-dispatch", dispatchScope, auth, { kind: "implementation" });
-          if (probe.acceptable) {
-            continue;
-          }
-          const nativeLess = probe.unmet.filter((u) => {
-            const text = `${u.message} ${u.suggestedAction ?? ""}`;
-            return /harness/i.test(text) || /to READY|READY first|SpecApprovedReady/i.test(text);
-          });
-          if (nativeLess.length > 0) {
-            const target = dispatchScope.workPackageId ?? dispatchScope.moduleId;
-            findings.push({
-              severity: "blocker",
-              check: "missing-transition-surface",
-              detail: `scope '${target}' cannot dispatch and the blockers have no native path: ${nativeLess.map((u) => u.message).join("; ")}`,
-            });
-          }
-        }
-      }
+      // The former missing-transition-surface check (CF-12 req 6) is
+      // retired: harness recording, spec advancement, and
+      // architecture transitions all have native paths now, and the
+      // planning runway in `nextAction` surfaces the exact missing
+      // step (verified above through the shared dry-run source). A
+      // scope that cannot dispatch always resolves to an actionable
+      // runway, ceremony, or informative action instead of a stuck
+      // claim.
 
       // Deterministic project validation folds in identities,
       // traceability, approvals, evidence currency, attestations,

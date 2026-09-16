@@ -19,7 +19,7 @@
  * always passes.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { hashSkillSource, SKILL_RELEASE } from "@chrono/domain";
+import { buildRuntimeFingerprint, hashSkillSource, OPENCODE_TOOL_POLICY, SKILL_RELEASE } from "@chrono/domain";
 import { FIXTURE_SKILL_MD } from "../test/test-skill-fixture.js";
 import {
   chmodSync,
@@ -409,6 +409,85 @@ if (!BLACKBOX) {
       const parsed = JSON.parse(init.output.slice(init.output.indexOf("{"))) as { ok: boolean; step: string };
       expect(parsed.ok).toBe(true);
       expect(parsed.step).toBe("READY");
+    }, BOX_TIMEOUT);
+
+    it("blocks on a stale loaded plugin until a full restart loads the installed generation", async () => {
+      // Stale-loaded-runtime repair (gate item 3, production sequence
+      // 1-7): files upgraded under a live OpenCode process must block
+      // with RUNTIME_RESTART_REQUIRED (never readiness from repaired
+      // files alone); a fresh process loading the installed generation
+      // clears automatically. Every load row below comes from a real
+      // ChronoGatePlugin() initialization; only the "previous
+      // generation" file bytes are fixture-derived (current template
+      // with the embedded fingerprint replaced by the fingerprint the
+      // real function derives for the pre-runway tool set), documented
+      // as the vintage generation the live process still runs.
+      const b = requireBox();
+      const pluginFile = join(b.project, ".opencode", "plugins", "chrono-gate.js");
+      expect(existsSync(pluginFile)).toBe(true);
+      const RUNWAY_TOOLS = [
+        "chrono_architecture_submit",
+        "chrono_architecture_approve",
+        "chrono_spec_submit",
+        "chrono_spec_ready",
+        "chrono_spec_needs_revision",
+        "chrono_harness_record",
+      ];
+      const previousPolicy = Object.fromEntries(
+        Object.entries(OPENCODE_TOOL_POLICY).filter(([name]) => !RUNWAY_TOOLS.includes(name))
+      ) as Record<string, "read" | "mutate" | "planning" | "delegate" | "lifecycle">;
+      const previousFingerprint = buildRuntimeFingerprint(previousPolicy);
+      expect(previousFingerprint).not.toBe(buildRuntimeFingerprint());
+      const currentBytes = readFileSync(pluginFile, "utf8");
+      const currentFingerprint = buildRuntimeFingerprint();
+      expect(currentBytes).toContain(`buildFingerprint: "${currentFingerprint}"`);
+      // 1+2. Generation A installed and loaded (the still-alive old process).
+      const generationA = currentBytes.split(`buildFingerprint: "${currentFingerprint}"`);
+      expect(generationA).toHaveLength(2);
+      writeFileSync(pluginFile, [generationA[0], `buildFingerprint: "${previousFingerprint}"`, generationA[1]].join(""), "utf8");
+      const moduleA = (await import(`${pathToFileURL(pluginFile).href}?gen=a`)) as {
+        ChronoGatePlugin: (ctx: unknown) => Promise<unknown>;
+      };
+      await moduleA.ChronoGatePlugin({ directory: b.project });
+      const doctorRounds = (extraEnv?: Record<string, string>): { exit: number; stdout: string; stderr: string } => {
+        try {
+          const stdout = execFileSync(b.chronoBin, ["doctor", "--path", b.project, "--json"], {
+            encoding: "utf8",
+            cwd: b.project,
+            env: childEnv(b, extraEnv),
+            timeout: 120000,
+            stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
+          });
+          return { exit: 0, stdout, stderr: "" };
+        } catch (e) {
+          const err = e as { status?: unknown; stdout?: unknown; stderr?: unknown };
+          return {
+            exit: typeof err.status === "number" ? err.status : 1,
+            stdout: typeof err.stdout === "string" ? err.stdout : "",
+            stderr: typeof err.stderr === "string" ? err.stderr : "",
+          };
+        }
+      };
+      // 3+4. Upgrade + repair files to generation B while A stays
+      // alive: disk is B, loaded runtime is A → doctor blocks.
+      writeFileSync(pluginFile, currentBytes, "utf8");
+      const stale = doctorRounds();
+      expect(stale.exit).toBe(1);
+      expect(stale.stdout).toContain("RUNTIME_RESTART_REQUIRED");
+      expect(stale.stdout).toContain(`"runtimeStatus": "stale"`);
+      // 5. The old runtime cannot be treated as current: no readiness.
+      expect(stale.stdout).not.toMatch(/"ok":\s*true/);
+      // 6. Full restart: a fresh process loads the installed generation.
+      const moduleB = (await import(`${pathToFileURL(pluginFile).href}?gen=b`)) as {
+        ChronoGatePlugin: (ctx: unknown) => Promise<unknown>;
+      };
+      await moduleB.ChronoGatePlugin({ directory: b.project });
+      // 7. Doctor becomes ready: the blocker clears automatically.
+      const ready = doctorRounds();
+      expect(ready.exit).toBe(0);
+      expect(ready.stdout).not.toContain("RUNTIME_RESTART_REQUIRED");
+      expect(ready.stdout).toContain(`"runtimeStatus": "current"`);
     }, BOX_TIMEOUT);
 
     afterAll(() => {
