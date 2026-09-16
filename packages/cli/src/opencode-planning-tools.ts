@@ -71,6 +71,12 @@ export const CHRONO_NATIVE_TOOLS = [
   "chrono_defect_resolve",
   "chrono_module_activate",
   "chrono_review_reconcile",
+  "chrono_architecture_submit",
+  "chrono_architecture_approve",
+  "chrono_spec_submit",
+  "chrono_spec_ready",
+  "chrono_spec_needs_revision",
+  "chrono_harness_record",
 ] as const;
 
 export type ChronoNativeTool = (typeof CHRONO_NATIVE_TOOLS)[number];
@@ -106,7 +112,7 @@ export function checkPlanningToolsFile(existing: string | null): PlanningToolsSt
 }
 
 /**
-  * Generated `.opencode/tools/chrono.ts`. Single file, thirty-two
+  * Generated `.opencode/tools/chrono.ts`. Single file, thirty-eight
   * named exports (`chrono_<export>` tool names). Self-contained except
   * the pinned `@opencode-ai/plugin` import and node builtins.
   */
@@ -116,7 +122,7 @@ export function buildPlanningToolsFile(): string {
  * \`chrono setup --adapter <id>\` / \`chrono init --runtime opencode\`
  * — do not hand-edit (drift fails closed; repair regenerates).
  *
-  * Thirty-two model-callable tools (OpenCode names: chrono_<export>).
+  * Thirty-eight model-callable tools (OpenCode names: chrono_<export>).
   * Planning (Gaspar entry):
   * - artifact_status: Core-backed planning status projection (safe).
   * - artifact_propose: materialize one planning draft (inline body).
@@ -149,6 +155,15 @@ export function buildPlanningToolsFile(): string {
   * - module_complete: terminal module completion (runs authorization).
   * - module_activate: activate a planned module to APPROVED after both
   *   current approvals (Gaspar only; idempotent replay).
+  * - architecture_submit: submit the proposed architecture for review.
+  * - architecture_approve: approve the architecture (needs a current
+  *   architecture-security approval for the exact revision).
+  * - spec_submit: submit a DRAFT spec for review.
+  * - spec_ready: release a reviewed spec to READY (needs
+  *   architecture-security, a fresh Harness, and no blockers).
+  * - spec_needs_revision: return a spec to DRAFT for revision.
+  * - harness_record: record the authoritative Harness for an exact
+  *   Spec revision (content travels on stdin).
   * - review_reconcile: reconcile a premature review as invalid history
   *   (Gaspar only; append-only, never blocking).
   * - wp_authorize: authorize one Work Package (Gaspar only).
@@ -882,6 +897,103 @@ export const review_reconcile = tool({
     const res = runChrono(["review-reconcile", "--review", args.review, ...agentArgs(root, token, callerAgent(context))]);
     if (res.exit !== 0 || !res.json || res.json.ok !== true) {
       deny(res.json, "review reconcile denied");
+    }
+    return JSON.stringify(res.json);
+  },
+});
+
+export const architecture_submit = tool({
+  description: "CHRONO: submit the proposed architecture for review (Gaspar only; the planning runway before module activation).",
+  args: {},
+  async execute(_args, context) {
+    const root = projectRoot(context.directory);
+    const token = hostToken(root, context.sessionID);
+    const res = runChrono(["architecture-submit", ...commonArgs(root, token)]);
+    if (res.exit !== 0 || !res.json || res.json.ok !== true) {
+      deny(res.json, "architecture submit denied");
+    }
+    return JSON.stringify(res.json);
+  },
+});
+
+export const architecture_approve = tool({
+  description: "CHRONO: approve the architecture (Gaspar only; needs a current architecture-security approval for the exact revision — no ceremony needed when one already stands).",
+  args: {},
+  async execute(_args, context) {
+    const root = projectRoot(context.directory);
+    const token = hostToken(root, context.sessionID);
+    const res = runChrono(["architecture-approve", ...commonArgs(root, token)]);
+    if (res.exit !== 0 || !res.json || res.json.ok !== true) {
+      deny(res.json, "architecture approve denied");
+    }
+    return JSON.stringify(res.json);
+  },
+});
+
+export const spec_submit = tool({
+  description: "CHRONO: submit a DRAFT spec for review (Gaspar only; first step of the spec READY pipeline).",
+  args: {
+    spec: tool.schema.string().describe("spec identifier"),
+  },
+  async execute(args, context) {
+    const root = projectRoot(context.directory);
+    const token = hostToken(root, context.sessionID);
+    const res = runChrono(["spec-submit", "--spec", args.spec, ...commonArgs(root, token)]);
+    if (res.exit !== 0 || !res.json || res.json.ok !== true) {
+      deny(res.json, "spec submit denied");
+    }
+    return JSON.stringify(res.json);
+  },
+});
+
+export const spec_ready = tool({
+  description: "CHRONO: release a reviewed spec to READY (Gaspar only; needs architecture-security, a fresh Harness for the exact revision, and no blockers).",
+  args: {
+    spec: tool.schema.string().describe("spec identifier"),
+  },
+  async execute(args, context) {
+    const root = projectRoot(context.directory);
+    const token = hostToken(root, context.sessionID);
+    const res = runChrono(["spec-ready", "--spec", args.spec, ...commonArgs(root, token)]);
+    if (res.exit !== 0 || !res.json || res.json.ok !== true) {
+      deny(res.json, "spec ready denied");
+    }
+    return JSON.stringify(res.json);
+  },
+});
+
+export const spec_needs_revision = tool({
+  description: "CHRONO: return a spec to DRAFT for revision (Gaspar only; correction entry for specs).",
+  args: {
+    spec: tool.schema.string().describe("spec identifier"),
+  },
+  async execute(args, context) {
+    const root = projectRoot(context.directory);
+    const token = hostToken(root, context.sessionID);
+    const res = runChrono(["spec-needs-revision", "--spec", args.spec, ...commonArgs(root, token)]);
+    if (res.exit !== 0 || !res.json || res.json.ok !== true) {
+      deny(res.json, "spec needs-revision denied");
+    }
+    return JSON.stringify(res.json);
+  },
+});
+
+export const harness_record = tool({
+  description: "CHRONO: record the authoritative Harness for an exact Spec revision (Gaspar only; content travels on stdin; harnesses take no approval ceremony).",
+  args: {
+    revision: tool.schema.string().describe("exact spec revision hash the harness binds"),
+    contentHash: tool.schema.string().describe("sha256:<64 hex> of the canonical harness content"),
+    content: tool.schema.string().describe("canonical harness content"),
+  },
+  async execute(args, context) {
+    const root = projectRoot(context.directory);
+    const token = hostToken(root, context.sessionID);
+    const res = runChrono(
+      ["harness-record", "--revision", args.revision, "--content-hash", args.contentHash, "--content-stdin", ...commonArgs(root, token)],
+      args.content
+    );
+    if (res.exit !== 0 || !res.json || res.json.ok !== true) {
+      deny(res.json, "harness record denied");
     }
     return JSON.stringify(res.json);
   },

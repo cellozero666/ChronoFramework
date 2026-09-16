@@ -229,6 +229,29 @@ export function resolveGasparNextAction(action: string): GasparNextActionRoute {
   return route;
 }
 
+/**
+ * Ceremony verification + planning-runway prose, embedded verbatim
+ * in the Gaspar contract (pilot repair): approvals are verified
+ * landed, never assumed — and the pre-activation runway advances
+ * through native tools in dependency order, never file edits.
+ */
+function gasparCeremonyVerification(): string {
+  return [
+    "## Approval verification (mandatory — never assume an approval landed)",
+    "",
+    "- After EVERY human Approve answer, verify the landing before doing anything else: `chrono_approval_status` for the ticket (must read live=false, consumed, with an approval id) and `chrono doctor` (its ceremony section reports WHERE each confirmation stands — finalized, refused with reason, or absent).",
+    "- One ticket per question call, always: a question naming two or more tickets authorizes nothing (the Core refuses the whole ceremony without consuming). Put the ticket challenge (`approve-TICKET-xxxx`) in the Approve option label itself — answers echo option labels only, so a bare `Approve` label without the challenge never finalizes.",
+    "- If the approval did not land, diagnose by the ceremony kind and repeat correctly instead of proceeding: `approval-multi-ticket` → split into one-ticket questions; `approval-answer-no-match` → the answer did not echo the challenge, re-ask with the challenge in the label; `approval-no-session` → reopen OpenCode so entry redeems; `approval-no-key` → the PO signing key is unavailable, stop for the PO; `approval-ticket-not-live` → ticket consumed, expired, or stale, re-request for the current revision; `approval-record-denied` → quote the Core code and fix the named cause.",
+    "- A `chrono_next` hold (`await-approval`, `approve-security`) clears only when the Core reports the approval current — never when the UI merely showed an answer.",
+    "",
+    "## Planning runway (pre-activation order — native tools only, never file edits)",
+    "",
+    "- Architecture first: `chrono_architecture_submit`, then the `architecture-security` ceremony if no current approval stands (skip the ceremony when one already does — re-requesting denies as duplicate), then `chrono_architecture_approve`. File edits never move architecture state.",
+    "- Then per spec, in order: `chrono_spec_submit` → `architecture-security` ceremony for the exact spec revision → `chrono_harness_record` (harnesses take no approval ceremony) → `chrono_spec_ready`. A spec whose content changed needs its approvals re-issued for the new revision: freeze content before approving, or the cycle repeats.",
+    "- Only with every module spec READY does `chrono_module_activate` succeed; only then do `chrono_wp_authorize` and dispatch follow.",
+  ].join("\n");
+}
+
 /** Prose rendering of the map, embedded verbatim in the Gaspar contract. */
 function gasparNextActionTable(): string {
   const lines: string[] = [
@@ -377,6 +400,8 @@ const ROLE_BODIES: Record<ChronoOpenCodeRole, string> = {
     "  prerequisite instead of retrying blindly.",
     "",
     ...gasparNextActionTable().split("\n"),
+    "",
+    ...gasparCeremonyVerification().split("\n"),
     "- Apply the Karpathy Guidelines skill throughout (think before coding,",
     `  simplicity first, surgical changes, goal-driven verified execution; pinned ${SKILL_RELEASE.pinnedCommit})`,
     "  without ever simplifying away security, traceability, evidence,",

@@ -52,6 +52,14 @@ import { runArtifactPropose, runArtifactRevise, runArtifactStatus, runArtifactSu
 import { runApprovalRecord, runApprovalRequest, runApprovalTicket } from "./approval-ceremony-cli.js";
 import { runDispatchClaim, runDispatchRequest, runDispatchTaskCheck } from "./dispatch-cli.js";
 import {
+  runArchitectureApprove,
+  runArchitectureSubmit,
+  runHarnessRecord,
+  runSpecNeedsRevision,
+  runSpecReady,
+  runSpecSubmit,
+} from "./readiness-cli.js";
+import {
   runCompleteModule,
   runCorrectionComplete,
   runCorrectionOpen,
@@ -200,6 +208,9 @@ interface CommandOpts {
   readonly timestamp?: unknown;
   readonly signature?: unknown;
   readonly bodyStdin?: unknown;
+  readonly contentFile?: unknown;
+  readonly contentHash?: unknown;
+  readonly contentStdin?: unknown;
   readonly by?: unknown;
   readonly evidence?: unknown;
   readonly controls?: unknown;
@@ -4221,6 +4232,138 @@ export function createProgram(cwd: string): Command {
           module: String(opts.module ?? ""),
           ...(typeof opts.wp === "string" && opts.wp.length > 0 ? { wp: opts.wp } : {}),
           event: String(opts.event ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("architecture-submit")
+    .description("Submit the proposed architecture for review (gaspar/PO planning authority)")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runArchitectureSubmit(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("architecture-approve")
+    .description("Approve the architecture (gaspar/PO; needs a current architecture-security approval)")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runArchitectureApprove(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("spec-submit")
+    .description("Submit a DRAFT spec for review (gaspar/PO planning authority)")
+    .requiredOption("--spec <id>", "spec identifier")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runSpecSubmit(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          spec: String(opts.spec ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("spec-ready")
+    .description("Release a reviewed spec to READY (gaspar/PO; needs architecture-security, harness, unblocked)")
+    .requiredOption("--spec <id>", "spec identifier")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runSpecReady(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          spec: String(opts.spec ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("spec-needs-revision")
+    .description("Return a spec to DRAFT for revision (gaspar/PO correction entry)")
+    .requiredOption("--spec <id>", "spec identifier")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      emitProgramResult(
+        program,
+        runSpecNeedsRevision(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          spec: String(opts.spec ?? ""),
+          json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("harness-record")
+    .description("Record the authoritative Harness for an exact Spec revision (gaspar/PO)")
+    .requiredOption("--revision <rev>", "exact spec revision hash the harness binds")
+    .requiredOption("--content-hash <sha256>", "sha256:<64 hex> of the canonical harness content")
+    .option("--content-file <path>", "harness content file (exactly one of --content-file or --content-stdin)")
+    .option("--content-stdin", "read the harness content from stdin (native tools use this; no temp file)")
+    .requiredOption("--as <actor>", "calling identity: gaspar or PO")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      const stdinContent = opts.contentStdin === true ? readInlineBody(opts.json === true) : null;
+      if (stdinContent === null && opts.contentStdin === true) {
+        return;
+      }
+      emitProgramResult(
+        program,
+        runHarnessRecord(projectPath, {
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          revision: String(opts.revision ?? ""),
+          contentHash: String(opts.contentHash ?? ""),
+          ...(typeof opts.contentFile === "string" && opts.contentFile.length > 0 ? { contentFile: opts.contentFile } : {}),
+          ...(stdinContent !== null ? { contentText: stdinContent } : {}),
           json: opts.json === true,
         })
       );

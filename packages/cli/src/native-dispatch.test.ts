@@ -394,6 +394,12 @@ describe("Native governed dispatch", () => {
       "chrono_defect_resolve",
       "chrono_module_activate",
       "chrono_review_reconcile",
+      "chrono_architecture_submit",
+      "chrono_architecture_approve",
+      "chrono_spec_submit",
+      "chrono_spec_ready",
+      "chrono_spec_needs_revision",
+      "chrono_harness_record",
     ]);
     expect(Object.keys(tools).join(" ")).toContain("dispatch");
     expect(Object.keys(tools).join(" ")).toContain("dispatch_claim");
