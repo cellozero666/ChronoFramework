@@ -1160,9 +1160,41 @@ describe("Completion authorization", () => {
     return authz.value!.grantId;
   }
 
+  let completionBindSeq = 0;
+  /**
+   * Canonical evidence rule: proof rides a live binding. Mint one
+   * worker binding through the native chain (request → delegate →
+   * claim → confirm) for the module scope. The caller releases through
+   * Gaspar oversight once the recorded proof has served its gate.
+   */
+  function boundCompletionWorker(fx: CompletionFixture, role: string, kind: string): { auth: CallerAuth; dispatchId: string } {
+    completionBindSeq += 1;
+    const requested = core.requestDispatch(
+      { moduleId: "MOD-0001", kind, rationale: `completion binding for ${role}` },
+      fx.gaspar
+    );
+    expect(requested.ok).toBe(true);
+    expect(core.recordTaskDelegation({ agent: role, parentRuntimeSession: `completion-parent-${completionBindSeq}` }, fx.gaspar).ok).toBe(true);
+    const claimed = core.claimDispatch({ dispatchId: requested.value!.dispatchId, childRuntimeSession: `completion-child-${completionBindSeq}` }, fx.gaspar);
+    expect(claimed.ok).toBe(true);
+    expect(core.confirmClaim(requested.value!.dispatchId, fx.gaspar).ok).toBe(true);
+    return {
+      auth: { actor: role, session: { id: claimed.value!.session.id, token: claimed.value!.session.token } },
+      dispatchId: requested.value!.dispatchId,
+    };
+  }
+
+  function releaseCompletionBinding(fx: CompletionFixture, dispatchId: string): void {
+    expect(core.releaseDispatch(dispatchId, fx.gaspar).ok).toBe(true);
+  }
+
   function passVerification(fx: CompletionFixture): void {
-    testEvidence(core, fx.lucca, fx.revision, "unit");
-    testEvidence(core, fx.glenn, fx.revision, "review");
+    const luccaBound = boundCompletionWorker(fx, "lucca", "test");
+    testEvidence(core, luccaBound.auth, fx.revision, "unit");
+    releaseCompletionBinding(fx, luccaBound.dispatchId);
+    const glennBound = boundCompletionWorker(fx, "glenn", "security-review");
+    testEvidence(core, glennBound.auth, fx.revision, "review");
+    releaseCompletionBinding(fx, glennBound.dispatchId);
     approve(core, sign, "implementation-security", "MOD-0001", fx.revision);
     expect(core.recordVerification("MOD-0001", "PASS", "spekkio", [], [], [], fx.spekkio).ok).toBe(true);
     const grantId = authorizeVerdict(fx);
@@ -1246,8 +1278,12 @@ describe("Completion authorization", () => {
 
   it("denies with an open blocking defect, allows after correction", () => {
     const fx = verifyingModule();
-    testEvidence(core, fx.lucca, fx.revision, "unit");
-    testEvidence(core, fx.glenn, fx.revision, "review");
+    // Bound producers: Lucca and Glenn evidence rides live bindings
+    // reused for the post-correction re-evidence below.
+    const luccaBound = boundCompletionWorker(fx, "lucca", "test");
+    const glennBound = boundCompletionWorker(fx, "glenn", "security-review");
+    testEvidence(core, luccaBound.auth, fx.revision, "unit");
+    testEvidence(core, glennBound.auth, fx.revision, "review");
     approve(core, sign, "implementation-security", "MOD-0001", fx.revision);
     const defect = core.recordDefect(
       {
@@ -1291,22 +1327,38 @@ describe("Completion authorization", () => {
       fx.gaspar
     );
     expect(claimed.ok).toBe(true);
+    // The correction binding goes live before it can carry proof.
+    expect(core.confirmClaim(correction.value!.dispatchId, fx.gaspar).ok).toBe(true);
+    const correctionWorker: CallerAuth = {
+      actor: "belthazar",
+      session: { id: claimed.value!.session.id, token: claimed.value!.session.token },
+    };
     const looped = core.openCorrectionLoop(defect.value!.id, fx.gaspar);
     expect(looped.ok).toBe(false);
     expect(looped.error?.code).toBe("DUPLICATE_IDENTITY");
     const loops = core.nextAction({ moduleId: "MOD-0001" }, fx.gaspar);
     expect(loops.ok).toBe(true);
     expect(loops.value!.action).toBe("correct-defect");
-    const fixEvidence = testEvidence(core, fx.belthazar, fx.revision, "fix");
-    expect(fixEvidence.length).toBeGreaterThan(0);
-    const openLoop = core.nextAction({ moduleId: "MOD-0001" }, fx.gaspar).value!.summary;
-    const loopMatch = /'(COR-[0-9]+)'/.exec(openLoop);
-    expect(loopMatch).not.toBe(null);
-    expect(core.completeCorrectionLoop(loopMatch![1]!, fx.belthazar).ok).toBe(true);
+    const fixId = testEvidence(core, correctionWorker, fx.revision, "fix");
+    expect(fixId.length).toBeGreaterThan(0);
+    // The open loop id arrives on the structured advance boundary —
+    // never parsed from prose.
+    const advanced = core.advance({ moduleId: "MOD-0001" }, fx.gaspar);
+    expect(advanced.ok).toBe(true);
+    expect(advanced.value!.trail).toEqual([]);
+    const boundary = advanced.value!.decision;
+    expect(boundary.type).toBe("AGENT_WORK_REQUIRED");
+    if (boundary.type !== "AGENT_WORK_REQUIRED" || boundary.phase !== "correct") {
+      throw new Error("expected a correction boundary naming its loop");
+    }
+    expect(boundary.loopId).toBeTruthy();
+    expect(boundary.defectId).toBe(defect.value!.id);
+    expect(core.completeCorrectionLoop(boundary.loopId as string, correctionWorker).ok).toBe(true);
     // Pre-correction proof went stale with the loop: re-record the
-    // completion evidence the profile requires, then re-verify.
-    testEvidence(core, fx.lucca, fx.revision, "unit");
-    testEvidence(core, fx.glenn, fx.revision, "review");
+    // completion evidence the profile requires on the live bindings,
+    // then re-verify.
+    testEvidence(core, luccaBound.auth, fx.revision, "unit");
+    testEvidence(core, glennBound.auth, fx.revision, "review");
     const progressGrant = authorizeWorkerStep(fx);
     expect(
       core.transitionState("MOD-0001", "ImplementationComplete", { actor: "belthazar", session: fx.belthazar.session, grantId: progressGrant }).ok
@@ -1321,6 +1373,10 @@ describe("Completion authorization", () => {
       core.transitionState("MOD-0001", "SpekkioPassed", { actor: "spekkio", session: fx.spekkio.session, grantId: passGrant }).ok
     ).toBe(true);
     expect(core.authorizeCompletion("MOD-0001", fx.gaspar).ok).toBe(true);
+    // Bound producers stand down through oversight once gates pass.
+    releaseCompletionBinding(fx, luccaBound.dispatchId);
+    releaseCompletionBinding(fx, glennBound.dispatchId);
+    releaseCompletionBinding(fx, correction.value!.dispatchId);
   });
 
   it("lets a valid waiver cover a security blocker at completion", () => {

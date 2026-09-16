@@ -5432,40 +5432,12 @@ export class ChronoCore {
       if (data.tool !== null) {
         toToolIdentity(data.tool);
       }
-      const evidenceTarget = this.artifacts.findArtifactIdByRevision(data.targetRevision);
-      // Scope follows the revision's owner: a Work Package revision is
-      // WP-scoped (a WP-bound worker records for its own package, never
-      // a sibling's), module/spec revisions are module-scoped.
-      let targetWp: string | null = null;
-      if (evidenceTarget !== null) {
-        try {
-          if (this.artifacts.findById(evidenceTarget).type === "WP") {
-            targetWp = evidenceTarget;
-          }
-        } catch {
-          targetWp = null;
-        }
-      }
-      this.assertSessionScope(
-        caller,
-        {
-          moduleId: evidenceTarget === null ? null : this.artifactScopeModule(evidenceTarget),
-          workPackageId: targetWp,
-        },
-        "record evidence"
-      );
-      // Workflow honesty: evidence must ride a matching ACTIVE
-      // dispatch binding held by this session — proof recorded
-      // outside any binding can never advance the workflow (release
-      // and completion gates only honor bound proof), so recording
-      // it would strand an unreachable row. Existence, scope match,
-      // and freshness only; attestation/blocker gates stay where
-      // they belong (advance, release, verdict paths).
-      this.requireEvidenceBinding(
-        caller.session.id,
-        evidenceTarget === null ? null : this.artifactScopeModule(evidenceTarget),
-        targetWp
-      );
+      // Validation precedence (canonical evidence rule): secret-bearing
+      // evidence denies SECRET_DETECTED and malformed evidence denies
+      // with its validation error BEFORE any binding check — only
+      // structurally valid, secret-free evidence reaches binding
+      // validation. A binding denial must never mask a secret leak or
+      // a malformed payload.
       this.assertNoSecrets(data.checkName, data.diagnostics, "evidence");
       if (!isRevisionHash(data.targetRevision)) {
         throw new ChronoError({
@@ -5490,6 +5462,41 @@ export class ChronoCore {
           suggestedAction: "Compute integrity as sha256 over the canonical {result, diagnostics, target_revision}",
         });
       }
+      const evidenceTarget = this.artifacts.findArtifactIdByRevision(data.targetRevision);
+      // Scope follows the revision's owner: a Work Package revision is
+      // WP-scoped (a WP-bound worker records for its own package, never
+      // a sibling's), module/spec revisions are module-scoped.
+      let targetWp: string | null = null;
+      if (evidenceTarget !== null) {
+        try {
+          if (this.artifacts.findById(evidenceTarget).type === "WP") {
+            targetWp = evidenceTarget;
+          }
+        } catch {
+          targetWp = null;
+        }
+      }
+      this.assertSessionScope(
+        caller,
+        {
+          moduleId: evidenceTarget === null ? null : this.artifactScopeModule(evidenceTarget),
+          workPackageId: targetWp,
+        },
+        "record evidence"
+      );
+      // Canonical evidence rule: evidence must ride a live binding
+      // held by the recording session — an ACTIVE dispatch (native
+      // track) or a live grant (legacy `chrono run` track). Proof
+      // recorded outside any binding can never advance the workflow
+      // (release and completion gates only honor bound proof), so
+      // recording it would strand an unreachable row. Existence,
+      // scope match, and freshness only; attestation/blocker gates
+      // stay where they belong (advance, release, verdict paths).
+      this.requireEvidenceBinding(
+        caller,
+        evidenceTarget === null ? null : this.artifactScopeModule(evidenceTarget),
+        targetWp
+      );
       const timestamp = this.now();
       const id = this.sequences.allocate("EVD");
 
@@ -7408,62 +7415,96 @@ export class ChronoCore {
 
   /**
    * Binding existence for evidence recording: the caller session must
-   * hold one ACTIVE, unexpired dispatch whose scope covers the
-   * evidence scope (exact work package for WP evidence; same module
-   * for module/spec evidence; any live binding when the revision
-   * resolves to no artifact). Deliberately narrower than
-   * `validateActiveBinding` (no attestation/blocker/revision gates):
-   * this proves the proof rides a live binding, nothing more —
-   * downstream gates still judge currency and sufficiency.
+   * hold a live binding covering the evidence scope — an ACTIVE,
+   * unexpired dispatch (native track) or a live grant (legacy
+   * `chrono run` track: unconsumed, unexpired, bound to this session,
+   * role, and scope). Scope rule mirrors `validateActiveBinding`: an
+   * exact work package for WP evidence, the same module for
+   * module/spec evidence, existence only when the revision resolves
+   * to no artifact. Deliberately narrower than `validateActiveBinding`
+   * (no attestation/blocker/revision gates): this proves the proof
+   * rides a live binding, nothing more — downstream gates still judge
+   * currency and sufficiency.
    */
   private requireEvidenceBinding(
-    sessionId: string,
+    caller: {
+      kind: string;
+      role: string;
+      session: { id: string; adapter: string; runtime: string };
+    },
     moduleId: string | null,
     workPackageId: string | null
   ): void {
+    const sessionId = caller.session.id;
     const binding = this.db.dispatches().findActiveByWorkerSession(sessionId);
-    if (binding === null) {
-      throw new ChronoError({
-        code: ErrorCode.EXECUTION_DENIED,
-        severity: Severity.BLOCKER,
-        message: `Session '${sessionId}' holds no active dispatch binding: evidence outside a binding cannot advance the workflow`,
-        invariantRef: "INV §5.1",
-        affectedTarget: sessionId,
-        suggestedAction: "Claim a validated dispatch intent before recording proof",
-      });
-    }
-    if (Number.isNaN(Date.parse(binding.expiresAt)) || Date.parse(binding.expiresAt) <= Date.parse(this.now())) {
-      throw new ChronoError({
-        code: ErrorCode.EXECUTION_DENIED,
-        severity: Severity.BLOCKER,
-        message: `Dispatch '${binding.id}' expired: evidence on a dead binding cannot advance the workflow`,
-        invariantRef: "INV §5.1",
-        affectedTarget: binding.id,
-        suggestedAction: "Request a fresh dispatch intent",
-      });
-    }
-    if (moduleId !== null) {
-      if (binding.moduleId !== moduleId) {
+    if (binding !== null) {
+      if (Number.isNaN(Date.parse(binding.expiresAt)) || Date.parse(binding.expiresAt) <= Date.parse(this.now())) {
         throw new ChronoError({
           code: ErrorCode.EXECUTION_DENIED,
           severity: Severity.BLOCKER,
-          message: `Dispatch '${binding.id}' binds module '${binding.moduleId}', not the evidence scope '${moduleId}'`,
-          invariantRef: "INV §10.2",
-          affectedTarget: moduleId,
-          suggestedAction: "Record proof inside the bound scope only",
+          message: `Dispatch '${binding.id}' expired: evidence on a dead binding cannot advance the workflow`,
+          invariantRef: "INV §5.1",
+          affectedTarget: binding.id,
+          suggestedAction: "Request a fresh dispatch intent",
         });
       }
-      if (workPackageId !== null && binding.workPackageId !== workPackageId) {
-        throw new ChronoError({
-          code: ErrorCode.EXECUTION_DENIED,
-          severity: Severity.BLOCKER,
-          message: `Dispatch '${binding.id}' binds work package '${binding.workPackageId ?? "none"}', not '${workPackageId}'`,
-          invariantRef: "INV §10.2",
-          affectedTarget: workPackageId,
-          suggestedAction: "Record proof inside the bound Work Package only",
-        });
+      if (moduleId !== null) {
+        if (binding.moduleId !== moduleId) {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Dispatch '${binding.id}' binds module '${binding.moduleId}', not the evidence scope '${moduleId}'`,
+            invariantRef: "INV §10.2",
+            affectedTarget: moduleId,
+            suggestedAction: "Record proof inside the bound scope only",
+          });
+        }
+        if (workPackageId !== null && binding.workPackageId !== workPackageId) {
+          throw new ChronoError({
+            code: ErrorCode.EXECUTION_DENIED,
+            severity: Severity.BLOCKER,
+            message: `Dispatch '${binding.id}' binds work package '${binding.workPackageId ?? "none"}', not '${workPackageId}'`,
+            invariantRef: "INV §10.2",
+            affectedTarget: workPackageId,
+            suggestedAction: "Record proof inside the bound Work Package only",
+          });
+        }
       }
+      return;
     }
+    // Legacy run track: a live single-use grant bound to this session
+    // is an equivalent binding for evidence. Grants are Core-minted,
+    // session/role/scope-bound, and TTL'd; a consumed or expired grant
+    // (e.g. already burned by its transition) authorizes nothing.
+    const nowMs = Date.parse(this.now());
+    const liveGrant = this.db.grants().findLiveBySession(sessionId).find((grant) => {
+      if (grant.role !== caller.role) {
+        return false;
+      }
+      if (Number.isNaN(Date.parse(grant.expiresAt)) || Date.parse(grant.expiresAt) <= nowMs) {
+        return false;
+      }
+      if (moduleId !== null) {
+        if (grant.moduleId !== moduleId) {
+          return false;
+        }
+        if (workPackageId !== null && grant.workPackageId !== workPackageId) {
+          return false;
+        }
+      }
+      return true;
+    });
+    if (liveGrant !== undefined) {
+      return;
+    }
+    throw new ChronoError({
+      code: ErrorCode.EXECUTION_DENIED,
+      severity: Severity.BLOCKER,
+      message: `Session '${sessionId}' holds no active dispatch binding or live grant: evidence outside a binding cannot advance the workflow`,
+      invariantRef: "INV §5.1",
+      affectedTarget: sessionId,
+      suggestedAction: "Claim a validated dispatch intent before recording proof",
+    });
   }
 
   /**

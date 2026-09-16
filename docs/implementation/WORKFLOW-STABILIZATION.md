@@ -107,8 +107,9 @@ Semantics (normative):
 
 ## 3. Specified operation: `ChronoCore.advance()`
 
-**Not implemented** (implementing it is a separate authorized task;
-the RED test below forbids faking it).
+Implemented (signature; the RED-test prohibition on faking it stands —
+every step below runs through the same guarded operation the
+corresponding native tool calls):
 
 ```
 advance(scope, auth) -> CoreResult<{
@@ -215,11 +216,73 @@ the flag is off by default. No existing test was modified for the
 engine; existing security checks are unchanged (all denial codes
 preserved and asserted).
 
+### 5.1 Structured boundary fields (no prose parsing)
+
+`AGENT_WORK_REQUIRED` carries `phase` (`request` | `claim` |
+`execute` | `correct` | `record-harness`) plus exactly the ids each
+phase needs: `dispatchId` (claim/execute phases), `specId` /
+`specRevision` (record-harness phase), `loopId` / `defectId` /
+`attempt` (correct phase); `adapterId` is always null because adapter
+choice belongs to the orchestrator side, never the Core.
+`INDEPENDENT_REVIEW_REQUIRED` carries `reviewId` (set whenever an
+ASSIGNED review exists; null for request-completion, which names the
+verification still to be assigned). Orchestration switches on these
+fields plus the scope ids; `objective` / `reason` / `rationale` /
+`summary` prose is descriptive only. Proven by `advance.test.ts`
+"routes every boundary on structured fields with garbled prose"
+(every prose field overwritten with garbage containing decoy ids —
+any parser would deflect onto a wrong scope and fail) and by the
+removal of every prose-regex id recovery from the default suite
+(review ids arrive on assignment results; loop ids arrive on
+`advance()` boundaries and structured `CorrectionOpened` events).
+
+### 5.2 Canonical evidence rule
+
+Evidence must ride a live binding held by the recording session: an
+ACTIVE dispatch (native track) or a live grant (legacy `chrono run`
+track — unconsumed, unexpired, bound to the same session, role, and
+scope). Validation precedence is fixed: secret-bearing evidence
+denies `SECRET_DETECTED` and malformed evidence denies its
+`VALIDATION_ERROR` before any binding evaluation, so a binding
+denial never masks a leak or a malformed payload; only structurally
+valid, secret-free evidence reaches binding validation. `chrono run`
+re-authorizes before recording so its proof rides the same live
+grant that then carries the completion transition. Every Core
+fixture records through request → delegate → claim → confirm
+bindings; binding-less recording denies `EXECUTION_DENIED`.
+
+### 5.3 Restart-safe step transactions (not whole-call atomicity)
+
+`advance()` offers no whole-call atomicity: each consumed step is
+its own transaction, a crash keeps exactly the committed prefix, and
+the next `advance()` resumes past it with no repetition. Proven by
+`advance.test.ts` "injected failure commits the prefix only" (the
+`failAfterSteps` diagnostic seam aborts after exactly 2 committed
+steps with `WORKFLOW_INJECTED_FAILURE`; the N+1th transition leaves
+no partial write; close/reopen/resume emits only the 3-step suffix
+and the exact 8-transition sequence once) and "injection past the
+mechanical prefix never fires".
+
+### 5.4 What the Core tests prove — and do not prove
+
+The workflow/advance suites prove STATE CONVERGENCE of the
+deterministic Core: lifecycle transitions, gates, bindings, evidence
+indexes, and boundary routing, including across close/reopen. They
+do NOT prove product-file mutation: worker commands are fixture
+executables, Harnesses are fixture strings, and no real product
+repository is modified by any Core test. Runtime integration
+(OpenCode native tools calling `advance()`, Gaspar contract
+simplifications, real worker mutation of product files) remains open
+work — see §6.
+
 ## 6. What unblocks this gate (separate authorization required)
 
-1. ~~Implement `advance()` per §3~~ — done, this tranche.
+1. ~~Implement `advance()` per §3~~ — done, this tranche (engine,
+   structured boundary fields, canonical evidence rule, restart-safe
+   step transactions, prose-independence; full suite green).
 2. Runtime integration (OpenCode tools calling `advance()`,
-   Gaspar contract simplifications) — explicitly later work.
+   Gaspar contract simplifications, real worker mutation of product
+   files) — explicitly later work.
 3. Independent review, then pilot.
 
 (End of file)

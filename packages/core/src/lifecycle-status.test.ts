@@ -350,14 +350,22 @@ describe("Lifecycle status (next-action, execution, evidence, deep check)", () =
   });
 
   it("evidence status lists current rows by id and hides stale history", () => {
-    const workerSession = core.openSession(
-      { role: "belthazar", adapter: "test-adapter", runtime: "test-runtime", scopeModule: "MOD-0002", ttlSeconds: 3600 },
-      { interactive: true }
+    // Canonical evidence rule: proof rides a live binding minted
+    // through the native chain for this package scope.
+    const requested = core.requestDispatch(
+      { moduleId: "MOD-0002", workPackageId: "WP-0001", kind: "implementation", rationale: "status flow binding", adapterId: "fixture" },
+      gaspar
     );
-    expect(workerSession.ok).toBe(true);
-    const worker: CallerAuth = { actor: "belthazar", session: { id: workerSession.value!.id, token: workerSession.value!.token } };
+    expect(requested.ok).toBe(true);
+    expect(core.recordTaskDelegation({ agent: "belthazar", parentRuntimeSession: "opencode-parent-status" }, gaspar).ok).toBe(true);
+    const claimed = core.claimDispatch({ dispatchId: requested.value!.dispatchId, childRuntimeSession: "opencode-child-status" }, gaspar);
+    expect(claimed.ok).toBe(true);
+    expect(core.confirmClaim(requested.value!.dispatchId, gaspar).ok).toBe(true);
+    const worker: CallerAuth = { actor: "belthazar", session: { id: claimed.value!.session.id, token: claimed.value!.session.token } };
     const evidenceId = recordEvidence(worker, wpRev, "unit");
-    const status = core.evidenceStatus({ targetRevision: wpRev }, worker);
+    // The WP-bound holder cannot query module-level status; Gaspar
+    // observes the projection instead.
+    const status = core.evidenceStatus({ targetRevision: wpRev }, gaspar);
     expect(status.ok).toBe(true);
     expect(status.value!.current).toHaveLength(1);
     expect(status.value!.current[0]).toMatchObject({ evidenceId, producer: "belthazar", check: "unit", result: "pass" });

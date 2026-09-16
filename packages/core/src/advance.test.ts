@@ -614,10 +614,18 @@ describe("Workflow engine (ChronoCore.advance)", () => {
       const fix = roundTrip("correction", "belthazar");
       const rev = core.getArtifact(WP).revision;
       recordEvidenceAs(fix.worker, rev, "fix");
-      const looped = core.nextAction({ workPackageId: WP }, gaspar).value!;
-      const loopMatch = /'(COR-[0-9]+)'/.exec(looped.summary);
-      expect(loopMatch).not.toBe(null);
-      expect(core.completeCorrectionLoop(loopMatch![1]!, fix.worker).ok).toBe(true);
+      // The open loop id arrives on the structured CorrectionOpened
+      // event for this defect (entityId + payload defect match) —
+      // never parsed from prose. Latest event wins: each FAILED
+      // verdict opens the next attempt.
+      const loopedAction = core.nextAction({ workPackageId: WP }, gaspar).value!;
+      expect(loopedAction.action).toBe("correct-defect");
+      const opened = core.listEvents().filter(
+        (e) => e.eventType === "CorrectionOpened" && (JSON.parse(e.payload) as { defectId?: string }).defectId === defectId
+      );
+      expect(opened.length).toBeGreaterThan(0);
+      const loopId = opened[opened.length - 1]!.entityId;
+      expect(core.completeCorrectionLoop(loopId, fix.worker).ok).toBe(true);
       expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "ImplementationDone" }, fix.worker).ok).toBe(true);
       expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "VerificationReady" }, fix.worker).ok).toBe(true);
       expect(core.releaseDispatch(fix.dispatchId, fix.worker).ok).toBe(true);
@@ -732,5 +740,212 @@ describe("Workflow engine (ChronoCore.advance)", () => {
     if (decision.type === "PO_DECISION_REQUIRED") {
       expect(decision.action).toBe("planning-approval");
     }
+  });
+
+  it("injected failure commits the prefix only: no N+1 transition, resume without duplicates", () => {
+    // Restart-safe step transactions (not whole-call atomicity): each
+    // consumed step is its own transaction, so a crash after N steps
+    // keeps exactly N committed transitions. The diagnostic seam
+    // `failAfterSteps` proves it deterministically.
+    buildStack();
+    expect(core.submitArchitectureForReview(gaspar).ok).toBe(true);
+    approve("architecture-security", "ARCH", archRev);
+    approve("planning-approval", "SP-0001", core.getArtifact("SP-0001").revision);
+    approve("architecture-security", "SP-0001", core.getArtifact("SP-0001").revision);
+    const specRev = core.getArtifact("SP-0001").revision;
+    const harnessContent = "# harness";
+    expect(core.recordHarness(specRev, `sha256:${createHash("sha256").update(harnessContent, "utf8").digest("hex")}`, harnessContent, gaspar).ok).toBe(true);
+    const modRev = core.getArtifact(MOD).revision;
+    approve("planning-approval", MOD, modRev);
+    approve("module-approval", MOD, modRev);
+    const transitionsBefore = core.listEvents().filter((e) => e.eventType === "StateTransition").length;
+    const archTransitionsBefore = core.listEvents().filter((e) => e.eventType === "StateTransition" && e.entityId === "ARCH").length;
+    // Crash after exactly 2 committed steps (approve-architecture,
+    // submit-spec): the call fails with the distinguishable seam
+    // error instead of a boundary.
+    const crashed = core.advance({ moduleId: MOD }, gaspar, { failAfterSteps: 2 });
+    expect(crashed.ok).toBe(false);
+    expect(crashed.error?.code).toBe("WORKFLOW_INJECTED_FAILURE");
+    // Exactly the 2-step prefix committed — no third transition, no
+    // partial write from the unstarted ready-spec step.
+    const transitionsAfterCrash = core.listEvents().filter((e) => e.eventType === "StateTransition");
+    expect(transitionsAfterCrash.length).toBe(transitionsBefore + 2);
+    const archTransitions = transitionsAfterCrash.filter((e) => e.entityId === "ARCH");
+    expect(archTransitions.length).toBe(archTransitionsBefore + 1);
+    expect(core.getArtifact("SP-0001").status).toBe("REVIEW");
+    expect(core.getArtifact(MOD).status).toBe("DRAFT");
+    expect(core.getArtifact(WP).status).toBe("PLANNED");
+    // Close and reopen: the failed call wrote nothing further, so a
+    // fresh advance resumes past the injection point.
+    const session = gaspar.session;
+    core.close();
+    core = new ChronoCore({ projectPath: tempDir, runtime: "test-runtime" });
+    gaspar = { actor: "gaspar", session };
+    const resumed = core.advance({ moduleId: MOD }, gaspar);
+    expect(resumed.ok).toBe(true);
+    // The remaining suffix only — the committed prefix never repeats.
+    expect(resumed.value!.trail.map((t) => t.action)).toEqual([
+      "ready-spec",
+      "activate-module",
+      "authorize-wp",
+    ]);
+    const decision = resumed.value!.decision;
+    expect(decision.type).toBe("AGENT_WORK_REQUIRED");
+    if (decision.type === "AGENT_WORK_REQUIRED") {
+      expect(decision.kind).toBe("implementation");
+      expect(decision.workPackageId).toBe(WP);
+    }
+    // No duplicate events: the full prefix exists exactly once.
+    const transitionsFinal = core.listEvents().filter((e) => e.eventType === "StateTransition");
+    // Five trail actions commit six transitions: activate-module
+    // moves DRAFT→Planned→Approved in one step. The exact ordered
+    // sequence proves the committed prefix never repeats and the
+    // resume continued past the injection point.
+    expect(transitionsFinal.map((e) => `${e.entityId}:${(JSON.parse(e.payload) as { eventType: string }).eventType}`)).toEqual([
+      "fixture:AdapterApproved",
+      "ARCH:ArchitectureReviewed",
+      "ARCH:ArchitectureSecurityApproved",
+      "SP-0001:SpecSubmittedForReview",
+      "SP-0001:SpecApprovedReady",
+      `${MOD}:ModulePlanned`,
+      `${MOD}:ModuleApproved`,
+      `${WP}:WorkPackageAuthorized`,
+    ]);
+    expect(core.getArtifact("SP-0001").status).toBe("READY");
+    expect(core.getArtifact(MOD).status).toBe("APPROVED");
+    expect(core.getArtifact(WP).status).toBe("AUTHORIZED");
+  });
+
+  it("routes every boundary on structured fields with garbled prose", () => {
+    // Prose-independence: every human-readable field on every decision
+    // is replaced with garbage before handling — including DECOY ids
+    // (MOD-9999 and friends). The driver below touches ONLY structured
+    // fields (phase, dispatchId, reviewId, action, scopeId, revision,
+    // role, kind, moduleId, workPackageId). Any step parsing prose to
+    // recover an operational id would operate on a decoy scope and
+    // fail; reaching the reviewer boundary proves it never happens.
+    // Dispatch rationales are garbage throughout, proving rationale
+    // text is opaque input rather than a control channel.
+    const GARBLE = "PROSE GARBAGE — operational ids never live here: MOD-9999 WP-9999 DSP-9999 REV-9999 COR-9999";
+    const scrub = (d: WorkflowDecision): void => {
+      if ("rationale" in d) {
+        (d as { rationale: string }).rationale = GARBLE;
+      }
+      if ("reason" in d) {
+        (d as { reason: string }).reason = GARBLE;
+      }
+      if ("summary" in d) {
+        (d as { summary: string }).summary = GARBLE;
+      }
+      if ("objective" in d) {
+        (d as { objective: string }).objective = GARBLE;
+      }
+    };
+    const decideStructured = (): WorkflowDecision => {
+      const res = core.advance({ moduleId: MOD }, gaspar);
+      expect(res.ok).toBe(true);
+      scrub(res.value!.decision);
+      return res.value!.decision;
+    };
+    buildStack();
+    expect(core.submitArchitectureForReview(gaspar).ok).toBe(true);
+    approve("architecture-security", "ARCH", archRev);
+    approve("planning-approval", "SP-0001", core.getArtifact("SP-0001").revision);
+    approve("architecture-security", "SP-0001", core.getArtifact("SP-0001").revision);
+    const specRev = core.getArtifact("SP-0001").revision;
+    const harnessContent = "# harness";
+    expect(core.recordHarness(specRev, `sha256:${createHash("sha256").update(harnessContent, "utf8").digest("hex")}`, harnessContent, gaspar).ok).toBe(true);
+    const modRev = core.getArtifact(MOD).revision;
+    approve("planning-approval", MOD, modRev);
+    approve("module-approval", MOD, modRev);
+    // Request boundary: no dispatch row exists yet.
+    let d = decideStructured();
+    expect(d.type).toBe("AGENT_WORK_REQUIRED");
+    if (d.type !== "AGENT_WORK_REQUIRED") {
+      throw new Error("expected a request boundary");
+    }
+    expect(d.phase).toBe("request");
+    expect(d.dispatchId).toBe(null);
+    expect(d.adapterId).toBe(null);
+    expect(d.moduleId).toBe(MOD);
+    expect(d.workPackageId).toBe(WP);
+    const requested = core.requestDispatch(
+      {
+        moduleId: d.moduleId,
+        ...(d.workPackageId !== null ? { workPackageId: d.workPackageId } : {}),
+        kind: d.kind,
+        rationale: GARBLE,
+        adapterId: "fixture",
+      },
+      gaspar
+    );
+    expect(requested.ok).toBe(true);
+    // Claim boundary names its row.
+    d = decideStructured();
+    expect(d.type).toBe("AGENT_WORK_REQUIRED");
+    if (d.type !== "AGENT_WORK_REQUIRED") {
+      throw new Error("expected a claim boundary");
+    }
+    expect(d.phase).toBe("claim");
+    expect(d.dispatchId).toBe(requested.value!.dispatchId);
+    expect(core.recordTaskDelegation({ agent: d.role, parentRuntimeSession: "opencode-parent-prose" }, gaspar).ok).toBe(true);
+    const claimed = core.claimDispatch({ dispatchId: d.dispatchId as string, childRuntimeSession: "opencode-child-prose" }, gaspar);
+    expect(claimed.ok).toBe(true);
+    expect(core.confirmClaim(d.dispatchId as string, gaspar).ok).toBe(true);
+    const worker = { actor: d.role, session: { id: claimed.value!.session.id, token: claimed.value!.session.token } };
+    // Execute boundary names the live binding.
+    d = decideStructured();
+    expect(d.type).toBe("AGENT_WORK_REQUIRED");
+    if (d.type !== "AGENT_WORK_REQUIRED") {
+      throw new Error("expected an execute boundary");
+    }
+    expect(d.phase).toBe("execute");
+    expect(d.dispatchId).toBe(requested.value!.dispatchId);
+    const scopeRev = core.getArtifact(WP).revision;
+    recordEvidenceAs(worker, scopeRev, "unit-prose-garbage-check");
+    expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "ImplementationDone" }, worker).ok).toBe(true);
+    expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "VerificationReady" }, worker).ok).toBe(true);
+    expect(core.releaseDispatch(d.dispatchId as string, worker).ok).toBe(true);
+    // Review boundary names the assigned review row.
+    const assigned = core.assignReview({ kind: "verification", moduleId: MOD, workPackageId: WP }, gaspar);
+    expect(assigned.ok).toBe(true);
+    d = decideStructured();
+    expect(d.type).toBe("INDEPENDENT_REVIEW_REQUIRED");
+    if (d.type !== "INDEPENDENT_REVIEW_REQUIRED") {
+      throw new Error("expected a review boundary");
+    }
+    expect(d.role).toBe("spekkio");
+    expect(d.kind).toBe("verification");
+    expect(d.reviewId).toBe(assigned.value!.reviewId);
+    expect(d.targetRevision).toBe(scopeRev);
+    const spek = roundTrip("verification", "spekkio");
+    expect(core.recordVerification(MOD, "PASS", "spekkio", [], [], [], spek.worker, WP).ok).toBe(true);
+    expect(core.completeReview({ reviewId: d.reviewId as string }, spek.worker).ok).toBe(true);
+    expect(core.releaseDispatch(spek.dispatchId, spek.worker).ok).toBe(true);
+  });
+
+  it("injection past the mechanical prefix never fires", () => {    buildStack();
+    expect(core.submitArchitectureForReview(gaspar).ok).toBe(true);
+    approve("architecture-security", "ARCH", archRev);
+    approve("planning-approval", "SP-0001", core.getArtifact("SP-0001").revision);
+    approve("architecture-security", "SP-0001", core.getArtifact("SP-0001").revision);
+    const specRev = core.getArtifact("SP-0001").revision;
+    const harnessContent = "# harness";
+    expect(core.recordHarness(specRev, `sha256:${createHash("sha256").update(harnessContent, "utf8").digest("hex")}`, harnessContent, gaspar).ok).toBe(true);
+    const modRev = core.getArtifact(MOD).revision;
+    approve("planning-approval", MOD, modRev);
+    approve("module-approval", MOD, modRev);
+    // Five mechanical steps exist; the seam at 50 never trips, so the
+    // walk converges to the dispatch boundary exactly as without it.
+    const res = core.advance({ moduleId: MOD }, gaspar, { failAfterSteps: 50 });
+    expect(res.ok).toBe(true);
+    expect(res.value!.trail.map((t) => t.action)).toEqual([
+      "approve-architecture",
+      "submit-spec",
+      "ready-spec",
+      "activate-module",
+      "authorize-wp",
+    ]);
+    expect(res.value!.decision.type).toBe("AGENT_WORK_REQUIRED");
   });
 });

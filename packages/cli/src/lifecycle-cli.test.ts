@@ -328,6 +328,23 @@ describe("Lifecycle CLI", () => {
     expect(JSON.parse(premature.stdout).error.code).toBe("EXECUTION_DENIED");
     // Position the work through a bound implementation dispatch, then assign.
     const { workerToken } = fullDispatch();
+    // Canonical evidence rule: the forward step demands current proof
+    // by the advancing role, recorded through the live binding first.
+    const workerId = workerToken.slice(0, workerToken.indexOf("/"));
+    const workerSecret = workerToken.slice(workerToken.indexOf("/") + 1);
+    {
+      const core = new ChronoCore({ projectPath: root, runtime: "opencode" });
+      try {
+        const wpRev = core.getArtifact("WP-0001").revision;
+        expect(core.recordEvidence({
+          producer: "belthazar", tool: "vitest", targetRevision: wpRev, checkName: "unit",
+          result: "pass", diagnostics: null,
+          integrityHash: computeRevisionHash({ result: "pass", diagnostics: null, target_revision: wpRev }),
+        }, { actor: "belthazar", session: { id: workerId, token: workerSecret } }).ok).toBe(true);
+      } finally {
+        core.close();
+      }
+    }
     const advanced = runScopeAdvance(root, {
       as: "belthazar", sessionToken: workerToken, module: "MOD-0002", wp: "WP-0001",
       event: "ImplementationDone", json: true,

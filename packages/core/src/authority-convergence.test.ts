@@ -605,10 +605,16 @@ describe("Authority convergence (CORE_FIX_2)", () => {
     // restart with the ceremony still outstanding.
     const fix = dispatchRoundTrip("correction", "belthazar", "fix");
     recordEvidenceAs(fix.worker, rev, "fix");
-    const loops = core.nextAction({ workPackageId: WP }, gaspar).value!;
-    const loopMatch = /'(COR-[0-9]+)'/.exec(loops.summary);
-    expect(loopMatch).not.toBe(null);
-    expect(core.completeCorrectionLoop(loopMatch![1]!, fix.worker).ok).toBe(true);
+    // The open loop id arrives on the structured CorrectionOpened
+    // event for this defect — never parsed from prose.
+    const loopsAction = core.nextAction({ workPackageId: WP }, gaspar).value!;
+    expect(loopsAction.action).toBe("correct-defect");
+    const openedLoops = core.listEvents().filter(
+      (e) => e.eventType === "CorrectionOpened" && (JSON.parse(e.payload) as { defectId?: string }).defectId === defect.value!.id
+    );
+    expect(openedLoops.length).toBeGreaterThan(0);
+    const openLoopId = openedLoops[openedLoops.length - 1]!.entityId;
+    expect(core.completeCorrectionLoop(openLoopId, fix.worker).ok).toBe(true);
     // Pre-correction proof went stale with the loop: Lucca retests
     // the RUNNING fix beside correction, then the fix advances.
     const retest = dispatchRoundTrip("test", "lucca", "retest the fix");

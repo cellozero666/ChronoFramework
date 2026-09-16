@@ -192,6 +192,31 @@ describe("Transition reachability (every nonterminal MOD/WP state)", () => {
     return { actor: role, session: { id: res.value!.id, token: res.value!.token } };
   }
 
+  let bindSeq = 0;
+  /**
+   * Canonical evidence rule: proof rides a live binding. Mint one
+   * worker binding through the full native chain (request → delegate
+   * → claim → confirm) and return its session plus dispatch row.
+   * Release through the holder (needs its just-recorded proof) or
+   * Gaspar oversight once the scope settles.
+   */
+  function bindWorker(role: string, kind: string, moduleId: string, workPackageId?: string): { auth: CallerAuth; dispatchId: string } {
+    bindSeq += 1;
+    const requested = core.requestDispatch(
+      { moduleId, ...(workPackageId !== undefined ? { workPackageId } : {}), kind, rationale: `reachability binding for ${role}`, adapterId: "fixture" },
+      gaspar
+    );
+    expect(requested.ok).toBe(true);
+    expect(core.recordTaskDelegation({ agent: role, parentRuntimeSession: `reach-parent-${bindSeq}` }, gaspar).ok).toBe(true);
+    const claimed = core.claimDispatch({ dispatchId: requested.value!.dispatchId, childRuntimeSession: `reach-child-${bindSeq}` }, gaspar);
+    expect(claimed.ok).toBe(true);
+    expect(core.confirmClaim(requested.value!.dispatchId, gaspar).ok).toBe(true);
+    return {
+      auth: { actor: role, session: { id: claimed.value!.session.id, token: claimed.value!.session.token } },
+      dispatchId: requested.value!.dispatchId,
+    };
+  }
+
   function recordEvidenceAs(auth: CallerAuth, targetRevision: string, checkName: string): string {
     const res = core.recordEvidence({
       producer: auth.actor,
@@ -580,6 +605,10 @@ describe("Transition reachability (every nonterminal MOD/WP state)", () => {
       actor: "belthazar",
       session: { id: claimed.value!.session.id, token: claimed.value!.session.token },
     };
+    // Canonical evidence rule: ImplementationDone demands current
+    // proof by the advancing role, so the bound holder evidences the
+    // current revision before stepping forward.
+    recordEvidenceAs(worker, core.getArtifact("WP-0023").revision, "unit");
     expect(core.advanceScope({ moduleId: "MOD-0023", workPackageId: "WP-0023", event: "ImplementationDone" }, worker).ok).toBe(true);
     // The live binding reports execution until released; reviews
     // assign once it settles on the stable revision.
@@ -617,17 +646,23 @@ describe("Transition reachability (every nonterminal MOD/WP state)", () => {
     };
     const wpRev = core.getArtifact("WP-0024").revision;
     recordEvidenceAs(worker, wpRev, "unit");
-    const lucca = openWorker("lucca", "MOD-0024");
-    recordEvidenceAs(lucca, wpRev, "unit");
+    // Parallel test evidence rides its own bound worker: Lucca binds a
+    // test-kind dispatch for this package, records, and releases before
+    // review assignment so later projections see one live binding.
+    const luccaBinding = bindWorker("lucca", "test", "MOD-0024", "WP-0024");
+    recordEvidenceAs(luccaBinding.auth, wpRev, "unit");
+    expect(core.releaseDispatch(luccaBinding.dispatchId, luccaBinding.auth).ok).toBe(true);
     expect(core.advanceScope({ moduleId: "MOD-0024", workPackageId: "WP-0024", event: "ImplementationDone" }, worker).ok).toBe(true);
     expect(core.advanceScope({ moduleId: "MOD-0024", workPackageId: "WP-0024", event: "VerificationReady" }, worker).ok).toBe(true);
-    expect(core.assignReview({ kind: "verification", moduleId: "MOD-0024", workPackageId: "WP-0024" }, gaspar).ok).toBe(true);
+    const assignedReview = core.assignReview({ kind: "verification", moduleId: "MOD-0024", workPackageId: "WP-0024" }, gaspar);
+    expect(assignedReview.ok).toBe(true);
+    const reviewId = assignedReview.value!.reviewId;
     const spekkio = openWorker("spekkio", "MOD-0024");
     expect(core.recordVerification("MOD-0024", "PASS", "spekkio", [], [], [], spekkio, "WP-0024").ok).toBe(true);
-    const submit = expectAction({ workPackageId: "WP-0024" }, spekkio, ["submit-review"]);
-    const reviewId = submit.summary.match(/'(REV-[0-9]+)'/)?.[1];
-    expect(reviewId).toBeTruthy();
-    expect(core.completeReview({ reviewId: reviewId as string }, spekkio).ok).toBe(true);
+    // The assigned review id comes from the assignment result itself —
+    // never parsed from prose (see prose-independence coverage).
+    expectAction({ workPackageId: "WP-0024" }, spekkio, ["submit-review"]);
+    expect(core.completeReview({ reviewId }, spekkio).ok).toBe(true);
     // Gaspar sees the live binding progressing, not a denial: the
     // ACTIVE dispatch outranks readiness until it is released.
     expectAction({ workPackageId: "WP-0024" }, gaspar, ["execute-dispatch"]);
@@ -712,13 +747,16 @@ describe("Transition reachability (every nonterminal MOD/WP state)", () => {
     expect(core.recordTaskDelegation({ agent: "belthazar", parentRuntimeSession: "opencode-parent-3" }, gaspar).ok).toBe(true);
     const fixClaimed = core.claimDispatch({ dispatchId: fix.value!.dispatchId, childRuntimeSession: "opencode-child-3" }, gaspar);
     expect(fixClaimed.ok).toBe(true);
+    // The correction binding goes live before it can carry proof:
+    // ENACTED sessions cannot record evidence.
+    expect(core.confirmClaim(fix.value!.dispatchId, gaspar).ok).toBe(true);
     expect(core.getArtifact("WP-0026").status).toBe("RUNNING");
     expectAction({ workPackageId: "WP-0026" }, gaspar, ["correct-defect"]);
     const fixer: CallerAuth = {
       actor: "belthazar",
       session: { id: fixClaimed.value!.session.id, token: fixClaimed.value!.session.token },
     };
-    recordEvidenceAs(fixer, wpRev, "fix");
+    recordEvidenceAs(fixer, core.getArtifact("WP-0026").revision, "fix");
     expectDeepClean();
   });
 
@@ -744,15 +782,23 @@ describe("Transition reachability (every nonterminal MOD/WP state)", () => {
     expectAction({ moduleId: "MOD-0030" }, gaspar, ["execute-dispatch"]);
     expectAction({ moduleId: "MOD-0030" }, worker, ["record-evidence"]);
     const modRev = core.getArtifact("MOD-0030").revision;
+    // Test evidence binds before implementation evidence exists: once
+    // implementation proof lands on an EXECUTING module, further
+    // dispatches demand Implementation Security Acceptance first.
+    const luccaBinding = bindWorker("lucca", "test", "MOD-0030");
+    recordEvidenceAs(luccaBinding.auth, modRev, "unit");
+    expect(core.releaseDispatch(luccaBinding.dispatchId, luccaBinding.auth).ok).toBe(true);
     recordEvidenceAs(worker, modRev, "unit");
-    const lucca = openWorker("lucca", "MOD-0030");
-    recordEvidenceAs(lucca, modRev, "unit");
     expect(core.advanceScope({ moduleId: "MOD-0030", event: "ImplementationComplete" }, worker).ok).toBe(true);
     expect(core.getArtifact("MOD-0030").status).toBe("VERIFYING");
     expectAction({ moduleId: "MOD-0030" }, gaspar, ["execute-dispatch"]);
     expect(core.releaseDispatch(requested.value!.dispatchId, worker).ok).toBe(true);
     expectAction({ moduleId: "MOD-0030" }, gaspar, ["assign-review"]);
-    expect(core.assignReview({ kind: "verification", moduleId: "MOD-0030" }, gaspar).ok).toBe(true);
+    const assigned = core.assignReview({ kind: "verification", moduleId: "MOD-0030" }, gaspar);
+    expect(assigned.ok).toBe(true);
+    // The review id arrives on the assignment result itself — never
+    // parsed from prose (see prose-independence coverage).
+    const submitId = assigned.value!.reviewId;
     const verifying = core.requestDispatch(
       { moduleId: "MOD-0030", kind: "verification", rationale: "verify the package-less flow", adapterId: "fixture" },
       gaspar
@@ -768,10 +814,7 @@ describe("Transition reachability (every nonterminal MOD/WP state)", () => {
     };
     expect(core.recordVerification("MOD-0030", "PASS", "spekkio", [], [], [], spekkio).ok).toBe(true);
     expectAction({ moduleId: "MOD-0030" }, spekkio, ["submit-review"]);
-    const submitted = core.nextAction({ moduleId: "MOD-0030" }, spekkio).value!;
-    const submitId = submitted.summary.match(/'(REV-[0-9]+)'/)?.[1];
-    expect(submitId).toBeTruthy();
-    expect(core.completeReview({ reviewId: submitId as string }, spekkio).ok).toBe(true);
+    expect(core.completeReview({ reviewId: submitId }, spekkio).ok).toBe(true);
     // The implementation binding completed at line 753 and retired
     // its worker session with it: re-release is idempotent through a
     // live overseer session, never through the retired worker.

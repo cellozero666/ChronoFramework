@@ -1675,6 +1675,19 @@ export class GrantRepository {
     return this.findById(id);
   }
 
+  /**
+   * Live (unconsumed) grants bound to one session, newest first.
+   * Expiry is evaluated by the caller against its own clock so audit
+   * and gate paths share one time source. Consumed grants never
+   * return: a burned grant authorizes nothing further.
+   */
+  findLiveBySession(sessionId: string): GrantRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM execution_grant WHERE session = ? AND consumed = 0 ORDER BY issued_at DESC")
+      .all(sessionId) as GrantRow[];
+    return rows.map((row) => this.mapGrantRow(row));
+  }
+
   private mapGrantRow(row: GrantRow): GrantRecord {
     const parseMap = (value: unknown): Record<string, string> => {
       if (typeof value !== "string") {

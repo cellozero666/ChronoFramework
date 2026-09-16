@@ -2135,6 +2135,21 @@ export function runDispatch(
     const output = `entrypoint-sha256:${entrypointHash}\nstdout:\n${ran.stdout}\nstderr:\n${ran.stderr}`;
     const diagnostics = output.length > 8000 ? `${output.slice(0, 8000)}\n[truncated]` : output;
     const targetRevision = core.getArtifact(target).revision;
+    // Canonical evidence rule: proof must ride a live binding. The
+    // start grant was consumed by its transition, so re-authorize
+    // first: this fresh grant is the binding the evidence records
+    // through, and it then carries the completion transition — one
+    // live grant per step, none bypassed, none orphaned.
+    const resumed = core.authorizeExecution(options.module, {
+      ...(options.wp !== undefined ? { workPackageId: options.wp } : {}),
+      actor: options.role,
+      role: options.role,
+      session: executor,
+      adapterId: adapter.id,
+    });
+    if (!resumed.ok) {
+      return coreError(resumed.error, asJson);
+    }
     const evidence = core.recordEvidence({
       producer: options.role,
       tool: adapter.id,
@@ -2146,16 +2161,6 @@ export function runDispatch(
     }, { actor: options.role, session: executor });
     if (!evidence.ok) {
       return coreError(evidence.error, asJson);
-    }
-    const resumed = core.authorizeExecution(options.module, {
-      ...(options.wp !== undefined ? { workPackageId: options.wp } : {}),
-      actor: options.role,
-      role: options.role,
-      session: executor,
-      adapterId: adapter.id,
-    });
-    if (!resumed.ok) {
-      return coreError(resumed.error, asJson);
     }
     const done = core.transitionState(target, doneEvent, {
       actor: options.role,
