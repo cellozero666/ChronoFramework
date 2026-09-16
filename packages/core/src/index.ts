@@ -13,6 +13,7 @@ export {
   type GateDecision,
   type NextAction,
   type NextActionValue,
+  type WorkflowDecision,
   type PoEnrollment,
   type SessionAuthorization,
   NEXT_ACTIONS,

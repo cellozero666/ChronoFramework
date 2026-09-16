@@ -17,7 +17,8 @@
     "test:watch": "vitest",
     "clean": "rimraf packages/*/dist packages/*/tsconfig.tsbuildinfo tsconfig.tsbuildinfo",
     "test:blackbox": "CHRONO_BLACKBOX=1 vitest run packages/cli/src/entry-blackbox.test.ts packages/cli/src/opencode-plugin-blackbox.test.ts packages/cli/src/planning-blackbox.test.ts packages/cli/src/lifecycle-blackbox.test.ts",
-    "test:network": "CHRONO_NETWORK=1 vitest run packages/cli/src/skill-network.test.ts"
+    "test:network": "CHRONO_NETWORK=1 vitest run packages/cli/src/skill-network.test.ts",
+    "test:workflow": "WORKFLOW_STABILIZATION=1 vitest run packages/cli/src/workflow-stabilization.test.ts"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.30",

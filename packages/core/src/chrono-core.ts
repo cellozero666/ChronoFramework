@@ -178,6 +178,23 @@ export const NEXT_ACTIONS = [
 
 export type NextActionValue = (typeof NEXT_ACTIONS)[number];
 
+/**
+ * Canonical workflow boundary (WORKFLOW-STABILIZATION, specified
+ * only — see `docs/implementation/WORKFLOW-STABILIZATION.md`).
+ * The future `ChronoCore.advance()` resolves every lifecycle state
+ * to exactly one of these five boundaries after consuming all safe
+ * mechanical transitions. No operation returns this type yet;
+ * `nextAction` continues to report fine-grained executable actions
+ * until `advance()` is implemented under separate authorization.
+ * Type-only: no runtime behavior.
+ */
+export type WorkflowDecision =
+  | "PO_DECISION_REQUIRED"
+  | "AGENT_WORK_REQUIRED"
+  | "INDEPENDENT_REVIEW_REQUIRED"
+  | "BLOCKED"
+  | "COMPLETE";
+
 export interface NextAction {
   readonly action: string;
   /**
