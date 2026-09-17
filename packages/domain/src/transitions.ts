@@ -74,6 +74,12 @@ export const WORK_PACKAGE_TRANSITIONS: readonly LegalTransition[] = [
   { fromState: "VERIFYING", toState: "COMPLETE", eventType: "SpekkioPassed" },
   { fromState: "VERIFYING", toState: "FAILED", eventType: "SpekkioFailed" },
   { fromState: "FAILED", toState: "RUNNING", eventType: "CorrectionComplete" },
+  // Post-verdict rework is NOT the only way back: a defect found on
+  // VERIFYING work (before any verdict) opens a correction loop, and
+  // the bound correction claim re-enters RUNNING through the same
+  // event. The verdict chain still gates completion afterwards, so a
+  // FAILED verdict is never required merely to fix.
+  { fromState: "VERIFYING", toState: "RUNNING", eventType: "CorrectionComplete" },
   // Post-implementation rework: a defect found on IMPLEMENTED work
   // (before any verdict) opens a correction loop, and the bound
   // correction claim re-enters RUNNING through the same event. Without

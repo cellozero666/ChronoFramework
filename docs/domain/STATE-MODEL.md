@@ -128,6 +128,7 @@ Spekkio PASS                                VERIFYING → COMPLETE
 Spekkio FAILED                              VERIFYING → FAILED
 Correction complete, re-authorized          FAILED → RUNNING
 Correction rework before verification       IMPLEMENTED → RUNNING
+Correction rework from verification         VERIFYING → RUNNING
 Blocker raised (any active state)           ANY → BLOCKED
 Blocker resolved (validated re-entry)       BLOCKED → (prior valid state)
 ```

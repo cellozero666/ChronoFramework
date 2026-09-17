@@ -51,6 +51,19 @@ export function isLegalSetupAdvance(current: string | null, next: SetupStep): bo
 /** Bounded lifetime for broker-minted Gaspar sessions (30 minutes). */
 export const BROKER_SESSION_TTL_SECONDS = 1800;
 
+/**
+ * Sliding session renewal: an authenticated call landing inside this
+ * window before expiry extends the session by its original TTL, so
+ * active work never dies mid-flight (entry sessions included).
+ * Renewal is hard-capped by SESSION_MAX_LIFETIME_SECONDS: activity
+ * prolongs, never immortalizes. Expired or revoked sessions never
+ * renew — re-entry mints a fresh session.
+ */
+export const SESSION_RENEW_WINDOW_SECONDS = 600;
+
+/** Absolute session lifetime cap from issuance (30 days). */
+export const SESSION_MAX_LIFETIME_SECONDS = 2592000;
+
 /** Required opening behavior per persisted project state [SLICE-10 §5.3]. */
 export const GASPAR_ENTRY_ACTIONS: Record<string, { key: string; summary: string }> = {
   UNINITIALIZED: { key: "begin-discovery", summary: "Explain CHRONO/PO authority briefly and begin adaptive product discovery." },

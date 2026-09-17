@@ -329,6 +329,8 @@ install/uninstall lifecycle hooks — asserted by test).
 | hook drift in `doctor` | hand-edited managed asset | re-run setup/init to reconcile by ownership and hash |
 | keychain failure | locked keychain / missing helper | unlock the login keychain (`security`) or install `libsecret-tools` |
 | broker entry denied | revoked credential / stale routing | `chrono doctor` names the cause; re-prove routing or rotate the broker |
+| Session expired mid-work | bearer TTL elapsed (sessions renew slidingly while active, up to 30 days absolute) | reopen the session (`chrono session open`), run `chrono dispatch-reconcile` to retire the orphaned binding, then `chrono_next` guides a fresh dispatch — bindings never transfer between sessions by design |
+| Several open correction loops | one scope, two or more defects awaiting correction | re-request the correction dispatch with `--defect <id>` naming one open loop (the denial lists them) |
 | OpenCode answers as a generic assistant | Gaspar activation never injected (see `activation` in `doctor`) | confirm `.opencode/plugins/chrono-gate.js` is current via `chrono init --runtime opencode`, then open OpenCode normally and send a message; `doctor` must show `activation: OBSERVED` |
 
 ## 7. Security notes

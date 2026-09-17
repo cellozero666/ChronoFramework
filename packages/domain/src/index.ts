@@ -256,6 +256,8 @@ export {
   BROKER_SESSION_TTL_SECONDS,
   GASPAR_ENTRY_ACTIONS,
   SETUP_STEPS,
+  SESSION_MAX_LIFETIME_SECONDS,
+  SESSION_RENEW_WINDOW_SECONDS,
   isLegalSetupAdvance,
   setupStepIndex,
   type GasparEntryProjection,

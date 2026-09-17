@@ -168,7 +168,7 @@ export const GASPAR_NEXT_ACTION_MAP: Record<string, GasparNextActionRoute> = {
     tool: "chrono_dispatch",
     args: ["module", "wp?", "kind=correction", "rationale"],
     hold: null,
-    note: "Open correction loop with no correction dispatch: dispatch kind correction (the Core binds the defect owner — never Gaspar's choice), then exactly one task delegation to that owner.",
+    note: "Open correction loop with no correction dispatch: dispatch kind correction (the Core binds the defect owner — never Gaspar's choice), then exactly one task delegation to that owner. With several loops open, pass the defect id the denial names.",
   },
   "correct-defect": {
     tool: null,

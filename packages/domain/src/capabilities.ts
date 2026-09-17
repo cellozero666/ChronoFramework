@@ -143,10 +143,18 @@ export const EVENT_ROLE_ALLOWLIST: Record<string, readonly CapabilityHolder[]> =
   ModulePlanned: ["gaspar", "PO"],
   ModuleApproved: ["gaspar", "PO"],
   ExecutionStarted: [...ALL_WORKERS, "gaspar", "PO"],
-  ImplementationComplete: [...ALL_WORKERS, "gaspar", "PO"],
+  ImplementationComplete: [...ALL_WORKERS, "lucca", "glenn", "gaspar", "PO"],
   SpekkioPassed: ["spekkio"],
   SpekkioFailed: ["spekkio"],
-  CorrectionComplete: [...ALL_WORKERS, "gaspar", "PO"],
+  // Correction-flow enactment admits every defect-owner role, not
+  // just initial implementers: DEFECT_ROUTING designates lucca (test
+  // defects) and glenn (security defects) as correction owners, and
+  // a correction claim enacts CorrectionComplete as its worker.
+  // Without this, owner-routed loops could never claim, evidence, or
+  // advance. Spekkio stays excluded everywhere (verdict
+  // independence); initial positioning (ExecutionStarted/Assigned)
+  // stays with implementers, gaspar, and PO.
+  CorrectionComplete: [...ALL_WORKERS, "lucca", "glenn", "gaspar", "PO"],
   ChangeControlInitiated: ["gaspar", "PO"],
   DefinitionOfDoneSatisfied: ["gaspar", "PO"],
   // Aggregate module completion rides the completion authority
@@ -154,8 +162,8 @@ export const EVENT_ROLE_ALLOWLIST: Record<string, readonly CapabilityHolder[]> =
   AllPackagesComplete: ["gaspar", "spekkio", "PO"],
   WorkPackageAuthorized: ["gaspar", "PO"],
   ExecutionAssigned: [...ALL_WORKERS, "gaspar", "PO"],
-  ImplementationDone: [...ALL_WORKERS, "gaspar", "PO"],
-  VerificationReady: [...ALL_WORKERS, "gaspar", "PO"],
+  ImplementationDone: [...ALL_WORKERS, "lucca", "glenn", "gaspar", "PO"],
+  VerificationReady: [...ALL_WORKERS, "lucca", "glenn", "gaspar", "PO"],
   ArchitectureReviewed: ["gaspar", "PO"],
   ArchitectureSecurityApproved: ["gaspar", "PO"],
   // Blocker linkage events: role-gated here AND linkage-governed in the

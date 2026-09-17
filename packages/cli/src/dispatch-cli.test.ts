@@ -423,4 +423,74 @@ describe("Native dispatch CLI", () => {
     // Released locks re-acquire cleanly in sequence.
     expect(withDispatchClaimLock(root, "lock-1", () => "second")).toBe("second");
   });
+
+  it("correction dispatch selects one open loop by --defect", () => {
+    const slash = gasparToken.indexOf("/");
+    const G = { actor: "gaspar", session: { id: gasparToken.slice(0, slash), token: gasparToken.slice(slash + 1) } };
+    const drive = (): void => {
+      const core = new ChronoCore({ projectPath: root, runtime: "opencode" });
+      try {
+        const requested = core.requestDispatch(
+          { moduleId: "MOD-0002", workPackageId: "WP-0001", rationale: "drive to implemented", adapterId: "fixture" },
+          G
+        );
+        expect(requested.ok).toBe(true);
+        expect(core.recordTaskDelegation({ agent: "belthazar", parentRuntimeSession: "p-defect-1" }, G).ok).toBe(true);
+        const claimed = core.claimDispatch({ dispatchId: requested.value!.dispatchId, childRuntimeSession: "c-defect-1" }, G);
+        expect(claimed.ok).toBe(true);
+        expect(core.confirmClaim(requested.value!.dispatchId, G).ok).toBe(true);
+        const worker = { actor: "belthazar", session: { id: claimed.value!.session.id, token: claimed.value!.session.token } };
+        const rev = core.getArtifact("WP-0001").revision;
+        const ev = core.recordEvidence({
+          producer: "belthazar", tool: "vitest", targetRevision: rev, checkName: "unit",
+          result: "pass", diagnostics: null,
+          integrityHash: computeRevisionHash({ result: "pass", diagnostics: null, target_revision: rev }),
+        }, worker);
+        expect(ev.ok).toBe(true);
+        expect(core.advanceScope({ moduleId: "MOD-0002", workPackageId: "WP-0001", event: "ImplementationDone" }, worker).ok).toBe(true);
+        expect(core.releaseDispatch(requested.value!.dispatchId, worker).ok).toBe(true);
+        const spekSession = core.openSession(
+          { role: "spekkio", adapter: "fixture", runtime: "opencode", scopeModule: "MOD-0002", ttlSeconds: 3600 },
+          { interactive: true }
+        );
+        expect(spekSession.ok).toBe(true);
+        const spek = { actor: "spekkio", session: { id: spekSession.value!.id, token: spekSession.value!.token } };
+        const d1 = core.recordDefect({
+          classification: "IMPLEMENTATION_DEFECT", severity: "low", evidenceRefs: [],
+          affectedCriteria: [], affectedArtifacts: ["WP-0001"], blockingScope: "WP-0001", reproInfo: null,
+        }, spek);
+        expect(d1.ok).toBe(true);
+        const d2 = core.recordDefect({
+          classification: "TEST_DEFECT", severity: "low", evidenceRefs: [],
+          affectedCriteria: [], affectedArtifacts: ["WP-0001"], blockingScope: "WP-0001", reproInfo: null,
+        }, spek);
+        expect(d2.ok).toBe(true);
+        expect(core.openCorrectionLoop(d1.value!.id, G).ok).toBe(true);
+        expect(core.openCorrectionLoop(d2.value!.id, G).ok).toBe(true);
+      } finally {
+        core.close();
+      }
+    };
+    drive();
+    const base = {
+      module: "MOD-0002", wp: "WP-0001", kind: "correction",
+      rationale: "fix selected defect", as: "gaspar", sessionToken: gasparToken,
+      adapter: "fixture", opencodeSession: gasparKey, json: true as const,
+    };
+    const ambiguous = runDispatchRequest(root, base);
+    expect(ambiguous.exitCode).toBe(1);
+    // Resolve defect ids through Core events, then select through the CLI.
+    const probe = new ChronoCore({ projectPath: root, runtime: "opencode" });
+    let defectA = "";
+    try {
+      const events = probe.listEvents().filter((e) => e.eventType === "CorrectionOpened");
+      expect(events.length).toBe(2);
+      defectA = (JSON.parse(events[0]!.payload) as { defectId: string }).defectId;
+    } finally {
+      probe.close();
+    }
+    const chosen = runDispatchRequest(root, { ...base, defect: defectA });
+    expect(chosen.exitCode).toBe(0);
+    expect(JSON.parse(chosen.stdout)).toMatchObject({ ok: true, kind: "correction" });
+  });
 });

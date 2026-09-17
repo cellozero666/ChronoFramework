@@ -3371,7 +3371,7 @@ export function createProgram(cwd: string): Command {
     .requiredOption("--runtime <name>", "runtime the session operates in")
     .option("--scope-module <id>", "assigned module scope (required for worker roles)")
     .option("--scope-wp <id>", "assigned work-package scope")
-    .option("--ttl <seconds>", "lifetime in seconds (default 3600, max 86400)")
+    .option("--ttl <seconds>", "lifetime in seconds (default 3600, max 2592000)")
     .option("--parent-token <id/token>", "delegate from an existing session instead of a terminal")
     .option("--rationale <text>", "purpose bound into a privileged-session PO signature")
     .option("--path <dir>", "project directory (default: current directory)")
@@ -3871,6 +3871,7 @@ export function createProgram(cwd: string): Command {
     .requiredOption("--module <id>", "module scope identifier")
     .option("--wp <id>", "work-package scope identifier")
     .option("--kind <kind>", "dispatch kind: implementation, test, security-review, verification, correction (default: implementation)")
+    .option("--defect <id>", "correction only: defect whose open loop this dispatch serves (required when several loops are open)")
     .option("--proposed-profile <profile>", "proposed rigor profile: lean, standard, critical (can only raise, never lower)")
     .requiredOption("--rationale <text>", "why this dispatch starts now (1-500 chars)")
     .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
@@ -3887,6 +3888,7 @@ export function createProgram(cwd: string): Command {
           module: String(opts.module ?? ""),
           ...(typeof opts.wp === "string" && opts.wp.length > 0 ? { wp: opts.wp } : {}),
           ...(typeof opts.kind === "string" && opts.kind.length > 0 ? { kind: opts.kind } : {}),
+          ...(typeof opts.defect === "string" && opts.defect.length > 0 ? { defect: opts.defect } : {}),
           ...(typeof opts.proposedProfile === "string" && opts.proposedProfile.length > 0
             ? { proposedProfile: opts.proposedProfile }
             : {}),

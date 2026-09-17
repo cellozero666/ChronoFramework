@@ -493,6 +493,8 @@ export interface DispatchRequestOptions {
   readonly wp?: string | undefined;
   /** Dispatch kind: implementation work, test execution, reviews, verification, or correction. */
   readonly kind?: string | undefined;
+  /** Correction only: defect whose open loop this dispatch serves (required when several loops are open). */
+  readonly defect?: string | undefined;
   /** Proposed rigor profile: can only raise above project policy and content risk, never lower. */
   readonly proposedProfile?: string | undefined;
   readonly rationale: string;
@@ -551,6 +553,7 @@ export function runDispatchRequest(projectPath: string, options: DispatchRequest
         moduleId: options.module,
         ...(options.wp !== undefined && options.wp.length > 0 ? { workPackageId: options.wp } : {}),
         ...(options.kind !== undefined && options.kind.length > 0 ? { kind: options.kind } : {}),
+        ...(options.defect !== undefined && options.defect.length > 0 ? { defectId: options.defect } : {}),
         ...(options.proposedProfile !== undefined && options.proposedProfile.length > 0
           ? { proposedProfile: options.proposedProfile }
           : {}),

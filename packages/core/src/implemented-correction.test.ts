@@ -199,16 +199,20 @@ describe("IMPLEMENTED correction re-entry", () => {
     return res.value!.id;
   }
 
-  function bindWorker(role: string, kind: string, moduleId: string, workPackageId?: string): { auth: CallerAuth; dispatchId: string } {
+  function bindWorker(role: string, kind: string, moduleId: string, workPackageId?: string, defectId?: string): { auth: CallerAuth; dispatchId: string } {
     seq += 1;
     const requested = core.requestDispatch(
-      { moduleId, ...(workPackageId !== undefined ? { workPackageId } : {}), kind, rationale: `implemented-correction binding for ${role}`, adapterId: "fixture" },
+      {
+        moduleId, ...(workPackageId !== undefined ? { workPackageId } : {}), kind,
+        ...(defectId !== undefined ? { defectId } : {}),
+        rationale: `implemented-correction binding for ${role}`, adapterId: "fixture",
+      },
       gaspar
     );
-    expect(requested.ok).toBe(true);
+    expect(requested.ok, JSON.stringify(requested.ok ? null : requested.error)).toBe(true);
     expect(core.recordTaskDelegation({ agent: role, parentRuntimeSession: `implcorr-parent-${seq}` }, gaspar).ok).toBe(true);
     const claimed = core.claimDispatch({ dispatchId: requested.value!.dispatchId, childRuntimeSession: `implcorr-child-${seq}` }, gaspar);
-    expect(claimed.ok).toBe(true);
+    expect(claimed.ok, JSON.stringify(claimed.ok ? null : claimed.error)).toBe(true);
     expect(core.confirmClaim(requested.value!.dispatchId, gaspar).ok).toBe(true);
     return {
       auth: { actor: role, session: { id: claimed.value!.session.id, token: claimed.value!.session.token } },
@@ -280,6 +284,18 @@ describe("IMPLEMENTED correction re-entry", () => {
     approve("module-approval", MOD, modRev);
     expect(core.activateModule(MOD, gaspar).ok).toBe(true);
     expect(core.transitionState(WP, "WorkPackageAuthorized", gaspar).ok).toBe(true);
+  }
+
+  /** Drive the package to VERIFYING, then stand the worker down. */
+  function driveVerifying(): { auth: CallerAuth; dispatchId: string } {
+    const impl = bindWorker("belthazar", "implementation", MOD, WP);
+    const rev = core.getArtifact(WP).revision;
+    recordEvidenceAs(impl.auth, rev, "unit-impl");
+    expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "ImplementationDone" }, impl.auth).ok).toBe(true);
+    expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "VerificationReady" }, impl.auth).ok).toBe(true);
+    expect(core.getArtifact(WP).status).toBe("VERIFYING");
+    expect(core.releaseDispatch(impl.dispatchId, impl.auth).ok).toBe(true);
+    return impl;
   }
 
   /** Drive the package to IMPLEMENTED, then stand the worker down. */
@@ -411,6 +427,153 @@ describe("IMPLEMENTED correction re-entry", () => {
     expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "VerificationReady" }, fix.auth).ok).toBe(true);
     expect(core.getArtifact(WP).status).toBe("VERIFYING");
     expect(core.releaseDispatch(fix.dispatchId, fix.auth).ok).toBe(true);
+  });
+
+  it("re-enters RUNNING from VERIFYING through a correction claim", () => {
+    buildStack();
+    driveVerifying();
+    // Glenn's security finding reaches Spekkio, who records the defect;
+    // Gaspar opens the loop; the engine routes request-correction.
+    const spek = bindWorker("spekkio", "verification", MOD, WP);
+    const defect = core.recordDefect(
+      {
+        classification: "SECURITY_DEFECT",
+        severity: "major",
+        evidenceRefs: [],
+        affectedCriteria: [],
+        affectedArtifacts: [WP],
+        blockingScope: WP,
+        reproInfo: null,
+      },
+      spek.auth
+    );
+    expect(defect.ok).toBe(true);
+    expect(core.releaseDispatch(spek.dispatchId, gaspar).ok).toBe(true);
+    expect(core.openCorrectionLoop(defect.value!.id, gaspar).ok).toBe(true);
+    const guided = core.nextAction({ workPackageId: WP }, gaspar);
+    expect(guided.ok).toBe(true);
+    expect(guided.value!.action).toBe("request-correction");
+    // The correction claim itself moves VERIFYING → RUNNING; the fix
+    // then walks the normal forward path. No verdict is faked to get
+    // editable state back.
+    const fix = bindWorker("glenn", "correction", MOD, WP);
+    expect(core.getArtifact(WP).status).toBe("RUNNING");
+    recordEvidenceAs(fix.auth, core.getArtifact(WP).revision, "security-fix");
+    const opened = core.listEvents().filter(
+      (e) => e.eventType === "CorrectionOpened" && (JSON.parse(e.payload) as { defectId?: string }).defectId === defect.value!.id
+    );
+    expect(opened.length).toBeGreaterThan(0);
+    expect(core.completeCorrectionLoop(opened[opened.length - 1]!.entityId, fix.auth).ok).toBe(true);
+    expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "ImplementationDone" }, fix.auth).ok).toBe(true);
+    expect(core.getArtifact(WP).status).toBe("IMPLEMENTED");
+    expect(core.releaseDispatch(fix.dispatchId, fix.auth).ok).toBe(true);
+  });
+
+  it("selects one open loop by defect when several are open", () => {
+    buildStack();
+    driveImplemented();
+    const spek = bindWorker("spekkio", "verification", MOD, WP);
+    const first = core.recordDefect(
+      {
+        classification: "IMPLEMENTATION_DEFECT",
+        severity: "low",
+        evidenceRefs: [],
+        affectedCriteria: [],
+        affectedArtifacts: [WP],
+        blockingScope: WP,
+        reproInfo: null,
+      },
+      spek.auth
+    );
+    expect(first.ok).toBe(true);
+    const second = core.recordDefect(
+      {
+        classification: "TEST_DEFECT",
+        severity: "low",
+        evidenceRefs: [],
+        affectedCriteria: [],
+        affectedArtifacts: [WP],
+        blockingScope: WP,
+        reproInfo: null,
+      },
+      spek.auth
+    );
+    expect(second.ok).toBe(true);
+    expect(core.releaseDispatch(spek.dispatchId, gaspar).ok).toBe(true);
+    expect(core.openCorrectionLoop(first.value!.id, gaspar).ok).toBe(true);
+    expect(core.openCorrectionLoop(second.value!.id, gaspar).ok).toBe(true);
+    // Ambiguous requests name both open defects instead of guessing.
+    const denied = core.requestDispatch(
+      { moduleId: MOD, workPackageId: WP, kind: "correction", rationale: "fix one of two defects", adapterId: "fixture" },
+      gaspar
+    );
+    expect(denied.ok).toBe(false);
+    expect(denied.error?.code).toBe("EXECUTION_DENIED");
+    expect(denied.error?.message).toContain(first.value!.id);
+    expect(denied.error?.message).toContain(second.value!.id);
+    // Selecting a defect binds its loop and derives its owner.
+    const chosen = bindWorker("belthazar", "correction", MOD, WP, first.value!.id);
+    expect(core.getArtifact(WP).status).toBe("RUNNING");
+    // Finish that correction so the scope settles back to IMPLEMENTED.
+    recordEvidenceAs(chosen.auth, core.getArtifact(WP).revision, "fix-first");
+    const firstLoops = core.listEvents().filter(
+      (e) => e.eventType === "CorrectionOpened" && (JSON.parse(e.payload) as { defectId?: string }).defectId === first.value!.id
+    );
+    expect(firstLoops.length).toBeGreaterThan(0);
+    expect(core.completeCorrectionLoop(firstLoops[firstLoops.length - 1]!.entityId, chosen.auth).ok).toBe(true);
+    expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "ImplementationDone" }, chosen.auth).ok).toBe(true);
+    expect(core.getArtifact(WP).status).toBe("IMPLEMENTED");
+    expect(core.releaseDispatch(chosen.dispatchId, chosen.auth).ok).toBe(true);
+    // A defect whose loop covers another scope denies. A module-scoped
+    // reviewer session covers any package of the module.
+    expect(core.registerWorkPackage("WP-0002", "PLANNED", { id: "WP-0002", name: "W2", module: MOD, dependsOn: [] }, gaspar).ok).toBe(true);
+    const modSpekkioSession = core.openSession(
+      { role: "spekkio", adapter: "fixture", runtime: "test-runtime", scopeModule: MOD, ttlSeconds: 3600 },
+      { interactive: true }
+    );
+    expect(modSpekkioSession.ok).toBe(true);
+    const modSpekkio: CallerAuth = { actor: "spekkio", session: { id: modSpekkioSession.value!.id, token: modSpekkioSession.value!.token } };
+    const elsewhere = core.recordDefect(
+      {
+        classification: "IMPLEMENTATION_DEFECT",
+        severity: "low",
+        evidenceRefs: [],
+        affectedCriteria: [],
+        affectedArtifacts: ["WP-0002"],
+        blockingScope: "WP-0002",
+        reproInfo: null,
+      },
+      modSpekkio
+    );
+    expect(elsewhere.ok).toBe(true);
+    // A defect with no open loop denies (recorded now; its loop is
+    // never opened).
+    const lonely = core.recordDefect(
+      {
+        classification: "TEST_DEFECT",
+        severity: "low",
+        evidenceRefs: [],
+        affectedCriteria: [],
+        affectedArtifacts: [WP],
+        blockingScope: WP,
+        reproInfo: null,
+      },
+      modSpekkio
+    );
+    expect(lonely.ok).toBe(true);
+    expect(core.openCorrectionLoop(elsewhere.value!.id, gaspar).ok).toBe(true);
+    const crossed = core.requestDispatch(
+      { moduleId: MOD, workPackageId: WP, kind: "correction", defectId: elsewhere.value!.id, rationale: "cross-scope", adapterId: "fixture" },
+      gaspar
+    );
+    expect(crossed.ok).toBe(false);
+    expect(crossed.error?.code).toBe("EXECUTION_DENIED");
+    const unopened = core.requestDispatch(
+      { moduleId: MOD, workPackageId: WP, kind: "correction", defectId: lonely.value!.id, rationale: "no loop", adapterId: "fixture" },
+      gaspar
+    );
+    expect(unopened.ok).toBe(false);
+    expect(unopened.error?.code).toBe("EXECUTION_DENIED");
   });
 
   it("reconcile revokes orphaned ACTIVE bindings and preserves live ones", () => {

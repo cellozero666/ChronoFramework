@@ -2046,6 +2046,19 @@ export class SessionRepository {
   }
 
   /**
+   * Sliding-renewal write: move one live session's expiry forward,
+   * conditional on the expected current value so concurrent renewals
+   * cannot stack past the Core-computed bound. Returns false (no
+   * state change) when another renewal won the race.
+   */
+  renewExpiry(id: string, expectedExpiresAt: string, newExpiresAt: string): boolean {
+    const info = this.db
+      .prepare("UPDATE agent_session SET expires_at = ? WHERE id = ? AND revoked = 0 AND expires_at = ?")
+      .run(newExpiresAt, id, expectedExpiresAt);
+    return info.changes === 1;
+  }
+
+  /**
    * Live sessions for integrity sweeps (deep check, reconcile): not
    * revoked and not yet expired at `nowIso`. Findings carry ids and
    * roles only — token hashes never leave the store.

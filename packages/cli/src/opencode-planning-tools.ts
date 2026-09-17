@@ -424,11 +424,12 @@ export const memo_write = tool({
 });
 
 export const dispatch = tool({
-  description: "CHRONO: validate every dispatch gate for a module/work package and record a native dispatch intent (Gaspar only). Then delegate with the task tool to exactly one fitting role; the worker claims the intent. Never ask the PO to run shell commands.",
+  description: "CHRONO: validate every dispatch gate for a module/work package and record a native dispatch intent (Gaspar only). Then delegate with the task tool to exactly one fitting role; the worker claims the intent. For kind correction with several open loops, pass the defect id the denial names. Never ask the PO to run shell commands.",
   args: {
     module: tool.schema.string().describe("module identifier (must be approved/current)"),
     wp: tool.schema.string().optional().describe("work-package identifier (required when the module has Work Packages)"),
     kind: tool.schema.string().optional().describe("dispatch kind: implementation, test, security-review, verification, correction (default implementation)"),
+    defect: tool.schema.string().optional().describe("correction only: defect id whose open loop this dispatch serves (required when several loops are open)"),
     proposedProfile: tool.schema.string().optional().describe("proposed rigor profile: lean, standard, critical (can only raise, never lower)"),
     rationale: tool.schema.string().describe("why this dispatch starts now (1-500 chars)"),
   },
@@ -444,6 +445,9 @@ export const dispatch = tool({
     }
     if (args.kind !== undefined && args.kind.length > 0) {
       argv.push("--kind", args.kind);
+    }
+    if (args.defect !== undefined && args.defect.length > 0) {
+      argv.push("--defect", args.defect);
     }
     if (args.proposedProfile !== undefined && args.proposedProfile.length > 0) {
       argv.push("--proposed-profile", args.proposedProfile);

@@ -70,6 +70,8 @@ import {
   setupStepIndex,
   BROKER_SESSION_TTL_SECONDS,
   GASPAR_ENTRY_ACTIONS,
+  SESSION_MAX_LIFETIME_SECONDS,
+  SESSION_RENEW_WINDOW_SECONDS,
   parseActorIdentity,
   parseApprovalPublicKey,
   skillVendorPath,
@@ -2029,11 +2031,62 @@ export class ChronoCore {
     }
     // `last_seen` is best-effort observability, not authorization: read-only
     // opens (detection, doctor) skip the write because SQLite enforces
-    // no-write at the file layer.
+    // no-write at the file layer. Sliding renewal rides the same gate:
+    // an authenticated call landing inside the renew window extends a
+    // live session by its original TTL, hard-capped at the absolute
+    // lifetime — active work survives, expired/revoked never renew.
     if (this.config.readOnly !== true) {
       this.db.sessions().touch(id, this.now());
+      const renewed = this.renewSessionExpiry(session);
+      if (renewed !== null) {
+        session = { ...session, expiresAt: renewed };
+      }
     }
     return session;
+  }
+
+  /**
+   * Sliding renewal for one validated live session. Returns the new
+   * expiry, or null when no renewal applies (fresh sessions, sessions
+   * past their absolute cap). Renewal is an audited event, never
+   * silent: expiry extensions stay visible in the log.
+   */
+  private renewSessionExpiry(session: AgentSessionRecord): string | null {
+    const nowMs = Date.parse(this.now());
+    const expiresMs = Date.parse(session.expiresAt);
+    if (Number.isNaN(expiresMs) || expiresMs - nowMs > SESSION_RENEW_WINDOW_SECONDS * 1000) {
+      return null;
+    }
+    const issuedMs = Date.parse(session.issuedAt);
+    if (Number.isNaN(issuedMs)) {
+      return null;
+    }
+    const absoluteMaxMs = issuedMs + SESSION_MAX_LIFETIME_SECONDS * 1000;
+    if (nowMs >= absoluteMaxMs) {
+      return null;
+    }
+    const originalTtlMs = expiresMs - issuedMs;
+    if (!Number.isFinite(originalTtlMs) || originalTtlMs <= 0) {
+      return null;
+    }
+    const candidateMs = Math.min(nowMs + originalTtlMs, absoluteMaxMs);
+    if (candidateMs <= expiresMs) {
+      return null;
+    }
+    const renewed = new Date(candidateMs).toISOString();
+    if (!this.db.sessions().renewExpiry(session.id, session.expiresAt, renewed)) {
+      return null;
+    }
+    this.events.append({
+      eventType: "SessionRenewed",
+      entityId: session.id,
+      payload: { role: session.role, priorExpiry: session.expiresAt, newExpiry: renewed },
+      actor: session.role,
+      priorState: "active",
+      newState: "active",
+      reasoning: "Sliding renewal: active session extended inside its renew window",
+    });
+    return renewed;
   }
 
   /**
@@ -2295,11 +2348,11 @@ export class ChronoCore {
           });
         }
       }
-      if (!Number.isFinite(input.ttlSeconds) || input.ttlSeconds <= 0 || input.ttlSeconds > 86400) {
+      if (!Number.isFinite(input.ttlSeconds) || input.ttlSeconds <= 0 || input.ttlSeconds > SESSION_MAX_LIFETIME_SECONDS) {
         throw new ChronoError({
           code: ErrorCode.VALIDATION_ERROR,
           severity: Severity.ERROR,
-          message: "Session TTL must be within 1 second and 24 hours",
+          message: "Session TTL must be within 1 second and 30 days",
           invariantRef: "INV §14.4",
           suggestedAction: "Request a bounded session lifetime",
         });
@@ -6440,6 +6493,8 @@ export class ChronoCore {
       rationale: string;
       adapterId?: string | undefined;
       proposedProfile?: string | undefined;
+      /** Correction only: the defect whose open loop this dispatch serves (required when several loops are open). */
+      defectId?: string | undefined;
     },
     auth: CallerAuth
   ): CoreResult<{
@@ -6500,11 +6555,13 @@ export class ChronoCore {
       }
       // Correction dispatches bind their defect's owner and open loop
       // up front: the role is derived, never chosen, and a missing
-      // open loop denies here rather than mid-claim.
+      // open loop denies here rather than mid-claim. With several
+      // loops open the caller names its defect explicitly.
       let role: string | null = null;
       let correctionOf: string | null = null;
       if (kind === "correction") {
-        const loop = this.requireOpenCorrectionLoop(input.moduleId, input.workPackageId ?? null, null);
+        const selected = input.defectId !== undefined && input.defectId.length > 0 ? input.defectId : null;
+        const loop = this.requireOpenCorrectionLoop(input.moduleId, input.workPackageId ?? null, selected);
         const owner = loop.ownerRole;
         if (!isRoleForDispatchKind(kind, owner)) {
           throw new ChronoError({
@@ -8034,7 +8091,18 @@ export class ChronoCore {
           suggestedAction: "Open a correction loop for the defect first",
         });
       }
-      return open[0]!;
+      const loop = open[0]!;
+      if (loop.moduleId !== moduleId || (loop.workPackageId ?? null) !== workPackageId) {
+        throw new ChronoError({
+          code: ErrorCode.EXECUTION_DENIED,
+          severity: Severity.BLOCKER,
+          message: `Defect '${defectId}' owns no open loop on this scope: its loop covers '${loop.workPackageId ?? loop.moduleId}'`,
+          invariantRef: "INV §5.1",
+          affectedTarget: defectId,
+          suggestedAction: "Select a defect whose open loop covers the requested scope",
+        });
+      }
+      return loop;
     }
     const scoped = this.db.correctionLoops().listByScope(moduleId, workPackageId)
       .filter((l) => l.status === "OPEN" || l.status === "CORRECTING");
@@ -8049,13 +8117,14 @@ export class ChronoCore {
       });
     }
     if (scoped.length > 1) {
+      const openDefects = scoped.map((l) => l.defectId).join(", ");
       throw new ChronoError({
         code: ErrorCode.EXECUTION_DENIED,
         severity: Severity.BLOCKER,
-        message: "Scope has several open correction loops: resolve to one defect before dispatching correction",
+        message: `Scope has several open correction loops (${openDefects}): select one defect for this correction dispatch`,
         invariantRef: "INV §5.1",
         affectedTarget: workPackageId ?? moduleId,
-        suggestedAction: "Complete or escalate loops until one remains",
+        suggestedAction: `Re-request with --defect <id> naming one of: ${openDefects}`,
       });
     }
     return scoped[0]!;
