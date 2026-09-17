@@ -655,7 +655,7 @@ describe("Kiro entry (hermetic contract, real runtime open)", () => {
     expect(driftReasons.some((r) => r.includes("chrono-entry-kiro.json"))).toBe(true);
   });
 
-  it("denies Kiro entry without routing proof or registration", async () => {
+  it("warns (not denies) Kiro entry without routing proof; still denies unregistered adapters (ADR-009)", async () => {
     const project = await readyProject(tempDir, binDir);
     const listed = runBrokerList(tempDir, { json: true, as: "gaspar", session: project.gaspar });
     const brokerId = (JSON.parse(listed.stdout) as { credentials: { id: string }[] }).credentials[0]!.id;
@@ -668,8 +668,9 @@ describe("Kiro entry (hermetic contract, real runtime open)", () => {
       secret
     );
     expect(ghost.exitCode).toBe(1);
-    // Approved-but-unproven Kiro adapter: entry reaches the routing gate
-    // and denies there.
+    // Approved-but-unproven Kiro adapter: RTK posture is advisory-only
+    // (ADR-009), so entry succeeds with a recorded RtkWarning instead of
+    // denying at the routing gate.
     const entrypoint = kiroEntrypoint();
     approveKiroAdapter(project.store, entrypoint);
     const unproven = runEntry(
@@ -677,9 +678,8 @@ describe("Kiro entry (hermetic contract, real runtime open)", () => {
       { adapter: "kiro", broker: brokerId, runtime: "opencode", tokenOut: join(binDir, "k2.token"), json: true },
       secret
     );
-    expect(unproven.exitCode).toBe(1);
-    expect((JSON.parse(unproven.stdout) as { error: { code: string } }).error.code).toBe("RTK_ROUTING_FAILURE");
-    expect(existsSync(join(binDir, "k2.token"))).toBe(false);
+    expect(unproven.exitCode).toBe(0);
+    expect(existsSync(join(binDir, "k2.token"))).toBe(true);
   });
 });
 

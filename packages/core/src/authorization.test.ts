@@ -213,11 +213,9 @@ function approvedModule(core: ChronoCore, sign: SignFn, privateKeyPem: string): 
   return { modRev, gaspar };
 }
 
-function recordAttestations(
+function recordRtkOnly(
   core: ChronoCore,
-  auth: CallerAuth,
-  privateKeyPem: string,
-  timestamp = new Date().toISOString()
+  auth: CallerAuth
 ): void {
   // The RTK binary is a real fixture script so routing proofs can hash it.
   const rtkBin = join(core.projectPath(), "fixture-rtk.sh");
@@ -237,6 +235,12 @@ function recordAttestations(
       ttlSeconds: 3600,
     }).ok
   ).toBe(true);
+}
+
+function recordSkillOnly(
+  core: ChronoCore,
+  auth: CallerAuth
+): void {
   expect(
     core.recordSkillAttestation(auth, {
       upstream: SKILL_UPSTREAM,
@@ -265,6 +269,16 @@ function recordAttestations(
     mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, FIXTURE_SKILL_MD, "utf8");
   }
+}
+
+function recordAttestations(
+  core: ChronoCore,
+  auth: CallerAuth,
+  privateKeyPem: string,
+  timestamp = new Date().toISOString()
+): void {
+  recordRtkOnly(core, auth);
+  recordSkillOnly(core, auth);
   // Approved fixture adapter plus a current routing proof: dispatch
   // requires effective routing, not just attestation currency.
   const po = { actor: "PO", session: bootstrapPrivilegedSession(core, "PO", privateKeyPem, undefined, timestamp) };
@@ -510,12 +524,26 @@ describe("Execution authorization", () => {
     expect(res.error?.code).toBe("EXECUTION_DENIED");
   });
 
-  it("denies without attestations (missing capability, explicit code)", () => {
+  it("warns without RTK attestation but authorizes when skill is current (ADR-009)", () => {
     const { gaspar } = approvedModule(core, sign, privateKeyPem);
+    recordSkillOnly(core, gaspar);
+    const worker = openTestSession(core, "belthazar", "MOD-0001");
+    const res = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar", session: worker, requesterSession: gaspar.session });
+    // RTK posture is advisory-only per PO decision ADR-009: missing
+    // attestation warns (audited RtkWarning) but never denies.
+    expect(res.ok).toBe(true);
+    const warnings = core.listEvents().filter((e) => e.eventType === "RtkWarning");
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(JSON.stringify(warnings.map((w) => w.payload))).toContain("RTK attestation missing");
+  });
+
+  it("still denies without skill attestation even when RTK is recorded", () => {
+    const { gaspar } = approvedModule(core, sign, privateKeyPem);
+    recordRtkOnly(core, gaspar);
     const worker = openTestSession(core, "belthazar", "MOD-0001");
     const res = core.authorizeExecution("MOD-0001", { actor: "gaspar", role: "belthazar", session: worker, requesterSession: gaspar.session });
     expect(res.ok).toBe(false);
-    expect(res.error?.code).toBe("BLOCKED_RTK");
+    expect(res.error?.code).toBe("BLOCKED_PROCESS_SKILL");
   });
 
   it("denies without module approval even when attestations exist", () => {
@@ -1010,10 +1038,13 @@ describe("Dispatch grants (session binding)", () => {
     }
   });
 
-  it("records proofs pre-registration but never authorizes dispatch with them", () => {
+  it("records proofs pre-registration and warns (not denies) at authorize time (ADR-009)", () => {
     // Evidence precedes approval by design (setup proves routing before
     // the PO approves adapters). Recording succeeds for a merely
-    // registered (pending) adapter; dispatch still denies until active.
+    // registered (pending) adapter; authorize-time RTK posture is now
+    // advisory-only, so it warns naming the scope instead of denying.
+    // Enactment through the grant still requires an approved adapter
+    // (independent adapter-authority gate, unchanged).
     const { core, sign, poPrivateKey, restoreTty: restorePendingTty } = clockedCore(T0);
     try {
       const { gaspar } = approvedModule(core, sign, poPrivateKey);
@@ -1044,16 +1075,16 @@ describe("Dispatch grants (session binding)", () => {
       });
       expect(recorded.ok).toBe(true);
       const worker = openTestSession(core, "belthazar", "MOD-0001");
-      const denied = core.authorizeExecution("MOD-0001", {
+      const warned = core.authorizeExecution("MOD-0001", {
         actor: "gaspar",
         role: "belthazar",
         session: worker,
         requesterSession: gaspar.session,
         adapterId: "pending-ad",
       });
-      expect(denied.ok).toBe(false);
-      expect(denied.error?.code).toBe("RTK_ROUTING_FAILURE");
-      expect(denied.error?.message ?? "").toContain("pending-ad");
+      expect(warned.ok).toBe(true);
+      const messages = core.listEvents().filter((e) => e.eventType === "RtkWarning").map((e) => JSON.stringify(e.payload));
+      expect(messages.some((m) => m.includes("pending-ad"))).toBe(true);
     } finally {
       restorePendingTty();
       core.close();
@@ -1426,9 +1457,11 @@ describe("Completion authorization", () => {
 
 describe("Routing proof authority (candidate promotes to authoritative)", () => {
   // Adversarial coverage for FIXES-SL-10.1 C2/C3 [ADR-006]: recorded
-  // proofs are non-authoritative candidates; only promotion after signed
-  // adapter approval authorizes dispatch, and every binding (attestation,
-  // binary, registration, assets, TTL, scope) re-validates per use.
+  // proofs are non-authoritative candidates; promotion after signed
+  // adapter approval restores proven routing, and every binding
+  // (attestation, binary, registration, assets, TTL, scope) re-validates
+  // per use. Per PO decision ADR-009 the proof state is advisory-only:
+  // dispatch proceeds with an audited RtkWarning instead of denying.
   let tempDir: string;
   const T0 = "2026-09-11T00:00:00.000Z";
 
@@ -1517,6 +1550,11 @@ describe("Routing proof authority (candidate promotes to authoritative)", () => 
     return { id: res.value!.id, token: res.value!.token };
   }
 
+  /** RtkWarning payloads recorded so far (RTK is advisory-only per ADR-009). */
+  function rtkWarningMessages(core: ChronoCore): string[] {
+    return core.listEvents().filter((e) => e.eventType === "RtkWarning").map((e) => JSON.stringify(e.payload));
+  }
+
   function dispatch(
     core: ChronoCore,
     gaspar: CallerAuth,
@@ -1537,7 +1575,7 @@ describe("Routing proof authority (candidate promotes to authoritative)", () => 
     return { ok: false, code: res.error?.code, message: res.error?.message ?? "" };
   }
 
-  it("candidate proofs deny dispatch until promoted, then authorize", () => {
+  it("candidate proofs warn but authorize dispatch; promotion clears the warning (ADR-009)", () => {
     const h = harness();
     try {
       const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
@@ -1545,14 +1583,16 @@ describe("Routing proof authority (candidate promotes to authoritative)", () => 
       recordAttestations(h.core, gaspar, h.privateKeyPem, T0);
       approveSecondAdapter(h.core, po, h.sign, "route-ad");
       const id = recordCandidate(h.core, gaspar, "route-ad");
-      const denied = dispatch(h.core, gaspar, "route-ad");
-      expect(denied.ok).toBe(false);
-      expect(denied.code).toBe("RTK_ROUTING_FAILURE");
-      expect(denied.message ?? "").toContain("non-authoritative candidate");
-      expect(denied.message ?? "").toContain("route-ad");
+      const warned = dispatch(h.core, gaspar, "route-ad");
+      // Advisory-only: dispatch proceeds, warning names the candidate state.
+      expect(warned.ok).toBe(true);
+      const messages = rtkWarningMessages(h.core);
+      expect(messages.some((m) => m.includes("non-authoritative candidate") && m.includes("route-ad"))).toBe(true);
       installManagedProofAssets(tempDir, "route-ad");
       expect(h.core.promoteRoutingProof(id, po).ok).toBe(true);
+      const before = rtkWarningMessages(h.core).length;
       expect(dispatch(h.core, gaspar, "route-ad").ok).toBe(true);
+      expect(rtkWarningMessages(h.core)).toHaveLength(before);
     } finally {
       h.restoreTty();
       h.core.close();
@@ -1663,7 +1703,7 @@ describe("Routing proof authority (candidate promotes to authoritative)", () => 
     }
   });
 
-  it("dispatch denies an expired proof", () => {
+  it("dispatch warns on an expired proof (ADR-009)", () => {
     const h = harness();
     try {
       const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
@@ -1674,17 +1714,16 @@ describe("Routing proof authority (candidate promotes to authoritative)", () => 
       installManagedProofAssets(tempDir, "route-ad");
       expect(h.core.promoteRoutingProof(id, po).ok).toBe(true);
       h.clockRef.now = new Date(Date.parse(T0) + 2000).toISOString();
-      const denied = dispatch(h.core, gaspar, "route-ad");
-      expect(denied.ok).toBe(false);
-      expect(denied.code).toBe("RTK_ROUTING_FAILURE");
-      expect(denied.message ?? "").toContain("expired");
+      const warned = dispatch(h.core, gaspar, "route-ad");
+      expect(warned.ok).toBe(true);
+      expect(rtkWarningMessages(h.core).some((m) => m.includes("expired"))).toBe(true);
     } finally {
       h.restoreTty();
       h.core.close();
     }
   });
 
-  it("dispatch denies a binary replaced after promotion", () => {
+  it("dispatch warns on a binary replaced after promotion (ADR-009)", () => {
     const h = harness();
     try {
       const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
@@ -1696,17 +1735,16 @@ describe("Routing proof authority (candidate promotes to authoritative)", () => 
       expect(h.core.promoteRoutingProof(id, po).ok).toBe(true);
       expect(dispatch(h.core, gaspar, "route-ad").ok).toBe(true);
       writeFileSync(join(tempDir, "fixture-rtk.sh"), "#!/bin/sh\necho fixture-rtk REPLACED\n", "utf8");
-      const denied = dispatch(h.core, gaspar, "route-ad");
-      expect(denied.ok).toBe(false);
-      expect(denied.code).toBe("RTK_ROUTING_FAILURE");
-      expect(denied.message ?? "").toContain("changed since the proof");
+      const warned = dispatch(h.core, gaspar, "route-ad");
+      expect(warned.ok).toBe(true);
+      expect(rtkWarningMessages(h.core).some((m) => m.includes("changed since the proof"))).toBe(true);
     } finally {
       h.restoreTty();
       h.core.close();
     }
   });
 
-  it("dispatch denies managed-asset drift after promotion", () => {
+  it("dispatch warns on managed-asset drift after promotion (ADR-009)", () => {
     const h = harness();
     try {
       const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
@@ -1718,17 +1756,16 @@ describe("Routing proof authority (candidate promotes to authoritative)", () => 
       expect(h.core.promoteRoutingProof(id, po).ok).toBe(true);
       expect(dispatch(h.core, gaspar, "route-ad").ok).toBe(true);
       writeFileSync(join(tempDir, ".opencode", "plugins", "chrono-gate.js"), "tampered-by-test\n", "utf8");
-      const denied = dispatch(h.core, gaspar, "route-ad");
-      expect(denied.ok).toBe(false);
-      expect(denied.code).toBe("RTK_ROUTING_FAILURE");
-      expect(denied.message ?? "").toContain("managed-asset drift");
+      const warned = dispatch(h.core, gaspar, "route-ad");
+      expect(warned.ok).toBe(true);
+      expect(rtkWarningMessages(h.core).some((m) => m.includes("managed-asset drift"))).toBe(true);
     } finally {
       h.restoreTty();
       h.core.close();
     }
   });
 
-  it("dispatch denies adapter re-registration after promotion", () => {
+  it("dispatch warns on adapter re-registration after promotion (ADR-009)", () => {
     const h = harness();
     try {
       const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
@@ -1751,17 +1788,16 @@ describe("Routing proof authority (candidate promotes to authoritative)", () => 
       } finally {
         raw.close();
       }
-      const denied = dispatch(h.core, gaspar, "route-ad");
-      expect(denied.ok).toBe(false);
-      expect(denied.code).toBe("RTK_ROUTING_FAILURE");
-      expect(denied.message ?? "").toContain("current adapter registration");
+      const warned = dispatch(h.core, gaspar, "route-ad");
+      expect(warned.ok).toBe(true);
+      expect(rtkWarningMessages(h.core).some((m) => m.includes("current adapter registration"))).toBe(true);
     } finally {
       h.restoreTty();
       h.core.close();
     }
   });
 
-  it("dispatch denies cross-runtime and cross-adapter proof reuse", () => {
+  it("dispatch warns on cross-adapter proof reuse (ADR-009)", () => {
     const h = harness();
     try {
       const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
@@ -1779,23 +1815,24 @@ describe("Routing proof authority (candidate promotes to authoritative)", () => 
       expect(foreign.ok).toBe(false);
       expect(foreign.error?.code).toBe("INCONSISTENT_REFERENCE");
       // Cross-adapter: a live session on the approved second adapter has
-      // no proof in its own scope, so lookup denies.
+      // no proof in its own scope, so the dispatch warns (advisory-only)
+      // instead of denying.
       approveSecondAdapter(h.core, po, h.sign, "route-ad");
       const otherAdapter = dispatch(h.core, gaspar, "route-ad", "test-runtime");
-      expect(otherAdapter.ok).toBe(false);
-      expect(otherAdapter.code).toBe("RTK_ROUTING_FAILURE");
-      expect(otherAdapter.message ?? "").toContain("no current RTK routing proof");
+      expect(otherAdapter.ok).toBe(true);
+      expect(rtkWarningMessages(h.core).some((m) => m.includes("no current RTK routing proof"))).toBe(true);
     } finally {
       h.restoreTty();
       h.core.close();
     }
   });
 
-  it("identity-only and already-routed inputs never reach the Core as proofs", () => {
+  it("identity-only and already-routed inputs record as evidence, dispatch still warns (ADR-009)", () => {
     // The CLI rejects these before recording (covered in rtk-cli
     // tests); the Core additionally binds the pre-routing input so a
-    // smuggled identity-only routed command is auditable as evidence,
-    // not authority: a candidate alone never dispatches.
+    // smuggled identity-only routed command is auditable as evidence.
+    // The recorded candidate stays non-authoritative: dispatch proceeds
+    // with an advisory warning naming the candidate state.
     const h = harness();
     try {
       const { gaspar } = approvedModule(h.core, h.sign, h.privateKeyPem);
@@ -1820,7 +1857,8 @@ describe("Routing proof authority (candidate promotes to authoritative)", () => 
       // candidate authorizes nothing and promotion still requires the
       // full approval + manifest bindings.
       expect(res.ok).toBe(true);
-      expect(dispatch(h.core, gaspar, "route-ad").ok).toBe(false);
+      expect(dispatch(h.core, gaspar, "route-ad").ok).toBe(true);
+      expect(rtkWarningMessages(h.core).some((m) => m.includes("non-authoritative candidate"))).toBe(true);
     } finally {
       h.restoreTty();
       h.core.close();
@@ -1911,8 +1949,8 @@ describe.each([11, 12])("Routing proof migration (v%i → current)", (baseline) 
   // schema v11/v12 (no authority columns) migrate with evidence intact,
   // default to non-authoritative CANDIDATE (never accidentally
   // AUTHORITATIVE), and remain promotable after signed approval with
-  // current bindings — so dispatch denies before promotion and
-  // authorizes after.
+  // current bindings — dispatch warns before promotion (advisory-only
+  // per ADR-009) and records no warning after.
   let tempDir: string;
   const T0 = "2026-09-11T00:00:00.000Z";
 
@@ -2067,22 +2105,21 @@ describe.each([11, 12])("Routing proof migration (v%i → current)", (baseline) 
     }
   });
 
-  it("denies dispatch for the vintage candidate before promotion", () => {
+  it("warns on the vintage candidate before promotion (ADR-009)", () => {
     seedVintageDb();
     const h = migratedHarness();
     try {
       const worker = openTestSession(h.core, "belthazar", "MOD-0001");
-      const denied = h.core.authorizeExecution("MOD-0001", {
+      const warned = h.core.authorizeExecution("MOD-0001", {
         actor: "gaspar",
         role: "belthazar",
         session: worker,
         requesterSession: h.gaspar.session,
         adapterId: "test-adapter",
       });
-      expect(denied.ok).toBe(false);
-      expect(denied.error?.code).toBe("RTK_ROUTING_FAILURE");
-      expect(denied.error?.message ?? "").toContain("RTE-0001");
-      expect(denied.error?.message ?? "").toContain("non-authoritative candidate");
+      expect(warned.ok).toBe(true);
+      const messages = h.core.listEvents().filter((e) => e.eventType === "RtkWarning").map((e) => JSON.stringify(e.payload));
+      expect(messages.some((m) => m.includes("RTE-0001") && m.includes("non-authoritative candidate"))).toBe(true);
     } finally {
       h.restoreTty();
       h.core.close();

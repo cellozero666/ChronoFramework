@@ -64,7 +64,7 @@ Approved artifacts MUST NOT be silently overwritten. Material changes MUST creat
 
 A current SecurityProfile and Architecture Security Approval are required for affected readiness. Current SecurityReport/test evidence and Implementation Security Acceptance are required for final verification/completion. An unresolved SecurityBlocker fails closed.
 
-Every agent-driven CLI execution MUST reference a current RTKAttestation for the active adapter. The accepted upstream is `https://github.com/rtk-ai/rtk`. Missing, incompatible, stale, unhealthy, or bypassed RTK state MUST prevent dispatch.
+Every agent-driven CLI execution SHOULD reference a current RTKAttestation for the active adapter (advisory telemetry). The accepted upstream is `https://github.com/rtk-ai/rtk`. Missing, incompatible, stale, unhealthy, or bypassed RTK state records an advisory `RtkWarning` and NEVER prevents dispatch (PO decision ADR-009).
 
 Every agent execution MUST reference a current SkillAttestation for the pinned `https://github.com/multica-ai/andrej-karpathy-skills` source. Runtime artifacts MUST be deterministically derived from its canonical `skills/karpathy-guidelines/SKILL.md`, semantically equivalent, licensed/attributed, discoverable, permitted, and activation-tested. Invalid or absent state MUST prevent dispatch.
 

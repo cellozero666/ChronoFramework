@@ -97,11 +97,8 @@ Reference: `[CORE §16]`, `[FW §1055-1077]`.
 
 ```
 FUNCTION dispatch_approved_command(adapter, command, args):
-    # 1. Check RTK
-    rtk_result = chrono gate rtk  # internal check
-    IF rtk_result != AUTHORIZED:
-        PRINT rtk_result.reason
-        RAISE BLOCKED_RTK
+    # 1. Report RTK posture (advisory-only per ADR-009: warn, never deny)
+    rtk_warnings = chrono rtk status  # reported; execution proceeds regardless
 
     # 2. Check skill
     skill_result = chrono gate skill  # internal check
@@ -118,8 +115,8 @@ FUNCTION dispatch_approved_command(adapter, command, args):
         PRINT exec_result.reason
         RAISE EXECUTION_DENIED
 
-    # 4. Dispatch through RTK
-    result = rtk exec adapter command args
+    # 4. Dispatch (through RTK when healthy; directly with a warning otherwise)
+    result = exec adapter command args
     RETURN result
 ```
 
@@ -201,15 +198,13 @@ Adapters MUST NOT:
 - Override `DENIED` results.
 - Hardcode a provider, model name, or model version `[INV §11.2, FW §22]`.
 
-### 6.2 No silent fallback
+### 6.2 No silent posture
 
-If RTK is absent, incompatible, or bypassed, the adapter MUST stop and provide actionable instructions. It MUST NOT fall back to raw/unfiltered command output `[REF §1192]`, `[INV §8.3]`.
+If RTK is absent, incompatible, or bypassed, the adapter MUST report the degraded state (surfaced as `RtkWarning` with actionable instructions) and proceed. It MUST NOT suppress the degraded state `[ADR-009]`.
 
-### 6.3 RTK routing requirement
+### 6.3 RTK routing telemetry (advisory-only per ADR-009)
 
-Every command that the agent dispatches MUST be covered by a current
-AUTHORITATIVE routing proof for the (adapter, runtime, project) scope
-`[CORE §10.2, INV §8.7, ADR-006]`:
+Routing proofs remain observable optimization telemetry. Recording and promotion work as before (candidate → authoritative after signed adapter approval), but proof state NEVER gates dispatch:
 
 ```
 chrono rtk prove --adapter <id> -- <raw command>   # records a CANDIDATE (authorizes nothing)
@@ -223,8 +218,8 @@ pre-routing input, routed command, output hash, and TTL as evidence.
 Identity-only commands (`rtk gain`, `rtk --version`) prove binary and
 dashboard identity for attestation — never routing. `promote`
 re-validates attestation, binary, approval, and managed-asset bindings
-and snapshots the registration and asset hashes; dispatch re-validates
-all of them per use, so drift invalidates without further ceremony.
+and snapshots the registration and asset hashes for observability; drift is
+reported (not enforced) without further ceremony.
 
 Configuration-file presence (`rtk.yaml`) is NOT proof of routing `[P8.7]`.
 
@@ -390,7 +385,7 @@ Evidence from non-web toolchains (Rust, Python, C, compiled tests, shell, etc.) 
 
 ### 9.3 Cross-runtime equivalence
 
-RTKAttestation and SkillAttestation apply identically across all supported runtimes. There is no per-runtime bypass. `[P6.5]`, `[P6.6]`, `[INV §8]`, `[INV §9]`.
+RTKAttestation is reported (advisory `RtkWarning`, never blocking) identically across all supported runtimes; SkillAttestation still fails closed with no per-runtime bypass. `[P6.5]`, `[P6.6]`, `[INV §8]`, `[INV §9]`, `[ADR-009]`.
 
 ---
 
@@ -430,11 +425,11 @@ Each runtime adapter MUST demonstrate:
 
 1. **Dispatch authorization**: `chrono gate execution` is called before dispatch and is enforced. `[FW §1077]`.
 2. **In-runtime hook**: Native pre-tool hooks call `chrono gate` before protected actions, proven by effective routing evidence (`[CORE §10.3]`). `[REF §1214]`.
-3. **RTK routing**: Every dispatched command is covered by a current AUTHORITATIVE routing proof (recorded with `chrono rtk prove`, promoted with `chrono rtk promote` after signed adapter approval). `rtk gain` proves binary/dashboard identity for attestation only — never routing. `[CORE §10, INV §8, ADR-006]`.
+3. **RTK routing telemetry**: routing-proof state (`chrono rtk prove` candidate, `chrono rtk promote` authoritative) is reported, never enforced. `rtk gain` proves binary/dashboard identity for attestation only — never routing. `[CORE §10, ADR-006, ADR-009]`.
 4. **Skill activation**: Karpathy Guidelines skill is active (not just discoverable) in the runtime. `[P6.6]`.
 5. **No hardcoded model**: No provider/model/version string in adapter source or defaults. `[INV §11.2]`.
 
-If any conformance point cannot be proven, the runtime adapter is non-conformant and the Core MUST deny dispatch for that runtime. `[INV §15.1]`.
+If any conformance point except RTK telemetry cannot be proven, the runtime adapter is non-conformant and the Core MUST deny dispatch for that runtime. `[INV §15.1]`. RTK posture alone NEVER renders an adapter non-conformant (ADR-009).
 
 6. **Runtime generation handshake**: every OpenCode plugin load records its generation (CHRONO version, tool policy version, deterministic build fingerprint over the canonical tool policy and managed skill pin, per-load process identifier). `chrono doctor` compares the latest observed load against the installed expectations: a mismatch reports the blocking condition `RUNTIME_RESTART_REQUIRED` (exit 1) until a complete OpenCode termination followed by a fresh process loads a matching generation — which clears automatically on its fresh load event. Repaired disk files alone never report runtime readiness. Rerunning `chrono init` does not hot-reload a running OpenCode process.
 
@@ -447,7 +442,7 @@ All gate and dispatch errors MUST use the taxonomy from `[CORE §14]` / `[INV §
 - Exit code 1 for DENIED, 2 for system error.
 - Event logged to SQLite for audit.
 
-Error codes: `AUTH`, `INVALID_STATE`, `SECURITY_BLOCKER`, `APPROVAL_REQUIRED`, `BLOCKED_RTK`, `BLOCKED_PROCESS_SKILL`, `EXECUTION_DENIED`, `COMPLETION_DENIED`, `STALE_REVISION`, `DAG_CYCLE`, `SECRET_DETECTED`, `CONFIG_ERROR`, etc.
+Error codes: `AUTH`, `INVALID_STATE`, `SECURITY_BLOCKER`, `APPROVAL_REQUIRED`, `BLOCKED_PROCESS_SKILL`, `EXECUTION_DENIED`, `COMPLETION_DENIED`, `STALE_REVISION`, `DAG_CYCLE`, `SECRET_DETECTED`, `CONFIG_ERROR`, etc. (`BLOCKED_RTK` / `RTK_ROUTING_FAILURE` survive only as command-level `rtk` failures, never work gates, per ADR-009.)
 
 No conversational-only error is acceptable for authority-relevant failures.
 
@@ -487,7 +482,7 @@ revoked adapter burn fail-closed.
 | Approval/waiver authenticity (signed, interactive) | Agent reasoning and planning |
 | Reference integrity (resolvable, current revisions) | Code editing, testing, refactoring |
 | Evidence binding (to revision) | Model selection (PO-configured, NOT by adapter) |
-| RTK/Skill attestation freshness | Output generation |
+| Skill attestation freshness (fail-closed) + RTK posture reporting (advisory) | Output generation |
 | No hidden child states in Project projection | UI rendering, file formatting |
 | No hardcoded provider/model/version | Session management |
 

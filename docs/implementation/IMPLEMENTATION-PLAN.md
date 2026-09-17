@@ -151,11 +151,11 @@ Implement security as Core-enforced state, not prompt-only guidance:
 
 Only the PO may accept residual risk. Generic approval is insufficient, and `WAIVED` must never be normalized to `PASS`.
 
-### Mandatory RTK guardrail
+### Advisory RTK integration (warn-only per PO decision ADR-009)
 
-RTK is required for all agent-driven CLI execution. Implement a runtime-neutral `TokenOptimizer` capability with RTK as the mandatory v1 provider. Before dispatch, the Core must validate an auditable health result containing binary identity, compatible version, integration mode, routing self-test, timestamp, and adapter identity. Missing, stale, incompatible, unhealthy, or bypassed RTK must return `EXECUTION_DENIED`.
+RTK is advisory for all agent-driven CLI execution: it optimizes output but NEVER gates it. Implement a runtime-neutral `TokenOptimizer` capability with RTK as the v1 provider. Before dispatch, the Core computes RTK posture (binary identity, compatible version, integration mode, routing self-test, timestamp, adapter identity) and records an audited `RtkWarning` when it is missing, stale, incompatible, unhealthy, or bypassed. Execution always proceeds.
 
-Installation is a setup prerequisite, not an implicit privilege: detect first, request applicable permission when installation is needed, verify provenance/integrity, pin a compatible range, and never fall back silently. Persist `rtk gain`/session evidence for observability, but do not confuse estimated token savings with billing savings.
+Installation is a setup recommendation, not an implicit privilege: detect first, request applicable permission when installation is needed, verify provenance/integrity, pin a compatible range. Persist `rtk gain`/session evidence for observability, but do not confuse estimated token savings with billing savings.
 
 **Canonical and only accepted upstream repository:** [https://github.com/rtk-ai/rtk](https://github.com/rtk-ai/rtk). The installer must reject the unrelated Rust Type Kit package with the same `rtk` name. `rtk --version` alone is insufficient: `rtk gain` must succeed and display the Token Killer savings dashboard.
 
@@ -197,9 +197,9 @@ The Cargo path is preferred because it installs directly from the canonical repo
 
 `rtk init -g --opencode` installs the official OpenCode TypeScript plugin. `rtk init -g --auto-patch` installs and registers the official Claude Code `PreToolUse` hook non-interactively, while RTK creates backups of affected Claude configuration. The process must display the intended global changes before requesting permission, run both commands only after approval, and require the affected runtimes to be restarted.
 
-#### Mandatory post-install verification
+#### Post-install verification (advisory)
 
-Configuration-file presence is not proof of operation. Before enabling CHRONO agents, the bootstrap must persist evidence that:
+Configuration-file presence is not proof of operation. The bootstrap reports evidence for each of the following (warnings, never blockers):
 
 - `rtk gain` succeeds, proving the binary is Rust Token Killer;
 - `rtk init --show` reports the integration as installed;
@@ -208,7 +208,7 @@ Configuration-file presence is not proof of operation. Before enabling CHRONO ag
 - `rtk git status` succeeds inside the target project;
 - the installed version satisfies CHRONO's pinned compatibility policy.
 
-Any failed check must set setup state to `BLOCKED_RTK` and prevent all agent dispatch. The raw-output fallback is forbidden.
+Any failed check records an advisory warning with actionable remediation. No RTK state prevents agent dispatch (ADR-009).
 
 ### Mandatory Karpathy Guidelines process skill
 
@@ -291,8 +291,8 @@ Required negative tests:
 - prompts/adapters cannot clear security blockers or accept risk;
 - secrets are not written to prompts, logs, reports, fixtures, or persisted artifacts;
 - destructive/production actions require explicit applicable authorization;
-- missing, unhealthy, incompatible, stale, or bypassed RTK denies agent execution;
-- adapter tests prove actual RTK command routing and record savings evidence;
+- missing, unhealthy, incompatible, stale, or bypassed RTK warns (audited `RtkWarning`) and execution proceeds (ADR-009);
+- adapter tests report actual RTK command routing and record savings evidence (advisory);
 - floating, redirected, modified, unlicensed, divergent, undiscoverable, unauthorized, inactive, or bypassed Karpathy Guidelines artifacts deny execution;
 - generated Claude/OpenCode/Kiro skill bodies are semantically identical to the pinned canonical source;
 - the skill cannot override CHRONO authority or simplify away mandatory controls.
@@ -305,7 +305,7 @@ Add recovery, atomicity, migrations, audit history, adversarial/compliance tests
 
 Implement and verify the mandatory v1 capabilities from the [SDD Innovation Standard](../product/SDD-INNOVATION-STANDARD.md): explainable gates, deterministic dry run, drift/scoped invalidation, portable audit export, privacy-preserving local metrics, progressive output, bounded loops, and technology-agnostic conformance. Provide a stable rigor-profile and policy-pack boundary without expanding bundled post-v1 scope.
 
-Each adapter must pass identical lifecycle, security, RTK, restart, authorization, evidence, and correction-loop tests. Adapter-specific hooks translate runtime behavior; they never own CHRONO policy. Codex and Gemini remain later adapters.
+Each adapter must pass identical lifecycle, security, restart, authorization, evidence, and correction-loop tests, plus advisory RTK reporting checks. Adapter-specific hooks translate runtime behavior; they never own CHRONO policy. Codex and Gemini remain later adapters.
 
 **Final innovation gate:** Gaspar's Innovation Review, Lucca's mandatory capability tests, Glenn's security/privacy review, and Spekkio's independent `INNOVATION_PASS` MUST all reference current evidence. Polyglot, non-web, deterministic replay, drift, audit-redaction, bounded-loop, and cross-runtime tests are release blocking.
 
@@ -328,4 +328,4 @@ Do not build a dashboard, remote orchestrator, database server, custom LLM provi
 
 CHRONO reaches final v1 when the global launcher and pinned local Core install cleanly, the complete lifecycle works through OpenCode, Claude Code, and Kiro, all conformance/security/innovation/upgrade/recovery/license tests pass, signed cross-platform packages include the required Apache-2.0 and third-party notices, and fresh polyglot/non-web fixtures complete without relying on conversation memory. The PO-selected model generates the implementation but owns no policy decision.
 
-No MVP is complete unless the PO has made both required security decisions from recorded evidence, the Core has proven that missing/stale security state, unresolved blockers, and unauthorized risk acceptance fail closed, OpenCode/Claude Code/Kiro agent execution demonstrably uses RTK without bypass, and every CHRONO agent demonstrably activates the pinned Karpathy Guidelines skill. MVP completion is only the gate into hardening; final v1 requires every Phase 7 exit condition above.
+No MVP is complete unless the PO has made both required security decisions from recorded evidence, the Core has proven that missing/stale security state, unresolved blockers, and unauthorized risk acceptance fail closed, RTK posture is reported (advisory warnings, never denials, per ADR-009), and every CHRONO agent demonstrably activates the pinned Karpathy Guidelines skill. MVP completion is only the gate into hardening; final v1 requires every Phase 7 exit condition above.

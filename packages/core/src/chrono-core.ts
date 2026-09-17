@@ -824,7 +824,7 @@ export class ChronoCore {
       this.checkWaivers(errors);
       this.checkEvidence(errors, warnings);
       this.checkSecurity(errors, specs, modules);
-      this.checkAttestations(errors, modules, workPackages);
+      this.checkAttestations(errors, warnings, modules, workPackages);
       this.checkRuntime(errors, warnings, project, modules, workPackages);
       this.checkProjectionAgreement(errors);
 
@@ -1173,9 +1173,11 @@ export class ChronoCore {
     }
   }
 
-  /** RTK/skill attestations are required once execution-relevant state exists [P7 §3]. */
+  /** Skill attestation is required once execution-relevant state exists;
+   * RTK posture is advisory-only (ADR-009) and reports as a warning. [P7 §3] */
   private checkAttestations(
     errors: string[],
+    warnings: string[],
     modules: ReadonlyArray<{ status: string }>,
     workPackages: ReadonlyArray<{ status: string }>
   ): void {
@@ -1189,7 +1191,7 @@ export class ChronoCore {
     const rtk = this.db.rtkAttestations().latest();
     const rtkState = this.attestationState(rtk, nowMs);
     if (rtkState !== "current") {
-      errors.push(`RTK attestation ${rtkState}: agent execution requires a current RTKAttestation`);
+      warnings.push(`RTK attestation ${rtkState}: advisory only, execution proceeds (run chrono rtk verify to refresh)`);
     }
     const skill = this.db.skillAttestations().latest();
     const skillState = this.attestationState(skill, nowMs);
@@ -3218,11 +3220,22 @@ export class ChronoCore {
         });
       }
       this.requireSetupAtLeast("ADAPTERS_REGISTERED_AND_APPROVED", input.adapterId);
-      this.requireCurrentRtk(
+      // RTK posture is advisory-only (ADR-009): warn, never deny entry.
+      for (const message of this.rtkWarnings(
         input.adapterId,
         { id: "broker-entry", adapter: adapter.id, runtime: input.runtime },
         adapter.id
-      );
+      )) {
+        this.events.append({
+          eventType: "RtkWarning",
+          entityId: input.adapterId,
+          payload: { severity: "WARNING", message },
+          actor: "gaspar",
+          priorState: undefined,
+          newState: undefined,
+          reasoning: "RTK posture is advisory-only per PO decision ADR-009: warned, never denied",
+        });
+      }
       this.requireCurrentSkill(input.adapterId);
       const token = randomBytes(32).toString("hex");
       const tokenHash = createHash("sha256").update(token, "utf8").digest("hex");
@@ -4224,13 +4237,18 @@ export class ChronoCore {
     }
   }
 
-  /** The exact attestation row bound at issuance must still be current. */
+  /** The exact attestation row bound at issuance must still be current.
+   * RTK bindings are advisory-only (ADR-009) and never invalidate a
+   * grant; skill bindings still fail closed. */
   private revalidateGrantAttestation(
     attestationId: string | null,
     kind: string,
     grantId: string,
     target: string
   ): void {
+    if (kind === "rtk") {
+      return;
+    }
     if (attestationId === null) {
       this.burnGrant(grantId);
       throw new ChronoError({
@@ -6297,10 +6315,25 @@ export class ChronoCore {
         options.kind ?? undefined
       );
 
+      // All prerequisites hold: RTK posture is advisory-only (ADR-009),
+      // so record any warnings without denying.
+      for (const message of prereqs.rtkWarnings) {
+        this.events.append({
+          eventType: "RtkWarning",
+          entityId: options.workPackageId ?? moduleId,
+          payload: { severity: "WARNING", message },
+          actor: requester.auditActor,
+          priorState: undefined,
+          newState: undefined,
+          reasoning: "RTK posture is advisory-only per PO decision ADR-009: warned, never denied",
+        });
+      }
+
       // All prerequisites hold: issue the single-use dispatch grant bound
       // to the project, exact module/work-package/spec revisions, Harness
-      // bindings, one assigned role, the executing session, both
-      // attestations, both approvals, the optional adapter, and the policy
+      // bindings, one assigned role, the executing session, the skill
+      // attestation (RTK is recorded but advisory-only per ADR-009), both
+      // approvals, the optional adapter, and the policy
       // version.
       const grantId = this.issueBoundGrant({
         moduleId,
@@ -6324,12 +6357,14 @@ export class ChronoCore {
   /**
    * Shared dispatch gate prerequisites (native dispatch repair): every
    * deterministic check `authorizeExecution` performs that does not
-   * require an executor session — module state, runtime, RTK/skill,
+   * require an executor session — module state, runtime, skill,
    * module approval currency, architecture approvals, Spec readiness
    * with fresh Harnesses, post-approval change, Work Package scope,
-   * blockers, and implementation-security resumption. Session-scoped
-   * checks and grant issuance stay with the caller. Throws the exact
-   * unmet prerequisite; identical errors from both entry points.
+   * blockers, and implementation-security resumption. RTK posture is
+   * advisory-only (returned as warnings, never thrown) per PO decision
+   * ADR-009. Session-scoped checks and grant issuance stay with the
+   * caller. Throws the exact unmet prerequisite; identical errors from
+   * both entry points.
    */
   private assertDispatchPrerequisites(
     moduleId: string,
@@ -6337,7 +6372,7 @@ export class ChronoCore {
     sessionInfo: { id: string; adapter: string; runtime: string },
     adapterId: string | null,
     kind?: string
-  ): { moduleRevision: string; archRevision: string; specIds: string[] } {
+  ): { moduleRevision: string; archRevision: string; specIds: string[]; rtkWarnings: string[] } {
     const moduleArtifact = this.artifacts.findById(moduleId);
     // Re-authorization states: APPROVED/EXECUTING for dispatch, and
     // VERIFYING/PASSED/FAILED for step-scoped re-authorization (every
@@ -6368,8 +6403,8 @@ export class ChronoCore {
       });
     }
 
-    this.requireCurrentRtk(moduleId, sessionInfo, adapterId);
     this.requireCurrentSkill(moduleId);
+    const rtkWarnings = this.rtkWarnings(moduleId, sessionInfo, adapterId);
 
     // New dispatch work presupposes current activation authority
     // (CF2-2): both the planning and the module approval must be
@@ -6472,7 +6507,7 @@ export class ChronoCore {
         });
       }
     }
-    return { moduleRevision: moduleArtifact.revision, archRevision: archRev, specIds };
+    return { moduleRevision: moduleArtifact.revision, archRevision: archRev, specIds, rtkWarnings };
   }
 
   /**
@@ -6510,6 +6545,8 @@ export class ChronoCore {
     effectiveProfile: PolicyProfile;
     riskTriggers: string[];
     expiresAt: string;
+    /** Advisory RTK posture warnings (never blocking) per PO decision ADR-009. */
+    rtkWarnings: string[];
   }> {
     const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
     try {
@@ -6606,6 +6643,19 @@ export class ChronoCore {
         expiresAt: new Date(Date.parse(now) + ttlSeconds * 1000).toISOString(),
         createdAt: now,
       });
+      // RTK posture is advisory-only (ADR-009): record each warning as an
+      // audited event and return them, but never deny the dispatch.
+      for (const message of prereqs.rtkWarnings) {
+        this.events.append({
+          eventType: "RtkWarning",
+          entityId: input.workPackageId ?? input.moduleId,
+          payload: { severity: "WARNING", message, dispatchId },
+          actor: requester.auditActor,
+          priorState: undefined,
+          newState: undefined,
+          reasoning: "RTK posture is advisory-only per PO decision ADR-009: warned, never denied",
+        });
+      }
       this.events.append({
         eventType: "DispatchRequested",
         entityId: input.workPackageId ?? input.moduleId,
@@ -6620,6 +6670,7 @@ export class ChronoCore {
           rationale,
           effectiveProfile,
           riskTriggers: triggers.map((t) => t.key),
+          rtkWarnings: prereqs.rtkWarnings,
         },
         actor: requester.auditActor,
         priorState: undefined,
@@ -6641,6 +6692,7 @@ export class ChronoCore {
           effectiveProfile,
           riskTriggers: triggers.map((t) => t.key),
           expiresAt: new Date(Date.parse(now) + ttlSeconds * 1000).toISOString(),
+          rtkWarnings: prereqs.rtkWarnings,
         },
       };
     } catch (e) {
@@ -7670,8 +7722,10 @@ export class ChronoCore {
    * Shared freshness validation for a committed dispatch binding: the
    * dispatch is ACTIVE and unexpired, the caller session is the bound
    * worker session with the bound role, revisions match current
-   * state, scope permits mutation, attestations are current, and no
-   * blocker targets the scope. Throws the exact unmet condition.
+   * state, scope permits mutation, the skill attestation is current
+   * (RTK posture is advisory-only per ADR-009 and warns at the coarse
+   * gates, never here), and no blocker targets the scope. Throws the
+   * exact unmet condition.
    */
   private validateActiveBinding(caller: {
     kind: string;
@@ -7822,7 +7876,9 @@ export class ChronoCore {
         });
       }
     }
-    this.requireCurrentRtk(binding.moduleId, { id: caller.session.id, adapter: caller.session.adapter, runtime: caller.session.runtime }, null);
+    // RTK posture is advisory-only (ADR-009) and this is the per-tool
+    // hot path: the dispatch/claim/entry gates already record RtkWarning
+    // events, so no check here — neither denial nor per-call log flood.
     this.requireCurrentSkill(binding.moduleId);
     this.denyIfBlocked(binding.workPackageId ?? binding.moduleId);
     this.denyIfBlocked(binding.moduleId);
@@ -8732,31 +8788,36 @@ export class ChronoCore {
   }
 
   /**
-   * Current RTK attestation with proven routing, else BLOCKED_RTK.
-   * Currency alone is insufficient: dispatch additionally requires a
-   * current, valid routing proof for the adapter under dispatch (the
-   * grant-bound adapter when present, else the executing session's
-   * adapter) in the session's runtime/project scope
-   * [SLICE-9 §9.3, P8.5, INV §8.4].
+   * RTK posture as warnings, never a gate (PO decision, ADR-009).
+   * Returns zero or more advisory warnings describing a missing, stale,
+   * incompatible, or unproven RTK attestation/routing state. Execution
+   * proceeds regardless: callers record the warnings as audited
+   * `RtkWarning` events (and, where the result shape allows, return
+   * them) instead of denying. Currency alone was never sufficient for
+   * authority; now it is not even necessary — the routing proof remains
+   * observable telemetry for cost/optimization review.
+   * [PO decision ADR-009; supersedes SLICE-9 §9.3, P8.5, INV §8.4-8.5
+   * denial semantics for RTK only. Skill attestation still fails closed.]
    */
-  private requireCurrentRtk(
+  private rtkWarnings(
     target: string,
     session: { id: string; adapter: string; runtime: string },
     adapterId: string | null
-  ): void {
+  ): string[] {
     const attestation = this.db.rtkAttestations().latest();
     const state = this.attestationState(attestation, Date.parse(this.now()));
     if (attestation === null || state !== "current") {
-      throw new ChronoError({
-        code: ErrorCode.BLOCKED_RTK,
-        severity: Severity.BLOCKER,
-        message: `Module ${target}: RTK attestation ${attestation === null ? "missing" : state}`,
-        invariantRef: "INV §8.5",
-        affectedTarget: target,
-        suggestedAction: "Verify a genuine RTK installation and record a current attestation",
-      });
+      return [
+        `Module ${target}: RTK attestation ${attestation === null ? "missing" : state} (advisory: execution proceeds; run chrono rtk verify to refresh)`,
+      ];
     }
-    this.requireCurrentRoutingProof(target, adapterId ?? session.adapter, session.runtime, attestation.id);
+    try {
+      this.requireCurrentRoutingProof(target, adapterId ?? session.adapter, session.runtime, attestation.id);
+    } catch (e) {
+      const detail = e instanceof ChronoError ? e.message : String(e);
+      return [`${detail} (advisory: execution proceeds; run chrono rtk prove/promote to restore proven routing)`];
+    }
+    return [];
   }
 
   /**
@@ -9087,14 +9148,36 @@ export class ChronoCore {
    * Implements gate_completion [CORE §7.6, DOM §6.6]: Spekkio PASS bound
    * to the revision, current Lucca and Glenn evidence, current
    * Implementation Security Acceptance, no blocking defects, security
-   * blockers resolved or validly waived, current attestations, intact
+   * blockers resolved or validly waived, current skill attestation
+   * (RTK posture is advisory-only per ADR-009), intact
    * traceability, and a legal transition. Every denial is audited.
    */
   authorizeCompletion(moduleId: string, auth: CallerAuth): CoreResult<boolean> {
     try {
       const caller = this.resolveCaller(auth, "authorize completion");
       this.requireCapability("completion.request", caller);
-      return this.checkModuleCompletion(moduleId, caller);
+      const result = this.checkModuleCompletion(moduleId, caller);
+      if (result.ok) {
+        // RTK posture is advisory-only (ADR-009): warn here in the
+        // auditing wrapper; checkModuleCompletion itself stays pure
+        // for nextAction/deep-check dry-runs.
+        for (const message of this.rtkWarnings(
+          moduleId,
+          { id: caller.session.id, adapter: caller.session.adapter, runtime: caller.session.runtime },
+          null
+        )) {
+          this.events.append({
+            eventType: "RtkWarning",
+            entityId: moduleId,
+            payload: { severity: "WARNING", message },
+            actor: caller.auditActor,
+            priorState: undefined,
+            newState: undefined,
+            reasoning: "RTK posture is advisory-only per PO decision ADR-009: warned, never denied",
+          });
+        }
+      }
+      return result;
     } catch (e) {
       this.auditDenial(moduleId, "CompletionAuthorization", e, auth.actor);
       return this.handleError(e);
@@ -9305,7 +9388,10 @@ export class ChronoCore {
         }
       }
 
-      this.requireCurrentRtk(moduleId, { id: caller.session.id, adapter: caller.session.adapter, runtime: caller.session.runtime }, null);
+      // RTK posture is advisory-only (ADR-009) and this pure check
+      // must not persist: dry-run callers (nextAction, deep_check)
+      // observe no RTK unmet condition, and the auditing
+      // authorizeCompletion wrapper above records the warnings.
       this.requireCurrentSkill(moduleId);
 
       return { ok: true, value: true };
@@ -10544,7 +10630,28 @@ export class ChronoCore {
     try {
       const caller = this.resolveCaller(auth, "authorize aggregate completion");
       this.requireCapability("completion.request", caller);
-      return this.checkAggregateCompletion(moduleId, workPackageIds, caller);
+      const result = this.checkAggregateCompletion(moduleId, workPackageIds, caller);
+      if (result.ok) {
+        // RTK posture is advisory-only (ADR-009): warn here in the
+        // auditing wrapper; checkAggregateCompletion itself stays pure
+        // for nextAction/deep-check dry-runs.
+        for (const message of this.rtkWarnings(
+          moduleId,
+          { id: caller.session.id, adapter: caller.session.adapter, runtime: caller.session.runtime },
+          null
+        )) {
+          this.events.append({
+            eventType: "RtkWarning",
+            entityId: moduleId,
+            payload: { severity: "WARNING", message },
+            actor: caller.auditActor,
+            priorState: undefined,
+            newState: undefined,
+            reasoning: "RTK posture is advisory-only per PO decision ADR-009: warned, never denied",
+          });
+        }
+      }
+      return result;
     } catch (e) {
       this.auditDenial(moduleId, "AggregateCompletionAuthorization", e, auth.actor);
       return this.handleError(e);
@@ -10654,7 +10761,10 @@ export class ChronoCore {
           suggestedAction: "Record the implementation-security decision for this revision",
         });
       }
-      this.requireCurrentRtk(moduleId, { id: caller.session.id, adapter: caller.session.adapter, runtime: caller.session.runtime }, null);
+      // RTK posture is advisory-only (ADR-009) and this pure check
+      // must not persist: dry-run callers observe no RTK unmet
+      // condition, and the auditing authorizeAggregateCompletion
+      // wrapper above records the warnings.
       this.requireCurrentSkill(moduleId);
       return { ok: true, value: true };
     } catch (e) {

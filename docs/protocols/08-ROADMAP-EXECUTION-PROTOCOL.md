@@ -37,7 +37,7 @@ For every dispatch, the Core MUST verify:
 - module approval covers the target revision;
 - dependencies are satisfied and no blocker applies;
 - runtime capabilities and least-privilege permissions are valid;
-- a genuine RTK installation from `https://github.com/rtk-ai/rtk` is healthy and routing commands;
+- RTK posture is reported (advisory `RtkWarning`, never blocking, per ADR-009);
 - the pinned Karpathy Guidelines skill from `https://github.com/multica-ai/andrej-karpathy-skills` is trusted, equivalent, discoverable, permitted, and activation-tested for the assigned agent;
 - no relevant artifact changed after validation/approval.
 
@@ -51,11 +51,11 @@ Adapters MAY define agent files, skills, hooks, permissions, and subprocess beha
 
 OpenCode, Claude Code, and Kiro are required v1 adapters. Each MUST support bidirectional enforcement: `chrono run` obtains Core authorization before dispatch, and a native blocking pre-tool hook calls `chrono gate` before protected actions even when the runtime was started directly. Absence or failure of either path MUST deny agent execution. Runtime/model selection comes only from PO-owned configuration; no provider, model, or version may be hardcoded.
 
-## 7. Mandatory RTK execution
+## 7. Advisory RTK execution (warn-only per ADR-009)
 
-OpenCode MUST use RTK's official OpenCode integration. Claude Code MUST use the official `PreToolUse` integration. Kiro MUST use a tested blocking `PreToolUse` interceptor or equivalent wrapper until official native support is verified. Configuration-file presence is insufficient; each runtime MUST pass a routing smoke test after restart.
+OpenCode SHOULD use RTK's official OpenCode integration. Claude Code SHOULD use the official `PreToolUse` integration. Kiro SHOULD use a tested `PreToolUse` interceptor or equivalent wrapper until official native support is verified. Configuration-file presence is insufficient for a proven report; each runtime SHOULD pass a routing smoke test after restart.
 
-RTK absence, name collision, incompatibility, stale attestation, failed routing, or bypass MUST produce `BLOCKED_RTK` and prevent all agent dispatch. Installation requires applicable permission and MUST use the canonical upstream defined above.
+RTK absence, name collision, incompatibility, stale attestation, failed routing, or bypass records an advisory `RtkWarning` and NEVER prevents agent dispatch. Installation requires applicable permission and SHOULD use the canonical upstream defined above.
 
 ## 7.1 Mandatory process-skill execution
 

@@ -286,7 +286,7 @@ function openSessionFor(
     expect(present.value?.errors.filter((e) => e.includes("SecurityProfile"))).toHaveLength(0);
   });
 
-  it("requires attestations and runtime once execution-relevant", () => {
+  it("requires skill attestation and runtime once execution-relevant; RTK is advisory-only", () => {
     approveArchitecture();
     readySpec();
     expect(core.recordSecurityProfile({ title: "P" }, gaspar).ok).toBe(true);
@@ -315,7 +315,9 @@ function openSessionFor(
 
     const result = core.validate();
     expect(result.value?.valid).toBe(false);
-    expect(result.value?.errors.some((e) => e.includes("RTK attestation"))).toBe(true);
+    // RTK posture is advisory-only per ADR-009: warning, never an error.
+    expect(result.value?.errors.some((e) => e.includes("RTK attestation"))).toBe(false);
+    expect(result.value?.warnings.some((e) => e.includes("RTK attestation"))).toBe(true);
     expect(result.value?.errors.some((e) => e.includes("Skill attestation"))).toBe(true);
     expect(result.value?.errors.some((e) => e.includes("Runtime not configured"))).toBe(true);
   });

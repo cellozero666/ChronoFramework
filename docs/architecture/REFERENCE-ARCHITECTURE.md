@@ -576,19 +576,18 @@ SPEC HARNESS
 Agent Context
 ```
 
-Rust Token Killer (RTK) is a mandatory operational dependency for all
-CHRONO CLI runtime adapters.
+Rust Token Killer (RTK) is an advisory output-optimization dependency for all
+CHRONO CLI runtime adapters (PO decision ADR-009).
 
-The Core must require a valid RTK capability/health attestation before
-authorizing agent execution. Each adapter must detect the genuine RTK binary
-and compatible version, verify provenance/integrity, configure native RTK
-integration when officially supported or a tested hook/wrapper otherwise,
-verify actual command routing, persist health/bypass/savings evidence, and deny
-execution when RTK is missing, unhealthy, incompatible, or bypassed.
+The Core records RTK capability/health attestation for observability but
+NEVER denies agent execution on RTK posture. Each adapter detects the genuine
+RTK binary and compatible version, verifies provenance/integrity, configures
+native RTK integration when officially supported or a tested hook/wrapper
+otherwise, reports actual command routing, and persists health/bypass/savings
+evidence. Missing, unhealthy, incompatible, stale, or bypassed RTK produces an
+audited `RtkWarning` and execution proceeds.
 
-RTK installation requires applicable user/system permission. Lack of permission
-blocks setup with actionable instructions; CHRONO must never silently fall back
-to unfiltered command output. RTK remains external to domain ownership: it does
+RTK installation requires applicable user/system permission. RTK remains external to domain ownership: it does
 not define CHRONO state, governance, gates, or lifecycle.
 
 The Karpathy Guidelines skill is a second mandatory adapter-level process
@@ -1111,7 +1110,7 @@ Those mechanisms belong to the adapter layer.
 
 They must not redefine CHRONO governance or lifecycle rules.
 
-Integration is bidirectional. `chrono run` MUST obtain Core authorization before dispatching a runtime, and each required runtime MUST install a native pre-tool hook that calls `chrono gate` before protected actions. A direct OpenCode, Claude Code, or Kiro session therefore remains subject to CHRONO, RTK, process-skill, permission, approval, and security gates. Failure to prove either dispatch or hook enforcement denies agent execution.
+Integration is bidirectional. `chrono run` MUST obtain Core authorization before dispatching a runtime, and each required runtime MUST install a native pre-tool hook that calls `chrono gate` before protected actions.   A direct OpenCode, Claude Code, or Kiro session therefore remains subject to CHRONO, process-skill, permission, approval, and security gates (RTK posture is advisory-only per ADR-009). Failure to prove either dispatch or hook enforcement denies agent execution.
 
 ------------------------------------------------------------------------
 
@@ -1213,8 +1212,8 @@ architectural definition of CHRONO.
 5.  selecting Gaspar autonomy mode;
 6.  detecting supported agent runtimes;
 7.  configuring the selected runtime adapter;
-8.  detecting and health-checking the mandatory RTK installation;
-9.  configuring and verifying RTK interception for the selected runtime;
+8.  detecting and health-checking the advisory RTK installation (warn-only per ADR-009);
+9.  reporting RTK interception state for the selected runtime;
 10. installing, converting, and activation-testing the mandatory Karpathy Guidelines skill;
 11. recording Product Owner-selected agent/model configuration without embedding a provider or model default;
 12. launching or preparing the initial Gaspar system-analysis session.
@@ -1585,7 +1584,7 @@ Recommended implementation order:
 14. integrate Lucca/Glenn evidence;
 15. implement Spekkio verification and defect routing;
 16. implement correction loops;
-17. enforce mandatory RTK installation, interception, health, audit, and savings checks;
+17. report advisory RTK installation, interception, health, audit, and savings state (warn-only per ADR-009);
 18. enforce pinned Karpathy Guidelines installation, conversion, activation, and equivalence checks;
 19. add model recommendations/configuration;
 20. validate the entire workflow end-to-end;

@@ -106,7 +106,7 @@ The names are a fan tribute to *Chrono Trigger*. CHRONO Framework is an independ
 - OpenCode, Claude Code, and Kiro adapters with `chrono run` dispatch and blocking `chrono gate` hooks;
 - versioned Markdown/YAML contracts plus transactional SQLite operational state;
 - cryptographically signed, interactive, human-only Product Owner approvals;
-- mandatory RTK integration from [rtk-ai/rtk](https://github.com/rtk-ai/rtk);
+- advisory RTK telemetry from [rtk-ai/rtk](https://github.com/rtk-ai/rtk) (warn-only, never blocking, per ADR-009);
 - mandatory Karpathy Guidelines process skill from [multica-ai/andrej-karpathy-skills](https://github.com/multica-ai/andrej-karpathy-skills);
 - no hardcoded provider, model name, or model version;
 - fail-closed security, verification, correction, and approval loops.

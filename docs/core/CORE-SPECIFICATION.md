@@ -478,8 +478,7 @@ FUNCTION gate_execution(module_id, wp_id, spec_revision):
     ASSERT dependencies_satisfied
     ASSERT runtime_capabilities_valid
     ASSERT least_privilege_permissions_verified
-    ASSERT rtk_attestation EXISTS AND status == current
-    ASSERT authoritative routing proof EXISTS for the (adapter, runtime, project) scope AND all bindings re-validate [§10.2]
+    WARN rtk_posture (advisory RtkWarning, never denial) [ADR-009]
     ASSERT skill_attestation EXISTS AND status == current
     ASSERT no_active blocker targeting module OR work_package
     ASSERT no_relevant_artifact_changed_after_approval
@@ -507,10 +506,10 @@ FUNCTION gate_verification(module_id, wp_id):
     ASSERT current_security_evidence EXISTS AND binds_to(revision)
     ASSERT implementation_security_decision IS current
     ASSERT no_missing OR stale OR contradictory_security_evidence
-    ASSERT rtk_attestation current
+    WARN rtk_posture (advisory RtkWarning, never denial) [ADR-009]
     ASSERT skill_attestation current
     ASSERT no_active blocker targeting module OR work_package
-    ASSERT no_blocked_rtk OR blocked_process_skill
+    ASSERT no blocked_process_skill
     RETURN AUTHORIZED
 ```
 
@@ -529,7 +528,7 @@ FUNCTION gate_completion(module_id):
     ASSERT documentation_synchronized
     ASSERT no_blocking_defect
     ASSERT spekkio_verdict == PASS
-    ASSERT rtk_attestation current
+    WARN rtk_posture (advisory RtkWarning, never denial) [ADR-009]
     ASSERT skill_attestation current
     ASSERT traceability_chain_complete
     ASSERT legal_state_transition_to_complete
@@ -664,39 +663,26 @@ FUNCTION verify_and_record_rtk():
 
 Reference: `[DOM §3.27]`, `[INV §8]`, `[P6.5]`, `[REF §13]`, `[ADR-006]`.
 
-### 10.2 Dispatch-time RTK check
+### 10.2 Dispatch-time RTK posture (advisory-only per ADR-009)
 
-Before any agent-driven CLI dispatch:
+Before any agent-driven CLI dispatch, and at entry, binding-use, verification, and completion points:
 
 ```
-FUNCTION check_rtk_before_dispatch(target, adapter_id, session):
-    rtk = SELECT latest FROM rtk_attestation WHERE status == current
-    IF rtk IS NULL:
-        RAISE BLOCKED_RTK
-    IF rtk.bypass_events IS NOT EMPTY:
-        rtk.status = invalid
-        RAISE BLOCKED_RTK
+FUNCTION rtk_warnings(target, adapter_id, session):
+    rtk = SELECT latest FROM rtk_attestation
+    IF rtk IS NULL OR stale/invalid/bypassed:
+        WARN "RTK attestation {missing|stale|invalid}"  # audited RtkWarning; proceed
+        RETURN [warning]
     proof = SELECT latest_authoritative FROM routing_proof
             WHERE adapter_id AND runtime == session.runtime AND project_id
-    IF proof IS NULL:
-        # A non-authoritative candidate names the missing step;
-        # no proof at all means routing is unproven.
-        RAISE RTK_ROUTING_FAILURE
-    IF proof.expired OR proof.rtk_attestation_id != rtk.id:
-        RAISE RTK_ROUTING_FAILURE
-    IF NOT adapter_active(proof.adapter_id):
-        RAISE RTK_ROUTING_FAILURE
-    IF proof.adapter_hash != current_registration_hash(proof.adapter_id):
-        RAISE RTK_ROUTING_FAILURE
-    IF sha256(proof.binary_path) != proof.binary_hash:
-        RAISE RTK_ROUTING_FAILURE
-    IF proof.asset_hash != current_managed_asset_manifest(proof.adapter_id):
-        RAISE RTK_ROUTING_FAILURE
-    RETURN (rtk, proof)
+    IF proof missing/expired/superseded/drifted/cross-scope:
+        WARN "<exact binding condition>"  # audited RtkWarning; proceed
+        RETURN [warning]
+    RETURN []
 ```
 
 Configuration-file presence alone is NOT proof `[P8.7, INV §8.4]`.
-Attestation currency alone NEVER authorizes dispatch `[INV §8.5, ADR-006]`.
+Attestation/proof state NEVER authorizes or denies dispatch `[ADR-009]`; the `prove`/`promote` commands keep their own command-level failures.
 
 ### 10.3 Routing proofs (candidate → authoritative)
 
@@ -707,7 +693,7 @@ Effective routing is proven per adapter through `chrono rtk prove`
 FUNCTION prove_routing(adapter_id, raw_command):
     REJECT IF raw_command is empty, already rtk-prefixed, or identity-only
         (gain, --version, config, init, help: binary/dashboard surface only)
-    binary = resolve_genuine_rtk()  # --version + gain, else BLOCKED_RTK
+    binary = resolve_genuine_rtk()  # --version + gain, else the prove command itself fails
     mapped = execute(binary, ["rewrite", ...raw_command])
     REJECT IF rewrite refuses, the mapping escapes the genuine binary,
         execution fails, or output exceeds the provability cap
@@ -860,7 +846,7 @@ No CHRONO source file, default, template, test, or adapter MAY hardcode a provid
 
 ### 14.4 Fail-closed
 
-Whenever any mandatory state cannot be confirmed, the Core MUST deny the operation `[INV §15]` `[FW §592]`.
+Whenever any mandatory state cannot be confirmed, the Core MUST deny the operation `[INV §15]` `[FW §592]`. RTK posture is explicitly excluded from fail-closed scope: it warns only (ADR-009).
 
 ### 14.5 No conversational authority
 
@@ -890,6 +876,7 @@ Event types:
 - `DefectRaised`, `DefectResolved`
 - `EvidenceRecorded`, `RtKAttested`, `SkillAttested`
 - `RoutingProofRecorded`, `ProofPromoted`
+- `RtkWarning` (advisory RTK posture, ADR-009)
 - `ModuleCompleted`, `ProjectInitialized`
 - `DENIED` (gate failure audit)
 
@@ -911,7 +898,7 @@ The Core exposes deterministic functions. Adapters MAY call them but MUST NOT re
 | `gate_completion(module_id)` | `AUTHORIZED` or error | Completion gate |
 | `resolve_reference(ref, rev?)` | artifact or error | Reference resolution |
 | `chrono_approve(action, scope, rev, rationale)` | approval_id or `APPROVAL_REQUIRED` | Interactive PO approval |
-| `verify_and_record_rtk()` | `current` attestation or `BLOCKED_RTK` | RTK verification |
+| `verify_and_record_rtk()` | `current` attestation or command-level `BLOCKED_RTK` (never a work gate) | RTK verification |
 | `verify_and_record_skill()` | `current` attestation or `BLOCKED_PROCESS_SKILL` | Skill verification |
 | `propose_planning_artifact(kind, id?, title, body, refs?)` | `{id, revision, path, approvalCommand}` or error | Governed planning draft (Gaspar/PO) |
 | `revise_planning_artifact(id, title, body)` | `{id, revision, path, approvalCommand, healed, recovered}` or error | New planning revision; stales approvals; rematerializes a lost file (`healed`) or a lost structured registry row for Specs (`recovered`, audited) |

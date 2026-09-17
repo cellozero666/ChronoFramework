@@ -16,7 +16,7 @@
 | [I-04] Gate | Fail-closed authorization, no bypass by prompt/adapter/agent |
 | [I-05] Traceability | Implementation → Task → WorkPackage → AcceptanceCriterion → Requirement → Specification → ADR |
 | [I-06] Security | Security Profile, two PO decisions, fail-closed, risk acceptance scope |
-| [I-07] RTK | Mandatory, genuine, routing-verified, fail-closed |
+| [I-07] RTK | Advisory, genuine, routing-reported, warn-only (ADR-009) |
 | [I-08] Process Skill | Mandatory, pinned, deterministic, activation-tested, fail-closed |
 | [I-09] Reference Integrity | Unique IDs, resolvable references, no stale revisions for execution |
 | [I-10] Evidence | Binds to revision, append-only, current for verification |
@@ -201,31 +201,31 @@ Secrets MUST NOT be written to prompts, logs, reports, fixtures, or persisted ar
 
 ---
 
-## 8. RTK Invariants [I-07]
+## 8. RTK Advisory Posture [I-07] (warn-only per PO decision ADR-009)
 
-### 8.1 Mandatory RTK
-RTK is required for all agent-driven CLI execution. Its absence MUST fail closed.
-- `[P6.5, P1.37, REF.§1188, P8.7]`
+### 8.1 Advisory RTK
+RTK is advisory for all agent-driven CLI execution. Its posture MUST be observed and reported, and MUST NEVER deny execution.
+- `[P6.5, P1.37, REF.§1188, P8.7, ADR-009]`
 
 ### 8.2 Genuine RTK only
 Only the binary from `https://github.com/rtk-ai/rtk` (Rust Token Killer) is accepted. `rtk --version` alone is insufficient; `rtk gain` MUST succeed to prove identity.
 - `[P1.37, REF.§123]`
 
-### 8.3 No silent fallback
-CHRONO MUST NOT silently fall back to raw/unfiltered command output when RTK is absent, incompatible, or bypassed. It MUST stop with actionable instructions.
-- `[REF.§1192, P1.37, REF.§1220]`
+### 8.3 No silent posture
+CHRONO MUST report RTK state (current/stale/invalid/unproven) through audited `RtkWarning` events, dispatch results, `doctor`, and `validate` warnings. It MUST NOT suppress a degraded RTK state.
+- `[REF.§1192, P1.37, REF.§1220, ADR-009]`
 
-### 8.4 Routing verification required
-Configuration-file presence is NOT proof of operation. Each adapter MUST prove effective command routing: the raw pre-routing command mapped through `rtk rewrite` and executed through the genuine binary with bound evidence. `rtk gain` proves binary/dashboard identity only, never routing.
-- `[P6.5, REF.§1189, P8.7, ADR-006]`
+### 8.4 Routing reported, not enforced
+Configuration-file presence is NOT proof of operation. Each adapter SHOULD prove effective command routing (the raw pre-routing command mapped through `rtk rewrite` and executed through the genuine binary with bound evidence). `rtk gain` proves binary/dashboard identity only, never routing. Unproven or drifted routing warns; it never denies.
+- `[P6.5, REF.§1189, P8.7, ADR-006, ADR-009]`
 
-### 8.5 RTK attestation freshness
-A current RTKAttestation is required before dispatch. Stale or invalid attestation → `BLOCKED_RTK` → dispatch denied. Attestation currency alone never authorizes dispatch: a current AUTHORITATIVE routing proof for the (adapter, runtime, project) scope is additionally required.
-- `[P6.5, P6.7, P7.3, P8.5, P8.7, ADR-006]`
+### 8.5 RTK attestation freshness (advisory)
+A current RTKAttestation and (where reported) a current AUTHORITATIVE routing proof describe healthy optimization. Stale or invalid attestation, or missing/drifted proof, → audited `RtkWarning` → execution proceeds.
+- `[P6.5, P6.7, P7.3, P8.5, P8.7, ADR-006, ADR-009]`
 
 ### 8.7 Routing-proof authority
-Recorded routing proofs are non-authoritative CANDIDATE rows. Only explicit promotion after signed adapter approval (`chrono rtk promote`, PO session) makes a proof AUTHORITATIVE, snapshotting the adapter registration hash and the managed-asset manifest hash. Dispatch re-validates every binding per use; binary replacement, re-registration, asset drift, revocation, expiry, or a superseded attestation invalidates.
-- `[FIXES-SL-10.1 C2, C3, ADR-006]`
+Recorded routing proofs are non-authoritative CANDIDATE rows. Only explicit promotion after signed adapter approval (`chrono rtk promote`, PO session) makes a proof AUTHORITATIVE, snapshotting the adapter registration hash and the managed-asset manifest hash. Promotion remains the observable routing signal; dispatch proceeds regardless of proof state.
+- `[FIXES-SL-10.1 C2, C3, ADR-006, ADR-009]`
 
 ### 8.6 RTK outside domain ownership
 RTK does NOT own CHRONO state, governance, gates, or lifecycle. Token savings evidence MUST NOT be conflated with billing savings validation.
@@ -352,9 +352,10 @@ The Core uses this taxonomy to classify and report invariant violations. Errors 
 | `COMPLETION_DENIED` | One or more completion preconditions failed | I-04.1, I-05.3 |
 | `APPROVAL_REQUIRED` | Missing, invalid, or non-interactive approval | I-04.1, I-03.6 |
 | `SECURITY_BLOCKER` | Material security condition prevents progress | I-07.4 |
-| `BLOCKED_RTK` | RTK missing, stale, incompatible, unhealthy, or bypassed | I-08.5 |
 | `BLOCKED_PROCESS_SKILL` | Skill missing, divergent, untrusted, inactive, or bypassed | I-09.7 |
 | `PRODUCT_BLOCKER` | Product ambiguity prevents architecture | I-01.2 |
+
+(RTK posture is advisory-only per ADR-009 and no longer denies authorization; see §14.6.)
 
 ### 14.2 State violations
 | Code | Meaning | Invariant |
@@ -390,11 +391,12 @@ The Core uses this taxonomy to classify and report invariant violations. Errors 
 | `SECURITY_APPROVAL_STALE` | Architecture Security Approval or Implementation Security Acceptance is stale/invalid | I-05.6, I-06.2 |
 | `SECRET_DETECTED` | Secret material found in output to be persisted | I-07.9 |
 
-### 14.6 RTK/skill failures
+### 14.6 RTK/skill findings
 | Code | Meaning | Invariant |
 |---|---|---|
-| `BLOCKED_RTK` | RTK attestation missing/stale/invalid/bypassed | I-08.5 |
-| `RTK_ROUTING_FAILURE` | No current AUTHORITATIVE routing proof for the scope (unproven, candidate-only, expired, superseded, drifted, or cross-scope) | I-08.4 |
+| `RtkWarning` (WARNING, never denial) | RTK attestation missing/stale/invalid/bypassed, or no current AUTHORITATIVE routing proof for the scope (unproven, candidate-only, expired, superseded, drifted, or cross-scope) | I-07 (advisory per ADR-009) |
+| `BLOCKED_RTK` (command-level only) | `rtk verify` cannot establish a genuine attestation (binary absent or non-genuine). Never gates dispatch, entry, verification, or completion since ADR-009 | I-07 |
+| `RTK_ROUTING_FAILURE` (command-level only) | `rtk prove`/`promote` binding failure (unmapped input, superseded attestation, drifted bindings). Never gates dispatch, entry, verification, or completion since ADR-009 | I-07 |
 | `RTK_NAME_COLLISION` | Installed `rtk` is not Rust Token Killer | I-08.2 |
 | `BLOCKED_PROCESS_SKILL` | Skill attestation missing/stale/invalid/bypassed | I-09.7 |
 | `SKILL_PROVENANCE_FAILURE` | Upstream divergence, hash mismatch, or license issue | I-09.2, I-09.3 |
@@ -447,7 +449,7 @@ The deterministic Core applies fail-closed semantics whenever any mandatory stat
 | Cannot confirm | Result |
 |---|---|
 | Local Core absent, incompatible, or unverifiable | Fail closed; global launcher does NOT substitute its own Core |
-| RTK attestation missing, stale, incompatible, unhealthy, or bypassed | `BLOCKED_RTK`; dispatch denied |
+| RTK attestation missing, stale, incompatible, unhealthy, bypassed, or routing unproven | Audited `RtkWarning`; execution proceeds (advisory-only per ADR-009) |
 | Skill attestation missing, divergent, untrusted, inactive, or bypassed | `BLOCKED_PROCESS_SKILL`; dispatch denied |
 | PO approval missing, non-interactive, or signature invalid | `APPROVAL_REQUIRED` |
 | Security Profile or PO security decision missing/stale/contradictory | `EXECUTION_DENIED` / `COMPLETION_DENIED` |
@@ -471,7 +473,7 @@ The deterministic Core applies fail-closed semantics whenever any mandatory stat
 | I-04 | FW.611-650, P7.5, P8.5 |
 | I-05 | FW.681-716, P3.4 |
 | I-06 | FW.497-573, P1.5, P2.6, P4.4, P5.5, P9.3 |
-| I-07 | P1.37, P6.5, P8.7, REF.1188-1220 |
+| I-07 | P1.37, P6.5, P8.7, REF.1188-1220, ADR-009 (advisory-only) |
 | I-08 | P1.41, P6.6, P8.6, REF.1196-1198 |
 | I-09 | P3.2-3.5, P5.7, P7.2, P8.3 |
 | I-10 | P3.4, P9.2-9.5 |

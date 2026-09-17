@@ -61,13 +61,13 @@ Corrections MUST trigger impact analysis. Affected approvals, Harnesses, evidenc
 
 ## 8. RTK and evidence completeness
 
-CLI verification MUST use a current RTKAttestation. RTK-compressed results MUST preserve exit status and actionable failures. When compression is insufficient, full output MAY be retained outside LLM context under secrets/privacy controls and referenced by evidence. RTK bypass MUST block verification rather than silently use raw output.
+CLI verification SHOULD use a current RTKAttestation; its absence records an advisory `RtkWarning` and never blocks verification (ADR-009). RTK-compressed results MUST preserve exit status and actionable failures. When compression is insufficient, full output MAY be retained outside LLM context under secrets/privacy controls and referenced by evidence.
 
 Verification and correction agents MUST use a current SkillAttestation for the pinned Karpathy Guidelines source at `https://github.com/multica-ai/andrej-karpathy-skills`. Spekkio MUST verify that changes were assumption-aware, minimally sufficient, surgically scoped, and driven by explicit success criteria, while treating CHRONO contracts and mandatory controls as higher authority. Skill absence, divergence, inactivity, or bypass MUST block the verdict.
 
 ## 9. Definition of Done
 
-A Module may become `COMPLETE` only when implementation matches approved Specs, criteria are verified, required tests pass, Lucca and Glenn evidence is current, blockers are resolved or validly waived, documentation is synchronized, no blocking defect remains, the PO implementation-security decision is current, RTKAttestation and SkillAttestation are current, Spekkio issued `PASS`, traceability is intact, and the state transition is legal. Final v1 release additionally requires Spekkio's current `INNOVATION_PASS` and the complete evidence set defined by the [SDD Innovation Standard](../product/SDD-INNOVATION-STANDARD.md).
+A Module may become `COMPLETE` only when implementation matches approved Specs, criteria are verified, required tests pass, Lucca and Glenn evidence is current, blockers are resolved or validly waived, documentation is synchronized, no blocking defect remains, the PO implementation-security decision is current, SkillAttestation is current (RTK posture is advisory-only per ADR-009), Spekkio issued `PASS`, traceability is intact, and the state transition is legal. Final v1 release additionally requires Spekkio's current `INNOVATION_PASS` and the complete evidence set defined by the [SDD Innovation Standard](../product/SDD-INNOVATION-STANDARD.md).
 
 ## 10. Completion record
 

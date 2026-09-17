@@ -34,7 +34,7 @@ Gaspar MUST determine whether the project is greenfield, existing, or already CH
 
 Initialization MUST run through the globally installed `chrono` launcher, pin and verify the project-local Core, and register both dispatch and blocking `chrono gate` hooks for OpenCode, Claude Code, and Kiro. A missing/incompatible local Core or unproven hook MUST block agent execution. The Product Owner's runtime/model selection MUST be recorded as configuration; no provider, model, or version may be supplied by a hardcoded default.
 
-Initialization MUST detect the selected runtime and a genuine, compatible RTK installation from `https://github.com/rtk-ai/rtk`. `rtk gain` MUST succeed (binary identity) and an effective routing proof MUST be recorded per adapter (`chrono rtk prove`; CANDIDATE until `chrono rtk promote` after adapter approval). Missing, stale, incompatible, or bypassed RTK MUST create `BLOCKED_RTK`; no agent-driven CLI execution MAY begin. `[ADR-006, INV §8]`.
+Initialization SHOULD detect the selected runtime and a genuine, compatible RTK installation from `https://github.com/rtk-ai/rtk`. `rtk gain` SHOULD succeed (binary identity) and an effective routing proof SHOULD be recorded per adapter (`chrono rtk prove`; CANDIDATE until `chrono rtk promote` after adapter approval). Missing, stale, incompatible, or bypassed RTK records an advisory `RtkWarning` and NEVER blocks execution (PO decision ADR-009). `[ADR-006, ADR-009]`.
 
 Initialization MUST also install or verify the mandatory Karpathy Guidelines skill from the CHRONO-pinned immutable revision of `https://github.com/multica-ai/andrej-karpathy-skills`. The adapter MUST prove provenance, source/generated hashes, license attribution, runtime discovery, agent permission, and activation. Missing, divergent, modified, untrusted, inactive, or bypassed skill state MUST create `BLOCKED_PROCESS_SKILL` and prevent Gaspar or specialist dispatch.
 
@@ -83,7 +83,7 @@ Completion authorizes architecture analysis only. It does not authorize implemen
 
 ## 9. Invalid behavior
 
-The following MUST fail validation: fixed-questionnaire completion without gap analysis; asking the PO for discoverable facts; unlabelled inference; conversational-only decisions; hidden assumptions; silent security defaults; RTK bypass; missing/bypassed mandatory process skill; and implementation before later gates.
+The following MUST fail validation: fixed-questionnaire completion without gap analysis; asking the PO for discoverable facts; unlabelled inference; conversational-only decisions; hidden assumptions; silent security defaults; missing/bypassed mandatory process skill; and implementation before later gates. RTK bypass is advisory-only (warn, never fail) per ADR-009.
 
 ## 10. Approved implementation boundary
 

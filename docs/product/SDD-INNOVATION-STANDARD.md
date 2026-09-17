@@ -91,10 +91,12 @@ No profile may disable:
 - PO-only decisions and signed approval integrity;
 - mandatory architecture and implementation security decisions;
 - Spec/Harness traceability;
-- RTK and Karpathy Guidelines attestations;
+- Karpathy Guidelines attestations;
 - fail-closed authorization;
 - independent final verification;
 - distinction between `FAILED`, `PASSED`, and `WAIVED`.
+
+(RTK posture is advisory-only for every profile per PO decision ADR-009; it is observed telemetry, not a gate.)
 
 If complete profile support would compromise the final v1, the Core MUST deliver a stable policy interface and the `standard` profile first; other profiles become explicit post-v1 roadmap items.
 

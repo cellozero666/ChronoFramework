@@ -1217,7 +1217,7 @@ Agent Context
 
 This reduces hallucination, context pollution, and token consumption.
 
-Rust Token Killer (RTK) is a mandatory operational dependency for every CHRONO CLI runtime adapter. CHRONO must detect a genuine, compatible RTK installation, record its version and integration mode, and verify that command output is routed through RTK before starting agent execution. If RTK is absent, unhealthy, incompatible, or bypassed, execution must fail closed with `RTK_REQUIRED` or `RTK_BYPASS_DETECTED`.
+Rust Token Killer (RTK) is an advisory output-optimization dependency for every CHRONO CLI runtime adapter (PO decision ADR-009). CHRONO detects a genuine, compatible RTK installation, records its version and integration mode, and reports whether command output is routed through RTK. If RTK is absent, unhealthy, incompatible, stale, or bypassed, the Core records an audited `RtkWarning` and execution proceeds: RTK posture NEVER denies dispatch, entry, verification, or completion.
 
 RTK remains an external output-optimization component rather than the owner of CHRONO domain state, gates, authority, or lifecycle. Installation requires the applicable user/system permission; when permission is unavailable, CHRONO must stop with actionable installation instructions instead of silently falling back to raw command output. Runtime adapters must use RTK's native integration when officially supported and a tested hook/wrapper when it is not. Version constraints, provenance, integrity verification, configuration, health checks, bypass events, and token-saving evidence must be persistent and auditable.
 
@@ -1395,7 +1395,7 @@ The first version should prioritize:
 16. Independent verification through Spekkio
 17. Defect routing and correction loops
 18. Traceability
-19. Context budgeting and mandatory RTK installation, routing, and attestation
+19. Context budgeting and advisory RTK installation, routing, and attestation (warn-only per ADR-009)
 20. Mandatory Karpathy Guidelines installation, conversion, activation, and attestation
 21. Runtime and model independence
 22. Explainable gates, deterministic dry run, drift detection, audit export, bounded loops, and privacy-preserving metrics

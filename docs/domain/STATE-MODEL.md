@@ -354,7 +354,7 @@ COMPLETE is terminal for the Project unless a material change triggers re-specif
 
 The Core MUST treat time-bound and change-bound state as "current" or "stale/invalid." Exact time windows are specified in the Core Specification; this model defines the invalidation triggers and the concept.
 
-### 4.1 RTKAttestation freshness `[P6.5, REF.§1188]`
+### 4.1 RTKAttestation freshness (advisory-only per ADR-009) `[P6.5, REF.§1188]`
 
 | Condition | State |
 |---|---|
@@ -363,10 +363,7 @@ The Core MUST treat time-bound and change-bound state as "current" or "stale/inv
 | Binary changed, version mismatch, collision detected, bypass event | `invalid` |
 | Re-tested and healthy | → `current` |
 
-Attestation currency alone never authorizes dispatch: dispatch additionally
-requires a current AUTHORITATIVE routing proof for the (adapter, runtime,
-project) scope (`chrono rtk prove` records a CANDIDATE; `chrono rtk promote`
-authorizes it after signed adapter approval) `[ADR-006, INV §8.7]`.
+Attestation currency never authorizes or denies dispatch. A current AUTHORITATIVE routing proof for the (adapter, runtime, project) scope (`chrono rtk prove` records a CANDIDATE; `chrono rtk promote` authorizes it after signed adapter approval) remains the observable routing signal `[ADR-006]`, reported — never enforced.
 
 **Invalidation triggers:**
 - RTK binary path or version changes `[REF.§123]`
@@ -374,7 +371,7 @@ authorizes it after signed adapter approval) `[ADR-006, INV §8.7]`.
 - No current AUTHORITATIVE routing proof, or any proof binding drifted (binary, registration, managed assets, attestation) `[ADR-006]`
 - Bypass event detected `[P7.3, P8.7]`
 
-**Effect:** `stale` or `invalid` → `BLOCKED_RTK` → dispatch denied `[P6.5, P7.3, P8.7]`; missing/drifted proof → `RTK_ROUTING_FAILURE` → dispatch denied.
+**Effect:** `stale`, `invalid`, missing, or drifted/unproven routing → audited `RtkWarning`; execution always proceeds `[ADR-009]`.
 
 ### 4.2 SkillAttestation freshness `[P6.6, REF.§1189-1190]`
 

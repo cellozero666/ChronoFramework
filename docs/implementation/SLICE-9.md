@@ -1,6 +1,7 @@
 # Slice 9 — Runtime Enforcement Closure
 
 **Status:** IMPLEMENTED — NOT COMPLETE; corrective work and real-runtime acceptance remain
+**Supersession note (2026-09-17, PO decision ADR-009):** §9.3 and exit criterion 3 (dispatch requires a current, valid, effective RTK routing proof) are superseded. RTK posture is advisory-only: dispatch proceeds with an audited `RtkWarning` whether routing is proven or not. The `prove`/`promote` mechanics, candidate/promote authority (ADR-006), and routing telemetry remain. All other exit criteria stand.
 **Scope:** Close the remaining Phase 5 enforcement gaps before Phase 6 MVP proof.  
 **Prerequisites:** Slices 1–8 and their corrective reviews are committed. The current factual baseline is this specification together with `SLICE-9-REPORT.md`, `FIXES-SL-10.md`, and `FIXES-SL-10.1.md`.
 **Non-authorization:** This slice does not authorize package installation outside the project, global runtime mutation, paid model execution, publication, push, tags, releases, or security-risk acceptance.

@@ -29,7 +29,7 @@ The Core MUST validate, where applicable:
 - Work Package dependency existence and acyclic DAG;
 - blocker, defect, waiver, and evidence status/freshness;
 - Security Profile and both applicable PO security decisions;
-- RTK binary/integration attestation, routing health, and bypass absence;
+- RTK binary/integration attestation and routing health as advisory warnings (never blocking, per ADR-009);
 - pinned Karpathy Guidelines source provenance/hash, generated artifact equivalence, license attribution, runtime discovery/permission, SkillAttestation freshness, activation, and bypass absence.
 
 Invalid deterministic state MUST fail closed. Prompts and adapters MUST NOT suppress Core findings.
@@ -46,7 +46,7 @@ Findings MUST cite affected artifacts and evidence and MUST be persisted. An age
 
 - Spec `READY` requires applicable deterministic and semantic validation success.
 - Module readiness/approval requires valid Specs, Harnesses, Security Profile, dependencies, and architecture-security decision.
-- Execution Authorization requires valid module approval, satisfied dependencies, no blocker, current Harness, current RTKAttestation, and current SkillAttestation.
+- Execution Authorization requires valid module approval, satisfied dependencies, no blocker, current Harness, and current SkillAttestation. RTK posture is reported as an advisory warning only (ADR-009).
 - Verification requires current test/security evidence and implementation-security decision.
 - Completion requires Spekkio `PASS`, or separately recorded failures/waivers according to policy without representing them as pass.
 - Final v1 release additionally requires current Innovation Review evidence and `INNOVATION_PASS` under the [SDD Innovation Standard](../product/SDD-INNOVATION-STANDARD.md).
@@ -66,7 +66,7 @@ Deterministic validation results MUST be reproducible from persisted inputs and 
 
 ## 8. RTK integrity
 
-RTK output compression MUST NOT convert a failing command into success or hide the availability of full evidence. Validation MUST preserve exit status and enough diagnostic information to reproduce failure. Suspected truncation or bypass MUST block the affected operation and permit controlled retrieval of full output outside model context.
+RTK output compression MUST NOT convert a failing command into success or hide the availability of full evidence. Validation MUST preserve exit status and enough diagnostic information to reproduce failure. Suspected truncation or bypass records an advisory `RtkWarning` (never a block) and permits controlled retrieval of full output outside model context.
 
 ## 9. Derived implementation details
 

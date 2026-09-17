@@ -382,8 +382,9 @@ Every authoritative artifact MUST have a revision identifier computed as a deter
 - `APPROVAL_REQUIRED` — missing/invalid/interactive approval `[P2.10, FW §12]`
 - `EXECUTION_DENIED` — authorization denied for dispatch `[P8.5, P7.5]`
 - `COMPLETION_DENIED` — completion denied `[FW §10, P9.3]`
-- `BLOCKED_RTK` — RTK missing/stale/incompatible/bypassed `[P1.4, P7.3]`
 - `BLOCKED_PROCESS_SKILL` — Karpathy Guidelines missing/divergent/inactive/bypassed `[P1.4, P6.7, P7.3]`
+
+(RTK posture is advisory-only per ADR-009 and no longer a blocker type; `RtkWarning` events carry the posture instead.)
 
 **Attributes**:
 - `id`
@@ -581,10 +582,10 @@ PRODUCT_AMBIGUITY     → Product Owner
 - `timestamp`
 - `status`: current | stale | invalid
 
-**Rules** `[P6.5, P1.4, REF §13, P8.5]`:
-- Every agent-driven CLI execution MUST reference a current RTKAttestation `[P6.5]`.
-- Missing, stale, incompatible, unhealthy, or bypassed RTK MUST prevent dispatch `[P6.5, REF §13, P8.7]`.
-- `rtk gain` must succeed to prove the binary is Rust Token Killer, not the collision package `[P1.4, REF §13]`.
+**Rules** `[P6.5, P1.4, REF §13, P8.5, ADR-009]`:
+- Every agent-driven CLI execution SHOULD reference a current RTKAttestation `[P6.5]`; it is advisory telemetry, never authority.
+- Missing, stale, incompatible, unhealthy, or bypassed RTK records an audited `RtkWarning` and NEVER prevents dispatch (PO decision ADR-009).
+- `rtk gain` proves the binary is Rust Token Killer, not the collision package `[P1.4, REF §13]`.
 - Configuration-file presence is NOT proof of operation `[P8.7]`.
 
 ### 3.28 SkillAttestation (`SKILL`)
@@ -656,9 +657,9 @@ PRODUCT_AMBIGUITY     → Product Owner
 - Missing interactivity, identity, key, or signature validity → `APPROVAL_REQUIRED` `[P2.10, FW §13]`.
 - Agents CANNOT impersonate or automate PO approval `[P2.10, FW §13]`.
 
-### 4.7 RTK and process-skill as domain state
+### 4.7 RTK as advisory telemetry, process-skill as domain state
 
-- RTKAttestation is mandatory for every agent-driven CLI execution `[P6.5, P3.6]`; its absence is `BLOCKED_RTK`.
+- RTKAttestation is advisory for every agent-driven CLI execution `[P6.5, P3.6, ADR-009]`; its absence warns as `RtkWarning` and never denies (`BLOCKED_RTK` is retired as a gate).
 - SkillAttestation is mandatory for every agent execution `[P6.6, P3.6]`; its absence is `BLOCKED_PROCESS_SKILL`.
 - RTK is external to domain ownership; it does not define CHRONO state/governance/lifecycle `[REF §13, P6.5]`.
 
@@ -764,7 +765,7 @@ Gates are the conditions that must hold for the Core to permit a transition. Eac
 - Module approval covers the target revision.
 - Dependencies satisfied; no blocker.
 - Runtime capabilities and least-privilege permissions valid.
-- Genuine RTK installation healthy and routing `[P8.5, P1.4]`.
+- RTK posture reported (advisory `RtkWarning`, never blocking) `[ADR-009]`.
 - Pinned Karpathy Guidelines skill trusted, equivalent, discoverable, permitted, activation-tested `[P8.5, P1.4]`.
 - No relevant artifact changed after validation/approval.
 
@@ -787,7 +788,7 @@ Gates are the conditions that must hold for the Core to permit a transition. Eac
 - Documentation synchronized.
 - No blocking defect remains.
 - Spekkio PASS.
-- RTKAttestation and SkillAttestation current.
+- SkillAttestation current (RTK posture is advisory-only per ADR-009).
 - Traceability intact.
 - Legal state transition.
 

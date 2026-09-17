@@ -316,8 +316,7 @@ install/uninstall lifecycle hooks — asserted by test).
 | Symptom | Cause | Recovery |
 |---|---|---|
 | `RTK_NAME_COLLISION` | installed `rtk` is not Rust Token Killer | install from `https://github.com/rtk-ai/rtk`, verify `rtk gain` |
-| `BLOCKED_RTK` | attestation missing/stale or routing unproven | `chrono rtk verify`, then prove routing and promote (below) |
-| `RTK_ROUTING_FAILURE` | no current AUTHORITATIVE proof, or drift since promotion | `chrono doctor` names the cause; re-prove/promote or reinstall hooks |
+| `RtkWarning` (RTK stale/unproven) | advisory only, execution proceeds | `chrono rtk verify`, then prove routing and promote (below) |
 | `ENTRY_BLOCKED[...]` | Gaspar entry failed (missing script, denied redeem, bad projection) | `chrono doctor` names the cause; entry never proceeds ungoverned |
 | `BLOCKED_PROCESS_SKILL` | skill missing/divergent/inactive | `chrono skill verify` |
 | `CONSENT_REQUIRED` | automation without a scope | add the named `--yes-*` flag or run interactively |

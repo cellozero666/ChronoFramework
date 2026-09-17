@@ -617,6 +617,7 @@ export function runDispatchRequest(projectPath: string, options: DispatchRequest
             effectiveProfile: v.effectiveProfile,
             riskTriggers: v.riskTriggers,
             expiresAt: record.expiresAt,
+            rtkWarnings: v.rtkWarnings,
           },
           null,
           2
@@ -624,6 +625,7 @@ export function runDispatchRequest(projectPath: string, options: DispatchRequest
         stderr: "",
       };
     }
+    const warningLines = (v.rtkWarnings as string[]).map((w) => `  warning[RTK]: ${w}`);
     return {
       exitCode: 0,
       stdout: [
@@ -631,6 +633,7 @@ export function runDispatchRequest(projectPath: string, options: DispatchRequest
         `  dispatch: ${dispatchId} [${v.kind}] (expires ${record.expiresAt})`,
         `  roles: ${v.dispatchableRoles.join(", ")}`,
         `  profile: ${v.effectiveProfile}${v.riskTriggers.length > 0 ? ` (risk: ${v.riskTriggers.join(", ")})` : ""}`,
+        ...warningLines,
       ].join("\n"),
       stderr: "",
     };
