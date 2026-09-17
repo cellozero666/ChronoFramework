@@ -1,3 +1,7 @@
+<p align="center">
+<img src="assets/chrono.png" alt="CHRONO Framework" width="600">
+</p>
+
 # CHRONO — Secure Spec-Driven Multi-Agent Development
 
 **Turn AI-assisted coding and vibe coding into controlled, traceable software engineering.**
