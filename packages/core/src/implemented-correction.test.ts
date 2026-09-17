@@ -661,4 +661,173 @@ describe("IMPLEMENTED correction re-entry", () => {
     expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "ImplementationDone" }, retry.auth).ok).toBe(true);
     expect(core.getArtifact(WP).status).toBe("IMPLEMENTED");
   });
+
+  it("rebinds CORRECTING after its dispatch is revoked (binding-defect repair)", () => {
+    buildStack();
+    driveImplemented();
+    const spek = bindWorker("spekkio", "verification", MOD, WP);
+    const defect = core.recordDefect(
+      {
+        classification: "SECURITY_DEFECT",
+        severity: "major",
+        evidenceRefs: [],
+        affectedCriteria: [],
+        affectedArtifacts: [WP],
+        blockingScope: WP,
+        reproInfo: null,
+      },
+      spek.auth
+    );
+    expect(defect.ok).toBe(true);
+    expect(core.releaseDispatch(spek.dispatchId, gaspar).ok).toBe(true);
+    expect(core.openCorrectionLoop(defect.value!.id, gaspar).ok).toBe(true);
+    // First correction binds the loop (OPEN -> CORRECTING, IMPLEMENTED
+    // -> RUNNING), then the claim is revoked: the loop stays CORRECTING
+    // with no live dispatch — the exact COR-0005 shape.
+    const first = bindWorker("glenn", "correction", MOD, WP, defect.value!.id);
+    expect(core.getArtifact(WP).status).toBe("RUNNING");
+    expect(core.revokeDispatch(first.dispatchId, gaspar, "abandoned claim").ok).toBe(true);
+    // Revocation leaves positioned RUNNING work: rework it to IMPLEMENTED
+    // through a plain implementation binding first.
+    const rework = bindWorker("belthazar", "implementation", MOD, WP);
+    recordEvidenceAs(rework.auth, core.getArtifact(WP).revision, "rework");
+    expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "ImplementationDone" }, rework.auth).ok).toBe(true);
+    expect(core.getArtifact(WP).status).toBe("IMPLEMENTED");
+    expect(core.releaseDispatch(rework.dispatchId, rework.auth).ok).toBe(true);
+    // A fresh correction dispatch rebinds the same CORRECTING loop
+    // (CORRECTING -> CORRECTING): previously aborted with the lifecycle
+    // trigger error.
+    const second = bindWorker("glenn", "correction", MOD, WP, defect.value!.id);
+    recordEvidenceAs(second.auth, core.getArtifact(WP).revision, "security-fix-retry");
+    const opened = core.listEvents().filter(
+      (e) => e.eventType === "CorrectionOpened" && (JSON.parse(e.payload) as { defectId?: string }).defectId === defect.value!.id
+    );
+    expect(opened.length).toBeGreaterThan(0);
+    expect(core.completeCorrectionLoop(opened[opened.length - 1]!.entityId, second.auth).ok).toBe(true);
+    expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "ImplementationDone" }, second.auth).ok).toBe(true);
+    expect(core.getArtifact(WP).status).toBe("IMPLEMENTED");
+    expect(core.releaseDispatch(second.dispatchId, second.auth).ok).toBe(true);
+  });
+
+  it("lets the dispatched executor complete another owner's loop (Glenn guides, Belthazar executes)", () => {
+    buildStack();
+    driveImplemented();
+    const spek = bindWorker("spekkio", "verification", MOD, WP);
+    const defect = core.recordDefect(
+      {
+        classification: "SECURITY_DEFECT",
+        severity: "major",
+        evidenceRefs: [],
+        affectedCriteria: [],
+        affectedArtifacts: [WP],
+        blockingScope: WP,
+        reproInfo: null,
+      },
+      spek.auth
+    );
+    expect(defect.ok).toBe(true);
+    expect(core.releaseDispatch(spek.dispatchId, gaspar).ok).toBe(true);
+    const looped = core.openCorrectionLoop(defect.value!.id, gaspar);
+    expect(looped.ok).toBe(true);
+    expect(looped.value!.owner).toBe("glenn");
+    // Gaspar delegates the glenn-owned loop to belthazar: the claim
+    // binds Belthazar as executor, Belthazar evidences, and Belthazar
+    // completes — previously denied as non-owner.
+    const fix = bindWorker("belthazar", "correction", MOD, WP, defect.value!.id);
+    expect(core.getArtifact(WP).status).toBe("RUNNING");
+    recordEvidenceAs(fix.auth, core.getArtifact(WP).revision, "guided-fix");
+    const opened = core.listEvents().filter(
+      (e) => e.eventType === "CorrectionOpened" && (JSON.parse(e.payload) as { defectId?: string }).defectId === defect.value!.id
+    );
+    const completed = core.completeCorrectionLoop(opened[opened.length - 1]!.entityId, fix.auth);
+    expect(completed.ok, JSON.stringify(completed.ok ? null : completed.error)).toBe(true);
+    expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "ImplementationDone" }, fix.auth).ok).toBe(true);
+    expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "VerificationReady" }, fix.auth).ok).toBe(true);
+    expect(core.getArtifact(WP).status).toBe("VERIFYING");
+    expect(core.releaseDispatch(fix.dispatchId, fix.auth).ok).toBe(true);
+  });
+
+  it("denies executor completion without a live correction binding", () => {
+    buildStack();
+    driveImplemented();
+    const spek = bindWorker("spekkio", "verification", MOD, WP);
+    const defect = core.recordDefect(
+      {
+        classification: "SECURITY_DEFECT",
+        severity: "major",
+        evidenceRefs: [],
+        affectedCriteria: [],
+        affectedArtifacts: [WP],
+        blockingScope: WP,
+        reproInfo: null,
+      },
+      spek.auth
+    );
+    expect(defect.ok).toBe(true);
+    expect(core.releaseDispatch(spek.dispatchId, gaspar).ok).toBe(true);
+    expect(core.openCorrectionLoop(defect.value!.id, gaspar).ok).toBe(true);
+    // Belthazar holds an implementation binding on RUNNING work here is
+    // impossible (IMPLEMENTED denies it); instead prove the negative with
+    // a verification binding: spekkio cannot complete glenn's loop.
+    const verifier = bindWorker("spekkio", "verification", MOD, WP);
+    const opened = core.listEvents().filter(
+      (e) => e.eventType === "CorrectionOpened" && (JSON.parse(e.payload) as { defectId?: string }).defectId === defect.value!.id
+    );
+    const denied = core.completeCorrectionLoop(opened[opened.length - 1]!.entityId, verifier.auth);
+    expect(denied.ok).toBe(false);
+    expect(denied.error?.code).toBe("EXECUTION_DENIED");
+    expect(core.releaseDispatch(verifier.dispatchId, gaspar).ok).toBe(true);
+  });
+
+  it("re-advances IMPLEMENTED with REVERIFY loops to VERIFYING for the formal verdict", () => {
+    buildStack();
+    driveImplemented();
+    const spek = bindWorker("spekkio", "verification", MOD, WP);
+    const defect = core.recordDefect(
+      {
+        classification: "IMPLEMENTATION_DEFECT",
+        severity: "major",
+        evidenceRefs: [],
+        affectedCriteria: [],
+        affectedArtifacts: [WP],
+        blockingScope: WP,
+        reproInfo: null,
+      },
+      spek.auth
+    );
+    expect(defect.ok).toBe(true);
+    expect(core.releaseDispatch(spek.dispatchId, gaspar).ok).toBe(true);
+    expect(core.openCorrectionLoop(defect.value!.id, gaspar).ok).toBe(true);
+    // Fix through the normal path, then stand the worker down while
+    // IMPLEMENTED with the loop in REVERIFY — the WP-0002 shape: fully
+    // evidenced, technically fixed, but no binding left to advance.
+    const fix = bindWorker("belthazar", "correction", MOD, WP);
+    recordEvidenceAs(fix.auth, core.getArtifact(WP).revision, "fix");
+    const opened = core.listEvents().filter(
+      (e) => e.eventType === "CorrectionOpened" && (JSON.parse(e.payload) as { defectId?: string }).defectId === defect.value!.id
+    );
+    expect(core.completeCorrectionLoop(opened[opened.length - 1]!.entityId, fix.auth).ok).toBe(true);
+    expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "ImplementationDone" }, fix.auth).ok).toBe(true);
+    expect(core.getArtifact(WP).status).toBe("IMPLEMENTED");
+    expect(core.releaseDispatch(fix.dispatchId, fix.auth).ok).toBe(true);
+    // A fresh implementation dispatch binds only (no state change at
+    // claim on positioned work), evidences, and advances IMPLEMENTED
+    // -> VERIFYING — previously denied as requiring AUTHORIZED/RUNNING.
+    const reAdvance = bindWorker("belthazar", "implementation", MOD, WP);
+    expect(core.getArtifact(WP).status).toBe("IMPLEMENTED");
+    recordEvidenceAs(reAdvance.auth, core.getArtifact(WP).revision, "re-advance-proof");
+    expect(core.advanceScope({ moduleId: MOD, workPackageId: WP, event: "VerificationReady" }, reAdvance.auth).ok).toBe(true);
+    expect(core.getArtifact(WP).status).toBe("VERIFYING");
+    expect(core.releaseDispatch(reAdvance.dispatchId, reAdvance.auth).ok).toBe(true);
+    // The formal verdict now binds on VERIFYING: Spekkio PASS closes the
+    // REVERIFY loop. (Terminal SpekkioPassed -> COMPLETE additionally
+    // requires profile evidence, reviews, and security acceptance, which
+    // ride their own gates outside this re-advance path.)
+    const verify = bindWorker("spekkio", "verification", MOD, WP);
+    const verdict = core.recordVerification(MOD, "PASS", "spekkio", [], [], [], verify.auth, WP);
+    expect(verdict.ok, JSON.stringify(verdict.ok ? null : verdict.error)).toBe(true);
+    const loops = core.listEvents().filter((e) => e.eventType === "CorrectionClosed");
+    expect(loops.length).toBeGreaterThan(0);
+    expect(core.releaseDispatch(verify.dispatchId, gaspar).ok).toBe(true);
+  });
 });

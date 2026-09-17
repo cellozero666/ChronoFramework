@@ -6553,10 +6553,13 @@ export class ChronoCore {
       for (const specId of prereqs.specIds) {
         specRevisions[specId] = this.artifacts.findById(specId).revision;
       }
-      // Correction dispatches bind their defect's owner and open loop
-      // up front: the role is derived, never chosen, and a missing
-      // open loop denies here rather than mid-claim. With several
-      // loops open the caller names its defect explicitly.
+      // Correction dispatches bind their defect's open loop up front:
+      // the recorded owner seeds the request-time role, but Gaspar may
+      // delegate to any correction-fitting role and the dispatched
+      // executor evidences/completes through its live binding (Glenn
+      // guides, Belthazar executes). A missing open loop denies here
+      // rather than mid-claim. With several loops open the caller names
+      // its defect explicitly.
       let role: string | null = null;
       let correctionOf: string | null = null;
       if (kind === "correction") {
@@ -8582,10 +8585,19 @@ export class ChronoCore {
   }
 
   /**
-   * Complete correction work (owner or PO): requires owner evidence
-   * recorded after the loop opened, then invalidates every other
-   * current evidence row for the affected revision so Lucca/Glenn
-   * refresh and Spekkio re-verifies against current proof only.
+   * Complete correction work (owner, dispatched executor, or PO):
+   * requires fix evidence recorded after the loop opened, then
+   * invalidates every other current evidence row for the affected
+   * revision so Lucca/Glenn refresh and Spekkio re-verifies against
+   * current proof only.
+   *
+   * Executor completion (Glenn guides, Belthazar executes): Gaspar
+   * dispatches the correction against the loop's defect and delegates
+   * to any correction-fitting role; the worker holding the live ACTIVE
+   * correction binding for this loop's defect/scope may evidence and
+   * complete it even when it is not the recorded owner. The completion
+   * event records the executor, so the handoff stays audited and the
+   * owner column never rewrites silently.
    */
   completeCorrectionLoop(
     loopId: string,
@@ -8595,14 +8607,17 @@ export class ChronoCore {
     try {
       const caller = this.resolveCaller(auth, "complete correction loop");
       const loop = this.db.correctionLoops().findById(loopId);
-      if (caller.role !== loop.ownerRole && caller.role !== "PO") {
+      const isOwner = caller.role === loop.ownerRole;
+      const isPO = caller.role === "PO";
+      const executorRole = isOwner || isPO ? null : this.correctionExecutorRole(caller, loop);
+      if (!isOwner && !isPO && executorRole === null) {
         throw new ChronoError({
           code: ErrorCode.EXECUTION_DENIED,
           severity: Severity.BLOCKER,
           message: `Correction loop '${loopId}' is owned by '${loop.ownerRole}': completion by '${caller.role}' denied`,
           invariantRef: "INV §5.1",
           affectedTarget: loopId,
-          suggestedAction: "Complete correction as the responsible owner",
+          suggestedAction: "Complete correction as the responsible owner, or through the live dispatched correction binding",
         });
       }
       if (loop.status !== "CORRECTING") {
@@ -8615,13 +8630,18 @@ export class ChronoCore {
           suggestedAction: "Dispatch the correction, evidence the fix, then complete",
         });
       }
+      // The completer's own fix evidence satisfies the loop: the owner
+      // evidences directly, while a dispatched executor evidences through
+      // its live correction binding (Glenn guides, Belthazar executes).
+      // Either way the proof must postdate the loop.
+      const completerRole = isPO ? loop.ownerRole : caller.role;
       const fresh = this.db.evidence().findCurrentByTargetRevision(loop.affectedRevision);
-      const ownerProof = fresh.some((e) => e.producer === loop.ownerRole && e.timestamp >= loop.createdAt);
+      const ownerProof = fresh.some((e) => e.producer === completerRole && e.timestamp >= loop.createdAt);
       if (!ownerProof) {
         throw new ChronoError({
           code: ErrorCode.EVIDENCE_MISSING,
           severity: Severity.BLOCKER,
-          message: `Correction loop '${loopId}' has no ${loop.ownerRole} evidence recorded after it opened`,
+          message: `Correction loop '${loopId}' has no ${completerRole} evidence recorded after it opened`,
           invariantRef: "INV §11.3",
           affectedTarget: loopId,
           suggestedAction: "Record evidence of the fix before completing correction",
@@ -8630,12 +8650,12 @@ export class ChronoCore {
       // Invalidate everything else bound to the affected revision:
       // pre-correction proof must not satisfy later gates. The fix
       // evidence recorded inside the correction window survives.
-      const invalidated = this.db.evidence().markStaleExcept(loop.affectedRevision, loop.ownerRole, loop.createdAt);
+      const invalidated = this.db.evidence().markStaleExcept(loop.affectedRevision, completerRole, loop.createdAt);
       const advanced = this.db.correctionLoops().markReverify(loopId);
       this.events.append({
         eventType: "CorrectionCompleted",
         entityId: loopId,
-        payload: { invalidatedEvidence: invalidated },
+        payload: { invalidatedEvidence: invalidated, ...(executorRole !== null ? { executor: caller.role } : {}) },
         actor: caller.auditActor,
         priorState: "CORRECTING",
         newState: advanced.status,
@@ -8646,6 +8666,48 @@ export class ChronoCore {
       this.auditDenial(loopId, "CorrectionComplete", e, actor);
       return this.handleError(e);
     }
+  }
+
+  /**
+   * Dispatched-executor check for correction completion: the caller holds
+   * a live ACTIVE correction dispatch whose defect and scope match the
+   * loop. Returns the executor role, else null. Never throws: callers
+   * without a binding fall back to the owner denial above.
+   */
+  private correctionExecutorRole(
+    caller: { role: string; session: { id: string } },
+    loop: { defectId: string; moduleId: string; workPackageId: string | null }
+  ): string | null {
+    let binding: {
+      kind: string;
+      moduleId: string;
+      workPackageId: string | null;
+      correctionOf: string | null;
+    } | null = null;
+    try {
+      const found: unknown = this.db.dispatches().findActiveByWorkerSession(caller.session.id);
+      binding = found as {
+        kind: string;
+        moduleId: string;
+        workPackageId: string | null;
+        correctionOf: string | null;
+      } | null;
+    } catch {
+      return null;
+    }
+    if (binding === null || binding.kind !== "correction") {
+      return null;
+    }
+    if (binding.moduleId !== loop.moduleId || (binding.workPackageId ?? null) !== loop.workPackageId) {
+      return null;
+    }
+    if ((binding.correctionOf ?? null) !== loop.defectId) {
+      return null;
+    }
+    if (!isRoleForDispatchKind("correction", caller.role)) {
+      return null;
+    }
+    return caller.role;
   }
 
   /**
@@ -8949,7 +9011,18 @@ export class ChronoCore {
     }
     const positioned = wp.status === "AUTHORIZED" || wp.status === "RUNNING";
     const worked = wp.status === "IMPLEMENTED" || wp.status === "VERIFYING" || wp.status === "FAILED";
-    const fits = kind === "security-review" || kind === "verification" || kind === "correction" ? worked : positioned;
+    // Re-advance path (formal-verdict repair): an IMPLEMENTED package whose
+    // correction loops all reached REVERIFY lost its worker binding before
+    // VerificationReady. Implementation/test dispatches bind only (the claim
+    // consumes the grant without re-enacting a start event on positioned
+    // work) so the fresh worker can evidence and advance IMPLEMENTED ->
+    // VERIFYING, where Spekkio's verdict then applies. Without a REVERIFY
+    // loop the package still requires AUTHORIZED/RUNNING.
+    const reAdvance =
+      wp.status === "IMPLEMENTED" &&
+      (kind === "implementation" || kind === "test") &&
+      this.db.correctionLoops().listByScope(moduleId, wpId).some((l) => l.status === "REVERIFY");
+    const fits = kind === "security-review" || kind === "verification" || kind === "correction" ? worked : positioned || reAdvance;
     if (!fits) {
       throw new ChronoError({
         code: ErrorCode.EXECUTION_DENIED,
@@ -11096,8 +11169,11 @@ export class ChronoCore {
         const escalation = loop.status === "ESCALATED" || loop.attempt >= loop.maxAttempts
           ? { escalation: `loop '${loop.id}' is at/over its attempt bound: PO decision required` }
           : {};
-        // Without a live correction dispatch the owner cannot act yet:
-        // Gaspar must dispatch the correction through the loop first.
+        // Without a live correction dispatch nobody can act yet: Gaspar
+        // must dispatch the correction through the loop first. The
+        // dispatched executor (any correction-fitting role) evidences
+        // and completes through its live binding — Glenn may guide
+        // while Belthazar executes.
         const liveCorrection = this.db.dispatches().listByScope(loop.moduleId, loop.workPackageId)
           .some((d) => d.kind === "correction" && (d.status === "PENDING" || d.status === "ENACTED" || d.status === "ACTIVE"));
         if (!liveCorrection) {
@@ -11105,7 +11181,7 @@ export class ChronoCore {
             action: "request-correction",
             targetKind,
             targetId,
-            summary: `Correction loop '${loop.id}' [${loop.status}] owned by ${loop.ownerRole} has no correction dispatch: request one (kind correction) so the owner can evidence the fix for defect '${loop.defectId}'`,
+            summary: `Correction loop '${loop.id}' [${loop.status}] owned by ${loop.ownerRole} has no correction dispatch: request one (kind correction, --defect ${loop.defectId}) so the dispatched executor can evidence the fix`,
             reason: `open correction loop '${loop.id}' without a correction dispatch`,
             policyRule,
             ...escalation,

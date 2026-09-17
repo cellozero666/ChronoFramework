@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 21;
+export const SCHEMA_VERSION = 22;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -1016,5 +1016,36 @@ export const MIGRATIONS: Record<number, string> = {
       base_revision TEXT,
       created_at   TEXT NOT NULL
     );
+  `,
+  22: `
+    -- Correction rebind (binding-defect repair): a CORRECTING loop whose
+    -- dispatch was revoked, expired, or otherwise lost (dispatch_id bound
+    -- to a non-ACTIVE row, or NULL after refail) must accept a fresh
+    -- correction dispatch without reopening the loop. The previous guard
+    -- allowed only OPEN -> CORRECTING, so rebinding CORRECTING ->
+    -- CORRECTING aborted with the lifecycle error even though the loop
+    -- never left CORRECTING. Permit same-state rebind; owner, scope,
+    -- revision, attempt, and history stay frozen (ownership handoff rides
+    -- the dispatched executor binding, never a silent owner rewrite).
+    DROP TRIGGER correction_status_guard;
+    CREATE TRIGGER correction_status_guard BEFORE UPDATE ON correction_loop
+    WHEN NOT (
+      (
+        (OLD.status = 'OPEN' AND NEW.status IN ('CORRECTING', 'ESCALATED')) OR
+        (OLD.status = 'CORRECTING' AND NEW.status IN ('CORRECTING', 'REVERIFY', 'ESCALATED')) OR
+        (OLD.status = 'REVERIFY' AND NEW.status IN ('CORRECTING', 'CLOSED', 'ESCALATED'))
+      )
+      AND OLD.id IS NEW.id
+      AND OLD.defect_id IS NEW.defect_id
+      AND OLD.module_id IS NEW.module_id
+      AND OLD.work_package_id IS NEW.work_package_id
+      AND OLD.affected_revision IS NEW.affected_revision
+      AND OLD.owner_role IS NEW.owner_role
+      AND OLD.max_attempts IS NEW.max_attempts
+      AND OLD.created_at IS NEW.created_at
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'correction loops mutate only through the bounded OPEN -> CORRECTING -> REVERIFY -> CLOSED/ESCALATED lifecycle');
+    END;
   `,
 };
