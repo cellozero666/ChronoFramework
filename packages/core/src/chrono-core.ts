@@ -5251,7 +5251,7 @@ export class ChronoCore {
         throw new ChronoError({
           code: ErrorCode.VALIDATION_ERROR,
           severity: Severity.ERROR,
-          message: `Unknown defect classification '${data.classification}'`,
+          message: `Unknown defect classification '${data.classification}': use one of: ${Object.keys(DEFECT_ROUTING).join(", ")}`,
           invariantRef: "INV §14.4",
           suggestedAction: `Use one of: ${Object.keys(DEFECT_ROUTING).join(", ")}`,
         });
@@ -6992,8 +6992,12 @@ export class ChronoCore {
   /**
    * Startup/crash sweep over incomplete claims (CF-3). PENDING rows
    * past expiry become EXPIRED; ENACTED rows past expiry lose their
-   * worker session and become REVOKED. Deterministic from stored
-   * timestamps: restart recovery never replays authority.
+   * worker session and become REVOKED; ACTIVE rows whose worker
+   * session died (missing, revoked, or expired) or whose own TTL
+   * elapsed are revoked as orphaned bindings. A live session on a
+   * live dispatch is never touched, so in-flight work survives.
+   * Deterministic from stored timestamps: restart recovery never
+   * replays authority.
    */
   reconcileStaleClaims(auth: CallerAuth): CoreResult<{ expired: string[]; revoked: string[] }> {
     const actor = typeof auth.actor === "string" ? auth.actor : "unknown";
@@ -7036,11 +7040,59 @@ export class ChronoCore {
         });
         revoked.push(stale.id);
       }
+      for (const orphan of this.db.dispatches().listOrphanedActive(nowIso)) {
+        const reason = this.orphanedBindingReason(orphan, nowIso);
+        if (orphan.workerSession !== null) {
+          try {
+            this.db.sessions().revoke(orphan.workerSession);
+          } catch {
+            // Best-effort: the session may already be gone.
+          }
+        }
+        this.db.dispatches().revoke(orphan.id);
+        this.events.append({
+          eventType: "DispatchRevoked",
+          entityId: orphan.id,
+          payload: { reason, workerSession: orphan.workerSession },
+          actor: caller.auditActor,
+          priorState: "ACTIVE",
+          newState: "REVOKED",
+          reasoning: "Crash-safety sweep: orphaned active binding cannot become usable authority",
+        });
+        revoked.push(orphan.id);
+      }
       return { ok: true, value: { expired, revoked } };
     } catch (e) {
       this.auditDenial("dispatch", "DispatchReconcile", e, actor);
       return this.handleError(e);
     }
+  }
+
+  /**
+   * Why an ACTIVE dispatch listed by the orphan sweep can never
+   * authorize again: dead worker session first, expired dispatch
+   * second. Used for the audit payload only.
+   */
+  private orphanedBindingReason(
+    dispatch: { workerSession: string | null; expiresAt: string },
+    nowIso: string
+  ): string {
+    if (dispatch.workerSession !== null) {
+      try {
+        const session = this.db.sessions().findById(dispatch.workerSession);
+        if (session.revoked) {
+          return "worker session revoked";
+        }
+        if (!Number.isNaN(Date.parse(session.expiresAt)) && Date.parse(session.expiresAt) <= Date.parse(nowIso)) {
+          return "worker session expired";
+        }
+      } catch {
+        return "worker session missing";
+      }
+    } else {
+      return "no worker session bound";
+    }
+    return "dispatch TTL elapsed";
   }
 
   /**

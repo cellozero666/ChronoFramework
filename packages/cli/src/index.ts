@@ -4157,7 +4157,7 @@ export function createProgram(cwd: string): Command {
   program
     .command("defect-record")
     .description("Record a defect against concrete artifacts (Spekkio authority; routes to the responsible owner)")
-    .requiredOption("--classification <class>", "defect classification")
+    .requiredOption("--classification <class>", "defect classification: IMPLEMENTATION_DEFECT, UX_DEFECT, INFRASTRUCTURE_DEFECT, TEST_DEFECT, SECURITY_DEFECT, ARCHITECTURE_DEFECT, SPECIFICATION_DEFECT, PRODUCT_AMBIGUITY")
     .requiredOption("--severity <level>", "defect severity")
     .option("--evidence <csv>", "comma-separated evidence ids")
     .option("--criteria <csv>", "comma-separated affected criteria")

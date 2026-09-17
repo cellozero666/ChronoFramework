@@ -3224,6 +3224,24 @@ export class DispatchRepository {
     return rows.map((r) => this.mapRow(r));
   }
 
+  /**
+   * Orphaned-binding sweep input: ACTIVE rows that can never authorize
+   * again — worker session missing, revoked, or expired, or the
+   * dispatch past its own TTL. A live session on a live dispatch is
+   * never listed here, so in-flight work survives the sweep.
+   */
+  listOrphanedActive(nowIso: string): DispatchRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT d.* FROM dispatch d LEFT JOIN agent_session s ON s.id = d.worker_session
+         WHERE d.status = 'ACTIVE'
+           AND (d.worker_session IS NULL OR s.id IS NULL OR s.revoked = 1 OR s.expires_at <= ? OR d.expires_at <= ?)
+         ORDER BY d.created_at ASC`
+      )
+      .all(nowIso, nowIso) as DispatchRow[];
+    return rows.map((r) => this.mapRow(r));
+  }
+
   private mapRow(row: DispatchRow): DispatchRecord {
     const parseStrings = (value: unknown): Record<string, string> => {
       if (typeof value !== "string") {

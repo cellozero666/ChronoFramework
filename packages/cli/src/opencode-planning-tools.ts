@@ -616,9 +616,9 @@ export const review_complete = tool({
 });
 
 export const defect_record = tool({
-  description: "CHRONO: record a defect against concrete artifacts (Spekkio only; routes to the responsible owner and blocks completion).",
+  description: "CHRONO: record a defect against concrete artifacts (Spekkio only; routes to the responsible owner and blocks completion). Classification is one of IMPLEMENTATION_DEFECT, UX_DEFECT, INFRASTRUCTURE_DEFECT, TEST_DEFECT, SECURITY_DEFECT, ARCHITECTURE_DEFECT, SPECIFICATION_DEFECT, PRODUCT_AMBIGUITY.",
   args: {
-    classification: tool.schema.string().describe("defect classification"),
+    classification: tool.schema.string().describe("defect classification (one of the eight taxonomy values)"),
     severity: tool.schema.string().describe("defect severity"),
     artifact: tool.schema.string().optional().describe("comma-separated affected artifact ids"),
     blockingScope: tool.schema.string().optional().describe("scope the defect blocks"),

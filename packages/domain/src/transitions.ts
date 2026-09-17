@@ -74,6 +74,13 @@ export const WORK_PACKAGE_TRANSITIONS: readonly LegalTransition[] = [
   { fromState: "VERIFYING", toState: "COMPLETE", eventType: "SpekkioPassed" },
   { fromState: "VERIFYING", toState: "FAILED", eventType: "SpekkioFailed" },
   { fromState: "FAILED", toState: "RUNNING", eventType: "CorrectionComplete" },
+  // Post-implementation rework: a defect found on IMPLEMENTED work
+  // (before any verdict) opens a correction loop, and the bound
+  // correction claim re-enters RUNNING through the same event. Without
+  // this row an IMPLEMENTED package whose binding died is unreachable:
+  // impl/test dispatch requires AUTHORIZED/RUNNING and no verdict can
+  // exist before VERIFYING.
+  { fromState: "IMPLEMENTED", toState: "RUNNING", eventType: "CorrectionComplete" },
   { fromState: "RUNNING", toState: "BLOCKED", eventType: "BlockerRaised" },
   { fromState: "AUTHORIZED", toState: "BLOCKED", eventType: "BlockerRaised" },
   { fromState: "IMPLEMENTED", toState: "BLOCKED", eventType: "BlockerRaised" },
