@@ -309,12 +309,17 @@ describe("OC-P11 native planning tools", () => {
       expect(typeof def.execute).toBe("function");
     }
     // No product-code, shell, hook, approval-confirmation, or
-    // credential surface. Dispatch claim confirmation
-    // (dispatch_confirm) is explicitly allowed: it confines a worker
-    // credential, it never signs a PO approval.
+    // credential surface. The single exception is the governed
+    // memo-write petition: model-callable, but it performs no
+    // model-side write — the Core writes ticket-bound bytes with
+    // backup on human approval.
     for (const name of Object.keys(tools)) {
+      if (name === "memo_write") {
+        continue;
+      }
       expect(name).not.toMatch(/write|edit|bash|shell|hook|token|key|secret|db|approval.?confirm|sign/i);
     }
+    expect(Object.keys(tools)).toContain("memo_write");
     // Schemas carry the contract Gaspar programs against.
     const propose = tools["artifact_propose"] as { args: Record<string, { parse: (v: unknown) => unknown }> };
     expect(() => propose.args["body"]?.parse("inline markdown")).not.toThrow();
@@ -372,8 +377,18 @@ describe("OC-P11 native planning tools", () => {
     await expect(
       tools["artifact_propose"].execute({ kind: "spec", id: "../../evil", title: "T", body: "B" }, toolContext())
     ).rejects.toThrow();
-    // The tool surface has no destination parameter at all.
-    expect(Object.keys(tools).join(" ")).not.toMatch(/path|destination|write|edit|bash|shell/);
+    // Exactly one tool names a destination — the governed memo-write
+    // petition, whose path is Core-validated (allowlist, containment,
+    // hash binding) and human-approved per act. Planning tools keep
+    // Core-derived destinations; nothing else takes paths.
+    for (const name of Object.keys(tools)) {
+      const argKeys = Object.keys((tools[name] as { args: Record<string, unknown> }).args ?? {});
+      if (name === "memo_write") {
+        expect(argKeys).toContain("path");
+        continue;
+      }
+      expect(argKeys.filter((k) => /\bpath\b|destination|filepath/i.test(k))).toEqual([]);
+    }
     expect(existsSync(join(root, "evil"))).toBe(false);
     expect(existsSync(join(root, "src"))).toBe(false);
   });
@@ -767,8 +782,12 @@ describe("OC-P11 planning tool packaging", () => {
       const suffix = name.replace(/^chrono_/, "");
       expect(buildPlanningToolsFile()).toContain(`export const ${suffix} = tool(`);
     }
-    // No shell, product-write, or credential surface in tool names.
-    expect(CHRONO_NATIVE_TOOLS.join(" ")).not.toMatch(/bash|shell|write|edit|token|key|secret/i);
+    // No shell, product-write, or credential surface in tool names —
+    // except the governed memo-write petition (Core-side,
+    // ticket-bound writes only; see above).
+    const unnamed = CHRONO_NATIVE_TOOLS.filter((n) => n !== "chrono_memo_write").join(" ");
+    expect(unnamed).not.toMatch(/bash|shell|write|edit|token|key|secret/i);
+    expect(CHRONO_NATIVE_TOOLS).toContain("chrono_memo_write");
   });
 
   it("detects missing and drifted tool installations", () => {

@@ -90,3 +90,20 @@ revision currency. Chat text alone never authorizes; the model cannot
 confirm, forge, replay, or auto-accept; denial changes nothing; no key
 or credential reaches the model. `--auto` mode refuses the ceremony.
 This path is Proposed until PO ratification at pilot acceptance.
+
+### 11.1 User-approved document writes (ADR-008)
+
+The same ceremony carries one further action, `document-write`, for
+Gaspar-as-co-architect documents the Product Owner asks for (fix
+plans, bug lists, memos). The ticket binds the canonical document
+path plus the exact proposed content hash (stored Core-side at
+request, never resent); the human confirms through the native
+`question` tool; the Core verifies signature, single-use, ceremony
+key, and base currency (absent stays absent), then performs the
+write itself — backup plus atomic replace — inside the finalize
+transaction, with compensation on failure. One human Approve
+authorizes at most one write of exactly the approved bytes. Paths
+must be project-contained Markdown outside `.chrono/`, `.git/`, and
+`node_modules/`; bodies are secret-scanned and size-bounded.
+Generic `write`/`edit`/`bash` remain dispatch-gated and are never
+the document path.

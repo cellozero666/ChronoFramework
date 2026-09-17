@@ -5,8 +5,8 @@
  */
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { accessSync, constants as fsConstants, existsSync as fsExistsSync, lstatSync as fsLstatSync, mkdirSync as fsMkdirSync, readFileSync, realpathSync, renameSync as fsRenameSync, rmSync as fsRmSync, writeFileSync as fsWriteFileSync } from "node:fs";
-import { dirname as pathDirname, join as joinPath, resolve as pathResolve, sep as pathSep } from "node:path";
+import { accessSync, chmodSync as fsChmodSync, constants as fsConstants, existsSync as fsExistsSync, lstatSync as fsLstatSync, mkdirSync as fsMkdirSync, readFileSync, realpathSync, renameSync as fsRenameSync, rmSync as fsRmSync, statSync as fsStatSync, writeFileSync as fsWriteFileSync } from "node:fs";
+import { dirname as pathDirname, join as joinPath, relative as pathRelative, resolve as pathResolve, sep as pathSep } from "node:path";
 import {
   ChronoDatabase,
   SCHEMA_VERSION,
@@ -96,8 +96,15 @@ import {
   ChronoError,
   ErrorCode,
   Severity,
+  DOCUMENT_BACKUP_SUFFIX,
+  DOCUMENT_MAX_BYTES,
+  DOCUMENT_MIN_BYTES,
+  DOCUMENT_WRITE_ACTION,
+  documentScopePath,
+  resolveDocumentScope,
   type CoreOperation,
   type PlanningKind,
+  type ResolvedDocumentScope,
 } from "@chrono/domain";
 import type { ProjectState, EntityType, ApprovalPayload, WaiverPayload, AgentRole, SetupStep, GasparEntryProjection, PolicyPayload } from "@chrono/domain";
 
@@ -5128,13 +5135,53 @@ export class ChronoCore {
   }
 
   /**
+   * Absolute contained path for a `doc:` scope relative path.
+   * Re-resolved on every use (request and finalize): a scope that
+   * escapes the canonical root denies instead of writing.
+   */
+  private documentAbsPath(relPath: string): string {
+    const root = this.canonicalProjectPath();
+    const abs = pathResolve(root, relPath);
+    const rel = pathRelative(root, abs);
+    if (rel === "" || rel.startsWith("..") || abs !== joinPath(root, rel)) {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: `Document scope '${relPath}' escapes the project root`,
+        invariantRef: "INV §14.4",
+        affectedTarget: relPath,
+        suggestedAction: "Scope document writes inside the project",
+      });
+    }
+    return abs;
+  }
+
+  /**
    * Current revision of an approval scope: artifact rows, the ARCH
    * architecture singleton (tracked on the project row), registered
-   * adapters (by registration hash), or null when the scope is unknown.
+   * adapters (by registration hash), user-approved documents (live
+   * file content hash under the `doc:` scope), or null when the scope
+   * is unknown (missing document included: nothing approved exists).
    */
   private currentRevisionOf(scopeId: string): string | null {
     if (scopeId === "ARCH") {
       return this.projects.findById("default").architectureRevision;
+    }
+    const docRel = documentScopePath(scopeId);
+    if (docRel !== null) {
+      let abs: string;
+      try {
+        abs = this.documentAbsPath(docRel);
+      } catch {
+        return null;
+      }
+      let content: string;
+      try {
+        content = readFileSync(abs, "utf8");
+      } catch {
+        return null;
+      }
+      return computeRevisionHash(content);
     }
     try {
       return this.artifacts.findById(scopeId).revision;
@@ -14781,6 +14828,16 @@ export class ChronoCore {
           suggestedAction: "Request a ticket for a canonical approval action",
         });
       }
+      if (input.action === "document-write") {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Document writes petition through memo-write, not approval-request: the ticket must bind proposed content, not live scope",
+          invariantRef: "INV §14.4",
+          affectedTarget: input.scopeArtifactId,
+          suggestedAction: "Request a document-write ticket with the exact proposed body",
+        });
+      }
       if (input.rationale.trim().length === 0 || input.securityImplications.trim().length === 0) {
         throw new ChronoError({
           code: ErrorCode.VALIDATION_ERROR,
@@ -14835,6 +14892,112 @@ export class ChronoCore {
   }
 
   /**
+   * Request a single-use document-write ticket (co-architect memos,
+   * fix plans). Gaspar/PO only (`approval.request`).
+   *
+   * Unlike artifact tickets, this binds PROPOSED content, not live
+   * scope: the ticket carries the exact body hash the human approves,
+   * and the body itself is stored Core-side so approval cannot drift
+   * onto different bytes. The human confirms through the same native
+   * ceremony; the Core performs the write (backup + atomic replace)
+   * on finalize. When the live document already carries exactly the
+   * proposed bytes, no ticket is needed (already-current no-op).
+   */
+  requestDocumentWriteTicket(
+    input: {
+      path: string;
+      body: string;
+      rationale: string;
+      securityImplications: string;
+    },
+    auth: CallerAuth
+  ): CoreResult<{ ticketId: string | null; challenge: string | null; expiresAt: string | null; alreadyCurrent: boolean; scopeId: string; contentHash: string; baseRevision: string | null }> {
+    try {
+      const caller = this.requireCapability("approval.request", this.resolveCaller(auth, "request document-write ticket"));
+      if (input.rationale.trim().length === 0 || input.securityImplications.trim().length === 0) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: "Document-write tickets require a rationale and explicit security implications",
+          invariantRef: "INV §14.4",
+          affectedTarget: input.path,
+          suggestedAction: "State why this document changes and its security implications",
+        });
+      }
+      const scope = resolveDocumentScope(this.canonicalProjectPath(), input.path);
+      const bodyBytes = Buffer.byteLength(input.body, "utf8");
+      if (bodyBytes < DOCUMENT_MIN_BYTES || bodyBytes > DOCUMENT_MAX_BYTES) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Document body must be ${DOCUMENT_MIN_BYTES} to ${DOCUMENT_MAX_BYTES} bytes, got ${bodyBytes}`,
+          invariantRef: "INV §14.4",
+          affectedTarget: scope.relPath,
+          suggestedAction: "Keep the proposed document within bounds",
+        });
+      }
+      this.assertNoSecrets(input.body, null, "document write");
+      const parent = pathDirname(scope.absPath);
+      let parentOk = false;
+      try {
+        parentOk = fsStatSync(parent).isDirectory();
+      } catch {
+        parentOk = false;
+      }
+      if (!parentOk) {
+        throw new ChronoError({
+          code: ErrorCode.VALIDATION_ERROR,
+          severity: Severity.ERROR,
+          message: `Document parent directory does not exist: '${scope.relPath}'`,
+          invariantRef: "INV §14.4",
+          affectedTarget: scope.relPath,
+          suggestedAction: "Write inside an existing directory",
+        });
+      }
+      const contentHash = computeRevisionHash(input.body);
+      const live = this.currentRevisionOf(scope.scopeId);
+      if (live !== null && !isStaleReference(contentHash, live)) {
+        return { ok: true, value: { ticketId: null, challenge: null, expiresAt: null, alreadyCurrent: true, scopeId: scope.scopeId, contentHash, baseRevision: live } };
+      }
+      const id = this.sequences.allocate("TICKET");
+      const createdAt = this.now();
+      const expiresAt = new Date(Date.parse(createdAt) + APPROVAL_TICKET_TTL_SECONDS * 1000).toISOString();
+      this.db.approvalTickets().create({
+        id,
+        action: DOCUMENT_WRITE_ACTION,
+        scopeArtifactId: scope.scopeId,
+        scopeRevision: contentHash,
+        authority: "PO",
+        rationale: input.rationale.trim(),
+        securityImplications: input.securityImplications.trim(),
+        requesterSession: caller.session.id,
+        createdAt,
+        expiresAt,
+      });
+      this.db.documentWrites().create({
+        ticketId: id,
+        path: scope.relPath,
+        contentHash,
+        body: input.body,
+        baseRevision: live,
+        createdAt,
+      });
+      this.events.append({
+        eventType: "ApprovalTicketIssued",
+        entityId: id,
+        payload: { action: DOCUMENT_WRITE_ACTION, scopeArtifactId: scope.scopeId, scopeRevision: contentHash },
+        actor: caller.auditActor,
+        priorState: undefined,
+        newState: "issued",
+        reasoning: "Document-write ticket issued for native human confirmation",
+      });
+      return { ok: true, value: { ticketId: id, challenge: approvalChallenge(id), expiresAt, alreadyCurrent: false, scopeId: scope.scopeId, contentHash, baseRevision: live } };
+    } catch (e) {
+      return this.handleError(e);
+    }
+  }
+
+  /**
    * Describe a ticket without secrets (host re-validation before
    * signing). Gaspar/PO session required. Tickets carry no key
    * material, so this projection is safe to log.
@@ -14859,13 +15022,32 @@ export class ChronoCore {
       const caller = this.requireCapability("approval.request", this.resolveCaller(auth, "describe approval ticket"));
       void caller;
       const ticket = this.db.approvalTickets().findById(ticketId);
-      const current = this.currentRevisionOf(ticket.scopeArtifactId);
-      const live =
+      const unexpired =
         !ticket.consumed &&
         !Number.isNaN(Date.parse(ticket.expiresAt)) &&
-        Date.parse(ticket.expiresAt) > Date.parse(this.now()) &&
-        current !== null &&
-        !isStaleReference(ticket.scopeRevision, current);
+        Date.parse(ticket.expiresAt) > Date.parse(this.now());
+      // Document-write tickets bind proposed content against the base
+      // captured at request: live means the base has not moved (a file
+      // already carrying the proposed bytes needs no ticket at all).
+      let live: boolean;
+      if (ticket.action === DOCUMENT_WRITE_ACTION) {
+        live = false;
+        if (unexpired) {
+          try {
+            const pending = this.db.documentWrites().findByTicketId(ticket.id);
+            const current = this.currentRevisionOf(ticket.scopeArtifactId);
+            live = pending.baseRevision === null ? current === null : current === pending.baseRevision;
+          } catch {
+            live = false;
+          }
+        }
+      } else {
+        const current = this.currentRevisionOf(ticket.scopeArtifactId);
+        live =
+          unexpired &&
+          current !== null &&
+          !isStaleReference(ticket.scopeRevision, current);
+      }
       return {
         ok: true,
         value: {
@@ -14884,6 +15066,156 @@ export class ChronoCore {
       };
     } catch (e) {
       return this.handleError(e);
+    }
+  }
+
+  /**
+   * Base-currency check for a document-write ticket: the live document
+   * must still match the base captured at request time (absent stays
+   * absent). Any drift burns the ticket — the human approved exact
+   * bytes against an exact base, never a moved target.
+   */
+  private enforceDocumentWriteCurrency(ticket: { id: string; scopeArtifactId: string }): { ticketId: string; path: string; contentHash: string; body: string; baseRevision: string | null; createdAt: string } {
+    let pending: { ticketId: string; path: string; contentHash: string; body: string; baseRevision: string | null; createdAt: string };
+    try {
+      pending = this.db.documentWrites().findByTicketId(ticket.id);
+    } catch {
+      this.db.approvalTickets().consume(ticket.id);
+      throw new ChronoError({
+        code: ErrorCode.ENTITY_NOT_FOUND,
+        severity: Severity.ERROR,
+        message: `Approval ticket '${ticket.id}' carries no proposed document body: replay denied`,
+        invariantRef: "INV §10.2",
+        affectedTarget: ticket.id,
+        suggestedAction: "Request a fresh document-write ticket",
+      });
+    }
+    const live = this.currentRevisionOf(ticket.scopeArtifactId);
+    const moved = pending.baseRevision === null ? live !== null : live !== pending.baseRevision;
+    if (moved) {
+      this.db.approvalTickets().consume(ticket.id);
+      throw new ChronoError({
+        code: ErrorCode.STALE_REVISION,
+        severity: Severity.ERROR,
+        message: `Approval ticket '${ticket.id}' no longer matches '${ticket.scopeArtifactId}' (base moved since request): re-request and re-confirm`,
+        invariantRef: "INV §4.4",
+        affectedTarget: ticket.scopeArtifactId,
+        suggestedAction: "Request a fresh document-write ticket for the current base and confirm again",
+      });
+    }
+    return pending;
+  }
+
+  /**
+   * Perform the approved document write: re-validate the path, back up
+   * any existing document (permission-preserving single backup),
+   * then atomically replace via tmp + rename. Returns the backup path
+   * (null on create) and whether the file is new, for compensation.
+   * Throws before touching the target on any validation failure, so
+   * the ticket stays live and retryable.
+   */
+  private performDocumentWrite(
+    scope: ResolvedDocumentScope,
+    body: string
+  ): { backupPath: string | null; createdNew: boolean } {
+    const abs = this.documentAbsPath(scope.relPath);
+    if (abs !== scope.absPath) {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: `Document path '${scope.relPath}' no longer resolves to its approved location`,
+        invariantRef: "INV §14.4",
+        affectedTarget: scope.relPath,
+        suggestedAction: "Request a fresh document-write ticket",
+      });
+    }
+    let existed = false;
+    let isFile = false;
+    try {
+      const stat = fsLstatSync(abs);
+      existed = true;
+      isFile = stat.isFile() && !stat.isSymbolicLink();
+    } catch {
+      existed = false;
+    }
+    if (existed && !isFile) {
+      throw new ChronoError({
+        code: ErrorCode.VALIDATION_ERROR,
+        severity: Severity.ERROR,
+        message: `Document path '${scope.relPath}' is not a regular file`,
+        invariantRef: "INV §14.4",
+        affectedTarget: scope.relPath,
+        suggestedAction: "Write documents, not directories or links",
+      });
+    }
+    this.assertNoSecrets(body, null, "document write");
+    let backupPath: string | null = null;
+    if (existed) {
+      backupPath = `${abs}${DOCUMENT_BACKUP_SUFFIX}`;
+      const original = readFileSync(abs, "utf8");
+      let mode = 0o644;
+      try {
+        mode = fsStatSync(abs).mode & 0o777;
+      } catch {
+        mode = 0o644;
+      }
+      fsWriteFileSync(backupPath, original, "utf8");
+      try {
+        fsChmodSync(backupPath, mode);
+      } catch {
+        // Best-effort permission preservation; content is intact.
+      }
+    }
+    const tmp = `${abs}.chrono-tmp-${randomBytes(8).toString("hex")}`;
+    fsWriteFileSync(tmp, body, "utf8");
+    fsRenameSync(tmp, abs);
+    return { backupPath, createdNew: !existed };
+  }
+
+  /**
+   * Compensate a failed document-write transaction: restore the backup
+   * over a replaced file, or remove a created one — but only when the
+   * live bytes are still exactly what this finalize wrote. Anything
+   * else means a third party moved the file mid-finalize: compensation
+   * refuses rather than clobbering foreign content. Best-effort I/O
+   * failures surface, never silent.
+   */
+  private compensateDocumentWrite(absPath: string, backupPath: string | null, createdNew: boolean, writtenHash: string): void {
+    const liveHash = (() => {
+      try {
+        return computeRevisionHash(readFileSync(absPath, "utf8"));
+      } catch {
+        return null;
+      }
+    })();
+    if (liveHash !== writtenHash) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Document write compensation refused for '${absPath}': live bytes changed after the write`,
+        invariantRef: "INV §5.1",
+        affectedTarget: absPath,
+        suggestedAction: "Inspect the document, reconcile by hand, then re-request",
+      });
+    }
+    try {
+      if (backupPath !== null) {
+        const backup = readFileSync(backupPath, "utf8");
+        const tmp = `${absPath}.chrono-tmp-${randomBytes(8).toString("hex")}`;
+        fsWriteFileSync(tmp, backup, "utf8");
+        fsRenameSync(tmp, absPath);
+      } else if (createdNew) {
+        fsRmSync(absPath, { force: true });
+      }
+    } catch (e) {
+      throw new ChronoError({
+        code: ErrorCode.EXECUTION_DENIED,
+        severity: Severity.BLOCKER,
+        message: `Document write compensation failed for '${absPath}': inspect the file before retrying`,
+        invariantRef: "INV §5.1",
+        affectedTarget: absPath,
+        suggestedAction: e instanceof Error ? e.message : "Restore the document from its backup, then re-request",
+      });
     }
   }
 
@@ -14984,17 +15316,24 @@ export class ChronoCore {
       }
       // Scope must STILL be current: a revision that moved after the
       // human confirmed burns the ticket instead of authorizing drift.
-      const current = this.currentRevisionOf(ticket.scopeArtifactId);
-      if (current === null || isStaleReference(ticket.scopeRevision, current)) {
-        this.db.approvalTickets().consume(ticket.id);
-        throw new ChronoError({
-          code: ErrorCode.STALE_REVISION,
-          severity: Severity.ERROR,
-          message: `Approval ticket '${ticket.id}' no longer matches '${ticket.scopeArtifactId}' (now at ${current ?? "unknown"}): re-request and re-confirm`,
-          invariantRef: "INV §4.4",
-          affectedTarget: ticket.scopeArtifactId,
-          suggestedAction: "Request a fresh ticket for the current revision and confirm again",
-        });
+      // Document writes compare against the base captured at request
+      // (the approved content is proposed, not live) — see below.
+      let documentPending: { ticketId: string; path: string; contentHash: string; body: string; baseRevision: string | null; createdAt: string } | null = null;
+      if (ticket.action === DOCUMENT_WRITE_ACTION) {
+        documentPending = this.enforceDocumentWriteCurrency(ticket);
+      } else {
+        const current = this.currentRevisionOf(ticket.scopeArtifactId);
+        if (current === null || isStaleReference(ticket.scopeRevision, current)) {
+          this.db.approvalTickets().consume(ticket.id);
+          throw new ChronoError({
+            code: ErrorCode.STALE_REVISION,
+            severity: Severity.ERROR,
+            message: `Approval ticket '${ticket.id}' no longer matches '${ticket.scopeArtifactId}' (now at ${current ?? "unknown"}): re-request and re-confirm`,
+            invariantRef: "INV §4.4",
+            affectedTarget: ticket.scopeArtifactId,
+            suggestedAction: "Request a fresh ticket for the current revision and confirm again",
+          });
+        }
       }
       const unsigned = buildApprovalPayload({
         action: ticket.action,
@@ -15030,6 +15369,41 @@ export class ChronoCore {
           suggestedAction: "Finalize only from the bound native ceremony for this exact ticket",
         });
       }
+      // Document writes execute Core-side between verification and
+      // commit: the human approved exact bytes, so the Core writes
+      // them (backup + atomic replace) rather than any agent shell.
+      // The pending body must still match the ticket hash (raw-DB
+      // swaps fail closed here), and the path re-validates now.
+      let documentScope: ResolvedDocumentScope | null = null;
+      let documentBody = "";
+      let documentBase: string | null = null;
+      if (ticket.action === DOCUMENT_WRITE_ACTION) {
+        if (documentPending === null) {
+          this.db.approvalTickets().consume(ticket.id);
+          throw new ChronoError({
+            code: ErrorCode.ENTITY_NOT_FOUND,
+            severity: Severity.ERROR,
+            message: `Approval ticket '${ticket.id}' carries no proposed document body: replay denied`,
+            invariantRef: "INV §10.2",
+            affectedTarget: ticket.id,
+            suggestedAction: "Request a fresh document-write ticket",
+          });
+        }
+        if (documentPending.contentHash !== ticket.scopeRevision) {
+          this.db.approvalTickets().consume(ticket.id);
+          throw new ChronoError({
+            code: ErrorCode.VALIDATION_ERROR,
+            severity: Severity.ERROR,
+            message: `Approval ticket '${ticket.id}' proposed body does not match its bound hash: refusing without writing`,
+            invariantRef: "INV §14.4",
+            affectedTarget: ticket.id,
+            suggestedAction: "Request a fresh document-write ticket",
+          });
+        }
+        documentScope = resolveDocumentScope(this.canonicalProjectPath(), documentPending.path);
+        documentBody = documentPending.body;
+        documentBase = documentPending.baseRevision;
+      }
       // Atomic exactly-once finalize: supersede-or-alias, claim,
       // consume, record, validation, and audit commit together, or
       // none of them does. A losing concurrent duplicate collides on
@@ -15038,7 +15412,13 @@ export class ChronoCore {
       // signature) never reaches here: verification above throws
       // before any state change, so the ticket stays live and
       // retryable.
-      const outcome = this.db.transaction(() => {
+      let written: { backupPath: string | null; createdNew: boolean; absPath: string } | null = null;
+      if (documentScope !== null) {
+        written = { ...this.performDocumentWrite(documentScope, documentBody), absPath: documentScope.absPath };
+      }
+      let outcome: { duplicate: false; approvalId: string; aliased: boolean; superseded: string | null };
+      try {
+        outcome = this.db.transaction(() => {
         const existing = this.approvals.findByScope(ticket.scopeArtifactId, ticket.scopeRevision, ticket.action);
         let approvalId: string;
         let aliased: boolean;
@@ -15182,6 +15562,24 @@ export class ChronoCore {
           newState: "granted",
           reasoning: "PO approval recorded through the native explicit-answer ceremony",
         });
+        if (ticket.action === DOCUMENT_WRITE_ACTION && written !== null) {
+          this.events.append({
+            eventType: "DocumentWritten",
+            entityId: ticket.scopeArtifactId,
+            payload: {
+              path: ticket.scopeArtifactId,
+              contentHash: ticket.scopeRevision,
+              baseRevision: documentBase,
+              backupPath: written.backupPath,
+              createdNew: written.createdNew,
+              ticketId: ticket.id,
+            },
+            actor: "PO",
+            priorState: written.createdNew ? "absent" : "present",
+            newState: "written",
+            reasoning: "User-approved document bytes written Core-side with backup",
+          });
+        }
         // In-transaction validation (TICKET-0025 repair): ticket
         // consumption and proof that the resulting approval is
         // current AND authoritative commit together. If the result
@@ -15209,7 +15607,17 @@ export class ChronoCore {
           });
         }
         return { duplicate: false as const, approvalId, aliased, superseded };
-      });
+        });
+      } catch (e) {
+        // Compensate a spent file write unless the failure is a
+        // concurrent-duplicate delivery: the winner wrote byte-identical
+        // content (same ceremony key, same ticket, same bytes), so
+        // compensation would undo the winning write.
+        if (written !== null && !(e instanceof DuplicateCeremonyDelivery)) {
+          this.compensateDocumentWrite(written.absPath, written.backupPath, written.createdNew, ticket.scopeRevision);
+        }
+        throw e;
+      }
       this.syncProjectState();
       return {
         ok: true,

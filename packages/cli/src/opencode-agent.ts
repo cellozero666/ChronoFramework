@@ -394,6 +394,22 @@ const ROLE_BODIES: Record<ChronoOpenCodeRole, string> = {
     "  replaced drafts with `chrono_artifact_supersede` (never delete",
     "  files or edit the database). Never sign, proxy, or claim PO",
     "  authority.",
+    "- Write user-requested Markdown documents ONLY through the memo",
+    "  petition, never shell, edit, or write tools: when the Product",
+    "  Owner asks for a document (fix plan, FIXES.md, memo), draft the",
+    "  exact content and call `chrono_memo_write` with the",
+    "  project-relative path, the inline body, a rationale, and explicit",
+    "  security implications. It returns a single-use ticket binding the",
+    "  path plus the exact content hash: ask the Product Owner through",
+    "  the native `question` tool carrying the exact challenge line,",
+    "  then verify the landing (`chrono_approval_status` must read",
+    "  live=false, consumed, with an approval id) before continuing —",
+    "  the Core wrote the file with a backup beside it, never you. One",
+    "  ticket authorizes exactly one write of exactly those bytes; a",
+    "  chat \"yes, write it\" alone authorizes nothing, and a changed",
+    "  document between request and confirmation burns the ticket, so",
+    "  re-request. After the landing, route the approved plan to workers",
+    "  or continue with `chrono_advance`.",
     "- Dispatch implementation ONLY through the native governed dispatch",
     "  flow, entirely inside this session, once the module and its Work",
     "  Packages are approved and current: (1) `chrono_dispatch` with the",
@@ -634,7 +650,7 @@ export function buildOpenCodeAgentDefinition(role: ChronoOpenCodeRole): string {
   // precedence; the in-execute ask() remains the backstop.
   const   permission =
     role === "gaspar"
-      ? "permission:\n  chrono_advance: allow\n  chrono_artifact_status: allow\n  chrono_artifact_propose: allow\n  chrono_artifact_revise: allow\n  chrono_artifact_supersede: allow\n  chrono_approval_request: allow\n  chrono_approval_status: allow\n  chrono_dispatch: allow\n  chrono_dispatch_claim: allow\n  question: allow\n"
+      ? "permission:\n  chrono_advance: allow\n  chrono_artifact_status: allow\n  chrono_artifact_propose: allow\n  chrono_artifact_revise: allow\n  chrono_artifact_supersede: allow\n  chrono_approval_request: allow\n  chrono_approval_status: allow\n  chrono_memo_write: allow\n  chrono_dispatch: allow\n  chrono_dispatch_claim: allow\n  question: allow\n"
       : "";
   return `---\ndescription: ${ROLE_DESCRIPTIONS[role]}\nmode: ${mode}\n${permission}---\n\n${ROLE_BODIES[role]}\n`;
 }

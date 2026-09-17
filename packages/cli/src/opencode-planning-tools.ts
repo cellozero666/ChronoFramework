@@ -45,6 +45,7 @@ export const CHRONO_NATIVE_TOOLS = [
   "chrono_artifact_supersede",
   "chrono_approval_request",
   "chrono_approval_status",
+  "chrono_memo_write",
   "chrono_dispatch",
   "chrono_dispatch_claim",
   "chrono_advance",
@@ -113,7 +114,7 @@ export function checkPlanningToolsFile(existing: string | null): PlanningToolsSt
 }
 
 /**
- * Generated `.opencode/tools/chrono.ts`. Single file, thirty-nine
+ * Generated `.opencode/tools/chrono.ts`. Single file, forty
  * named exports (`chrono_<export>` tool names). Self-contained except
  * the pinned `@opencode-ai/plugin` import and node builtins.
  */
@@ -123,15 +124,19 @@ export function buildPlanningToolsFile(): string {
  * \`chrono setup --adapter <id>\` / \`chrono init --runtime opencode\`
  * — do not hand-edit (drift fails closed; repair regenerates).
  *
-  * Thirty-nine model-callable tools (OpenCode names: chrono_<export>).
-  * Planning (Gaspar entry):
-  * - artifact_status: Core-backed planning status projection (safe).
+ * Forty model-callable tools (OpenCode names: chrono_<export>).
+ * Planning (Gaspar entry):
+ * - artifact_status: Core-backed planning status projection (safe).
   * - artifact_propose: materialize one planning draft (inline body).
   * - artifact_revise: revise one planning draft (inline body).
   * - artifact_supersede: retire one draft by its replacement.
   * - approval_request: open a single-use approval ticket.
-  * - approval_status: safe ticket projection (live/consumed/stale).
-  * - dispatch: validate every dispatch gate and record a native
+ * - approval_status: safe ticket projection (live/consumed/stale).
+ * - memo_write: request a single-use document-write ticket for a
+ *   user-approved Markdown document (inline body; binds path plus
+ *   exact content hash; finalize via approval-record after native
+ *   human confirmation, then the Core writes with backup).
+ * - dispatch: validate every dispatch gate and record a native
   *   dispatch intent (Gaspar only; module/WP ids, kind, rationale).
  * - dispatch_claim: bind one worker subagent session to a dispatch
  *   intent (first call a worker makes; host-held credentials only).
@@ -390,6 +395,29 @@ export const approval_status = tool({
     const res = runChrono(["approval-ticket", "--ticket", args.ticket, ...commonArgs(root, token)]);
     if (res.exit !== 0 || res.json?.ok !== true) {
       deny(res.json, "approval status denied");
+    }
+    return JSON.stringify(res.json);
+  },
+});
+
+export const memo_write = tool({
+  description: "CHRONO: request a single-use document-write ticket for a user-approved Markdown document (Gaspar only, after the Product Owner asked for it). Binds the document path plus the exact content hash; the human confirms through the native question tool and the Core writes with backup on finalize. Never generic file writes.",
+  args: {
+    path: tool.schema.string().describe("project-relative Markdown document path (e.g. docs/FIXES.md)"),
+    body: tool.schema.string().describe("inline Markdown body"),
+    rationale: tool.schema.string().describe("why this document changes"),
+    securityImplications: tool.schema.string().describe("explicit security implications"),
+  },
+  async execute(args, context) {
+    const root = projectRoot(context.directory);
+    const token = hostToken(root, context.sessionID);
+    const res = runChrono([
+      "memo-write", "--doc", args.path, "--body-stdin",
+      "--rationale", args.rationale, "--security-implications", args.securityImplications,
+      "--require-question", ...commonArgs(root, token),
+    ], args.body);
+    if (res.exit !== 0 || !res.json || res.json.ok !== true) {
+      deny(res.json, "memo write denied");
     }
     return JSON.stringify(res.json);
   },

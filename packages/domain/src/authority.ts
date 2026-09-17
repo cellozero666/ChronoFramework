@@ -31,6 +31,10 @@ export const APPROVAL_ACTIONS = [
   "architecture-security",
   "implementation-security",
   "adapter-registration",
+  // User-approved Gaspar document writes (co-architect memos, fix
+  // plans): bound to exact path + content hash through the same
+  // permission-bound ceremony, never chat text.
+  "document-write",
 ] as const;
 
 export type ApprovalAction = (typeof APPROVAL_ACTIONS)[number];

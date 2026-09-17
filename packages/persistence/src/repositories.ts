@@ -3774,4 +3774,77 @@ export class PolicyRepository {
   }
 }
 
+/** One approved document body awaiting its human confirmation. */
+export interface DocumentWriteRecord {
+  ticketId: string;
+  path: string;
+  contentHash: string;
+  body: string;
+  baseRevision: string | null;
+  createdAt: string;
+}
+
+/**
+ * Pending user-approved document bodies (co-architect writes). One row
+ * per ticket, written at request time and read back at finalize: the
+ * model never resends content, so approval cannot drift onto
+ * different bytes. Rows are append-only like tickets; spent rows stay
+ * as audit alongside their ticket.
+ */
+export class DocumentWriteRepository {
+  constructor(private readonly db: Database) {}
+
+  create(record: {
+    ticketId: string;
+    path: string;
+    contentHash: string;
+    body: string;
+    baseRevision: string | null;
+    createdAt: string;
+  }): DocumentWriteRecord {
+    try {
+      this.db.prepare(
+        `INSERT INTO document_write_pending (ticket_id, path, content_hash, body, base_revision, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(record.ticketId, record.path, record.contentHash, record.body, record.baseRevision, record.createdAt);
+    } catch {
+      throw new ChronoError({
+        code: ErrorCode.DUPLICATE_IDENTITY,
+        severity: Severity.ERROR,
+        message: `Document write request '${record.ticketId}' already exists`,
+        invariantRef: "INV §10.1",
+        affectedTarget: record.ticketId,
+        suggestedAction: "Request a fresh document-write ticket",
+      });
+    }
+    return this.findByTicketId(record.ticketId);
+  }
+
+  findByTicketId(ticketId: string): DocumentWriteRecord {
+    const row = this.db
+      .prepare("SELECT * FROM document_write_pending WHERE ticket_id = ?")
+      .get(ticketId) as
+      | { ticket_id: unknown; path: unknown; content_hash: unknown; body: unknown; base_revision: unknown; created_at: unknown }
+      | undefined;
+    if (row === undefined) {
+      throw new ChronoError({
+        code: ErrorCode.ENTITY_NOT_FOUND,
+        severity: Severity.ERROR,
+        message: `Document write request '${ticketId}' not found: replay denied`,
+        invariantRef: "INV §10.2",
+        affectedTarget: ticketId,
+        suggestedAction: "Request a fresh document-write ticket",
+      });
+    }
+    return {
+      ticketId: row.ticket_id as string,
+      path: row.path as string,
+      contentHash: row.content_hash as string,
+      body: row.body as string,
+      baseRevision: row.base_revision as string | null,
+      createdAt: row.created_at as string,
+    };
+  }
+}
+
 export { type Database };

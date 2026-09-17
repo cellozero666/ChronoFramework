@@ -832,3 +832,52 @@ describe("Review reconciliation (v20)", () => {
     }
   });
 });
+
+describe("Document-write pending store (v21)", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "chrono-v21-test-"));
+  });
+
+  afterEach(() => {
+    if (typeof tempDir === "string") {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("creates the pending table on every upgrade path", () => {
+    for (const baseline of [1, 20]) {
+      const dir = mkdtempSync(join(tmpdir(), "chrono-v21-upgrade-"));
+      try {
+        const first = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          first.migrate(baseline);
+        } finally {
+          first.close();
+        }
+        const second = new ChronoDatabase({ path: join(dir, "chrono.db") });
+        try {
+          second.migrate();
+          expect(second.schemaVersion()).toBe(SCHEMA_VERSION);
+          const created = second.documentWrites().create({
+            ticketId: "TICKET-0001", path: "docs/FIXES.md", contentHash: `sha256:${"a".repeat(64)}`,
+            body: "# Fixes\n", baseRevision: null, createdAt: "2026-09-17T00:00:00.000Z",
+          });
+          expect(created).toMatchObject({ ticketId: "TICKET-0001", path: "docs/FIXES.md", baseRevision: null });
+          expect(second.documentWrites().findByTicketId("TICKET-0001").body).toBe("# Fixes\n");
+          expect(() => second.documentWrites().findByTicketId("TICKET-9999")).toThrow(/not found/);
+          // Duplicate ticket rows collide fail-closed.
+          expect(() => second.documentWrites().create({
+            ticketId: "TICKET-0001", path: "docs/OTHER.md", contentHash: `sha256:${"b".repeat(64)}`,
+            body: "# Other\n", baseRevision: null, createdAt: "2026-09-17T00:00:00.000Z",
+          })).toThrow(/already exists/);
+        } finally {
+          second.close();
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+});

@@ -234,7 +234,7 @@ Adapters MUST distinguish five tool classes inside CHRONO projects:
 
 - **Governed planning mutation** — the NATIVE tools
   (`chrono_artifact_status/propose/revise/supersede`,
-  `chrono_approval_request/status`,
+  `chrono_approval_request/status`, `chrono_memo_write`,
   `chrono_dispatch/dispatch_claim`, plus the lifecycle set
   `chrono_next/execution_status/evidence_record/evidence_status/complete_request/review_request/review_complete/defect_record/defect_resolve/verify_record/correction_open/correction_complete/module_complete/wp_authorize/deep_check/policy_set/policy_status/dispatch_confirm/dispatch_release/dispatch_revoke/dispatch_reconcile/scope_advance` in
   `.opencode/tools/chrono.ts`, canonical list `CHRONO_NATIVE_TOOLS`;
@@ -253,7 +253,12 @@ Adapters MUST distinguish five tool classes inside CHRONO projects:
   recomputed ceremony key (canonical project, session, request,
   ticket, scope, action, revision) atomically with ticket consumption
   and approval registration — one human Approve authorizes at most
-  one ceremony claim and at most one approval row. Post-planning
+  one ceremony claim and at most one approval row. For the
+  `document-write` action (ADR-008) the same claim additionally
+  carries the Core-side file write (backup + atomic replace of the
+  exact approved bytes); the revision bound is the proposed content
+  hash and base currency (absent stays absent) replaces live-scope
+  currency. Post-planning
   dispatch runs entirely inside the runtime: `chrono_dispatch`
   (module/WP ids, kind, bounded rationale; every gate validated,
   Core-owned intent recorded) then exactly one worker subagent via

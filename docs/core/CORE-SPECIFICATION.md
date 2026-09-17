@@ -935,6 +935,8 @@ The Core exposes deterministic functions. Adapters MAY call them but MUST NOT re
 | `set_policy_profile(profile, rationale, signature?, timestamp?)` | `{profile, downgraded}` | Calibrate `lean`/`standard`/`critical` (Gaspar/PO; lowering needs a fresh PO signature; default `standard`) |
 | `complete_module(module_id)` | `{state}` | Terminal completion: package-less modules through their verdict chain, WP modules by aggregate (`AllPackagesComplete`); idempotent |
 | `planning_status()` | proposed/awaiting/approved/rejected/stale list | Safe status projection, no secrets |
+| `request_document_write(path, body, rationale, implications?)` | `{ticketId?, challenge?, expiresAt?, alreadyCurrent, scopeId, contentHash, baseRevision?}` or error | User-approved document petition (Gaspar/PO): validates path (project-contained `.md`, outside `.chrono/`, `.git/`, `node_modules/`), secret-scans and bounds the body, stores it Core-side, issues a `document-write` ticket binding path plus exact content hash; already-current bytes return no ticket |
+| `finalize_document_write` | via `finalizeApprovalTicket` | Same permission-bound finalize; on `document-write` tickets the Core additionally verifies base currency, writes the approved bytes (backup + atomic replace) inside the finalize transaction with compensation, and appends `DocumentWritten` audit |
 
 Reference: `[DOM §6]`, `[FW §13]`, `[REF §24]`.
 

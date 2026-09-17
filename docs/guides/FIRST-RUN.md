@@ -106,8 +106,29 @@ files, no tokens): `chrono_artifact_propose` / `chrono_artifact_revise`
 approval-confirm tool: the human confirmation travels only through
 the native `question` tool, which the Gaspar agent policy must
 explicitly allow (`question: allow` — OpenCode denies tools by
-default). Never generic file writes, never `chrono run` (execution
-grants are reserved for authorized implementation work).
+  default). Never generic file writes, never `chrono run` (execution
+  grants are reserved for authorized implementation work). The one
+  exception is a document you explicitly ask Gaspar to write (a fix
+  plan, `FIXES.md`, a memo): see §3.1.1 — it petitions through its
+  own ticket and the Core writes it only after your explicit Approve.
+
+## 3.1.1 User-requested documents (Gaspar petitions, you approve, the Core writes)
+
+When you ask Gaspar for a document, it drafts the exact content and
+calls `chrono_memo_write` with the project-relative path, the inline
+body, a rationale, and explicit security implications. That opens a
+single-use `document-write` ticket binding the path plus the exact
+content hash — Markdown documents only, inside the project, outside
+`.chrono/`, `.git/`, and `node_modules/` — and the flow continues
+exactly like §3.1: the native `question` UI shows the challenge, and
+only your explicit Approve answer lets the runtime host sign and the
+Core write the file (previous content kept as a `.chrono-bak`
+backup beside it). One Approve authorizes at most one write of
+exactly those bytes; a chat "yes, write it" alone authorizes
+nothing, and any change to the document between request and
+confirmation burns the ticket (re-request instead). After the
+landing, Gaspar routes the approved plan to workers or continues
+with `chrono_advance`.
 
 Each draft is approved **without leaving the runtime**: Gaspar opens
 a ticket, asks you through the native `question` UI showing the exact

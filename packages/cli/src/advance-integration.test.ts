@@ -12,7 +12,7 @@
  * - Gaspar's contract routes the normal workflow exclusively through
  *   `chrono_advance` (structured `decision.type` switching, never
  *   parsed prose, never PO-operated internals);
- * - `chrono_advance` is classified by the canonical policy (v9) and
+ * - `chrono_advance` is classified by the canonical policy (v10) and
  *   passes the real pre-tool gate; unknown tools stay denied;
  * - garbled prose never deflects a structured result.
  */
@@ -589,7 +589,7 @@ describe("Gaspar advance contract (normal workflow routing)", () => {
   });
 });
 
-describe("advance policy surface (canonical v9)", () => {
+describe("advance policy surface (canonical v10)", () => {
   function validPayload(sessionId = "SES-0001"): string {
     return JSON.stringify({
       ok: true,
@@ -604,7 +604,7 @@ describe("advance policy surface (canonical v9)", () => {
   }
 
   it("classifies chrono_advance as a planning tool under policy v9", () => {
-    expect(TOOL_POLICY_VERSION).toBe("9");
+    expect(TOOL_POLICY_VERSION).toBe("10");
     expect(classifyOpencodeTool("chrono_advance")).toBe("planning");
     expect(OPENCODE_TOOL_POLICY["chrono_advance"]).toBe("planning");
     // The generation identity moves with the tool addition.

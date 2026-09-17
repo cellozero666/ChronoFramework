@@ -737,7 +737,13 @@ describe("OC-P11 integrated approval ceremony", () => {
     const gate = async (tool: string, args: unknown): Promise<void> => {
       await hooks.before({ tool, sessionID: sessionKey, callID: `call-${tool}` }, { args });
     };
-    expect(Object.keys(tools).join(" ")).not.toMatch(/write|edit|bash|shell/);
+    // Only the governed memo-write petition names a write surface:
+    // it performs no model-side write (the Core writes ticket-bound
+    // bytes with backup on human approval). Everything else stays
+    // free of write/edit/shell surface.
+    const names = Object.keys(tools).join(" ").split(" ").filter((n) => n !== "memo_write").join(" ");
+    expect(names).not.toMatch(/write|edit|bash|shell/);
+    expect(Object.keys(tools)).toContain("memo_write");
     await expect(gate("write", { filePath: "src/app.ts", content: "x" })).rejects.toThrow();
     await expect(gate("edit", { filePath: "src/app.ts", oldText: "a", newText: "b" })).rejects.toThrow();
     await expect(gate("bash", { command: "npm run build" })).rejects.toThrow();

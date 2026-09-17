@@ -28,12 +28,13 @@ export const AUTHORITY_POLICY_VERSION = "9";
 /**
  * Version of the runtime tool-classification policy below. Bumped
  * independently from the authority matrix: tool classification affects
- * pre-tool gate decisions, never grant semantics. v9 adds the
- * chrono_advance workflow driver (Gaspar calls advance() and switches
- * on the structured decision); v8 classified the planning-runway
- * tools, so a v8-loaded runtime is stale by definition.
+ * pre-tool gate decisions, never grant semantics. v10 adds the
+ * chrono_memo_write user-approved document-write petition (Gaspar
+ * calls it after the PO asks, human confirms, Core writes); v9 added
+ * the chrono_advance workflow driver, so a v9-loaded runtime is
+ * stale by definition.
  */
-export const TOOL_POLICY_VERSION = "9";
+export const TOOL_POLICY_VERSION = "10";
 
 export type CapabilityHolder = AgentRole | "PO";
 
@@ -235,6 +236,13 @@ export const OPENCODE_TOOL_POLICY: Record<string, ToolClassification> = {
   chrono_artifact_supersede: "planning",
   chrono_approval_request: "planning",
   chrono_approval_status: "planning",
+  // User-approved document-write petition (co-architect memos, fix
+  // plans): Gaspar calls it after the PO asks for a document; the
+  // ticket binds path plus exact content hash, the human confirms
+  // through the native question tool, and the Core writes with
+  // backup on finalize. Entry only at the gate; every deeper check
+  // lives in the Core.
+  chrono_memo_write: "planning",
   // Native governed dispatch tools (post-planning deadlock repair):
   // chrono_dispatch opens a dispatch intent after full gate
   // validation (Gaspar session, host-held); chrono_dispatch_claim

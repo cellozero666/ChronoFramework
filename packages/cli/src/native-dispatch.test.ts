@@ -368,6 +368,7 @@ describe("Native governed dispatch", () => {
       "chrono_artifact_supersede",
       "chrono_approval_request",
       "chrono_approval_status",
+      "chrono_memo_write",
       "chrono_dispatch",
       "chrono_dispatch_claim",
       "chrono_advance",

@@ -49,7 +49,7 @@ import {
 } from "./entry-contract.js";
 import { constructionFailure, openReadProject, resolveProjectDir } from "./project.js";
 import { runArtifactPropose, runArtifactRevise, runArtifactStatus, runArtifactSupersede } from "./artifact-cli.js";
-import { runApprovalRecord, runApprovalRequest, runApprovalTicket } from "./approval-ceremony-cli.js";
+import { runApprovalRecord, runApprovalRequest, runApprovalTicket, runMemoWriteRequest } from "./approval-ceremony-cli.js";
 import { runDispatchClaim, runDispatchRequest, runDispatchTaskCheck } from "./dispatch-cli.js";
 import {
   runArchitectureApprove,
@@ -209,6 +209,7 @@ interface CommandOpts {
   readonly timestamp?: unknown;
   readonly signature?: unknown;
   readonly bodyStdin?: unknown;
+  readonly doc?: unknown;
   readonly contentFile?: unknown;
   readonly contentHash?: unknown;
   readonly contentStdin?: unknown;
@@ -3803,6 +3804,63 @@ export function createProgram(cwd: string): Command {
           as: String(opts.as ?? ""),
           ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
           json: opts.json === true,
+        })
+      );
+    });
+
+  program
+    .command("memo-write")
+    .description("Request a single-use document-write ticket for a user-approved Markdown document (binds path plus exact content hash; finalize via approval-record after native human confirmation)")
+    .requiredOption("--doc <path>", "project-relative Markdown document path (e.g. docs/FIXES.md)")
+    .option("--body-file <path>", "markdown body file (exactly one of --body-file or --body-stdin)")
+    .option("--body-stdin", "read the markdown body from stdin (native tools use this; no temp file)")
+    .requiredOption("--rationale <text>", "why this document changes")
+    .requiredOption("--security-implications <text>", "explicit security implications")
+    .option("--require-question", "refuse unless OpenCode exposes the native question tool to Gaspar (native tools always pass this)")
+    .requiredOption("--as <actor>", "requesting identity (gaspar or PO, matching the caller session)")
+    .option("--session-token <id/token>", "caller session credential (or CHRONO_SESSION_TOKEN)")
+    .option("--path <dir>", "project directory (default: current directory)")
+    .option("--json", "machine-readable JSON output")
+    .action((opts: CommandOpts) => {
+      const projectPath = resolveProjectDir(cwd, opts.path);
+      let body: string | null = null;
+      if (opts.bodyStdin === true) {
+        body = readInlineBody(opts.json === true);
+        if (body === null) {
+          return;
+        }
+      } else if (typeof opts.bodyFile === "string" && opts.bodyFile.length > 0) {
+        try {
+          body = readFileSync(opts.bodyFile, "utf8");
+        } catch (e) {
+          emitProgramResult(
+            program,
+            opts.json === true
+              ? { exitCode: 2, stdout: JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: `cannot read body file: ${e instanceof Error ? e.message : String(e)}` } }, null, 2), stderr: "" }
+              : { exitCode: 2, stdout: "", stderr: `Error [VALIDATION_ERROR]: cannot read body file` }
+          );
+          return;
+        }
+      } else {
+        emitProgramResult(
+          program,
+          opts.json === true
+            ? { exitCode: 2, stdout: JSON.stringify({ ok: false, error: { code: "VALIDATION_ERROR", message: "memo-write requires --doc, --body-file or --body-stdin, --rationale, and --security-implications" } }, null, 2), stderr: "" }
+            : { exitCode: 2, stdout: "", stderr: `Error [VALIDATION_ERROR]: memo-write requires --doc, --body-file or --body-stdin, --rationale, and --security-implications` }
+          );
+        return;
+      }
+      emitProgramResult(
+        program,
+        runMemoWriteRequest(projectPath, {
+          path: String(opts.doc ?? ""),
+          body,
+          rationale: String(opts.rationale ?? ""),
+          securityImplications: String(opts.securityImplications ?? ""),
+          as: String(opts.as ?? ""),
+          ...(typeof opts.sessionToken === "string" ? { sessionToken: opts.sessionToken } : {}),
+          json: opts.json === true,
+          ...(opts.requireQuestion === true ? { requireQuestion: true as const } : {}),
         })
       );
     });

@@ -379,3 +379,100 @@ export function runApprovalTicket(projectPath: string, options: ApprovalTicketOp
 }
 
 export { approvalChallenge };
+
+export interface MemoWriteRequestOptions {
+  readonly path: string;
+  readonly body: string;
+  readonly rationale: string;
+  readonly securityImplications: string;
+  readonly as: string;
+  readonly sessionToken?: string | undefined;
+  readonly json?: boolean | undefined;
+  /**
+   * Refuse the ticket unless the OpenCode `question` surface is
+   * available to the Gaspar agent: without it no human boundary can
+   * ever confirm the write (native tools always pass this).
+   */
+  readonly requireQuestion?: boolean | undefined;
+  /** Override for the OpenCode binary probe (tests inject a fixture). */
+  readonly opencodeBinary?: string | undefined;
+}
+
+/**
+ * Request a single-use document-write ticket (co-architect memos, fix
+ * plans). Binds the canonical document path plus the exact proposed
+ * content hash; the body is stored Core-side so approval cannot drift
+ * onto different bytes. The ticket authorizes nothing by itself: only
+ * a permission-bound finalize carrying a valid PO signature writes.
+ */
+export function runMemoWriteRequest(projectPath: string, options: MemoWriteRequestOptions): CliOutput {
+  const asJson = options.json === true;
+  if (options.as.length === 0) {
+    return coreError(
+      { code: "VALIDATION_ERROR", severity: "ERROR", message: "memo-write requires --as <gaspar|PO> matching the caller session" },
+      asJson
+    );
+  }
+  const session = resolveSessionToken(options.sessionToken);
+  if (session === null) {
+    return coreError(
+      { code: "VALIDATION_ERROR", severity: "ERROR", message: "memo-write requires --session-token (or CHRONO_SESSION_TOKEN)" },
+      asJson
+    );
+  }
+  if (options.requireQuestion === true) {
+    const surface = checkQuestionSurface(projectPath, options.opencodeBinary);
+    if (surface.available !== true) {
+      return coreError(
+        {
+          code: "VALIDATION_ERROR",
+          severity: "ERROR",
+          message: `document-write ticket refused: ${surface.reason}`,
+        },
+        asJson
+      );
+    }
+  }
+  let core: ChronoCore;
+  try {
+    core = new ChronoCore({ projectPath, pinnedVersion: CHRONO_VERSION });
+  } catch (e) {
+    return constructionFailure(e, asJson);
+  }
+  try {
+    const result = core.requestDocumentWriteTicket(
+      {
+        path: options.path,
+        body: options.body,
+        rationale: options.rationale,
+        securityImplications: options.securityImplications,
+      },
+      { actor: options.as, session }
+    );
+    if (!result.ok) {
+      return coreError(result.error, asJson);
+    }
+    const v = result.value!;
+    if (asJson) {
+      return { exitCode: 0, stdout: JSON.stringify({ ok: true, ...v }, null, 2), stderr: "" };
+    }
+    if (v.alreadyCurrent) {
+      return {
+        exitCode: 0,
+        stdout: `Document already carries the proposed bytes: '${v.scopeId}' (no ticket needed)`,
+        stderr: "",
+      };
+    }
+    return {
+      exitCode: 0,
+      stdout: [
+        `Document-write ticket issued: ${v.ticketId} (expires ${v.expiresAt})`,
+        `Human confirmation challenge: ${v.challenge}`,
+        `Ask the Product Owner through the native question tool with the exact challenge line, then finalize only from the observed human answer.`,
+      ].join("\n"),
+      stderr: "",
+    };
+  } finally {
+    core.close();
+  }
+}

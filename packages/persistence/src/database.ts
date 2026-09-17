@@ -24,6 +24,7 @@ import {
   CeremonyClaimRepository,
   CorrectionRepository,
   DispatchRepository,
+  DocumentWriteRepository,
   PolicyRepository,
   ProjectRepository,
   QaRepository,
@@ -251,6 +252,10 @@ export class ChronoDatabase {
 
   dispatches(): DispatchRepository {
     return new DispatchRepository(this.db);
+  }
+
+  documentWrites(): DocumentWriteRepository {
+    return new DocumentWriteRepository(this.db);
   }
 
   reviewAssignments(): ReviewRepository {

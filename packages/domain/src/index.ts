@@ -114,6 +114,19 @@ export {
   type PlanningKind,
 } from "./planning.js";
 
+// User-approved Gaspar document writes (co-architect memos, fix plans)
+export {
+  DOCUMENT_BACKUP_SUFFIX,
+  DOCUMENT_MAX_BYTES,
+  DOCUMENT_MIN_BYTES,
+  DOCUMENT_SCOPE_PREFIX,
+  DOCUMENT_WRITE_ACTION,
+  DOCUMENT_WRITE_EXTENSION,
+  documentScopePath,
+  resolveDocumentScope,
+  type ResolvedDocumentScope,
+} from "./documents.js";
+
 // Managed-asset inventory for routing drift binding [FIXES-SL-10.1 C2]
 export {
   ENTRY_SESSION_SCRIPT_ASSET,

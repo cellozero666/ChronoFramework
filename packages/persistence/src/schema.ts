@@ -4,7 +4,7 @@
  * [CORE §5, P3.9, FW §671]
  */
 
-export const SCHEMA_VERSION = 20;
+export const SCHEMA_VERSION = 21;
 
 export const MIGRATIONS: Record<number, string> = {
   1: `
@@ -1001,5 +1001,20 @@ export const MIGRATIONS: Record<number, string> = {
     BEGIN
       SELECT RAISE(ABORT, 'review assignments mutate only ASSIGNED -> SUBMITTED/SUPERSEDED/INVALID with frozen scope');
     END;
+  `,
+  21: `
+    -- User-approved document writes (co-architect memos, fix plans):
+    -- one pending body per approval ticket, written at request time
+    -- and read back at finalize so approval cannot drift onto
+    -- different bytes. Rows are append-only like tickets: spent rows
+    -- stay as audit alongside their ticket and approval.
+    CREATE TABLE document_write_pending (
+      ticket_id    TEXT PRIMARY KEY,
+      path         TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      body         TEXT NOT NULL,
+      base_revision TEXT,
+      created_at   TEXT NOT NULL
+    );
   `,
 };

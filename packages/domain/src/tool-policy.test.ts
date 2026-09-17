@@ -18,8 +18,13 @@ import {
 } from "./index.js";
 
 describe("OpenCode tool policy (dispatch repair)", () => {
-  it("is versioned at v9", () => {
-    expect(TOOL_POLICY_VERSION).toBe("9");
+  it("is versioned at v10", () => {
+    expect(TOOL_POLICY_VERSION).toBe("10");
+  });
+
+  it("classifies the memo-write petition as a planning tool", () => {
+    expect(classifyOpencodeTool("chrono_memo_write")).toBe("planning");
+    expect(OPENCODE_TOOL_POLICY["chrono_memo_write"]).toBe("planning");
   });
 
   it("classifies the advance workflow driver as a planning tool", () => {
